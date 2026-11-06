@@ -122,7 +122,7 @@ fn test_resolve_effort_defaults_to_none() {
         ModelRole::Scribe,
         ModelRole::Coder,
         ModelRole::Architect,
-        ModelRole::Primary,
+        ModelRole::REPL,
         ModelRole::Reviewer,
     ] {
         assert_eq!(config.resolve_effort(role), None);
@@ -153,7 +153,7 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
         Some(ReasoningEffort::High)
     );
     assert_eq!(config.resolve_effort(ModelRole::Reviewer), None);
-    assert_eq!(config.resolve_effort(ModelRole::Primary), None);
+    assert_eq!(config.resolve_effort(ModelRole::REPL), None);
     // Scribe is a single utility model and never carries effort.
     assert_eq!(config.resolve_effort(ModelRole::Scribe), None);
 }
@@ -504,7 +504,7 @@ architect = [{ model = "openrouter:only/architect", effort = "high" }]
     );
 
     for role in [
-        ModelRole::Primary,
+        ModelRole::REPL,
         ModelRole::Coder,
         ModelRole::Architect,
         ModelRole::Reviewer,
@@ -541,7 +541,7 @@ scribe = "Deep"
     );
 
     let deep = ModelRef::openrouter("deepseek/deepseek-chat");
-    assert_eq!(config.resolve_role(ModelRole::Primary), deep);
+    assert_eq!(config.resolve_role(ModelRole::REPL), deep);
     assert_eq!(config.scribe, Some(deep.clone()));
     assert_eq!(config.coder_tier(0).model, deep);
     assert_eq!(config.coder_tier(0).effort, Some(ReasoningEffort::Max));
@@ -641,7 +641,7 @@ primary = [
 
     // The role list keeps all three rungs of the same model, so the picker
     // presents rows that differ only by their reasoning depth.
-    let rows = config.role_entries(ModelRole::Primary);
+    let rows = config.role_entries(ModelRole::REPL);
     assert_eq!(rows.len(), 3);
     assert_eq!(
         rows.iter().map(|row| row.effort).collect::<Vec<_>>(),
@@ -681,7 +681,7 @@ primary = [
             effort: row.effort,
         };
         assert_eq!(
-            config.resolve_selection_effort(ModelRole::Primary, &tier),
+            config.resolve_selection_effort(ModelRole::REPL, &tier),
             row.effort
         );
         assert_eq!(config.resolve_model(&tier), model);
@@ -692,7 +692,7 @@ primary = [
     // removes.
     let collapsed = ModelSelection::Specific(model.clone());
     assert_eq!(
-        config.resolve_selection_effort(ModelRole::Primary, &collapsed),
+        config.resolve_selection_effort(ModelRole::REPL, &collapsed),
         Some(ReasoningEffort::Low)
     );
 }

@@ -247,12 +247,12 @@ impl AppConfig {
 
     /// The default active model based on `Primary` role.
     pub fn active_model(&self) -> ModelRef {
-        self.resolve_role(ModelRole::Primary)
+        self.resolve_role(ModelRole::REPL)
     }
 
     /// The default model selection based on `Primary` role.
     pub fn default_selection(&self) -> ModelSelection {
-        ModelSelection::Role(ModelRole::Primary)
+        ModelSelection::Role(ModelRole::REPL)
     }
 
     /// The model used for history summarization and squash commit message generation.
@@ -271,7 +271,7 @@ impl AppConfig {
             ModelRole::Scribe,
             ModelRole::Coder,
             ModelRole::Architect,
-            ModelRole::Primary,
+            ModelRole::REPL,
             ModelRole::Reviewer,
         ] {
             for entry in self.models.role_entries(role) {
@@ -513,7 +513,7 @@ auto_level_up = true
         );
         assert_eq!(
             config.default_selection(),
-            ModelSelection::Role(ModelRole::Primary)
+            ModelSelection::Role(ModelRole::REPL)
         );
         assert_eq!(
             config.history_model(),
@@ -567,7 +567,7 @@ auto_level_up = true
             roles.architect
         );
         assert_eq!(
-            config.resolve_model(&ModelSelection::Role(ModelRole::Primary)),
+            config.resolve_model(&ModelSelection::Role(ModelRole::REPL)),
             roles.primary
         );
         assert_eq!(
@@ -598,7 +598,7 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
             Some(ReasoningEffort::Medium)
         );
         assert_eq!(config.models.resolve_effort(ModelRole::Reviewer), None);
-        assert_eq!(config.models.resolve_effort(ModelRole::Primary), None);
+        assert_eq!(config.models.resolve_effort(ModelRole::REPL), None);
     }
 
     #[test]
@@ -632,7 +632,7 @@ primary = ["openrouter:anthropic/claude-3.7-sonnet"]
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
         assert_eq!(config.resolve_role(ModelRole::Architect), expected);
-        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
+        assert_eq!(config.resolve_role(ModelRole::REPL), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
         assert_eq!(config.active_model(), expected);
         assert_eq!(config.history_model(), expected);
@@ -653,7 +653,7 @@ primary = ["openrouter:alpha/model", "openrouter:beta/model"]
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
         assert_eq!(config.resolve_role(ModelRole::Architect), expected);
-        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
+        assert_eq!(config.resolve_role(ModelRole::REPL), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
 
         // The coder escalation ladder inherits the full primary list.
@@ -674,7 +674,7 @@ models = ["custom/external-fallback"]
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
         assert_eq!(config.resolve_role(ModelRole::Architect), expected);
-        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
+        assert_eq!(config.resolve_role(ModelRole::REPL), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
         assert_eq!(config.active_model(), expected);
         assert_eq!(config.history_model(), expected);

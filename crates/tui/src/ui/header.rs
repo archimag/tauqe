@@ -907,7 +907,7 @@ mod tests {
         let entry =
             tauqe_protocol::ModelEntry::new(ModelRef::openrouter("google/gemini-2.0-flash"), None);
         state.model_choice = crate::app::ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Primary),
+            selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(tauqe_protocol::ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn test_model_selector_label_tracks_running_turn() {
         let mut state = test_app_state();
-        state.model_choice.selection = ModelSelection::Role(ModelRole::Primary);
+        state.model_choice.selection = ModelSelection::Role(ModelRole::REPL);
         state.model.status = crate::views::repl::TurnStatus::Thinking;
         let summary = tauqe_protocol::ModelRolesSummary {
             scribe: ModelRef::openrouter("scribe-model"),

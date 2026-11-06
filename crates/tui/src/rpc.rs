@@ -6,6 +6,7 @@ pub mod transport;
 pub use events::{fail_safe_reject_edits, handle_event};
 pub use handshake::initialize_connection;
 pub use responses::handle_response;
+pub(crate) use responses::settle_squash_failure;
 pub use transport::{
     allocate_request_id, find_server_binary, send_request, send_request_with_id,
     send_request_with_rollback, spawn_message_reader, start_server, OptimisticRollback,

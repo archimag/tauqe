@@ -63,6 +63,7 @@ use tokio::sync::mpsc;
 
 use crate::handlers::architect::resolve_architect_provider;
 use crate::handlers::common::{record_synthesis_history, withdraw_streamed_attempt};
+use crate::reap::abort_and_reap;
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{emit, offload_review, publish_review};
@@ -312,7 +313,7 @@ pub(super) async fn run_review_post_analysis(
     // analysis is charged even when it fails or is cancelled.
     let usage_guard = state.begin_usage().await;
 
-    let cancel_rx = operation.cancel_receiver();
+    let mut cancel_rx = operation.cancel_receiver();
     let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
     let err_tx = tx.clone();
     let model_name = model.name.clone();
@@ -344,7 +345,18 @@ pub(super) async fn run_review_post_analysis(
     let mut failure: Option<String> = None;
     let mut stream_cancelled = false;
 
+    // The verdict arrives at token granularity, so a client that keeps its pipe
+    // open but stopped reading pauses the relay here instead of growing the
+    // outbound queue for the rest of the round. Only the arms that break this
+    // loop are exempted, because they publish the terminal notice of the round:
+    // a stall must never delay the cancellation or the failure it reports.
     while let Some(event) = rx.recv().await {
+        if !matches!(
+            event,
+            StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
+        ) {
+            state.out.wait_for_headroom(&mut cancel_rx).await;
+        }
         match event {
             StreamEvent::ReasoningDelta(delta) => emit(
                 &state.out,
@@ -405,7 +417,7 @@ pub(super) async fn run_review_post_analysis(
     let reported_usage = usage.unwrap_or_default();
     usage_guard.observe(&reported_usage).await;
     usage_guard.flush().await;
-    let session_total_cost = state.usage.lock().await.session.cost;
+    let session_total_cost = state.usage_snapshot().await.session.cost;
     let current_cost = reported_usage.cost.unwrap_or(0.0);
     emit(
         &state.out,
@@ -420,7 +432,7 @@ pub(super) async fn run_review_post_analysis(
     );
 
     if *cancel_rx.borrow() || stream_cancelled {
-        stream_task.abort();
+        let _ = abort_and_reap(&op_id, "review-post-analysis-stream", stream_task).await;
         return Err(post_analysis_error(
             errors::CANCELLED,
             format!(
@@ -430,7 +442,7 @@ pub(super) async fn run_review_post_analysis(
         ));
     }
     if let Some(message) = failure {
-        stream_task.abort();
+        let _ = abort_and_reap(&op_id, "review-post-analysis-stream", stream_task).await;
         return Err(post_analysis_error(errors::MODEL_ERROR, message));
     }
 
@@ -892,6 +904,10 @@ fn post_analysis_error(code: &'static str, message: String) -> ResponseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
+    use crate::handlers::review::tests::{
+        await_published, stall_outbound_transport, RecordingSink,
+    };
     use tauqe_core::config::{AppConfig, ModelsConfig};
     use tauqe_core::providers::mock::MockResponse;
     use tauqe_core::providers::{LlmProvider, MockLlmProvider};
@@ -908,6 +924,9 @@ mod tests {
     struct AnalysisFixture {
         root: std::path::PathBuf,
         state: Arc<AppState>,
+        /// Outbound queue of the fixture daemon, retained so a pacing regression
+        /// can drive the writer that drains it.
+        events: tokio::sync::mpsc::UnboundedReceiver<String>,
     }
 
     impl Drop for AnalysisFixture {
@@ -916,19 +935,25 @@ mod tests {
         }
     }
 
+    impl AnalysisFixture {
+        /// Takes the outbound queue receiver, leaving the receiver of a queue
+        /// that never receives, so a pacing regression can drive its own writer.
+        fn take_events(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+            let (_, placeholder) = tokio::sync::mpsc::unbounded_channel();
+            std::mem::replace(&mut self.events, placeholder)
+        }
+    }
+
     fn fixture(label: &str) -> AnalysisFixture {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-review-analysis-{}-{}-{}",
-            std::process::id(),
-            label,
-            crate::state::next_operation_id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let (out, _events) = crate::transport::OutChannel::new();
+        let root = scratch_root(&format!("review-analysis-{label}"));
+        let (out, events) = crate::transport::OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
-        AnalysisFixture { root, state }
+        AnalysisFixture {
+            root,
+            state,
+            events,
+        }
     }
 
     /// Runs one post-analysis round of the fixture session through the shared
@@ -1468,5 +1493,71 @@ mod tests {
             stored.post_analysis.is_none(),
             "a refused selection rewrites nothing"
         );
+    }
+    /// One post-analysis round obeys the transport's pacing contract: the verdict
+    /// arrives at token granularity, so a client that keeps its pipe open but
+    /// stopped reading must pause the relay instead of growing the outbound queue,
+    /// and the drain of that queue must release the paused round.
+    #[tokio::test]
+    async fn post_analysis_backpressures_a_stalled_client_until_the_queue_drains() {
+        let mut fixture = fixture("pacing");
+        let session = session();
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let injected: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(
+                classification("One shared boundary.", &[CORE_UUID], &[]),
+            )]));
+        *fixture.state.provider_override.lock().await = Some(injected);
+
+        // The client keeps its pipe open but stopped reading its stream.
+        stall_outbound_transport(&fixture.state);
+        let outbound = fixture.take_events();
+
+        let state = Arc::clone(&fixture.state);
+        let root = fixture.root.clone();
+        let analyzed_session = session.clone();
+        let operation = fixture
+            .state
+            .try_begin_operation()
+            .expect("the operation slot is free");
+        let analysis = tokio::spawn(async move {
+            run_review_post_analysis(&state, &root, &analyzed_session, None, &operation, false)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !analysis.is_finished(),
+            "a stalled client must pause the post-analysis relay"
+        );
+        let stalled = ReviewStorage::load_review(&fixture.root, "rev-analyze")
+            .unwrap()
+            .expect("the session is stored");
+        assert!(
+            stalled.description.is_none(),
+            "a stalled round must not persist its classification"
+        );
+
+        // Draining the queue below the low-water mark releases the paused relay.
+        let sink = RecordingSink::default();
+        let writing = tokio::spawn(fixture.state.out.writer(outbound).run_with(sink.clone()));
+        let published = await_published(&sink, events::REVIEW_ANALYZE_FINISHED).await;
+        assert!(
+            published.contains(events::REVIEW_CONTENT_DELTA),
+            "the drained round must publish the verdict it held"
+        );
+
+        let analyzed = analysis
+            .await
+            .expect("the analysis task joins")
+            .expect("the released round persists its classification");
+        assert_eq!(
+            analyzed.description.as_deref(),
+            Some("One shared boundary.")
+        );
+
+        writing.abort();
+        let _ = writing.await;
     }
 }

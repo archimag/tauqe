@@ -84,12 +84,13 @@ impl RepoSearchRequest {
     /// Normalizes the requested search path through the shared repository path
     /// rules.
     ///
-    /// An empty path, `.`, or `./` names the whole repository and normalizes to
-    /// an empty string. Any other path is validated through
-    /// [`normalize_repo_map_path`], so a repository search can never address a
-    /// location outside the repository; such a path yields `None` and the
-    /// request is dropped instead of being allowed to escape. The search
-    /// `regex` is preserved.
+    /// A path whose decoded segments are only `.` and separator segments — the
+    /// empty string, `.`, `./`, `./.`, `././`, and `.//` alike — names the whole
+    /// repository and normalizes to an empty string. Any other path is
+    /// validated through [`normalize_repo_map_path`], so a repository search
+    /// can never address a location outside the repository; such a path yields
+    /// `None` and the request is dropped instead of being allowed to escape.
+    /// The search `regex` is preserved.
     pub fn normalized(self) -> Option<Self> {
         normalize_repo_map_path(&self.path).map(|path| Self {
             path,
@@ -122,12 +123,13 @@ impl DirListRequest {
     /// Normalizes the requested directory path through the shared repository
     /// path rules.
     ///
-    /// An empty path, `.`, or `./` names the whole repository and normalizes to
-    /// an empty string. Any other path is validated through
-    /// [`normalize_repo_map_path`], so a directory listing can never address a
-    /// location outside the repository; such a path yields `None` and the
-    /// request is dropped instead of being allowed to escape. The `recursive`
-    /// flag is preserved.
+    /// A path whose decoded segments are only `.` and separator segments — the
+    /// empty string, `.`, `./`, `./.`, `././`, and `.//` alike — names the whole
+    /// repository and normalizes to an empty string. Any other path is
+    /// validated through [`normalize_repo_map_path`], so a directory listing can
+    /// never address a location outside the repository; such a path yields
+    /// `None` and the request is dropped instead of being allowed to escape.
+    /// The `recursive` flag is preserved.
     pub fn normalized(self) -> Option<Self> {
         normalize_repo_map_path(&self.path).map(|path| Self {
             path,
@@ -521,6 +523,23 @@ mod tests {
         assert!(DiscussionContextRequest::parse_spec("../escape.rs").is_none());
         assert!(DiscussionContextRequest::parse_spec("editable:a/../b").is_none());
         assert!(DiscussionContextRequest::parse_spec("a\0b").is_none());
+
+        // A doubled leading backslash decodes to one literal backslash byte,
+        // which roots the spelling outside the repository, so it yields no
+        // request at all.
+        for spelling in [r"\\server\share", r"\\etc\passwd", r"\\?\C:\x", r"\\"] {
+            assert!(
+                DiscussionContextRequest::parse_spec(spelling).is_none(),
+                "spelling '{spelling}' must yield no request"
+            );
+        }
+
+        // A request addresses a file rather than the repository root, so a
+        // spelling made only of dot and separator segments yields none either,
+        // exactly like the empty path it decodes to.
+        assert!(DiscussionContextRequest::parse_spec("./.").is_none());
+        assert!(DiscussionContextRequest::parse_spec("././").is_none());
+        assert!(DiscussionContextRequest::parse_spec(".//").is_none());
     }
 
     #[test]
@@ -859,5 +878,47 @@ mod tests {
             .with_context_requests(Vec::new())
             .context_requests
             .is_empty());
+    }
+    #[test]
+    fn test_discovery_builders_keep_dot_compositions_as_the_repository_root() {
+        // The whole-repository decision follows the decoded segment set, so a
+        // composition of dot and separator segments reaches the same root as
+        // the empty path instead of being dropped by the builder.
+        let response = DiscussionResponse::new("Root")
+            .with_repo_maps(vec![
+                "./.".to_string(),
+                "././".to_string(),
+                ".//".to_string(),
+                "./crates/core/".to_string(),
+            ])
+            .with_dir_lists(vec![
+                DirListRequest::new("./.", true),
+                DirListRequest::new(".//", false),
+                DirListRequest::new("./crates/protocol/", true),
+            ])
+            .with_repo_searches(vec![
+                RepoSearchRequest::new("././", "pub fn"),
+                RepoSearchRequest::new("./crates/core/", "fn run"),
+            ]);
+
+        // Every dot composition survives as the whole-repository root in the
+        // order it was declared, beside a real subtree that keeps its path.
+        assert_eq!(response.repo_maps.len(), 4);
+        assert!(response.repo_maps[..3].iter().all(|path| path.is_empty()));
+        assert_eq!(response.repo_maps[3], "crates/core");
+
+        assert_eq!(response.dir_lists.len(), 3);
+        assert!(response.dir_lists[0].path.is_empty());
+        assert!(response.dir_lists[0].recursive);
+        assert!(response.dir_lists[1].path.is_empty());
+        assert!(!response.dir_lists[1].recursive);
+        assert_eq!(response.dir_lists[2].path, "crates/protocol");
+        assert!(response.dir_lists[2].recursive);
+
+        assert_eq!(response.repo_searches.len(), 2);
+        assert!(response.repo_searches[0].path.is_empty());
+        assert_eq!(response.repo_searches[0].regex, "pub fn");
+        assert_eq!(response.repo_searches[1].path, "crates/core");
+        assert_eq!(response.repo_searches[1].regex, "fn run");
     }
 }

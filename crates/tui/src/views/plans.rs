@@ -22,7 +22,7 @@ pub use self::render::render_plans_view;
 // entry points its renderer and the Review view consume, so those callers keep
 // importing one tree vocabulary from the plans module.
 pub(crate) use self::tree::{
-    architect_badge, compute_unified_plan_lines, measure_plan_rows, status_style,
+    architect_badge, compute_unified_plan_lines, measure_plan_rows_from, status_style,
 };
 
 /// Saturating conversion for scroll arithmetic; avoids wrap-around on a very
@@ -925,30 +925,34 @@ impl PlansViewState {
     }
 
     /// Rendered line bounds of the row at `index`, measured without materializing
-    /// a single line.
+    /// a single line and without owning a single row.
     ///
-    /// The tree is walked once in document order and handed to the measuring
-    /// walk, which reproduces the row order, the separator between plans, and the
-    /// wrapped height of every row through the borrowed counter. The bounds can
-    /// therefore never disagree with the lines actually drawn, while positioning
-    /// the viewport no longer re-wraps the whole tree. The walk stops as soon as
-    /// the bounds are known, unless `measure_total` still needs the height of the
-    /// whole tree so the recenter cycle can clamp its last beat (c-2).
+    /// The view's lazy row walk drives the measuring walk directly, which
+    /// reproduces the row order, the separator between plans, and the wrapped
+    /// height of every row through the borrowed counter. The bounds can therefore
+    /// never disagree with the lines actually drawn, while positioning the
+    /// viewport neither re-wraps the whole tree nor collects an owned projection
+    /// of the rows above the cursor. The walk stops on the measured row unless
+    /// `measure_total` still needs the height of the whole tree so the recenter
+    /// cycle can clamp its last beat (c-2).
     fn render_bounds(&mut self, index: usize, measure_total: bool) -> Option<RowBounds> {
         let width = self.content_width.max(10);
         let theme_mode = self.theme_mode;
-
-        // The rows before the measured one give its offset, the row after it
-        // closes the bounds by opening the following row, and the recenter cycle
-        // additionally needs the height of everything below.
-        let mut rows = Vec::new();
-        self.walk_rows(&mut |row_index, row| {
-            rows.push(row);
-            row_index <= index || measure_total
-        });
-
-        let (offsets, total) =
-            measure_plan_rows(&rows, index, width, theme_mode, &mut self.markdown_cache);
+        let last_index = if measure_total { usize::MAX } else { index };
+        // The row walk borrows the plan tree while the Markdown cache the rows
+        // render their bodies through is owned by the same state, so the cache is
+        // taken out for the duration of the walk and put back afterwards
+        // (c-1, c-2).
+        let mut cache = std::mem::take(&mut self.markdown_cache);
+        let (offsets, total) = measure_plan_rows_from(
+            |visit| self.walk_rows(&mut |row_index, row| visit(row_index, &row)),
+            index,
+            last_index,
+            width,
+            theme_mode,
+            &mut cache,
+        );
+        self.markdown_cache = cache;
 
         let start = *offsets.get(index)?;
         let end = offsets.get(index + 1).copied().unwrap_or(total);

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use std::sync::{Mutex, MutexGuard};
@@ -44,6 +45,139 @@ struct PreparedPlan {
     /// File the plan belongs to, reused when the plan already lives under a
     /// differently sanitized name.
     target_file: PathBuf,
+}
+
+/// Repository snapshot one plan batch resolves its mutations against.
+///
+/// The snapshot is read from storage once, under the process-global lock, and
+/// records the document of every stored plan together with the file that carries
+/// it. A mutation resolves its identity, its target file, and the stored document
+/// from the snapshot and advances it in memory, so a batch of `k` mutations over
+/// `n` stored plans reads each stored document once instead of `O(k·n)` times.
+#[derive(Debug, Default)]
+struct PlanBatchSnapshot {
+    /// Stored plans in listing order: creation time, newest first.
+    plans: Vec<Plan>,
+    /// Storage file of each plan, positionally parallel to `plans`.
+    files: Vec<PathBuf>,
+    /// Lowercased plan id to the position of the plan in `plans`.
+    index: HashMap<String, usize>,
+}
+
+impl PlanBatchSnapshot {
+    /// Loads every stored plan together with the file that carries it.
+    ///
+    /// A missing storage directory is an empty repository, while a directory that
+    /// cannot be read is reported: the difference decides whether a batch creates
+    /// the first plan or writes over a repository it never saw.
+    fn load_unlocked(repo_root: &Path) -> Result<Self> {
+        let dir = PlanStorage::plans_dir(repo_root);
+        if !dir.is_dir() {
+            return Ok(Self::default());
+        }
+
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("Failed to read plans directory at {}", dir.display()))?;
+        let mut stored: Vec<(Plan, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<Plan>(&content) {
+                    Ok(plan) => stored.push((plan, path)),
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Skipping corrupted plan file"
+                    ),
+                },
+                Err(err) => tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to read plan file"
+                ),
+            }
+        }
+
+        // Creation time, not modification time, defines the tree order: a
+        // long-lived plan that was edited a moment ago must not jump above a
+        // newly created one, so the listing stays stable across edits.
+        stored.sort_by_key(|(plan, _)| std::cmp::Reverse(plan.created_at));
+        Ok(Self::from_stored(stored))
+    }
+
+    /// Builds the snapshot from stored documents paired with their files.
+    fn from_stored(stored: Vec<(Plan, PathBuf)>) -> Self {
+        let mut snapshot = Self::default();
+        for (plan, file) in stored {
+            snapshot.insert(plan, file);
+        }
+        snapshot
+    }
+
+    /// Consumes the snapshot and returns its plans in listing order.
+    fn into_plans(self) -> Vec<Plan> {
+        self.plans
+    }
+
+    /// Returns every stored plan in listing order.
+    fn plans(&self) -> &[Plan] {
+        &self.plans
+    }
+
+    /// Returns the stored document of `id` and the file that carries it.
+    fn find(&self, id: &str) -> Option<(&Plan, &Path)> {
+        let position = *self.index.get(&id.to_ascii_lowercase())?;
+        Some((
+            self.plans.get(position)?,
+            self.files.get(position)?.as_path(),
+        ))
+    }
+
+    /// Records the document a mutation produced, replacing the stored one.
+    ///
+    /// A plan the snapshot does not carry is appended, so a later mutation of the
+    /// same batch resolves against the plan an earlier mutation created.
+    fn remember(&mut self, plan: Plan, file: PathBuf) {
+        match self.index.get(&plan.id.to_ascii_lowercase()).copied() {
+            Some(position) => {
+                if let Some(stored) = self.plans.get_mut(position) {
+                    *stored = plan;
+                }
+                if let Some(stored) = self.files.get_mut(position) {
+                    *stored = file;
+                }
+            }
+            None => self.insert(plan, file),
+        }
+    }
+
+    /// Removes `id` from the snapshot and returns the document and file it held.
+    fn remove(&mut self, id: &str) -> Option<(Plan, PathBuf)> {
+        let position = self.index.remove(&id.to_ascii_lowercase())?;
+        if position >= self.plans.len() {
+            return None;
+        }
+        let plan = self.plans.remove(position);
+        let file = self.files.remove(position);
+        // Every plan behind the removed position shifts down by one entry.
+        for index in self.index.values_mut() {
+            if *index > position {
+                *index -= 1;
+            }
+        }
+        Some((plan, file))
+    }
+
+    /// Appends one stored plan and its file to the snapshot.
+    fn insert(&mut self, plan: Plan, file: PathBuf) {
+        self.index
+            .insert(plan.id.to_ascii_lowercase(), self.plans.len());
+        self.plans.push(plan);
+        self.files.push(file);
+    }
 }
 
 impl PlanStorage {
@@ -160,41 +294,7 @@ impl PlanStorage {
 
     /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
     fn load_all_unlocked(repo_root: &Path) -> Result<Vec<Plan>> {
-        let dir = Self::plans_dir(repo_root);
-        if !dir.is_dir() {
-            return Ok(Vec::new());
-        }
-
-        let mut plans = Vec::new();
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("Failed to read plans directory at {}", dir.display()))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<Plan>(&content) {
-                        Ok(plan) => plans.push(plan),
-                        Err(err) => tracing::warn!(
-                            path = %path.display(),
-                            error = %err,
-                            "Skipping corrupted plan file"
-                        ),
-                    },
-                    Err(err) => tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Failed to read plan file"
-                    ),
-                }
-            }
-        }
-
-        // Creation time, not modification time, defines the tree order: a
-        // long-lived plan that was edited a moment ago must not jump above a
-        // newly created one, so the listing stays stable across edits.
-        plans.sort_by_key(|p| std::cmp::Reverse(p.created_at));
-        Ok(plans)
+        Ok(PlanBatchSnapshot::load_unlocked(repo_root)?.into_plans())
     }
 
     /// Resolves the on-disk file that currently stores the plan identified by `id`,
@@ -250,6 +350,59 @@ impl PlanStorage {
     fn save_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<()> {
         // The directory is created before the barrier resolves the storage file,
         // because that resolution inspects the directory it is about to write into.
+        Self::ensure_plans_dir(repo_root)?;
+        let prepared = Self::prepare_plan_unlocked(repo_root, plan, None)?;
+        Self::write_prepared_unlocked(repo_root, &prepared)
+    }
+
+    /// Saves one plan of a batch through the snapshot of that batch.
+    ///
+    /// The snapshot already resolved the stored document and the file that carries
+    /// it, so a mutation writes that file directly instead of scanning the storage
+    /// directory for the plan, and it advances the snapshot with the document that
+    /// reached disk instead of reloading the repository afterwards. The returned
+    /// document is exactly the one a later mutation of the batch resolves against.
+    fn save_plan_in_snapshot_unlocked(
+        repo_root: &Path,
+        snapshot: &mut PlanBatchSnapshot,
+        plan: &Plan,
+    ) -> Result<Plan> {
+        Self::ensure_plans_dir(repo_root)?;
+        let prepared = Self::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
+        Self::write_prepared_unlocked(repo_root, &prepared)?;
+        snapshot.remember(prepared.plan.clone(), prepared.target_file);
+        Ok(prepared.plan)
+    }
+
+    /// Deletes one plan of a batch through the snapshot of that batch.
+    ///
+    /// The snapshot already resolved the file that stores the plan, so the removal
+    /// unlinks it directly instead of scanning the storage directory again. An id
+    /// the snapshot does not carry deletes nothing, which keeps a removal unable to
+    /// drop a file it never inspected.
+    fn delete_plan_in_snapshot_unlocked(
+        repo_root: &Path,
+        snapshot: &mut PlanBatchSnapshot,
+        id: &str,
+    ) -> Result<bool> {
+        let (plan, file) = match snapshot.remove(id) {
+            Some(removed) => removed,
+            None => return Ok(false),
+        };
+        std::fs::remove_file(&file)
+            .with_context(|| format!("Failed to remove plan file at {}", file.display()))?;
+
+        let safe_id = Self::sanitize_id(&plan.id);
+        if let Ok(Some(active)) = Self::load_active_id_unlocked(repo_root) {
+            if active.eq_ignore_ascii_case(&plan.id) || active.eq_ignore_ascii_case(&safe_id) {
+                let _ = Self::save_active_id_unlocked(repo_root, None);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Creates the plan storage directory.
+    fn ensure_plans_dir(repo_root: &Path) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
             format!(
@@ -257,19 +410,28 @@ impl PlanStorage {
                 dir.display()
             )
         })?;
+        Ok(())
+    }
 
-        let prepared = Self::prepare_plan_unlocked(repo_root, plan)?;
+    /// Writes one prepared plan and records the active-plan marker when the
+    /// repository has none, so clients always have a marker to render.
+    fn write_prepared_unlocked(repo_root: &Path, prepared: &PreparedPlan) -> Result<()> {
         let json = serde_json::to_string_pretty(&prepared.plan)
             .context("Failed to serialize plan to JSON")?;
         write_atomic(&prepared.target_file, json.as_bytes())?;
 
-        // If no active plan is set, make this plan active so clients always have
-        // a persisted active-plan marker to render.
         if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
             let _ = Self::save_active_id_unlocked(repo_root, Some(&prepared.plan.id));
         }
-
         Ok(())
+    }
+
+    /// Reads and decodes the plan stored at `path`.
+    fn read_plan_file_unlocked(path: &Path) -> Result<Plan> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read existing plan file at {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse existing plan JSON at {}", path.display()))
     }
 
     /// Normalizes a plan and runs the single structural barrier of persistence
@@ -282,7 +444,17 @@ impl PlanStorage {
     /// whole plan all run here, in this order, for both contracts. A plan that
     /// passes therefore persists, and a plan that fails is refused identically for
     /// every mutation source.
-    fn prepare_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<PreparedPlan> {
+    ///
+    /// The stored document and the file that carries it arrive through `snapshot`
+    /// when the caller resolved them under the storage lock already: a batch hands
+    /// its snapshot over, so a mutation neither scans the storage directory nor
+    /// re-reads a document the batch holds, while a single save passes `None` and
+    /// resolves the one file it addresses from disk.
+    fn prepare_plan_unlocked(
+        repo_root: &Path,
+        plan: &Plan,
+        snapshot: Option<&PlanBatchSnapshot>,
+    ) -> Result<PreparedPlan> {
         let dir = Self::plans_dir(repo_root);
         let safe_id = Self::sanitize_id(&plan.id);
         let default_target = dir.join(format!("{safe_id}.json"));
@@ -291,30 +463,36 @@ impl PlanStorage {
         normalized.implementation.normalize_leaf_files();
         normalized.implementation.refresh_parent_statuses();
 
-        // Reuse the file that already stores this plan even when its name differs
-        // from the sanitized id (for example after an id casing change). Writing to
-        // the resolved file keeps a single plan per id on disk instead of spawning a
-        // duplicate `{safe_id}.json` beside the original.
-        let target_file = if default_target.is_file() {
-            default_target
+        let (target_file, existing) = if let Some(snapshot) = snapshot {
+            match snapshot.find(&plan.id) {
+                Some((stored, file)) => (file.to_path_buf(), Some(stored.clone())),
+                // An id the snapshot does not carry owns no storage file yet. A
+                // default target already occupied by another artifact is resolved
+                // from disk, so a sanitized-name collision and a document that
+                // cannot be decoded keep the diagnostics a single save reports.
+                None if !default_target.is_file() => (default_target, None),
+                None => {
+                    let stored = Self::read_plan_file_unlocked(&default_target)?;
+                    (default_target, Some(stored))
+                }
+            }
         } else {
-            Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
-        };
-        let existing = if target_file.is_file() {
-            let content = std::fs::read_to_string(&target_file).with_context(|| {
-                format!(
-                    "Failed to read existing plan file at {}",
-                    target_file.display()
-                )
-            })?;
-            Some(serde_json::from_str::<Plan>(&content).with_context(|| {
-                format!(
-                    "Failed to parse existing plan JSON at {}",
-                    target_file.display()
-                )
-            })?)
-        } else {
-            None
+            // Reuse the file that already stores this plan even when its name
+            // differs from the sanitized id (for example after an id casing
+            // change). Writing to the resolved file keeps a single plan per id
+            // on disk instead of spawning a duplicate `{safe_id}.json` beside
+            // the original.
+            let target_file = if default_target.is_file() {
+                default_target
+            } else {
+                Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
+            };
+            let existing = if target_file.is_file() {
+                Some(Self::read_plan_file_unlocked(&target_file)?)
+            } else {
+                None
+            };
+            (target_file, existing)
         };
 
         if let Some(existing_plan) = existing {

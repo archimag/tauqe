@@ -145,21 +145,9 @@ mod tests {
         }
     }
 
-    /// Returns a scratch repository root that is unique to this test process.
-    fn scratch_root(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-review-decision-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("scratch root");
-        root
-    }
-
     #[test]
     fn a_decision_updates_the_status_the_note_and_the_recommendations() {
-        let root = scratch_root("apply");
+        let root = crate::test_paths::scratch_dir("review-decision-apply");
         ReviewStorage::save_session(&root, &session_with_finding()).expect("save the session");
 
         let decision = ReviewUpdateProposal {
@@ -214,7 +202,7 @@ mod tests {
 
     #[test]
     fn a_decision_that_names_no_stored_finding_is_reported() {
-        let root = scratch_root("absent");
+        let root = crate::test_paths::scratch_dir("review-decision-absent");
         ReviewStorage::save_session(&root, &session_with_finding()).expect("save the session");
 
         let decision = ReviewUpdateProposal {
@@ -238,7 +226,7 @@ mod tests {
     /// finished finding reports the exact commit that resolved it.
     #[test]
     fn a_commit_recorded_by_the_executor_is_persisted_with_the_finding() {
-        let root = scratch_root("commit");
+        let root = crate::test_paths::scratch_dir("review-decision-commit");
         ReviewStorage::save_session(&root, &session_with_finding()).expect("save the session");
 
         let commit = "0123456789abcdef0123456789abcdef01234567";

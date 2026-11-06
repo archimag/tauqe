@@ -318,21 +318,15 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
     use tauqe_protocol::{methods, ContextAccess, ContextLayer, Request, RequestId};
 
+    /// Scratch repository root of one context handler test, removed on drop.
     struct TestDir(std::path::PathBuf);
     impl TestDir {
         fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "tauqe-test-context-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::create_dir_all(&path);
-            Self(path)
+            Self(scratch_root("context"))
         }
         fn path(&self) -> &std::path::Path {
             &self.0

@@ -201,6 +201,7 @@ fn decode_with_capabilities(
 mod tests {
     use super::*;
     use crate::edits::stream::EditStreamFilter;
+    use crate::test_paths::scratch_dir;
     use tauqe_protocol::{
         ContextAccess, DocTopic, EditFileStatus, EditOperation, LlmOutcome, VerifyOnSuccess,
         VerifyTarget,
@@ -510,7 +511,7 @@ mod tests {
 
         // The streaming preview receives the identical list, so the file it
         // certifies as edited is the file the engine stages.
-        let mut filter = XmlStreamFilter::new(context_paths.clone(), std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(context_paths.clone(), scratch_dir("xml-preview"))
             .with_staged_contents(std::collections::HashMap::from([(
                 "crates/core/src/lib.rs".to_string(),
                 "old();\n".to_string(),

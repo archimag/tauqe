@@ -11,7 +11,9 @@ use tauqe_protocol::{
 };
 use tokio::sync::{watch, Mutex};
 
+use crate::reap::{abort_and_reap_with_deadline, task_exit_deadline, TaskExit};
 use crate::transport::OutChannel;
+use crate::usage::UsageLedger;
 
 /// Poll cadence while the last-resort hard-cancel abort waits for an in-flight
 /// git transaction to close.
@@ -163,7 +165,12 @@ pub struct AppState {
     /// from per-handler counters. The project lifetime scope is loaded from
     /// `<repo_root>/.tauqe/usage.json` at construction, so the counters survive
     /// a daemon restart.
-    pub usage: Mutex<UsageTotalsSnapshot>,
+    ///
+    /// Both the snapshot and the identity of the window that owns its in-flight
+    /// scope live in the ledger under this one mutex, so identity and window can
+    /// never disagree: a background task acting on the snapshot verifies it is
+    /// still that window before it publishes anything.
+    pub usage: Mutex<UsageLedger>,
     /// Active discussion focus anchor shared by REPL discussion turns.
     ///
     /// While a focus is set, every plain discussion prompt is enriched with the
@@ -243,7 +250,7 @@ impl AppState {
             history: Arc::new(Mutex::new(initial_history_manager)),
             session_lock: Mutex::new(()),
             active_cancel: std::sync::Mutex::new(None),
-            usage: Mutex::new(initial_usage),
+            usage: Mutex::new(UsageLedger::new(initial_usage)),
             discussion_focus: Mutex::new(DiscussionFocus::None),
             session_uuid: Mutex::new(tauqe_core::review::uuid::generate_uuid_v7()),
             history_sender,
@@ -311,7 +318,10 @@ impl AppState {
     /// releasing the session lock) until it observes the cancel signal and drops
     /// its [`OperationGuard`]. Clearing the slot immediately would let a client
     /// start `git/undo`, `config/set`, or a new turn against a half-unwound turn
-    /// and would let the batch supervisor abort a later step.
+    /// and would let the batch supervisor abort a later step. Only the
+    /// last-resort watchdog releases the registration on its own, and only when
+    /// its bounded exit confirmation expires: a task that never reaches a
+    /// suspension point would otherwise pin the slot for the daemon's lifetime.
     pub fn hard_cancel_active_operation(self: &Arc<Self>) {
         let Some(op_id) = self.signal_hard_cancel() else {
             return;
@@ -329,11 +339,19 @@ impl AppState {
     /// Cooperative cancellation is the primary path; this is the last resort for
     /// a workflow that ignored the cancel signal. The abort is deferred — never
     /// dropped — while a git transaction is still open, so a half-finished
-    /// checkpoint or step commit is never abandoned mid-transaction, and the
-    /// wait is bounded so a wedged turn cannot leak its task for the daemon's
-    /// lifetime. The handle is read fresh from the slot, so the abort targets
-    /// the currently running inner task and a superseded watchdog can never
-    /// abort a newer operation.
+    /// checkpoint or step commit is never abandoned mid-transaction. The handle
+    /// is read fresh from the slot, so the abort targets the currently running
+    /// inner task and a superseded watchdog can never abort a newer operation.
+    ///
+    /// The abort is never treated as synchronous death: a task terminates only
+    /// at its next suspension point. The registered slot is therefore watched
+    /// under the shared task-exit deadline until the operation releases it, and
+    /// an expired confirmation releases the registration itself, id-checked
+    /// exactly like an [`OperationGuard`] drop. A wedged task can thus neither
+    /// pin the slot until process exit nor wipe the registration of the operation
+    /// a client starts after it. The orphan keeps its abort delivered, dies at
+    /// its next suspension point, and releases its session lock only then; the
+    /// expiry diagnostic names it in the journal.
     pub async fn abort_stalled_operation(&self, op_id: u64) {
         let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
         while self.git_transaction_active.load(Ordering::SeqCst)
@@ -349,12 +367,17 @@ impl AppState {
                 _ => None,
             }
         };
-        if let Some(handle) = handle {
-            tracing::warn!(
-                operation_slot_id = op_id,
-                "Hard-cancel grace period elapsed; aborting stalled workflow task",
-            );
-            handle.abort();
+        let Some(handle) = handle else {
+            return;
+        };
+        tracing::warn!(
+            operation_slot_id = op_id,
+            "Hard-cancel grace period elapsed; aborting stalled workflow task",
+        );
+        handle.abort();
+
+        if self.confirm_operation_exit(op_id).await == TaskExit::Orphaned {
+            self.release_stale_registration(op_id);
         }
     }
 
@@ -422,16 +445,27 @@ impl AppState {
     /// period while a git transaction was still open.
     ///
     /// The caller hands over the still-running task together with the operation
-    /// registration it owns, so the operation slot stays registered until the
-    /// task has truly exited. Releasing it earlier — which is exactly what
-    /// happens when a turn returns with the task detached — would let a client
-    /// start `config/set`, `git/undo`, or a new turn against a half-unwound
-    /// workflow, and the next turn would then block on the session lock with no
-    /// registered operation left to cancel.
+    /// registration it owns, so the operation slot stays registered while the
+    /// task unwinds. Releasing it earlier — which is exactly what happens when a
+    /// turn returns with the task detached — would let a client start
+    /// `config/set`, `git/undo`, or a new turn against a half-unwound workflow,
+    /// and the next turn would then block on the session lock with no registered
+    /// operation left to cancel.
     ///
-    /// The deferral is bounded by [`HARD_CANCEL_TRANSACTION_DEFER_LIMIT`]: a
-    /// transaction open that long means the turn is wedged, so the task is
-    /// force-aborted regardless and the slot is released once it exits.
+    /// Both phases are bounded. The deferral waits at most
+    /// [`HARD_CANCEL_TRANSACTION_DEFER_LIMIT`] for an open transaction, because
+    /// one open that long means the turn is wedged, and the reap that follows is
+    /// confirmed through the shared abort-and-reap primitive under the shared
+    /// task-exit deadline. A task wedged in a non-yielding stretch never reaches
+    /// the suspension point its abort lands at, so an expired confirmation
+    /// releases the registration — the guard is dropped either way — and records
+    /// the orphan in the journal. The abort stays delivered: the orphan dies at
+    /// its next suspension point and releases its session lock only then, while
+    /// waiting for it would pin the slot until process exit and refuse every
+    /// later request with `OPERATION_IN_PROGRESS`.
+    ///
+    /// The deadline is resolved by this spawner and handed to the watchdog,
+    /// because a task-scoped value does not cross `tokio::spawn`.
     pub fn defer_abort_owning_operation<T>(
         self: &Arc<Self>,
         operation: Arc<OperationGuard>,
@@ -440,6 +474,7 @@ impl AppState {
         T: Send + 'static,
     {
         let state = Arc::clone(self);
+        let exit_deadline = task_exit_deadline();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
             while state.git_transaction_active.load(Ordering::SeqCst)
@@ -447,18 +482,88 @@ impl AppState {
             {
                 tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
             }
+            let op_id = operation.id;
             if !task.is_finished() {
                 tracing::warn!(
-                    operation_slot_id = operation.id,
+                    operation_slot_id = op_id,
                     "Deferred cancel grace elapsed; aborting stalled workflow task",
                 );
-                task.abort();
             }
-            // Awaiting the task is what keeps the slot honest: the guard is
-            // dropped only after the task has stopped running.
-            let _ = task.await;
+            let operation_label = op_id.to_string();
+            let exit = abort_and_reap_with_deadline(
+                &operation_label,
+                "deferred-operation",
+                exit_deadline,
+                task,
+            )
+            .await;
+            if exit == TaskExit::Orphaned {
+                tracing::warn!(
+                    operation_slot_id = op_id,
+                    "Releasing the operation registration of an orphaned task",
+                );
+            }
+            // The guard is dropped on both outcomes: a confirmed exit released
+            // its registration already, and an expired confirmation releases it
+            // here instead of pinning the slot for a task that may never yield.
             drop(operation);
         });
+    }
+
+    /// Confirms, within the shared task-exit deadline, that the operation
+    /// `op_id` released its registration.
+    ///
+    /// The slot is the only evidence an external watchdog can observe: the
+    /// session lock is released only when the aborted task really stops, so a
+    /// registration that is gone — cleared by the task's own guard drop or
+    /// replaced by a newer operation — is the confirmation that this operation
+    /// no longer owns any state.
+    async fn confirm_operation_exit(&self, op_id: u64) -> TaskExit {
+        let exit_deadline = task_exit_deadline();
+        let deadline = tokio::time::Instant::now() + exit_deadline;
+        loop {
+            let registered = {
+                let slot = self.lock_active_operation();
+                slot.as_ref().map(|op| op.id) == Some(op_id)
+            };
+            if !registered {
+                return TaskExit::Confirmed;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    operation_slot_id = op_id,
+                    deadline_ms = exit_deadline.as_millis() as u64,
+                    "task-exit confirmation expired; the aborted task is still running",
+                );
+                return TaskExit::Orphaned;
+            }
+            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// Releases the registration of `op_id` when its task never confirmed its
+    /// exit.
+    ///
+    /// The comparison is the id check an [`OperationGuard`] performs on drop, so
+    /// a registration a newer operation already took over is left untouched and
+    /// a superseded guard that drops later wipes nothing.
+    fn release_stale_registration(&self, op_id: u64) {
+        let released = {
+            let mut slot = self.lock_active_operation();
+            if slot.as_ref().map(|op| op.id) == Some(op_id) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            tracing::warn!(
+                operation_slot_id = op_id,
+                "Released the operation registration of an orphaned task",
+            );
+        }
     }
 
     /// Delivers a cancellation signal to the active operation without clearing
@@ -513,6 +618,16 @@ impl AppState {
     /// which can drift from the initialized repository.
     pub async fn repo_root(&self) -> PathBuf {
         self.context.read().await.repo_root().to_path_buf()
+    }
+
+    /// Returns the authoritative usage snapshot of the daemon.
+    ///
+    /// The accounting state describes the snapshot together with the identity
+    /// of the window that owns its in-flight scope, so every reader goes through
+    /// this accessor instead of reaching for the bare snapshot and silently
+    /// dropping the identity that guards it.
+    pub async fn usage_snapshot(&self) -> UsageTotalsSnapshot {
+        self.usage.lock().await.snapshot().clone()
     }
 
     /// Applies a mutation to the shared context atomically.
@@ -830,6 +945,7 @@ pub fn next_operation_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use tauqe_protocol::ContextAccess;
 
     /// Concurrent context mutations must all survive: a clone-then-overwrite
@@ -837,9 +953,7 @@ mod tests {
     /// monotonic revision.
     #[tokio::test]
     async fn mutate_context_serializes_concurrent_mutations() {
-        let root =
-            std::env::temp_dir().join(format!("tauqe-state-context-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-context");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -888,9 +1002,7 @@ mod tests {
     /// sequence would drop the records that finished earlier.
     #[tokio::test]
     async fn mutate_history_serializes_concurrent_mutations() {
-        let root =
-            std::env::temp_dir().join(format!("tauqe-state-history-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-history");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -932,8 +1044,7 @@ mod tests {
     /// session, because the prompt prefix those files warmed is gone.
     #[tokio::test]
     async fn clear_auto_context_rotates_the_session_when_files_were_removed() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-clear");
         std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
 
         let (out, _rx) = OutChannel::new();
@@ -967,8 +1078,7 @@ mod tests {
     /// prompt prefix is intact and the warm session must be preserved.
     #[tokio::test]
     async fn clear_auto_context_keeps_the_session_when_the_layer_is_empty() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-clear");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -991,8 +1101,7 @@ mod tests {
     /// session for exactly the same reason the auto-layer clear does.
     #[tokio::test]
     async fn clear_all_context_rotates_the_session_when_files_were_removed() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-clear");
         std::fs::write(root.join("user.rs"), "fn user() {}\n").unwrap();
 
         let (out, _rx) = OutChannel::new();
@@ -1028,9 +1137,7 @@ mod tests {
     /// keeps the warm session.
     #[tokio::test]
     async fn clear_transient_context_drops_both_transient_layers_and_rotates_the_session() {
-        let root =
-            std::env::temp_dir().join(format!("tauqe-state-transient-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-transient");
         std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
         // The external document lives in the isolated cache the registry
         // materializes into, never in the working tree. The layer addresses
@@ -1090,8 +1197,7 @@ mod tests {
     /// hard-cancel would abort a completed task instead of the work in flight.
     #[tokio::test]
     async fn clear_abort_handle_drops_the_installed_handle() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-abort-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-abort");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1142,8 +1248,7 @@ mod tests {
     /// half-unwound workflow.
     #[tokio::test]
     async fn deferred_abort_holds_the_slot_until_the_task_exits() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-defer-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-defer");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1204,8 +1309,7 @@ mod tests {
     /// keeps the warm one.
     #[tokio::test]
     async fn maybe_rotate_session_on_model_change_tracks_the_effective_model() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-model-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-model");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1237,8 +1341,7 @@ mod tests {
     /// carries no XML markup and therefore needs no injection marker at all.
     #[tokio::test]
     async fn next_turn_marker_is_absent_for_the_structured_protocol() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-marker-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-marker");
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1261,8 +1364,7 @@ mod tests {
     /// gate must not suppress it.
     #[tokio::test]
     async fn next_turn_marker_is_generated_for_the_xml_protocol() {
-        let root = std::env::temp_dir().join(format!("tauqe-state-marker-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("state-marker");
 
         let mut config = AppConfig::default();
         config.repl.protocol = EditProtocolKind::Xml;

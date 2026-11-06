@@ -107,6 +107,17 @@ about to publish. A legacy pid-less name records no writer and keeps the
 earlier reclaim behavior, and on a platform without a process probe every
 attributed sibling reports a live writer.
 
+A recorded writer whose process id lies outside the probe's target domain is
+reported as not provably gone and keeps ownership of its sibling, exactly as a
+writer on a platform without a process probe does. A value that does not fit
+the platform's `pid_t` names no process once converted, because the conversion
+wraps it negative and a negative id addresses a whole process group; the
+reserved low values address the caller's own group or the init process
+instead of the writer. The probe therefore validates its target before it
+signals, since an answer about a target that is not the writer — least of all
+"no such process" — is the answer that authorizes the reclaim sweep to delete
+staged content or move a live backup aside.
+
 ---
 
 ## 4. Process Execution
@@ -119,6 +130,12 @@ attributed sibling reports a live writer.
 3. **Cancellation Is Authoritative:** the wait for a child races its natural exit
    against the caller's cancellation signal. A cancelled wait kills the group and
    reaps the child instead of waiting the command out.
+   The group is signalled only while the direct child is unreaped, and the reap
+   follows the final group signal: a reaped pid may be recycled into a new
+   process group, and a negative-pid signal that names it would tear that
+   unrelated group down. The grace window of a polite termination is therefore
+   waited out with the leader unreaped, and the forceful signal that closes it
+   is harmless to a group whose only remaining member is the zombie leader.
 4. **Typed Diagnostics:** command output is parsed into file, line, column, severity,
    code, and message records. The report is rebuilt from those fields, so no ANSI
    escape, tool banner, or duplicated note reaches a model prompt.
@@ -143,10 +160,15 @@ marker a finished transaction already cleared.
 3. **Step Commits Are Temporary:** intermediate commits exist so verification can
    heal against a reproducible revision; finalization squashes them into one commit.
 4. **Recovery Requires Proof:** a startup recovery runs only with an open
-   transaction marker and a commit range created entirely by the harness. For
-   a born base the range is every commit between the recorded base and HEAD,
-   with the base still an ancestor of HEAD; for an unborn base it is every
-   commit reachable from HEAD. A foreign commit is never rewritten.
+   transaction marker and a commit range created entirely by the harness. The
+   proof is settled over one pinned identity: `HEAD` is resolved once, every
+   evidence step addresses that commit, and the identity is re-asserted
+   immediately before the reset or the return to the unborn state acts, so a
+   repository that advanced while the proof ran is refused with the skip
+   diagnostic instead of rewritten. For a born base the range is every commit
+   between the recorded base and the pinned commit, with the base still an
+   ancestor of it; for an unborn base it is every commit reachable from the
+   pinned commit. A foreign commit is never rewritten.
    Recovery additionally requires the recorded writer to be provably gone,
    the same decision the staging reclamation applies. A marker attributed to
    a process that still runs describes a live transaction: recovery reports
@@ -173,6 +195,16 @@ marker a finished transaction already cleared.
    blocking thread indefinitely. `run_git` carries the default budget with no
    call-site change, while `run_git_with_deadline` carries an explicit
    `GitDeadline`.
+8. **Destructive Steps Act on a Pinned Identity:** the checkpoint unwind and the
+   return to an unborn branch resolve `HEAD` exactly once, read the subject, the
+   parent, and the tracked paths from that commit, and re-assert it immediately
+   before they rewrite anything. The unwind resets to the explicit pinned parent
+   and deletes a root checkpoint's branch ref through the conditional
+   `git update-ref -d HEAD <pinned>`; the unborn return deletes the ref the same
+   conditional way before it removes a path. A `HEAD` that moved in between is a
+   typed refusal that rewrites no history, no index entry, and no working-tree
+   byte, so a commit a concurrent writer landed survives instead of being dropped
+   by a proof that never saw it.
 
 ---
 

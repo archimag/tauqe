@@ -78,7 +78,8 @@ scratchpad, and the abort escape hatch — with no file-edit capability and no
 toolchain verification, because a synthesis produces a horizon rather than a
 patch. The escape hatch travels with the profile because a synthesis runs
 unattended exactly as an isolated step does: a condition that only the
-improvised or downgraded into a blocked answer. It renders no session history,
+developer can resolve on the host system cannot be improvised or downgraded into a
+blocked answer. It renders no session history,
 exactly as an isolated step does: neither regime continues the developer's
 dialogue, so neither prompt carries the `<history>` block. Rendering is not
 recording: a step journals the two-sided card of its own event (§3.2.8), and a
@@ -393,11 +394,11 @@ diagnostic investigation step rather than a terminal completion.
    allowlist. It runs in its own process group with strict timeout enforcement
    and literal arguments.
 2. **Structured Journal Feedback:** The execution outcome (`exit status`, `stdout`,
-2. **Structured Journal Feedback:** The execution outcome (`exit status`, `stdout`,
    and `stderr`, truncated to safe scalar boundaries) is recorded into the
    turn-scoped `TurnResearchJournal` inside a structured `<project_command_feedback>`
    block.
-   the FSM requests an answer round from the model with the updated journal. The
+3. **Iterative Answer Round:** Once the invocation completes, the FSM requests an
+   answer round from the model with the updated journal. The
    model perceives the real command output, evaluates test failures or runtime
    panics, and either proposes corrective code edits, invokes another inspection tool,
    or emits an explicit terminal outcome (`<success>` / `<blocked>`).
@@ -416,7 +417,7 @@ A staging failure never aborts the turn and never discards work. Already staged
 files stay staged, the failing files and their matching errors are formatted into a
 report, and the model is asked to re-emit only the failing hunks. The repair log is
 append-only, so attempt *n* carries the history of attempts `1..n` instead of
-replacing it, and the loop is bounded by `develop.max_retries`.
+replacing it, and the loop is bounded by `repl.max_retries`.
 
 ### 3.3.6 Verification
 
@@ -445,14 +446,14 @@ skips the gate transparently instead of failing.
 
 A failed check enters a targeted healing round: the diagnostics are formatted into a
 clean report, missing error paths are staged into the context, and the prompt goes to
-the active role. Healing repeats while `develop.max_retries` lasts, and it stays
+the active role. Healing repeats while `repl.max_retries` lasts, and it stays
 inside one attempt of the current coder tier.
 
 When it does not converge, the turn reports its outcome and stops there. Retry and
 escalation belong to the step supervisor, not to the turn: the failed transaction is
 rolled back to the step's pre-turn checkpoint, the transient research context is
 pruned, and the step is re-asked on the same coder tier until
-`develop.max_tier_attempts` content attempts are spent. Only an exhausted tier
+`repl.max_tier_attempts` content attempts are spent. Only an exhausted tier
 advances one rung of the coder ladder — deeper reasoning on the same model first, a
 stronger coder afterwards — and that rung starts with a fresh budget of its own.
 Escalation never leaves the coder role and saturates on the final rung, where the
@@ -542,7 +543,6 @@ The in-process publisher reports the three structurally different mutations
 explicitly — appended, compacted, and rolled back — so a rollback never
 masquerades as a trailing append and a compaction never masquerades as a message.
 
-### 3.3.8 The five pipeline layers
 ### 3.3.9 The five pipeline layers
 The machine is decomposed so that each layer owns one reason to change, which is
 what makes it testable without a network:
@@ -575,7 +575,6 @@ between members, letting the current turn finish its verification and commit bef
 the queue halts. Hard cancellation wins when both are pending, and the two modes
 surface as distinct terminal statuses.
 
-### 3.3.9 Prompt layout policies across rounds
 ### 3.3.10 Prompt layout policies across rounds
 Every round re-sends the whole assembled prompt, and providers cache the longest
 unchanged token prefix. Turning that prompt into a message sequence is a policy
@@ -585,7 +584,6 @@ behind one trait, so the same rendered material can become different sequences:
   contract, the outline, the whole `<context>` block, the active plan, the language
   directive, the `<history>` block, and the scratchpad.
 - `ChronologicalLayout` turns the same material into an append-only transcript: a
-  byte-stable head, one message per history record with the context files that
   byte-stable head, one message per history record with the context files that
   record already observed placed right after it, and a volatile tail.
 
@@ -646,9 +644,9 @@ then the active plan, the context manifest of the chronological policy — paths
 access, never content — and the turn scratchpad, while round feedback (research
 findings, patch retry reports, verification diagnostics) is appended after the
 delta.
-fixed shape: task first, accumulated journal next, phase diagnostics last. A staging
-retry therefore differs from its own earlier attempt only in the trailing
-diagnostics.
+The user message keeps one fixed shape: task first, accumulated journal next, phase
+diagnostics last. A staging retry therefore differs from its own earlier attempt
+only in the trailing diagnostics.
 
 One typed resolution decides which policy a turn runs under: a declared layout wins,
 otherwise an interactive REPL turn takes the chronological transcript and a
@@ -707,11 +705,24 @@ an operation creates inherits it: the pre-flight verification gate runs while th
 slot is registered, reads the same channel, and tears its toolchain subprocess
 group down; the provider request and its completion path race the signal at every
 await; and every task spawned under the slot keeps the registration — with its
-abort handle — alive until the task has truly exited. A supervisor that dropped the
-future of a running step would break that last clause, so a queue unwinds through
-the member rather than around it. A phase that cannot observe the signal on its own
-is terminated by the deferred-abort watchdog, which defers while the operation still
-holds an open Git transaction and aborts once that transaction has closed.
+abort handle — alive while the task unwinds. A supervisor that dropped the future
+of a running step would break that last clause, so a queue unwinds through the
+member rather than around it. A phase that cannot observe the signal on its own is
+terminated by the deferred-abort watchdog, which defers while the operation still
+holds an open Git transaction and aborts once that transaction has closed. The
+abort is never treated as synchronous death: a task terminates only at its next
+suspension point, so every abort the daemon raises is followed by a confirmation of
+exit under one task-exit deadline, whether the task is reaped by the watchdog that
+followed the turn or by the last-resort watchdog that targets the registered
+operation directly. A watchdog that reaps a task it did not spawn resolves that
+deadline where it is spawned and applies it inside itself. An expired confirmation
+releases the registration with a diagnostic that names the orphan in the journal,
+because a registration parked on a task that may never reach a suspension point
+refuses every later request until the process exits. The orphan keeps its abort
+delivered: it dies at its next suspension point and releases its session lock only
+then. The raised signal classifies that termination, never the death of the task:
+the turn ends as cancelled, so the client that asked for the cancellation is not
+handed a spurious failure for the work it stopped.
 ### 3.3.13 Guards and budgets
 
 | Guard | Setting |
@@ -769,7 +780,7 @@ learns what to decompose instead of watching a turn fail anonymously.
   lifecycle states its own choice, so the change set is reported as unverified
   instead of being dressed up as a passed gate.
 - **An attempt on a tier is not an escalation.** Re-asking the same tier is finite
-  and configured by `develop.max_tier_attempts`; only an exhausted tier advances the
+  and configured by `repl.max_tier_attempts`; only an exhausted tier advances the
   ladder, and a saturated ladder ends the step instead of retrying it again.
 - **A broken connection does not burn a rung.** Transport failures are answered by
   the network layer and consume no content attempt, so a degraded link never promotes

@@ -35,9 +35,9 @@ and auditable.
 
 ### 1.3 The invariants
 
-1. **`primary` is mandatory** and lists at least one entry. Its first entry is the
+1. **`repl` is mandatory** and lists at least one entry. Its first entry is the
    idle active model and the deterministic default everywhere a role is implied.
-2. **An omitted specialized role inherits the entire `primary` list**, so a project
+2. **An omitted specialized role inherits the entire `repl` list**, so a project
    never loses access to a configured model merely because it did not repeat the
    list.
 3. **Escalation is intra-role.** A failed *how* is answered by a stronger coder
@@ -55,7 +55,7 @@ and auditable.
 
 | Role | Mandate | Produces |
 | --- | --- | --- |
-| `primary` | interactive engineering dialogue | answers, REPL turns |
+| `repl` | interactive engineering dialogue | answers, REPL turns |
 | `scribe` | history compaction, squash commit messages, summarization | dense summaries and commit text |
 | `coder` | plan steps, review fixes, verification healing | code changes |
 | `architect` | plan refinement, horizon synthesis, replanning, finding decomposition | plans and subplans |
@@ -85,9 +85,9 @@ The vocabulary is small and precise:
 
 ### 3.1 Resolution and inheritance
 
-`primary` is the only required list. `scribe` is a single utility model and falls
-back to the first `primary` entry. `coder`, `architect`, and `reviewer` are ordered
-lists that inherit the whole `primary` list when omitted. A specialized role
+`repl` is the only required list. `scribe` is a single utility model and falls
+back to the first `repl` entry. `coder`, `architect`, and `reviewer` are ordered
+lists that inherit the whole `repl` list when omitted. A specialized role
 therefore always resolves to something concrete, and a configuration can grow
 specialization one role at a time.
 
@@ -102,7 +102,7 @@ models = [
 ]
 
 [models]
-primary = ["Gemini Flash"]
+repl = ["Gemini Flash"]
 scribe = "Claude Haiku"
 
 # The coder list doubles as the escalation ladder.
@@ -249,7 +249,7 @@ Core subsystems dispatch to a role rather than to a model name:
 
 | Operation | Role |
 | --- | --- |
-| Interactive REPL turn | `primary` (or the developer's pinned model) |
+| Interactive REPL turn | `repl` (or the developer's pinned model) |
 | Plan step, review fix, healing | `coder` |
 | Plan refinement, replanning, finding decomposition | `architect` |
 | Review audit | `reviewer` |
@@ -311,7 +311,7 @@ selection that named only the model would leave the second coordinate for the
 server to guess, so a picked row sends `ModelSelection::Tier { model, effort }` —
 the exact role-list entry the developer chose.
 
-- **One contract, one DTO.** The primary picker, the Reviewer list of the review
+- **One contract, one DTO.** The `repl` picker, the Reviewer list of the review
   launcher, the Architect lists of the plan and review refinement dialogs, and the
   Coder list of the review-execution dialog all send the same pair. No consumer
   transports a model and reconstructs its depth afterwards.
@@ -325,12 +325,12 @@ the exact role-list entry the developer chose.
   concrete model and keeps the historical first-match lookup for its depth. The
   three shapes share one untagged wire form, so a stored session or an older client
   decodes unchanged.
-- **The catalog row shows the full provider catalog.** The last row of the primary
+- **The catalog row shows the full provider catalog.** The last row of the `repl`
   picker opens the complete list of models declared under `[providers]`, never a
   second view of the primary list. Configured primary models therefore never lock
   the developer out of a model the provider exposes, and the two lists stay
   distinguishable: one is a role list, the other is the provider catalog.
-- **A picked tier never feeds a ladder.** Escalation and replanning read the
+  second view of the `repl` list. Configured `repl` models therefore never lock
   configured ladders only. A tier selects what runs now and is never recorded as an
   escalation position.
 
@@ -361,8 +361,8 @@ the exact role-list entry the developer chose.
 - **A selection is not a text lookup.** A picked row carries its model and its
   reasoning depth together, so no consumer re-derives a depth the caller already
   knew and no label decides which entry was meant.
-- **The picker catalog is not the primary list.** The escape-hatch row presents the
-  provider catalog; it is never a duplicate of the configured primary models.
+- **The picker catalog is not the `repl` list.** The escape-hatch row presents the
+  provider catalog; it is never a duplicate of the configured `repl` models.
 - **The ladder is not an infinite retry.** It is a finite ordered list that
   saturates, so escalation has a deterministic terminus.
 - **A rung is not one attempt.** Each rung spends its own configured budget of

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::context::ContextAccess;
 use crate::discussion::{DirListRequest, DiscussionContextRequest, RepoSearchRequest};
 use crate::edit::normalize_repo_path;
-use crate::edit::proposal::strip_surrounding_markup;
+use crate::edit::proposal::decode_repo_path;
 
 pub(crate) fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -25,21 +25,31 @@ where
 /// Normalizes a single repository-path request of the model-output boundary.
 ///
 /// One rule serves every research list alike: the targeted repository map
-/// requests, the directory listings, and the repository searches. An empty
-/// path, `.`, or `./` names the whole repository and normalizes to an empty
-/// string. Any other path is validated through [`normalize_repo_path`], so a
-/// request can never address a location outside the repository; such a path
-/// yields `None` and the request is dropped. This is the crate's single shared
+/// requests, the directory listings, and the repository searches. The
+/// whole-repository root is derived from the decoded segment structure instead
+/// of being recognized by spelling: the shared core strips the surrounding
+/// markup, decodes the separator escapes, refuses an absolute spelling, and
+/// collapses every dot and empty segment, so a spelling that leaves no
+/// surviving segment names the whole repository and normalizes to an empty
+/// string. Any other path is validated through the same core, so a request
+/// can never address a location outside the repository; such a path yields
+/// `None` and the request is dropped. This is the crate's single shared
 /// normalizer for these paths, so every wire boundary applies the same rules.
 pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
     normalize_repo_map_path_checked(raw).ok()
 }
 
-/// Normalizes a repository-path request, keeping the rejection diagnostic.
+/// Normalizes a repository-path request, reporting the rejection diagnostic.
 ///
-/// The surrounding markup is stripped by the shared rule before a
-/// whole-repository spelling is recognized, so a backticked `.` keeps naming
-/// the repository root exactly like its bare form.
+/// The decision is derived from the decoded segment set rather than from a list
+/// of recognized spellings: the shared `decode_repo_path` core strips the
+/// surrounding markup, decodes the separator escapes, refuses an absolute
+/// spelling, and collapses every dot and empty segment. A spelling that leaves
+/// no surviving segment names the whole repository and yields the empty string,
+/// so `.`, `./`, `./.`, `.//`, and their single-backslash forms all reach the
+/// same root. A leading separator never names it: a spelling that decodes to a
+/// leading forward slash, or to the literal backslash byte the separator
+/// doubling escape places at position zero, is absolute and stays a refusal.
 ///
 /// A boundary that cannot drop a malformed entry decodes through this sibling
 /// instead of the dropping [`normalize_repo_map_path`]: a typed command field
@@ -47,11 +57,10 @@ pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
 /// decode failure. Both apply the very same rules and differ only in how they
 /// report a rejection.
 fn normalize_repo_map_path_checked(raw: &str) -> Result<String, String> {
-    let trimmed = strip_surrounding_markup(raw);
-    if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
-        return Ok(String::new());
-    }
-    normalize_repo_path(trimmed)
+    // The shared core already collapsed the segments, so an empty result is the
+    // whole-repository root this boundary reports and every other result is the
+    // normalized repository path.
+    decode_repo_path(raw)
 }
 
 /// Deserializes one repository-map-style path at the wire boundary.
@@ -216,15 +225,17 @@ mod tests {
         let raw = r#"{
             "message": "Map the subsystem first",
             "repo_dirs": true,
-            "repo_maps": [".", "./crates/core/", "../escape.rs", "crates/protocol/"]
+            "repo_maps": [".", "./.", "./crates/core/", "../escape.rs", "crates/protocol/"]
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.repo_dirs, Some(true));
-        // `.` names the whole repository, `./` prefixes collapse, and the
-        // traversal entry is dropped instead of escaping the repository.
+        // `.` and `./.` both name the whole repository through the derived
+        // segment rule, `./` prefixes collapse, and the traversal entry is
+        // dropped instead of escaping the repository.
         assert_eq!(
             resp.repo_maps,
             vec![
+                String::new(),
                 String::new(),
                 "crates/core".to_string(),
                 "crates/protocol".to_string()
@@ -237,7 +248,7 @@ mod tests {
         assert!(minimal.repo_maps.is_empty());
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"repo_dirs\":true"));
-        assert!(json.contains("\"repo_maps\":[\"\",\"crates/core\",\"crates/protocol\"]"));
+        assert!(json.contains("\"repo_maps\":[\"\",\"\",\"crates/core\",\"crates/protocol\"]"));
         assert_eq!(
             serde_json::from_str::<DiscussionResponse>(&json).unwrap(),
             resp
@@ -247,14 +258,20 @@ mod tests {
         let built = DiscussionResponse::new("x")
             .with_repo_dirs(false)
             .with_repo_maps(vec![
+                "./.".to_string(),
                 "./crates/core/".to_string(),
                 "../escape.rs".to_string(),
             ]);
         assert_eq!(built.repo_dirs, Some(false));
-        assert_eq!(built.repo_maps, vec!["crates/core".to_string()]);
+        assert_eq!(built.repo_maps.len(), 2);
+        assert!(built.repo_maps[0].is_empty());
+        assert_eq!(built.repo_maps[1], "crates/core");
 
         assert_eq!(normalize_repo_map_path(""), Some(String::new()));
+        assert_eq!(normalize_repo_map_path("."), Some(String::new()));
+        assert_eq!(normalize_repo_map_path("./"), Some(String::new()));
         assert_eq!(normalize_repo_map_path("  .  "), Some(String::new()));
+        assert_eq!(normalize_repo_map_path("./."), Some(String::new()));
         assert_eq!(
             normalize_repo_map_path("`crates/core`"),
             Some("crates/core".to_string())
@@ -268,29 +285,36 @@ mod tests {
         let raw = r#"{
             "message": "List the subsystem",
             "dir_lists": [
+                {"path": "./.", "recursive": false},
                 {"path": "./crates/core/", "recursive": false},
                 {"path": ".", "recursive": true},
                 {"path": "../escape", "recursive": true}
             ]
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
-        // `./` collapses, `.` names the repository root, and the traversal
-        // entry is dropped instead of escaping the repository.
-        assert_eq!(resp.dir_lists.len(), 2);
-        assert_eq!(resp.dir_lists[0].path, "crates/core");
+        // A `./.` composition leaves no surviving segment and names the
+        // repository root, `./` collapses, `.` names the root too, and the
+        // traversal entry is dropped instead of escaping the repository.
+        assert_eq!(resp.dir_lists.len(), 3);
+        assert_eq!(resp.dir_lists[0].path, "");
         assert!(!resp.dir_lists[0].recursive);
-        assert_eq!(resp.dir_lists[1].path, "");
-        assert!(resp.dir_lists[1].recursive);
+        assert_eq!(resp.dir_lists[1].path, "crates/core");
+        assert!(!resp.dir_lists[1].recursive);
+        assert_eq!(resp.dir_lists[2].path, "");
+        assert!(resp.dir_lists[2].recursive);
 
         // The builder applies the same normalization as the decoder.
         let built = DiscussionResponse::new("x").with_dir_lists(vec![
+            DirListRequest::new("./.", false),
             DirListRequest::new("./crates/protocol/", true),
             DirListRequest::new("../escape", false),
         ]);
-        assert_eq!(
-            built.dir_lists,
-            vec![DirListRequest::new("crates/protocol", true)]
-        );
+        let listed = &built.dir_lists;
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].path.is_empty());
+        assert!(!listed[0].recursive);
+        assert_eq!(listed[1].path, "crates/protocol");
+        assert!(listed[1].recursive);
 
         // `recursive` defaults to false on the wire and an empty listing stays
         // absent from the encoded payload.
@@ -305,6 +329,7 @@ mod tests {
         let raw = r#"{
             "message": "Search the subsystem",
             "repo_searches": [
+                {"path": "./.", "regex": "pub fn"},
                 {"path": "./crates/core/", "regex": "fn run"},
                 {"path": ".", "regex": "pub fn"},
                 {"path": "../escape", "regex": "secret"},
@@ -312,13 +337,17 @@ mod tests {
             ]
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
-        // `./` collapses, `.` names the repository root, and the traversal and
-        // absolute entries are dropped instead of escaping the repository.
-        assert_eq!(resp.repo_searches.len(), 2);
-        assert_eq!(resp.repo_searches[0].path, "crates/core");
-        assert_eq!(resp.repo_searches[0].regex, "fn run");
-        assert_eq!(resp.repo_searches[1].path, "");
-        assert_eq!(resp.repo_searches[1].regex, "pub fn");
+        // A `./.` composition leaves no surviving segment and names the
+        // repository root, `./` collapses, `.` names the root too, and the
+        // traversal and absolute entries are dropped instead of escaping the
+        // repository.
+        assert_eq!(resp.repo_searches.len(), 3);
+        assert_eq!(resp.repo_searches[0].path, "");
+        assert_eq!(resp.repo_searches[0].regex, "pub fn");
+        assert_eq!(resp.repo_searches[1].path, "crates/core");
+        assert_eq!(resp.repo_searches[1].regex, "fn run");
+        assert_eq!(resp.repo_searches[2].path, "");
+        assert_eq!(resp.repo_searches[2].regex, "pub fn");
 
         // A `null` payload still yields an empty list.
         let null_resp: DiscussionResponse =
@@ -327,13 +356,16 @@ mod tests {
 
         // The builder applies the same normalization as the decoder.
         let built = DiscussionResponse::new("x").with_repo_searches(vec![
+            RepoSearchRequest::new("./.", "pub fn"),
             RepoSearchRequest::new("./crates/core/", "fn run"),
             RepoSearchRequest::new("../escape", "secret"),
         ]);
-        assert_eq!(
-            built.repo_searches,
-            vec![RepoSearchRequest::new("crates/core", "fn run")]
-        );
+        let searched = &built.repo_searches;
+        assert_eq!(searched.len(), 2);
+        assert!(searched[0].path.is_empty());
+        assert_eq!(searched[0].regex, "pub fn");
+        assert_eq!(searched[1].path, "crates/core");
+        assert_eq!(searched[1].regex, "fn run");
 
         // An accepted request survives a full round-trip unchanged.
         let valid = RepoSearchRequest::new("crates/protocol", r"pub fn \w+");
@@ -415,5 +447,39 @@ mod tests {
             Some("src/`odd`/a.rs".to_string())
         );
         assert_eq!(normalize_repo_map_path("`../escape`"), None);
+    }
+
+    #[test]
+    fn test_repo_map_root_is_derived_from_the_decoded_segments() {
+        // A spelling that leaves no surviving segment names the repository root
+        // whatever dot and separator composition produces it, so the sibling
+        // that drops malformed entries keeps the request and the sibling that
+        // reports a rejection accepts it.
+        for raw in ["", ".", "./", "./.", "././", ".//", r".\."] {
+            assert_eq!(normalize_repo_map_path(raw), Some(String::new()));
+            assert_eq!(normalize_repo_map_path_checked(raw), Ok(String::new()));
+        }
+
+        // The single-backslash-separator composition reaches the same root, and
+        // the surrounding markup never hides it.
+        for raw in [r".\.\", " `./.` ", "`././`", "`.//`"] {
+            assert_eq!(normalize_repo_map_path(raw), Some(String::new()));
+            assert_eq!(normalize_repo_map_path_checked(raw), Ok(String::new()));
+        }
+
+        // A leading separator never names the repository root: a forward slash
+        // is absolute, and so is the literal backslash byte the separator
+        // doubling escape places at position zero. A UNC spelling, a lone
+        // doubled backslash, and the file-system root stay refusals.
+        for raw in ["/", "////", r"\\server\share", r"\\?\C:\x", r"\\"] {
+            assert_eq!(normalize_repo_map_path(raw), None);
+            assert!(normalize_repo_map_path_checked(raw).is_err());
+        }
+
+        // The rejection names the absolute spelling instead of reporting a
+        // missing segment, so a refusal is never mistaken for an empty request.
+        let rejection = normalize_repo_map_path_checked(r"\\server\share")
+            .expect_err("an absolute spelling must be rejected");
+        assert!(rejection.contains("repository-relative"));
     }
 }

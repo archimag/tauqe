@@ -45,14 +45,14 @@ pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
         scribe: cfg.models.resolve_effort(ModelRole::Scribe),
         coder: cfg.models.resolve_effort(ModelRole::Coder),
         architect: cfg.models.resolve_effort(ModelRole::Architect),
-        primary: cfg.models.resolve_effort(ModelRole::Primary),
+        primary: cfg.models.resolve_effort(ModelRole::REPL),
         reviewer: cfg.models.resolve_effort(ModelRole::Reviewer),
     });
     summary.entries = Some(ModelRolesEntries {
         scribe: cfg.models.role_entries(ModelRole::Scribe),
         coder: cfg.models.role_entries(ModelRole::Coder),
         architect: cfg.models.role_entries(ModelRole::Architect),
-        primary: cfg.models.role_entries(ModelRole::Primary),
+        primary: cfg.models.role_entries(ModelRole::REPL),
         reviewer: cfg.models.role_entries(ModelRole::Reviewer),
         catalog: provider_catalog(cfg),
     });
@@ -761,6 +761,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use tauqe_protocol::{EditProtocolKind, ModelRef, WorkflowKind};
 
     #[tokio::test]
@@ -887,7 +888,8 @@ mod tests {
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+        let root = scratch_root("config-set-model-role");
+        let state = AppState::new(cfg, root.clone(), history_sender, out);
 
         let req = Request {
             id: tauqe_protocol::RequestId::Number(1),
@@ -913,18 +915,15 @@ mod tests {
             Some(ModelSelection::Role(ModelRole::Scribe))
         );
         assert_eq!(res_state.model, ModelRef::openrouter("model/scribe"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn test_handle_config_set_workflow_and_protocol() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(
-            AppConfig::default(),
-            std::env::temp_dir(),
-            history_sender,
-            out,
-        );
+        let root = scratch_root("config-set-workflow");
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         let req = Request {
             id: tauqe_protocol::RequestId::Number(2),
@@ -947,6 +946,7 @@ mod tests {
         let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(res_state.workflow, WorkflowKind::Naive);
         assert_eq!(res_state.edit_protocol, EditProtocolKind::Structured);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A failed reload must not erase the CLI overrides captured at daemon
@@ -968,7 +968,7 @@ mod tests {
     /// location probe and the default-path computation.
     #[tokio::test]
     async fn test_resolve_status_paths_reports_discovered_and_default_locations() {
-        let root = unique_repo_dir("status-paths");
+        let root = scratch_root("status-paths");
         let repo_config = root.join("tauqe.toml");
         // The lookup only checks that a candidate is a file, so the fixture
         // carries no configuration.
@@ -1033,12 +1033,8 @@ mod tests {
     async fn test_credentials_create_stub_rejected_while_operation_active() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(
-            AppConfig::default(),
-            std::env::temp_dir(),
-            history_sender,
-            out,
-        );
+        let root = scratch_root("credentials-stub");
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         let _guard = state
             .try_begin_operation()
@@ -1053,6 +1049,7 @@ mod tests {
         let resp = handle_credentials_create_stub(req, &state).await;
         let err = resp.error.expect("stub creation must be rejected");
         assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `config/set` replaces the shared configuration and model selection, so it
@@ -1068,7 +1065,8 @@ mod tests {
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+        let root = scratch_root("config-set-exclusive");
+        let state = AppState::new(cfg, root.clone(), history_sender, out);
 
         let operation = state
             .try_begin_operation()
@@ -1095,21 +1093,7 @@ mod tests {
 
         drop(operation);
         assert!(!state.is_operation_active());
-    }
-
-    /// Creates an isolated temporary repository directory for tests that need a
-    /// `tauqe.toml` on disk.
-    fn unique_repo_dir(tag: &str) -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let index = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-config-{}-{}-{}",
-            tag,
-            std::process::id(),
-            index
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Builds a `config/set` request switching to `selection`.
@@ -1151,7 +1135,8 @@ mod tests {
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+        let root = scratch_root("config-rotate-session");
+        let state = AppState::new(cfg, root.clone(), history_sender, out);
 
         let warm = state.session_uuid().await;
         let resp = handle_config_set(
@@ -1166,6 +1151,7 @@ mod tests {
             state.session_uuid().await,
             "switching the effective model must rotate the session"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Reselecting the model that is already effective keeps the warm session:
@@ -1180,7 +1166,8 @@ mod tests {
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+        let root = scratch_root("config-keep-session");
+        let state = AppState::new(cfg, root.clone(), history_sender, out);
 
         let warm = state.session_uuid().await;
         let resp = handle_config_set(
@@ -1197,13 +1184,14 @@ mod tests {
             state.session_uuid().await,
             "an unchanged effective model must keep the session"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Reloading a configuration that resolves another model invalidates the
     /// session once, and a repeated reload of the same file keeps it warm.
     #[tokio::test]
     async fn test_handle_config_reload_rotates_the_session_on_a_model_change() {
-        let root = unique_repo_dir("reload");
+        let root = scratch_root("reload");
         std::fs::write(
             root.join("tauqe.toml"),
             "[models]\nprimary = [\"openrouter:deepseek/deepseek-chat\"]\n",
@@ -1246,7 +1234,7 @@ mod tests {
     /// with the typed conflict instead of mutating a value nobody can persist.
     #[tokio::test]
     async fn test_config_set_is_refused_for_a_key_a_module_declares() {
-        let root = unique_repo_dir("module-conflict");
+        let root = scratch_root("module-conflict");
         std::fs::write(
             root.join("tauqe.toml"),
             "[models]\nprimary = [\"openrouter:alpha/model\"]\n",

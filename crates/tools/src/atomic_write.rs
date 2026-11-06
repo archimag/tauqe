@@ -623,22 +623,39 @@ impl SiblingCommit {
     /// reports that staged content is what sits there. Removing it
     /// unconditionally would destroy the intact original on exactly the failure
     /// path this rollback exists to protect.
+    ///
+    /// Every rename and every removal of the rollback is recorded in the
+    /// directory that holds the target, so that directory is synced once the
+    /// restoration is complete, exactly as [`Self::commit`] and [`Self::finish`]
+    /// sync it after their own renames. A barrier that cannot run leaves the
+    /// restored working tree in place, because a rollback reports no state.
     pub fn rollback(&self) {
+        let mut mutated = false;
         if let Some(staged) = &self.staged {
-            if self.published {
-                let _ = std::fs::remove_file(&self.target);
+            if self.published && std::fs::remove_file(&self.target).is_ok() {
+                mutated = true;
             }
-            let _ = std::fs::remove_file(staged);
+            if std::fs::remove_file(staged).is_ok() {
+                mutated = true;
+            }
         }
-        if self.original_moved {
-            let _ = std::fs::rename(&self.backup, &self.target);
+        if self.original_moved && std::fs::rename(&self.backup, &self.target).is_ok() {
+            mutated = true;
+        }
+        if mutated {
+            let _ = sync_parent_directory(&self.target);
         }
     }
 
     /// Removes the staged content of a change that never reached its commit.
+    ///
+    /// The unlink is recorded in the directory that holds the target, so that
+    /// directory is synced once the staged content is gone.
     pub fn discard_staged_content(&self) {
         if let Some(staged) = &self.staged {
-            let _ = std::fs::remove_file(staged);
+            if std::fs::remove_file(staged).is_ok() {
+                let _ = sync_parent_directory(staged);
+            }
         }
     }
 
@@ -857,6 +874,63 @@ mod tests {
         assert!(staging_leftovers(&parent).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_restores_the_original_when_the_directory_barrier_cannot_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("write_only");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("source.rs");
+        std::fs::write(&target, "original").unwrap();
+
+        let mut change = SiblingCommit::stage(&target, b"updated").unwrap();
+
+        // Write and execute admit the staging file, the renames, and the
+        // metadata read; the missing read bit rejects the read-only open of the
+        // parent, so the commit reaches both renames and fails at its barrier.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let committed = change.commit();
+        change.rollback();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            committed.is_err(),
+            "the commit must report the barrier that never ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "a rollback restores the original even when its own barrier cannot run"
+        );
+        assert!(
+            staging_leftovers(&parent).is_empty(),
+            "a rollback must not leave a staging sibling behind"
+        );
+    }
+
+    #[test]
+    fn discarding_the_staged_content_of_an_uncommitted_change_keeps_the_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("source.rs");
+        std::fs::write(&target, "original").unwrap();
+
+        let change = SiblingCommit::stage(&target, b"updated").unwrap();
+        assert_eq!(staging_leftovers(dir.path()).len(), 1);
+
+        change.discard_staged_content();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "discarding the staged content never touches the target"
+        );
+        assert!(
+            staging_leftovers(dir.path()).is_empty(),
+            "the discarded staged content is gone"
+        );
+    }
     #[test]
     fn finishing_a_committed_sibling_drops_its_backup() {
         let dir = tempdir().unwrap();

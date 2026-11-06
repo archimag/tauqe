@@ -16,6 +16,8 @@ pub mod markdown;
 pub mod model_display;
 pub mod rpc;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod theme;
 pub mod ui;
 pub mod views;

@@ -120,12 +120,20 @@ async fn relay_contour_events(
 ) -> ContourRelaySummary {
     let mut summary = ContourRelaySummary::default();
     while let Some(event) = events_rx.recv().await {
+        // The gate wraps the whole iteration, so every forwarded coordinate —
+        // text, reasoning, context snapshots, turn phases, tier escalations,
+        // repo-map reports, connection retries, and the withdrawal notice —
+        // follows the pacing contract: a client that keeps its pipe open but
+        // stops reading pauses the synthesis instead of growing daemon memory.
+        // Only the terminal `Done` is exempt, because it ends the relay and
+        // must never wait for the stall it reports. A raised cancellation
+        // releases the gate, so an interrupted operation still reaches its
+        // terminal events without a reader.
+        if !matches!(event, StreamEvent::Done) {
+            state.out.wait_for_headroom(&mut cancel).await;
+        }
         match event {
             StreamEvent::TextDelta(delta) => {
-                // Token-granularity telemetry paces the relay against the
-                // outbound queue: a client that stopped reading pauses the
-                // synthesis instead of growing daemon memory.
-                state.out.wait_for_headroom(&mut cancel).await;
                 summary.assistant_text.push_str(&delta);
                 emit(
                     &state.out,
@@ -138,9 +146,6 @@ async fn relay_contour_events(
                 );
             }
             StreamEvent::ReasoningDelta(delta) => {
-                // Reasoning is paced by the same gate, so a stalled client holds
-                // the whole stream instead of only the answer.
-                state.out.wait_for_headroom(&mut cancel).await;
                 emit(
                     &state.out,
                     events::MODEL_REASONING_DELTA,
@@ -437,6 +442,10 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::workflow::fsm::structured::StructuredRefineStatus;
@@ -444,6 +453,7 @@ mod tests {
         ContextAccess, ModelRef, ModelRole, ModelUsageInfo, ReasoningEffort, TurnPhase,
     };
 
+    use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
 
     /// Builds a daemon state bound to its own scratch repository root.
@@ -454,12 +464,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<String>,
         PathBuf,
     ) {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-architect-bridge-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create the scratch repository root");
+        let root = scratch_root(&format!("architect-bridge-{label}"));
         let (out, rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
@@ -555,7 +560,7 @@ mod tests {
         assert!(!summary.cancelled);
         assert!(summary.error.is_none());
         assert_eq!(
-            state.usage.lock().await.operations,
+            state.usage_snapshot().await.operations,
             1,
             "the relay must close the usage window of the synthesis"
         );
@@ -733,7 +738,7 @@ mod tests {
             "one accepted round spends one provider request"
         );
         assert_eq!(
-            state.usage.lock().await.operations,
+            state.usage_snapshot().await.operations,
             1,
             "the whole synthesis is accounted as one operation"
         );
@@ -773,6 +778,185 @@ mod tests {
             std::ptr::eq(&*resolved, &*installed),
             "the resolver must return the client installed through the test seam"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sink that records everything the outbound writer publishes, so a pacing
+    /// test observes the relayed telemetry without touching the real stdout of
+    /// the process.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        published: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl RecordingSink {
+        /// Everything the writer published so far, decoded as UTF-8.
+        fn published(&self) -> String {
+            self.published
+                .lock()
+                .map(|published| String::from_utf8_lossy(&published).into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    impl tokio::io::AsyncWrite for RecordingSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if let Ok(mut published) = self.published.lock() {
+                published.extend_from_slice(buf);
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Pre-fills the outbound queue one line above the transport's high-water
+    /// mark, so the relay observes a client that keeps its pipe open but
+    /// stopped reading its stream.
+    fn stall_outbound_transport(state: &AppState) {
+        for _ in 0..=crate::transport::BACKLOG_HIGH_WATER {
+            emit(&state.out, "test/filler", None);
+        }
+    }
+
+    /// The pacing contract covers the whole relay rather than the textual arms
+    /// alone: a stalled client holds every forwarded coordinate, and the drain
+    /// of the queue releases it.
+    ///
+    /// The hold is read from the relay itself instead of from the queue depth.
+    /// The depth falls only once a writer publishes what it dequeued, so a
+    /// report the gate parked leaves the terminal event behind it unread. A
+    /// relay that forwarded the report before the gate would consume that
+    /// event and finish while the client is still stalled.
+    #[tokio::test]
+    async fn relay_withholds_telemetry_until_a_writer_drains_the_stalled_queue() {
+        let (state, rx, root) = test_state("relay-pacing");
+        stall_outbound_transport(&state);
+
+        let usage = state.begin_usage().await;
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut relay = tokio::spawn(relay_contour_events(
+            Arc::clone(&state),
+            "op-paced".to_string(),
+            usage,
+            events_rx,
+            cancel,
+        ));
+        // A repo-map report used to travel ungated, so it is the coordinate
+        // that proves the loop-level policy instead of the textual arms alone.
+        events_tx
+            .send(StreamEvent::RepoMapTokens(512))
+            .await
+            .expect("the relay is listening");
+        events_tx
+            .send(StreamEvent::Done)
+            .await
+            .expect("the relay is listening");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut relay)
+                .await
+                .is_err(),
+            "a stalled client must hold the relayed telemetry in the gate"
+        );
+
+        let sink = RecordingSink::default();
+        let writing = tokio::spawn(state.out.writer(rx).run_with(sink.clone()));
+
+        let mut published = String::new();
+        for _ in 0..200 {
+            published = sink.published();
+            if published.contains(events::TURN_REPOMAP) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            published.contains(events::TURN_REPOMAP) && published.contains("\"tokens\":512"),
+            "the drain of the stalled queue must release the paused relay"
+        );
+
+        drop(events_tx);
+        let summary = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("the released relay reaches the terminal event")
+            .expect("the relay joins");
+        assert!(summary.assistant_text.is_empty());
+        assert!(!summary.cancelled);
+        assert!(summary.error.is_none());
+
+        writing.abort();
+        let _ = writing.await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A raised cancellation releases a paused relay even while the client is
+    /// still stalled, so an interrupted synthesis reaches its terminal events
+    /// without waiting for a reader that never returns.
+    #[tokio::test]
+    async fn a_cancelled_operation_releases_a_paused_relay_without_a_drain() {
+        let (state, mut rx, root) = test_state("relay-pacing-cancel");
+        stall_outbound_transport(&state);
+
+        let usage = state.begin_usage().await;
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let relay = tokio::spawn(relay_contour_events(
+            Arc::clone(&state),
+            "op-paced-cancel".to_string(),
+            usage,
+            events_rx,
+            cancel,
+        ));
+        events_tx
+            .send(StreamEvent::RepoMapTokens(512))
+            .await
+            .expect("the relay is listening");
+
+        while rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "the stalled client must hold the relay"
+        );
+
+        let _ = cancel_tx.send(true);
+        events_tx
+            .send(StreamEvent::Done)
+            .await
+            .expect("the relay is listening");
+        drop(events_tx);
+
+        let summary = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("a cancelled operation must not wait for the stalled client")
+            .expect("the relay joins");
+        assert!(!summary.cancelled);
+
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            raw_events.push(raw);
+        }
+        let maps = collect(&raw_events, events::TURN_REPOMAP);
+        assert_eq!(
+            maps.len(),
+            1,
+            "the released relay must publish the telemetry it held"
+        );
+        assert_eq!(maps[0]["tokens"], 512);
 
         let _ = std::fs::remove_dir_all(&root);
     }

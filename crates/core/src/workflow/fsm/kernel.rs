@@ -1210,6 +1210,7 @@ async fn forward_provider_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_paths::scratch_dir;
 
     #[test]
     fn the_empty_step_reminder_requires_a_result_not_a_silent_status() {
@@ -1309,7 +1310,7 @@ mod tests {
         use crate::edits::stream::XmlStreamFilter;
 
         let filter = Box::new(
-            XmlStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
+            XmlStreamFilter::new(vec!["a.rs".to_string()], scratch_dir("fsm-kernel-xml"))
                 .with_staged_contents(HashMap::from([(
                     "a.rs".to_string(),
                     "fn old() {}\n".to_string(),
@@ -1366,7 +1367,7 @@ mod tests {
         use crate::edits::stream::JsonStreamFilter;
 
         let filter = Box::new(
-            JsonStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
+            JsonStreamFilter::new(vec!["a.rs".to_string()], scratch_dir("fsm-kernel-json"))
                 .with_staged_contents(HashMap::from([(
                     "a.rs".to_string(),
                     "alpha\nbeta\ngamma\n".to_string(),

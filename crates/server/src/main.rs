@@ -21,6 +21,7 @@ use tokio::signal::unix::Signal;
 mod dispatch;
 mod handlers;
 mod logging;
+mod reap;
 mod state;
 mod transport;
 mod usage;
@@ -147,7 +148,10 @@ async fn main() -> anyhow::Result<()> {
     // without interleaving. It owns the outbound queue and records a dead sink
     // on the shared channel state instead of exiting silently, so the request
     // loop below stops the daemon once nothing it produces can be delivered.
-    tokio::spawn(outbound.run());
+    // The handle is kept: the shutdown drain joins the writer so the terminal
+    // events of a cancelled operation are flushed instead of dropped with the
+    // runtime.
+    let outbound = tokio::spawn(outbound.run());
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -261,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     // The client closed the pipe or a signal asked the daemon to stop: cancel
     // the active operation and drain in-flight work so the process never exits
     // mid-transaction.
-    drain_in_flight(&state, &mut offloaded).await;
+    drain_in_flight(&state, &mut offloaded, outbound).await;
 
     Ok(())
 }
@@ -444,6 +448,15 @@ const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 const FORCE_ABORT_BUDGET: std::time::Duration =
     CLIENT_SHUTDOWN_WAIT.saturating_sub(SHUTDOWN_DRAIN_BUDGET);
 
+/// Window the final outbound flush may spend publishing the lines the drain
+/// produced.
+///
+/// It is the headroom the shared lifecycle contract grants the daemon on top of
+/// [`SHUTDOWN_DRAIN_BUDGET`], so the terminal events of a cancelled operation
+/// still reach a client that is reading. Only a client that keeps its pipe open
+/// and stops reading can consume the window, and waiting past it would be
+/// waiting for nothing: the writer is aborted and the process exits.
+const TRANSPORT_FLUSH_BUDGET: std::time::Duration = FORCE_ABORT_BUDGET;
 /// Collects every offloaded handler task that has already finished.
 ///
 /// A `JoinSet` retains a completed task — its output and its intrusive list
@@ -484,8 +497,26 @@ fn reap_finished_handlers(offloaded: &mut tokio::task::JoinSet<()>) {
 /// the registered operation is force-aborted through the slot, deferring over an
 /// open Git transaction for exactly the headroom the client grants on top of the
 /// drain budget. Startup crash recovery covers whatever residue remains.
-async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::JoinSet<()>) {
-    drain_in_flight_with_budget(state, offloaded, SHUTDOWN_DRAIN_BUDGET, FORCE_ABORT_BUDGET).await
+///
+/// The transport is the one part of the exit the drain cannot delegate: the
+/// terminal events of the cancelled operation are still queued in the outbound
+/// channel, and the writer that publishes them is a plain task that dies with
+/// the runtime. The drain therefore ends by joining that writer through
+/// [`flush_outbound`], so a client that is still reading observes the end of the
+/// operation it asked to cancel.
+async fn drain_in_flight(
+    state: &Arc<AppState>,
+    offloaded: &mut tokio::task::JoinSet<()>,
+    outbound: tokio::task::JoinHandle<()>,
+) {
+    drain_in_flight_with_budget(
+        state,
+        offloaded,
+        outbound,
+        SHUTDOWN_DRAIN_BUDGET,
+        FORCE_ABORT_BUDGET,
+    )
+    .await
 }
 
 /// Implements [`drain_in_flight`] with explicit deadlines, so a deterministic
@@ -493,26 +524,27 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
 async fn drain_in_flight_with_budget(
     state: &Arc<AppState>,
     offloaded: &mut tokio::task::JoinSet<()>,
+    outbound: tokio::task::JoinHandle<()>,
     drain_budget: std::time::Duration,
     abort_budget: std::time::Duration,
 ) {
     tracing::info!("Draining in-flight work before shutdown");
     let deadline = tokio::time::Instant::now() + drain_budget;
-    loop {
+    let drain_timed_out = loop {
         // Re-signal on every pass so an operation that registers while we wait
         // is cancelled too.
         state.cancel_active_operation();
 
         if !state.is_operation_active() && offloaded.is_empty() {
-            tracing::info!("In-flight work drained; shutdown complete");
-            return;
+            tracing::info!("In-flight work drained");
+            break false;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 timeout_ms = drain_budget.as_millis() as u64,
                 "Shutdown drain timed out; aborting remaining work",
             );
-            break;
+            break true;
         }
 
         if offloaded.is_empty() {
@@ -523,22 +555,65 @@ async fn drain_in_flight_with_budget(
                 _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {}
             }
         }
+    };
+
+    if drain_timed_out {
+        let remaining = offloaded.len();
+        offloaded.abort_all();
+        tracing::warn!(
+            remaining,
+            "Force-aborting in-flight handler tasks at shutdown"
+        );
+        while offloaded.join_next().await.is_some() {}
+
+        // The handler task is not where the work lives: a long-running request
+        // spawns its turn or batch and returns, so the join set is usually empty
+        // while the operation slot still holds the task that really runs.
+        // Reaching through the slot is the only way to abort it, and dropping
+        // the runtime instead would strand a Git transaction mid-write.
+        state.force_abort_active_operation(abort_budget).await;
     }
 
-    let remaining = offloaded.len();
-    offloaded.abort_all();
-    tracing::warn!(
-        remaining,
-        "Force-aborting in-flight handler tasks at shutdown"
-    );
-    while offloaded.join_next().await.is_some() {}
+    // The cancelled operation published its terminal events on the way out, and
+    // they are still queued in the outbound channel. The flush is therefore the
+    // last step of the drain: returning from `main` would drop the runtime and
+    // cancel the writer with those lines still unwritten.
+    flush_outbound(state, outbound, TRANSPORT_FLUSH_BUDGET).await;
+}
 
-    // The handler task is not where the work lives: a long-running request
-    // spawns its turn or batch and returns, so the join set is usually empty
-    // while the operation slot still holds the task that really runs. Reaching
-    // through the slot is the only way to abort it, and dropping the runtime
-    // instead would strand a Git transaction mid-write.
-    state.force_abort_active_operation(abort_budget).await;
+/// Publishes everything the drain produced and closes the outbound transport.
+///
+/// The terminal events of a cancelled operation — a turn cancellation, a batch
+/// completion, the rollback notifications — are enqueued by the very handlers
+/// and turns the drain waits for, so the shutdown ends by letting the writer
+/// publish them. Returning from `main` cancels the writer wherever it stands,
+/// and a client that is still reading would miss the end of the operation it
+/// asked to cancel while the journal, whose guard flushes on drop, recorded it.
+///
+/// The wait is bounded: a client that keeps its pipe open and stops reading must
+/// not hold the daemon past the deadline its spawner enforces, so the writer is
+/// aborted when [`TRANSPORT_FLUSH_BUDGET`] expires.
+async fn flush_outbound(
+    state: &Arc<AppState>,
+    mut outbound: tokio::task::JoinHandle<()>,
+    budget: std::time::Duration,
+) {
+    state.out.shutdown();
+
+    match tokio::time::timeout(budget, &mut outbound).await {
+        Ok(Ok(())) => tracing::info!("Outbound transport flushed; shutdown complete"),
+        Ok(Err(err)) => tracing::warn!(
+            error = %err,
+            "Outbound writer task ended abnormally during the shutdown flush"
+        ),
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = budget.as_millis() as u64,
+                "Outbound flush timed out; aborting the transport with lines still queued"
+            );
+            outbound.abort();
+        }
+    }
 }
 
 /// Renders a compact, secret-free summary of RPC parameters for the journal.
@@ -699,8 +774,9 @@ mod tests {
     /// Monotonic suffix keeping the scratch repositories of this module apart.
     static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    /// Builds a daemon state bound to its own scratch repository.
-    fn test_state(label: &str) -> (Arc<AppState>, PathBuf) {
+    /// Builds a daemon state bound to its own scratch repository, together with
+    /// the outbound writer task the shutdown drain joins.
+    fn test_state(label: &str) -> (Arc<AppState>, PathBuf, tokio::task::JoinHandle<()>) {
         let unique = SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "tauqe-drain-{}-{}-{}",
@@ -709,7 +785,8 @@ mod tests {
             unique
         ));
         let _ = std::fs::create_dir_all(&root);
-        let (out, _out_rx) = OutChannel::new();
+        let (out, out_rx) = OutChannel::new();
+        let writer = tokio::spawn(out.writer(out_rx).run());
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             AppState::new(
@@ -719,6 +796,7 @@ mod tests {
                 out,
             ),
             root,
+            writer,
         )
     }
 
@@ -741,7 +819,7 @@ mod tests {
     /// mid-transaction on process exit.
     #[tokio::test]
     async fn drain_deadline_force_aborts_the_registered_operation() {
-        let (state, root) = test_state("force-abort");
+        let (state, root, writer) = test_state("force-abort");
 
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
@@ -765,6 +843,7 @@ mod tests {
         drain_in_flight_with_budget(
             &state,
             &mut offloaded,
+            writer,
             std::time::Duration::from_millis(20),
             std::time::Duration::from_millis(500),
         )
@@ -818,7 +897,7 @@ mod tests {
     /// slot is still held.
     #[tokio::test]
     async fn drain_defers_the_force_abort_over_an_open_git_transaction() {
-        let (state, root) = test_state("defer-transaction");
+        let (state, root, writer) = test_state("defer-transaction");
 
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let aborted_while_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -869,6 +948,7 @@ mod tests {
         drain_in_flight_with_budget(
             &state,
             &mut offloaded,
+            writer,
             std::time::Duration::from_millis(30),
             std::time::Duration::from_secs(2),
         )
@@ -959,7 +1039,7 @@ mod tests {
     /// reviewed short handler reaches the client untouched.
     #[tokio::test]
     async fn answering_preserves_a_normal_response() {
-        let (state, root) = test_state("handler-answered");
+        let (state, root, _writer) = test_state("handler-answered");
         let request_id = RequestId::Number(3);
         let request = Request {
             id: request_id.clone(),
@@ -979,6 +1059,45 @@ mod tests {
             "a normal answer must pass through"
         );
         assert!(response.result.is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The drain must join the outbound writer before it returns: `main` exits
+    /// right after it, and dropping the runtime cancels the writer wherever it
+    /// stands, so a queued terminal event would never reach a client that is
+    /// still reading.
+    #[tokio::test]
+    async fn the_shutdown_drain_joins_the_outbound_writer() {
+        let (state, root, writer) = test_state("drain-flush");
+
+        // The flag is set by a task that awaits the writer, so it can only flip
+        // once the writer really ended. The current-thread runtime of this test
+        // runs no other task between a drain that returned without joining and
+        // the assertion below, so the check cannot pass by luck.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = {
+            let finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                let _ = writer.await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let mut offloaded = tokio::task::JoinSet::new();
+        drain_in_flight_with_budget(
+            &state,
+            &mut offloaded,
+            observed,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the drain must join the outbound writer so its queued lines are flushed"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

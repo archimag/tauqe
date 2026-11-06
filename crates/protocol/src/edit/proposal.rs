@@ -17,7 +17,11 @@ use crate::edit::EditFileOp;
 /// reproduces the same target instead of retargeting it. An operation is a typed
 /// enum variant rather than a
 /// list entry, so a rejected path surfaces as a decode failure naming it
-/// instead of being dropped silently. This is a first line of defence only:
+/// instead of being dropped silently. The absolute-path and drive-root
+/// rejections are derived from the decoded segment structure rather than from
+/// enumerated spellings, so a spelling that reaches the file-system root
+/// through separator escapes or dot segments is refused as well. This is a
+/// first line of defence only:
 /// `core` still canonicalizes and confines every path against the repository
 /// root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,47 +391,55 @@ mod repo_path {
     }
 }
 
-/// Normalizes and validates a repository-relative path in a single place.
+/// Reports whether a decoded segment opens with a Windows drive root.
 ///
-/// Surrounding whitespace and backtick markup are stripped first, then the
-/// separator escapes are decoded, and then `.` segments, repeated slashes, and
-/// leading `./` components are normalized. A backslash is read two ways,
-/// because a producer and a file name spell the same byte in opposite
-/// directions:
+/// A drive root is an ASCII letter followed by a colon at the start of the
+/// first surviving segment, whether the colon closes the segment (`C:`) or
+/// continues a drive-relative spelling (`C:name`): both leave the repository.
+fn is_drive_root(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// Decodes a repository-path spelling into its normalized segment structure.
 ///
-/// - a single backslash is a separator, so the spelling a Windows producer
-///   emits (`src\lib.rs`) addresses `src/lib.rs`;
-/// - a doubled backslash names one literal backslash byte, so a file whose own
-///   name carries a backslash stays addressable on a file system that permits
-///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
-///   the separator rule alone would silently retarget the identical spelling to
-///   the different path `src/new.rs`.
+/// This is the crate's single shared decode-and-collapse core for repository
+/// paths, so a boundary decides acceptance from this structure instead of
+/// restating the rules. Surrounding whitespace and backtick markup are
+/// stripped first, then the separator escapes are decoded, and then the decoded
+/// spelling is split into the segments that survive the collapse of `.`
+/// components and repeated slashes.
 ///
-/// The path is rejected when it is empty, absolute, a Windows drive path,
-/// contains a `..` traversal component, or carries a NUL byte. This is the
-/// crate's single shared path-cleaning routine, so every wire boundary applies
-/// identical rules. It is a first line of defence only: `core` must still
-/// canonicalize and confine paths against the repository root, because the
-/// protocol cannot guarantee that every path flows through this helper.
-pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
+/// Acceptance is derived from that structure instead of from enumerated
+/// spellings. A spelling that names no surviving segment yields an empty
+/// string, because it names the whole repository to a research request and no
+/// location at all to an edit operation, so each caller decides what it means.
+/// A spelling that can physically leave the repository is rejected here,
+/// because the repository confinement is never left to a caller:
+///
+/// - a NUL byte anywhere in the spelling;
+/// - an absolute spelling, decided from the decoded path rather than from a
+///   fixed prefix table: a leading forward slash is absolute, and so is a
+///   leading literal backslash byte, which the separator-doubling escape can
+///   place at position zero. The UNC spelling `\\server\share`, the doubled
+///   leading-separator traversal `\\etc\passwd`, the Windows extended-length
+///   prefix `\\?\C:\x`, and a lone doubled backslash all decode to such a
+///   string;
+/// - a `..` traversal component;
+/// - a Windows drive root, decided from the first segment that survives the
+///   collapse: a segment opening with an ASCII letter followed by a colon is a
+///   drive root, so `./C:/x` is refused exactly like `C:/x`, while the same
+///   bytes in a later segment stay part of a file name.
+pub(crate) fn decode_repo_path(raw: &str) -> Result<String, String> {
     if raw.contains('\0') {
         return Err("Change path must not contain NUL bytes".to_string());
     }
     let slashed = decode_path_separators(strip_surrounding_markup(raw));
     let trimmed = slashed.trim();
-    if trimmed.is_empty() {
-        return Err("Change path must not be empty".to_string());
-    }
-    if trimmed.starts_with('/') {
-        return Err(format!(
-            "Change path '{}' must be repository-relative",
-            trimmed
-        ));
-    }
-    if trimmed.len() >= 2
-        && trimmed.as_bytes()[1] == b':'
-        && trimmed.as_bytes()[0].is_ascii_alphabetic()
-    {
+    // An absolute spelling leaves the repository whatever separator spells
+    // it: a leading forward slash names the file-system root, and a leading
+    // literal backslash byte names a Windows drive root or a UNC server root.
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
         return Err(format!(
             "Change path '{}' must be repository-relative",
             trimmed
@@ -443,13 +455,57 @@ pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
                     trimmed
                 ));
             }
-            other => segments.push(other),
+            other => {
+                // The drive root is decided from the first segment that
+                // survives the collapse, so a spelling that only reaches it
+                // through dot segments is refused exactly like the bare drive
+                // path, while a later segment stays an ordinary file name.
+                if segments.is_empty() && is_drive_root(other) {
+                    return Err(format!(
+                        "Change path '{}' must be repository-relative",
+                        trimmed
+                    ));
+                }
+                segments.push(other);
+            }
         }
     }
-    if segments.is_empty() {
+    Ok(segments.join("/"))
+}
+
+/// Normalizes and validates a repository-relative path in a single place.
+///
+/// The shared decode-and-collapse core strips surrounding whitespace and
+/// backtick markup, decodes the separator escapes, collapses `.` segments and
+/// repeated slashes, and rejects every spelling that can leave the repository.
+/// A backslash is read two ways, because a producer and a file name spell the
+/// same byte in opposite directions:
+///
+/// - a single backslash is a separator, so the spelling a Windows producer
+///   emits (`src\lib.rs`) addresses `src/lib.rs`;
+/// - a doubled backslash names one literal backslash byte, so a file whose own
+///   name carries a backslash stays addressable on a file system that permits
+///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
+///   the separator rule alone would silently retarget the identical spelling to
+///   the different path `src/new.rs`.
+///
+/// The rejection follows the decoded structure. The path is rejected when it
+/// names no surviving segment, is absolute (a leading forward slash, or a
+/// leading literal backslash the separator-doubling escape places at position
+/// zero), carries a NUL byte, contains a `..` traversal component, or opens
+/// with a Windows drive root. Interior and trailing literal-backslash names
+/// keep decoding unchanged, so `src\\new.rs` addresses `src\new.rs` and
+/// `src\\` addresses `src\`. This is the crate's single shared path-cleaning
+/// routine, so every wire boundary applies identical rules. It is a first line
+/// of defence only: `core` must still canonicalize and confine paths against
+/// the repository root, because the protocol cannot guarantee that every path
+/// flows through this helper.
+pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
+    let normalized = decode_repo_path(raw)?;
+    if normalized.is_empty() {
         return Err("Change path must not be empty".to_string());
     }
-    Ok(segments.join("/"))
+    Ok(normalized)
 }
 
 /// Deserializes one repository-relative path at the wire boundary.
@@ -1074,5 +1130,96 @@ mod tests {
                 "diagnostic for {payload} must name the rejected path: {error}"
             );
         }
+    }
+    #[test]
+    fn test_absolute_rejection_is_derived_from_the_decoded_structure() {
+        // A doubled leading backslash decodes to a literal backslash byte at
+        // position zero, which names a Windows drive root or a UNC server
+        // root. Every spelling that produces it is absolute and leaves the
+        // repository, although none of them opens with a forward slash.
+        for raw in [
+            r"\\server\share",
+            r"\\etc\passwd",
+            r"\\?\C:\x",
+            r"\\",
+            r"\abs",
+            "/abs",
+        ] {
+            let rejection = normalize_repo_path(raw).expect_err("absolute path must be rejected");
+            assert!(
+                rejection.contains("repository-relative"),
+                "diagnostic for '{raw}' must name the absolute spelling: {rejection}"
+            );
+        }
+
+        // The drive root is decided from the first segment that survives the
+        // dot collapse, so a spelling that only reaches it through dot
+        // segments is refused exactly like the bare drive path.
+        for raw in ["C:/Windows", "./C:/Windows", "././C:name", r"C:\Windows"] {
+            assert!(normalize_repo_path(raw).is_err(), "drive path '{raw}'");
+        }
+
+        // The same bytes in a later segment stay part of a file name, and
+        // interior or trailing literal backslashes keep decoding unchanged.
+        assert_eq!(normalize_repo_path("src/C:/x").unwrap(), "src/C:/x");
+        assert_eq!(normalize_repo_path("src/C:name").unwrap(), "src/C:name");
+        assert_eq!(normalize_repo_path(r"src\\new.rs").unwrap(), "src\\new.rs");
+        assert_eq!(normalize_repo_path(r"src\\").unwrap(), "src\\");
+        assert_eq!(normalize_repo_path(r"a\\..\\b").unwrap(), "a\\..\\b");
+    }
+
+    #[test]
+    fn test_absolute_escape_spellings_fail_the_wire_and_conversion_boundaries() {
+        // The same absolute spellings are refused when they reach the edit
+        // boundary through serde, so no typed operation ever carries a target
+        // rooted outside the repository.
+        for payload in [
+            r#"{"type":"delete","path":"\\\\server\\share"}"#,
+            r#"{"type":"create","path":"\\\\etc\\passwd","content":""}"#,
+            r#"{"type":"overwrite","path":"\\\\?\\C:\\x","content":"x"}"#,
+            r#"{"type":"delete","path":"./C:/x"}"#,
+        ] {
+            let error = serde_json::from_str::<EditOperation>(payload)
+                .expect_err("an absolute edit path must be rejected");
+            assert!(
+                error.to_string().contains("repository-relative"),
+                "diagnostic for {payload} must name the absolute spelling: {error}"
+            );
+        }
+
+        // The proposal conversion applies the very same derived rules.
+        for path in [r"\\server\share", r"\\etc\passwd", r"\\?\C:\x", "./C:/x"] {
+            let rejection = proposal(EditFileOp::Delete, path)
+                .to_edit_operation_typed()
+                .expect_err("an absolute proposal path must be rejected");
+            assert_eq!(rejection.path(), None);
+            assert!(
+                rejection.to_string().contains("repository-relative"),
+                "diagnostic for '{path}' must name the absolute spelling: {rejection}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_repo_path_reports_the_root_and_refuses_absolute_spellings() {
+        // The shared core returns the collapsed segment structure, so a
+        // spelling that leaves no surviving segment yields the empty path.
+        // Every whole-repository caller derives its decision from that empty
+        // result instead of from an enumerated spelling list.
+        for raw in ["", ".", "./", "./.", "././", ".//", r".\."] {
+            assert_eq!(decode_repo_path(raw), Ok(String::new()));
+        }
+
+        // A leading separator is absolute whether a forward slash spells it or
+        // the separator-doubling escape places a literal backslash byte at
+        // position zero, so the core never reports such a spelling as a root.
+        for raw in ["/", "///", r"\\server\share", r"\\?\C:\x", r"\\"] {
+            assert!(decode_repo_path(raw).is_err());
+        }
+
+        // The traversal and drive-root rules keep their behaviour, so the
+        // derived root never widens acceptance beyond the decoded structure.
+        assert!(decode_repo_path("../escape.rs").is_err());
+        assert!(decode_repo_path("C:/Windows").is_err());
     }
 }

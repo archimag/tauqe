@@ -200,26 +200,38 @@ impl ReviewStorage {
         Ok(reviews)
     }
 
+    /// Reads and decodes the review session stored at `path`.
+    ///
+    /// A file that is absent, unreadable, or undecodable yields `None`: resolving a
+    /// session id treats every one of them as "this file does not carry the
+    /// session", exactly as the storage listing skips them.
+    fn read_session_file(path: &Path) -> Option<ReviewSession> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<ReviewSession>(&content).ok()
+    }
+
     /// Resolves the on-disk file that currently stores the review session identified
-    /// by `id`, or `None` when no stored session matches.
+    /// by `id`, together with the document that file carries.
     ///
     /// The storage file name is normally `sanitize_id(id)`, but an id change (for
     /// example a casing change) leaves the session under a differently sanitized
     /// name. Resolving the real file keeps save and delete operating on the existing
     /// artifact instead of creating or leaving behind a duplicate session file.
     ///
+    /// The default sanitized target answers the common case in one read, and the
+    /// document it decoded travels back to the caller, so neither a save nor a load
+    /// parses the file it resolved a second time.
+    ///
     /// Lock-free; the caller must hold the storage lock.
-    fn find_session_file_unlocked(repo_root: &Path, id: &str) -> Option<PathBuf> {
+    fn find_session_file_unlocked(repo_root: &Path, id: &str) -> Option<(PathBuf, ReviewSession)> {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let default_target = dir.join(format!("{safe_id}.json"));
 
-        let default_matches = std::fs::read_to_string(&default_target)
-            .ok()
-            .and_then(|content| serde_json::from_str::<ReviewSession>(&content).ok())
-            .is_some_and(|session| session.id.eq_ignore_ascii_case(id));
-        if default_target.is_file() && default_matches {
-            return Some(default_target);
+        if let Some(session) = Self::read_session_file(&default_target) {
+            if session.id.eq_ignore_ascii_case(id) {
+                return Some((default_target, session));
+            }
         }
 
         let entries = std::fs::read_dir(&dir).ok()?;
@@ -231,16 +243,12 @@ impl ReviewStorage {
             {
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let session = match serde_json::from_str::<ReviewSession>(&content) {
-                Ok(session) => session,
-                Err(_) => continue,
+            let session = match Self::read_session_file(&path) {
+                Some(session) => session,
+                None => continue,
             };
             if session.id.eq_ignore_ascii_case(id) {
-                return Some(path);
+                return Some((path, session));
             }
         }
         None
@@ -259,16 +267,10 @@ impl ReviewStorage {
 
     /// Lock-free core of [`Self::load_review`]; the caller must hold the storage lock.
     fn load_review_unlocked(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
-        let file_path = match Self::find_session_file_unlocked(repo_root, id) {
-            Some(path) => path,
-            None => return Ok(None),
-        };
-
-        let content = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("Failed to read review file at {}", file_path.display()))?;
-        let session: ReviewSession = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse review JSON at {}", file_path.display()))?;
-        Ok(Some(session))
+        // The resolver reads every candidate once and returns the document it
+        // decoded, so a load never parses the file that carries the session a
+        // second time.
+        Ok(Self::find_session_file_unlocked(repo_root, id).map(|(_, session)| session))
     }
 
     /// Loads the active or latest review session.
@@ -308,40 +310,22 @@ impl ReviewStorage {
             .with_context(|| format!("Failed to create reviews directory at {}", dir.display()))?;
 
         let safe_id = Self::sanitize_id(&session.id);
-        let default_target = dir.join(format!("{safe_id}.json"));
 
-        // Reuse the file that already stores this session even when its name differs
-        // from the sanitized id, so saving never spawns a duplicate session file.
-        let target_file =
-            Self::find_session_file_unlocked(repo_root, &session.id).unwrap_or(default_target);
-
-        // Refuse to overwrite a file that already stores a different review session
-        // whose sanitized storage name collides with this one (for example
-        // "team/auth" and "team-auth" both sanitize to "team-auth.json"), so a save
-        // never silently replaces an unrelated session.
-        if target_file.is_file() {
-            let content = std::fs::read_to_string(&target_file).with_context(|| {
-                format!(
-                    "Failed to read existing review file at {}",
-                    target_file.display()
-                )
-            })?;
-            let existing: ReviewSession = serde_json::from_str(&content).with_context(|| {
-                format!(
-                    "Failed to parse existing review JSON at {}",
-                    target_file.display()
-                )
-            })?;
-            if !existing.id.eq_ignore_ascii_case(&session.id) {
-                anyhow::bail!(
-                    "Cannot save review session '{}': storage name '{}.json' is already used by review session '{}'; choose a distinct review id",
-                    session.id,
-                    safe_id,
-                    existing.id
-                );
+        // Reuse the file that already stores this session even when its name
+        // differs from the sanitized id, so saving never spawns a duplicate
+        // session file. The resolver returns the document it decoded, so the save
+        // never parses the resolved file a second time.
+        let target_file = match Self::find_session_file_unlocked(repo_root, &session.id) {
+            Some((path, _stored)) => path,
+            // No stored session carries this id. The default sanitized target is
+            // free unless another artifact occupies the name, and overwriting that
+            // one would silently replace an unrelated session.
+            None => {
+                let default_target = dir.join(format!("{safe_id}.json"));
+                Self::ensure_free_target(&default_target, &session.id, &safe_id)?;
+                default_target
             }
-        }
-
+        };
         let json = serde_json::to_string_pretty(session)
             .context("Failed to serialize review session to JSON")?;
         write_atomic(&target_file, json.as_bytes())?;
@@ -354,6 +338,36 @@ impl ReviewStorage {
         Ok(())
     }
 
+    /// Refuses a save whose sanitized storage name is already occupied.
+    ///
+    /// The resolver already rejected this target, so a file stored there either
+    /// carries a different session — a sanitized-name collision such as
+    /// "team/auth" and "team-auth" both ending in `team-auth.json` — or cannot be
+    /// decoded at all. Both are reported instead of overwritten.
+    fn ensure_free_target(default_target: &Path, session_id: &str, safe_id: &str) -> Result<()> {
+        if !default_target.is_file() {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(default_target).with_context(|| {
+            format!(
+                "Failed to read existing review file at {}",
+                default_target.display()
+            )
+        })?;
+        let existing: ReviewSession = serde_json::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse existing review JSON at {}",
+                default_target.display()
+            )
+        })?;
+        anyhow::bail!(
+            "Cannot save review session '{}': storage name '{}.json' is already used by review session '{}'; choose a distinct review id",
+            session_id,
+            safe_id,
+            existing.id
+        );
+    }
+
     /// Deletes a review session from storage. Returns `true` if a file was deleted.
     pub fn delete_review(repo_root: &Path, id: &str) -> Result<bool> {
         crate::blocking::run_blocking(|| {
@@ -364,29 +378,15 @@ impl ReviewStorage {
 
     /// Lock-free core of [`Self::delete_review`]; caller must hold storage lock.
     fn delete_review_unlocked(repo_root: &Path, id: &str) -> Result<bool> {
-        let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
 
-        // Delete the file that actually stores this session. When the session lives
-        // under a differently sanitized name, removing only the default target would
-        // leave the real artifact behind. If the default target exists but stores a
-        // different session (collision), it must never be removed.
+        // Delete the file that actually stores this session. When the session
+        // lives under a differently sanitized name, removing only the default
+        // target would leave the real artifact behind, while a default target that
+        // stores a different session is a collision and is never removed.
         let target_file = match Self::find_session_file_unlocked(repo_root, id) {
-            Some(existing) => existing,
-            None => {
-                let default_target = dir.join(format!("{safe_id}.json"));
-                if !default_target.is_file() {
-                    return Ok(false);
-                }
-                let stores_other = std::fs::read_to_string(&default_target)
-                    .ok()
-                    .and_then(|content| serde_json::from_str::<ReviewSession>(&content).ok())
-                    .is_some_and(|session| !session.id.eq_ignore_ascii_case(id));
-                if stores_other {
-                    return Ok(false);
-                }
-                default_target
-            }
+            Some((path, _stored)) => path,
+            None => return Ok(false),
         };
 
         std::fs::remove_file(&target_file).with_context(|| {

@@ -8,7 +8,7 @@
 //! string, so the repository map block of the prompt stays byte-identical and a
 //! provider's prefix cache keeps matching its tokens across rounds.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauqe_protocol::TurnIntent;
 
 use crate::history::{HistoryManager, HistorySnapshot};
@@ -105,17 +105,32 @@ struct MemoizedContextFile {
     content: String,
 }
 
+fn context_item_disk_path(
+    repo_root: &Path,
+    path: &str,
+    layer: tauqe_protocol::ContextLayer,
+) -> PathBuf {
+    if layer == tauqe_protocol::ContextLayer::OuterDocs
+        && !crate::outer_docs::is_outer_docs_cache_path(path)
+    {
+        repo_root
+            .join(crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+            .join(path)
+    } else {
+        repo_root.join(path)
+    }
+}
+
 impl MemoizedContextFile {
-    /// Reads `path` and records the identity the read started from.
+    /// Reads `full_path` and records the identity the read started from.
     ///
     /// The metadata is taken before the body on purpose: a write that lands
     /// while the file is being read moves the identity, so the next round reads
     /// the file again instead of trusting content that may already be stale.
-    fn read(root: &Path, path: &str) -> Option<Self> {
-        let full_path = root.join(path);
-        let metadata = std::fs::metadata(&full_path).ok()?;
+    fn read(full_path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(full_path).ok()?;
         let identity = ContextFileIdentity::of(&metadata);
-        let content = std::fs::read_to_string(&full_path).ok()?;
+        let content = std::fs::read_to_string(full_path).ok()?;
         Some(Self { identity, content })
     }
 }
@@ -332,13 +347,14 @@ impl TurnInputCache {
         repo_root: &Path,
         items: &[tauqe_protocol::ContextItem],
     ) -> anyhow::Result<Vec<crate::context::ContextFileContent>> {
-        let mut memoized: Vec<String> = Vec::new();
-        let mut to_read: Vec<String> = Vec::new();
+        let mut memoized: Vec<(String, PathBuf)> = Vec::new();
+        let mut to_read: Vec<(String, PathBuf)> = Vec::new();
         for item in items {
+            let disk_path = context_item_disk_path(repo_root, &item.path, item.layer);
             if self.context_contents.contains_key(&item.path) {
-                memoized.push(item.path.clone());
+                memoized.push((item.path.clone(), disk_path));
             } else {
-                to_read.push(item.path.clone());
+                to_read.push((item.path.clone(), disk_path));
             }
         }
 
@@ -346,22 +362,21 @@ impl TurnInputCache {
         // read: the identity it recorded decides whether the bytes the memo
         // holds are still the bytes on disk.
         if !memoized.is_empty() {
-            let identities: Vec<(String, ContextFileIdentity)> = memoized
-                .iter()
-                .filter_map(|path| {
+            let identities: Vec<(String, PathBuf, ContextFileIdentity)> = memoized
+                .into_iter()
+                .filter_map(|(path, disk_path)| {
                     self.context_contents
-                        .get(path)
-                        .map(|entry| (path.clone(), entry.identity))
+                        .get(&path)
+                        .map(|entry| (path, disk_path, entry.identity))
                 })
                 .collect();
             if !identities.is_empty() {
-                let root = repo_root.to_path_buf();
                 let moved = crate::blocking::run_blocking_async(move || {
                     identities
                         .into_iter()
-                        .filter(|(path, identity)| !identity.is_current(&root.join(path.as_str())))
-                        .map(|(path, _)| path)
-                        .collect::<Vec<String>>()
+                        .filter(|(_, disk_path, identity)| !identity.is_current(disk_path))
+                        .map(|(path, disk_path, _)| (path, disk_path))
+                        .collect::<Vec<(String, PathBuf)>>()
                 })
                 .await?;
                 to_read.extend(moved);
@@ -369,12 +384,11 @@ impl TurnInputCache {
         }
 
         if !to_read.is_empty() {
-            let root = repo_root.to_path_buf();
             let read = crate::blocking::run_blocking_async(move || {
                 to_read
                     .into_iter()
-                    .map(|path| {
-                        let entry = MemoizedContextFile::read(&root, &path);
+                    .map(|(path, disk_path)| {
+                        let entry = MemoizedContextFile::read(&disk_path);
                         (path, entry)
                     })
                     .collect::<Vec<(String, Option<MemoizedContextFile>)>>()
@@ -804,5 +818,47 @@ mod tests {
             logs,
             "the frozen degradation must not be re-reported"
         );
+    }
+
+    /// External documentation snapshots in the OuterDocs layer are stored under
+    /// the isolated cache directory, while their context item records the
+    /// logical path. The turn cache must resolve them to their real on-disk
+    /// cache location rather than treating them as repository-relative files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outer_docs_context_files_are_read_from_the_isolated_cache() {
+        use crate::context::ContextManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let cache_dir = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+        std::fs::create_dir_all(cache_dir.join("openrouter")).unwrap();
+        std::fs::write(
+            cache_dir.join("openrouter/models.md"),
+            "# OpenRouter Models\n",
+        )
+        .unwrap();
+
+        let mut context = ContextManager::new(root.clone());
+        let cached_rel = format!(
+            "{}/openrouter/models.md",
+            crate::outer_docs::OUTER_DOCS_CACHE_DIR
+        );
+        context
+            .add_outer_docs_file(&cached_rel)
+            .expect("the external doc is added");
+        assert_eq!(
+            context.outer_docs_files(),
+            vec!["openrouter/models.md".to_string()]
+        );
+
+        let mut cache = TurnInputCache::default();
+        let state = context.get_state();
+        let files = cache
+            .context_files(&root, &state.items)
+            .await
+            .expect("read context files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "openrouter/models.md");
+        assert_eq!(files[0].content, "# OpenRouter Models\n");
     }
 }

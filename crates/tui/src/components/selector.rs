@@ -12,7 +12,35 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::command::{is_bare_press, translate_code};
 use crate::config::InputConfig;
-
+/// First row of the window of `visible_rows` rows that keeps row `selected`
+/// visible.
+///
+/// This is the single definition of the keep-selection-visible arithmetic. The
+/// window moves just enough to cover the selection and then clamps to the last
+/// full window, so a row that is already visible never moves the window and the
+/// window never scrolls past the end of the list. A surface that keeps an offset
+/// between frames passes the one it holds; a surface that projects the window
+/// from scratch on every frame passes `0`, because it remembers no window of its
+/// own. One definition therefore serves every list in the interface, and a
+/// correction reaches all of them at once instead of drifting between copies.
+pub fn keep_selection_visible(
+    scroll_offset: usize,
+    selected: usize,
+    item_count: usize,
+    visible_rows: usize,
+) -> usize {
+    if item_count == 0 || visible_rows == 0 {
+        return 0;
+    }
+    let height = visible_rows.min(item_count);
+    let mut start = scroll_offset;
+    if selected < start {
+        start = selected;
+    } else if selected >= start.saturating_add(height) {
+        start = selected + 1 - height;
+    }
+    start.min(item_count.saturating_sub(height))
+}
 /// State for a keyboard-navigable, scrollable list.
 ///
 /// The component is content-agnostic: it stores only the selection cursor, the
@@ -116,18 +144,17 @@ impl ListSelector {
     }
 
     /// Scrolls the window so the selected row stays visible.
+    ///
+    /// The offset arithmetic is the shared [`keep_selection_visible`], so every
+    /// list that keeps an offset between frames moves its window by the same
+    /// rule.
     pub fn ensure_visible(&mut self, visible_height: usize) {
-        if visible_height == 0 || self.item_count == 0 {
-            self.scroll_offset = 0;
-            return;
-        }
-        if self.selected_index < self.scroll_offset {
-            self.scroll_offset = self.selected_index;
-        } else if self.selected_index >= self.scroll_offset.saturating_add(visible_height) {
-            self.scroll_offset = self.selected_index + 1 - visible_height;
-        }
-        let max_scroll = self.item_count.saturating_sub(visible_height);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        self.scroll_offset = keep_selection_visible(
+            self.scroll_offset,
+            self.selected_index,
+            self.item_count,
+            visible_height,
+        );
     }
 
     /// Applies a standard navigation key (`↑`/`↓`, `n`/`p`, `j`/`k`,
@@ -317,5 +344,32 @@ mod tests {
             assert!(selector.handle_nav_key(KeyEvent::new(KeyCode::Down, modifiers), &input, 10));
             assert_eq!(selector.selected_index(), 6);
         }
+    }
+    /// The shared window arithmetic covers both shapes of the interface: a list
+    /// that keeps its offset between frames and a surface that projects the
+    /// window from scratch. Both must agree on the window the same selection
+    /// produces, which is what keeps the call sites from drifting apart.
+    #[test]
+    fn test_keep_selection_visible_serves_stateful_and_stateless_windows() {
+        // A selection inside the window neither moves nor shrinks it.
+        assert_eq!(keep_selection_visible(0, 0, 20, 5), 0);
+        assert_eq!(keep_selection_visible(0, 4, 20, 5), 0);
+        assert_eq!(keep_selection_visible(10, 12, 20, 5), 10);
+
+        // Below the window the offset follows the selection one row at a time.
+        assert_eq!(keep_selection_visible(0, 5, 20, 5), 1);
+        assert_eq!(keep_selection_visible(0, 19, 20, 5), 15);
+
+        // Above the window the offset rises to the selection itself.
+        assert_eq!(keep_selection_visible(10, 3, 20, 5), 3);
+
+        // A list shorter than its window has exactly one position.
+        assert_eq!(keep_selection_visible(3, 0, 2, 5), 0);
+        assert_eq!(keep_selection_visible(0, 1, 2, 5), 0);
+
+        // Degenerate inputs stay stable instead of panicking.
+        assert_eq!(keep_selection_visible(0, 0, 0, 5), 0);
+        assert_eq!(keep_selection_visible(0, 0, 5, 0), 0);
+        assert_eq!(keep_selection_visible(7, 9, 0, 0), 0);
     }
 }

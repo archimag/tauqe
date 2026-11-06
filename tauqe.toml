@@ -37,9 +37,9 @@ models = [
 # Every entry names a model either by its provider identifier ("~provider/model")
 # or by an alias registered in `[providers.openrouter].models`, and carries the
 # runtime parameters of that slot: an optional `effort` ("low", "medium", "high",
-# "xhigh", "max") and an optional `level_up` marker. A display alias is not a
-# role field — it describes the model itself and lives in the catalog entry, so
-# the same model is never labelled in two places.
+# "xhigh", "max"), an optional `attempts` budget, and an optional `level_up`
+# marker. A display alias is not a role field — it describes the model itself and
+# lives in the catalog entry, so the same model is never labelled twice.
 #
 # `level_up = false` keeps a coder or architect rung out of automatic level-up
 # escalation while leaving the model selectable by hand; the default (`true`)

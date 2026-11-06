@@ -27,6 +27,7 @@ use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelEntry, ModelRole};
 
 use crate::command::is_bare_press;
+use crate::components::selector::keep_selection_visible;
 use crate::config::{MetaModifier, PrimaryModifier};
 use crate::model_display::{numbered_selection_label, selection_label};
 use crate::theme::engine::current_engine;
@@ -296,19 +297,14 @@ impl ModelSelector {
 
     /// Resolves the `[start, end)` window of rows to draw so the selected entry
     /// stays visible within `visible_height`, clamped to the list bounds.
+    ///
+    /// The window arithmetic is the shared [`keep_selection_visible`]; the list
+    /// keeps no offset of its own, so the window is projected from scratch on
+    /// every frame.
     fn visible_range(&self, visible_height: usize) -> (usize, usize) {
         let len = self.entries.len();
-        if len == 0 || visible_height == 0 {
-            return (0, 0);
-        }
-
         let height = visible_height.min(len);
-        let max_start = len - height;
-        let mut start = 0;
-        if self.selected_index >= height {
-            start = self.selected_index + 1 - height;
-        }
-        start = start.min(max_start);
+        let start = keep_selection_visible(0, self.selected_index, len, height);
         (start, start + height)
     }
 

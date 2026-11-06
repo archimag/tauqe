@@ -7,6 +7,7 @@ use tauqe_protocol::{
     Request, Response,
 };
 
+use crate::reap::{abort_and_reap, await_bounded, Awaited};
 use crate::state::AppState;
 use crate::usage::UsageGuard;
 
@@ -427,12 +428,13 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
 
         // Surface both a cancelled turn and a streamed provider error so a
         // broken or interrupted provider never masquerades as a successful
-        // fallback message. The abandoned request is interrupted and awaited
-        // before the outcome is reported, so no provider call outlives the
-        // response.
+        // fallback message. The abandoned request is reaped through the shared
+        // bounded task-exit confirmation (`crate::reap::abort_and_reap`, governed by
+        // the task-exit deadline) before the outcome is reported, so no provider call
+        // outlives the response and a task that never reaches a suspension point
+        // cannot park the handler.
         if cancelled || stream_error.is_some() {
-            stream_task.abort();
-            let _ = stream_task.await;
+            let _ = abort_and_reap(&op_id, "squash-message-stream", stream_task).await;
             operation.clear_abort_handle();
             close_squash_usage(state, usage_guard, &op_id).await;
             let (code, message) = if cancelled {
@@ -449,21 +451,35 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             return Response::err(req.id, code, message);
         }
 
-        let stream_result = stream_task.await;
+        // A completed stream is awaited through the shared bounded task-exit
+        // confirmation (`crate::reap::await_bounded`, governed by the task-exit
+        // deadline).
+        let stream_result = await_bounded(&op_id, "squash-message-stream", stream_task).await;
         operation.clear_abort_handle();
         match stream_result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+            Awaited::Joined(Ok(Ok(()))) => {}
+            Awaited::Joined(Ok(Err(err))) => {
                 close_squash_usage(state, usage_guard, &op_id).await;
                 return Response::err(req.id, errors::INTERNAL_ERROR, err.to_string());
             }
-            Err(join_err) => {
+            Awaited::Joined(Err(join_err)) => {
                 close_squash_usage(state, usage_guard, &op_id).await;
                 return Response::err(
                     req.id,
                     errors::INTERNAL_ERROR,
                     format!("Squash message stream task failed: {}", join_err),
                 );
+            }
+            Awaited::Orphaned => {
+                // The confirmation expired, so the abandoned task is still running:
+                // the response carries the recorded expiry diagnostic instead of a
+                // result the provider never delivered.
+                close_squash_usage(state, usage_guard, &op_id).await;
+                let message = format!(
+                    "Squash message stream task did not stop within the {} ms task-exit deadline",
+                    crate::reap::task_exit_deadline().as_millis()
+                );
+                return Response::err(req.id, errors::INTERNAL_ERROR, message);
             }
         }
         let msg =
@@ -542,7 +558,7 @@ async fn close_squash_usage(
     op_id: &str,
 ) -> tauqe_protocol::UsageTotalsSnapshot {
     guard.flush().await;
-    let snapshot = state.usage.lock().await.clone();
+    let snapshot = state.usage_snapshot().await;
     let totals = snapshot.operation_totals().clone();
     state.out.send_event(&Event {
         method: events::MODEL_USAGE.to_string(),
@@ -703,6 +719,7 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use tauqe_core::config::AppConfig;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_protocol::{methods, RepositoryInitParams, RequestId};
@@ -714,14 +731,7 @@ mod tests {
     /// configuration reloaded and rebound.
     #[tokio::test]
     async fn repository_init_targets_authoritative_root_not_cwd() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-init-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("init");
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
@@ -756,14 +766,7 @@ mod tests {
 
     impl SquashTestRepo {
         fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "tauqe-squash-usage-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::create_dir_all(&root);
+            let root = scratch_root("squash-usage");
             tauqe_core::git::init_repository(Some(&root), true).unwrap();
             std::fs::write(root.join("README.md"), "# tauqe\n").unwrap();
             tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()]).unwrap();
@@ -828,7 +831,7 @@ mod tests {
         assert_eq!(result.session_total_cost, Some(0.25));
         assert_eq!(result.current_cost, Some(0.25));
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 1, "one terminal flush per operation");
         assert!(snapshot.cur.is_none(), "the flush closes the usage window");
         assert_eq!(snapshot.session.total_tokens, 40);
@@ -861,7 +864,7 @@ mod tests {
         assert!(result.session_total_cost.is_none());
         assert!(result.current_cost.is_none());
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 0, "a zero operation never counts");
         assert!(snapshot.session.is_empty());
         assert!(snapshot.prev.is_empty());
@@ -919,14 +922,7 @@ mod tests {
     /// instead of the refusal.
     #[tokio::test]
     async fn squash_message_generation_is_refused_before_reading_the_repository() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-squash-generate-exclusive-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("squash-generate-exclusive");
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -943,7 +939,7 @@ mod tests {
             state.is_operation_active(),
             "the running operation must keep owning the slot"
         );
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(
             snapshot.operations, 0,
             "a refused generation accounts no operation"
@@ -1064,14 +1060,7 @@ mod tests {
     /// a bare init that drops the commit the client asked for.
     #[tokio::test]
     async fn repository_init_rejects_malformed_payloads() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-init-invalid-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("init-invalid");
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();

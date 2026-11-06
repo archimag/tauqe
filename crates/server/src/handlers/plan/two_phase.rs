@@ -59,6 +59,7 @@ use crate::handlers::architect::{
 use crate::handlers::common::{
     cleanup_transient_context, emit, preload_readonly_files, record_synthesis_history,
 };
+use crate::reap::{abort_and_reap, await_bounded, Awaited};
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{find_duplicate_item_ids, offload_plan};
@@ -765,6 +766,7 @@ async fn run_critique_rounds(
             tier,
             messages.clone(),
             session_id.clone(),
+            op_id,
         )
         .await?;
 
@@ -801,6 +803,7 @@ async fn collect_structured_round(
     tier: &ArchitectTier,
     messages: Vec<ChatMessage>,
     session_id: Option<String>,
+    op_id: &str,
 ) -> Result<String, CritiqueFailure> {
     let usage = state.begin_usage().await;
     let (tx, mut rx) = mpsc::channel(64);
@@ -847,26 +850,40 @@ async fn collect_structured_round(
     }
     operation.clear_abort_handle();
 
+    // Both terminal rejections reap the streamed round through the shared bounded
+    // task-exit confirmation (`crate::reap::abort_and_reap`, governed by the
+    // task-exit deadline), so an abandoned provider call cannot outlive the critique
+    // and a task that never reaches a suspension point cannot park it.
     if *cancel_rx.borrow() || cancelled {
-        task.abort();
-        let _ = task.await;
+        let _ = abort_and_reap(op_id, "plan-critique-stream", task).await;
         usage.flush().await;
         return Err(CritiqueFailure::Cancelled);
     }
     if let Some(message) = stream_error {
-        task.abort();
-        let _ = task.await;
+        let _ = abort_and_reap(op_id, "plan-critique-stream", task).await;
         usage.flush().await;
         return Err(CritiqueFailure::Failed(message));
     }
-    let completion = task.await;
+    // A completed round is awaited through the shared bounded task-exit
+    // confirmation (`crate::reap::await_bounded`, governed by the task-exit
+    // deadline): a task that stops yielding after its last event becomes a typed
+    // stream failure carrying the recorded expiry diagnostic instead of parking the
+    // critique forever.
+    let completion = await_bounded(op_id, "plan-critique-stream", task).await;
     usage.flush().await;
     match completion {
-        Ok(Ok(())) => Ok(raw),
-        Ok(Err(err)) => Err(CritiqueFailure::Failed(err.to_string())),
-        Err(join_error) => Err(CritiqueFailure::Failed(format!(
+        Awaited::Joined(Ok(Ok(()))) => Ok(raw),
+        Awaited::Joined(Ok(Err(err))) => Err(CritiqueFailure::Failed(err.to_string())),
+        Awaited::Joined(Err(join_error)) => Err(CritiqueFailure::Failed(format!(
             "The independent critique task terminated unexpectedly: {join_error}"
         ))),
+        Awaited::Orphaned => {
+            let message = format!(
+                "The independent critique task did not stop within the {} ms task-exit deadline",
+                crate::reap::task_exit_deadline().as_millis()
+            );
+            Err(CritiqueFailure::Failed(message))
+        }
     }
 }
 

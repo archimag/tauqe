@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_custom_locale() {
-        let temp_dir = std::env::temp_dir().join(format!("tauqe_test_{}", std::process::id()));
+        let temp_dir = crate::testing::scratch_dir("locale-save-load");
         let file_path = temp_dir.join("subdir").join("custom_locale.json");
 
         let locale = sample_locale();
@@ -189,14 +189,14 @@ mod tests {
 
     #[test]
     fn test_load_corrupted_json_returns_none() {
-        let temp_file =
-            std::env::temp_dir().join(format!("corrupt_locale_{}.json", std::process::id()));
+        let temp_dir = crate::testing::scratch_dir("locale-corrupt");
+        let temp_file = temp_dir.join("corrupt_locale.json");
         fs::write(&temp_file, b"not valid json {{{").expect("write file");
 
         let loaded = load_custom_locale_from(&temp_file);
         assert_eq!(loaded, None);
 
-        let _ = fs::remove_file(&temp_file);
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -202,7 +202,7 @@ mod tests {
         let entries: Vec<ModelEntry> = (0..count)
             .map(|i| ModelEntry::new(ModelRef::openrouter(format!("model-{i}")), None))
             .collect();
-        let mut selector = ModelSelector::new(ModelRole::Primary, entries, 0);
+        let mut selector = ModelSelector::new(ModelRole::REPL, entries, 0);
 
         let area = selection_dialog_area(term, count);
         let list_area = selection_dialog_list_area(term, count);

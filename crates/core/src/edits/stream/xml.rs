@@ -694,11 +694,12 @@ impl EditStreamFilter for XmlStreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_paths::scratch_dir;
 
     #[test]
     fn test_doc_request_tags_hidden_from_stream_text() {
         let input = "Check docs.\n<doc_request topic=\"shortcuts\" />\nReady";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-doc-request"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -721,7 +722,7 @@ mod tests {
     fn test_plan_tags_hidden_from_stream_text() {
         let marker = "M456";
         let input = "Planning.\n<plan_M456 id=\"test\" title=\"T\">\n<item id=\"1\" title=\"Step 1\" />\n</plan_M456>\nReady.";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-plan"))
             .with_marker(Some(marker.to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -744,7 +745,7 @@ mod tests {
     #[test]
     fn test_plan_step_done_tags_hidden_from_stream_text() {
         let input = "Step done.\n<success commit_message=\"All checks pass\" />\nReady";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-step-done"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -764,7 +765,7 @@ mod tests {
     #[test]
     fn test_scratchpad_tags_hidden_from_stream_text() {
         let input = "Intro.\n<scratchpad>\nWorking hypothesis and notes.\n</scratchpad>\nOutro.";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-scratchpad"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -786,7 +787,7 @@ mod tests {
     fn test_marked_scratchpad_hidden_from_stream_text() {
         let marker = "M999";
         let input = "Intro.\n<scratchpad_M999>\nWorking notes.\n</scratchpad_M999>\nOutro.";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-marked"))
             .with_marker(Some(marker.to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -808,7 +809,7 @@ mod tests {
     fn test_marked_stream_suppresses_unmarked_scratchpad() {
         let marker = "M123456";
         let input = "Intro.\n<scratchpad>\nUnmarked working note.\n</scratchpad>\nOutro.";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-unmarked"))
             .with_marker(Some(marker.to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -830,7 +831,7 @@ mod tests {
     #[test]
     fn test_context_request_tags_hidden_from_stream_text() {
         let input = "Need files.\n<context_request path=\"a.rs\" access=\"editable\" />\nDone";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-context-req"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -852,7 +853,7 @@ mod tests {
     #[test]
     fn test_repo_search_tags_hidden_from_stream_text() {
         let input = "Searching symbols.\n<repo_search path=\"src\" regex=\"fn execute\" />\nReady";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-repo-search"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -875,7 +876,7 @@ mod tests {
     fn test_user_language_and_verify_tags_hidden_from_stream_text() {
         let marker = "M456";
         let input = "Hello!\n<user_language_M456>Russian</user_language_M456>\n<verify_M456 target=\"all\" on_success=\"silent\" />\nHere is my explanation.";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-lang-verify"))
             .with_marker(Some(marker.to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -899,6 +900,7 @@ mod tests {
         let marker = "K7Q2ZX";
         let input = "Hi\n<tauqe_edits_K7Q2ZX summary=\"Update\">\n<edit_K7Q2ZX path=\"xml.rs\">\n<search_K7Q2ZX>\nlet s = \"</search>\";\n</search_K7Q2ZX>\n<replace_K7Q2ZX>\nlet s = \"<create>\";\n</replace_K7Q2ZX>\n</edit_K7Q2ZX>\n</tauqe_edits_K7Q2ZX>\nBye";
         let paths = vec!["xml.rs".to_string()];
+        let root = scratch_dir("stream-marker");
         let proto = crate::edits::protocol::MarkedXmlEditProtocol::new(marker);
         let parsed = proto.parse_output(input, &paths);
         let (expected_old, expected_new) = match parsed {
@@ -918,7 +920,7 @@ mod tests {
             .map(|(idx, _)| idx)
             .chain(std::iter::once(input.len()))
         {
-            let mut filter = XmlStreamFilter::new(paths.clone(), std::env::temp_dir())
+            let mut filter = XmlStreamFilter::new(paths.clone(), root.clone())
                 .with_marker(Some(marker.to_string()))
                 .with_staged_contents(HashMap::from([(
                     "xml.rs".to_string(),
@@ -957,7 +959,7 @@ mod tests {
     #[test]
     fn test_xml_marker_accepts_case_insensitive_exact_match() {
         let input = "<tauqe_edits-k7q2zx>\n<create_K7Q2ZX path=\"new.rs\">\nliteral <edit> and </search>\n</create_K7Q2ZX>\n</tauqe_edits-k7q2zx>";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-marker-case"))
             .with_marker(Some("K7Q2ZX".to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -983,7 +985,7 @@ mod tests {
         // treated as literal content: tolerating near-misses would let
         // resembling source text forge marker-bound protocol tags.
         let input = "<tauqe_edits-k7q2zy>\n<create_k7q2zy path=\"new.rs\">\nliteral\n</create_k7q2zy>\n</tauqe_edits-k7q2zy>";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-near-miss"))
             .with_marker(Some("K7Q2ZX".to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -1005,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_xml_without_marker_keeps_legacy_tags() {
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-legacy"));
         let mut events =
             filter.push_chunk("<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>");
         events.extend(Box::new(filter).finish());
@@ -1017,7 +1019,7 @@ mod tests {
     #[test]
     fn test_stream_plan_with_embedded_edit_mentions_does_not_trigger_edit_started() {
         let input = "Here is the plan:\n<plan id=\"p1\" title=\"P\">\n<item id=\"1\" title=\"Add <edit> helper\" />\n</plan>\nHope this helps!";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-embedded"));
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -1037,7 +1039,7 @@ mod tests {
     #[test]
     fn test_xml_marker_ignores_unsuffixed_edit_tags_in_conversation() {
         let input = "Literal <edit path=\"a.rs\"> and </edit>, then <";
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-unsuffixed"))
             .with_marker(Some("K7Q2ZX".to_string()));
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -1060,7 +1062,7 @@ mod tests {
     #[test]
     fn test_with_marker_drops_malformed_marker_without_panicking() {
         // A malformed marker must not panic; it is dropped so legacy tags apply.
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-bad-marker"))
             .with_marker(Some("not a valid marker".to_string()));
         let mut events =
             filter.push_chunk("<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>");
@@ -1073,7 +1075,7 @@ mod tests {
     #[test]
     fn test_with_marker_after_streaming_is_ignored_without_panicking() {
         // A marker arriving after streaming began is ignored, not fatal.
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-late-marker"));
         let _ = filter.push_chunk("<ed");
         filter = filter.with_marker(Some("LATE123".to_string()));
         let events = Box::new(filter).finish();
@@ -1151,11 +1153,10 @@ mod tests {
             "Rewriting the branch.\n<file_edits>{}</file_edits>\nDone.",
             anchored_changes(path, &[(1, 1, "BETA\n")])
         );
-        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\ngamma\n".to_string(),
-            )]));
+        let root = scratch_dir("stream-anchor-preview");
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\ngamma\n".to_string())]),
+        );
         let mut events = Vec::new();
         for ch in input.chars() {
             events.extend(filter.push_chunk(&ch.to_string()));
@@ -1207,11 +1208,10 @@ mod tests {
             "<file_edits>{}</file_edits>",
             anchored_changes(path, &[(0, 0, "ALPHA\n"), (2, 2, "GAMMA\n")])
         );
-        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\ngamma\n".to_string(),
-            )]));
+        let root = scratch_dir("stream-anchor-batch");
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\ngamma\n".to_string())]),
+        );
         let mut events = filter.push_chunk(&input);
         assert_eq!(
             filter
@@ -1242,7 +1242,8 @@ mod tests {
             "Intro.\n<file_edits_{marker}>{}</file_edits_{marker}>\nOutro.",
             anchored_changes(path, &[(1, 1, "BETA\n")])
         );
-        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+        let root = scratch_dir("stream-marked-anchor");
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], root)
             .with_marker(Some(marker.to_string()))
             .with_staged_contents(HashMap::from([(
                 path.to_string(),
@@ -1269,11 +1270,10 @@ mod tests {
             "<file_edits>{}</file_edits>",
             anchored_changes(path, &[(4, 4, "x\n")])
         );
-        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\n".to_string(),
-            )]));
+        let root = scratch_dir("stream-anchor-beyond");
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\n".to_string())]),
+        );
         let mut events = filter.push_chunk(&input);
         events.extend(Box::new(filter).finish());
 
@@ -1295,7 +1295,7 @@ mod tests {
         // orders of magnitude more work than one that follows the appended bytes.
         let body = "a note line long enough to exercise the buffer\n".repeat(60_000);
         let input = format!("Intro.\n<scratchpad>\n{body}</scratchpad>\nOutro.");
-        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut filter = XmlStreamFilter::new(vec![], scratch_dir("stream-long-body"));
         let chars: Vec<char> = input.chars().collect();
         let started = std::time::Instant::now();
         let mut events = Vec::new();
@@ -1324,6 +1324,7 @@ mod tests {
         // neither the block nor its container ever does, so the authoritative
         // decoder refuses the whole text while the preview already announced
         // the file.
+        let root = scratch_dir("stream-truncated-edit");
         let truncated = concat!(
             "Editing.\n",
             "<edits>",
@@ -1338,7 +1339,7 @@ mod tests {
             .chain(std::iter::once(truncated.len()))
             .collect();
         for split in boundaries {
-            let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            let mut filter = XmlStreamFilter::new(vec![path.to_string()], root.clone())
                 .with_staged_contents(staged.clone());
             let mut events = filter.push_chunk(&truncated[..split]);
             events.extend(filter.push_chunk(&truncated[split..]));
@@ -1368,7 +1369,8 @@ mod tests {
         // The response ends exactly after the opening tag, leaving no buffered
         // byte at all: the truncation branch must sit outside the buffer guard,
         // otherwise the terminal event of the announced file is dropped.
-        let mut filter = XmlStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir());
+        let root = scratch_dir("stream-open-block");
+        let mut filter = XmlStreamFilter::new(vec!["a.rs".to_string()], root);
         let mut events = filter.push_chunk("<edits><edit path=\"a.rs\">");
         events.extend(Box::new(filter).finish());
 

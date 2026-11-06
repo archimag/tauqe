@@ -221,7 +221,7 @@ impl ModelsConfig {
     /// list, so it yields `None` and its entry is resolved on demand instead.
     fn role_slice(&self, role: ModelRole) -> Option<&[ModelEntry]> {
         match role {
-            ModelRole::Primary => Some(&self.primary),
+            ModelRole::REPL => Some(&self.primary),
             ModelRole::Coder => Some(self.coder.as_deref().unwrap_or(&self.primary)),
             ModelRole::Architect => Some(self.architect.as_deref().unwrap_or(&self.primary)),
             ModelRole::Reviewer => Some(self.reviewer.as_deref().unwrap_or(&self.primary)),
@@ -253,8 +253,8 @@ impl ModelsConfig {
         match selection {
             ModelSelection::Role(selected) => self.base_entry(*selected),
             ModelSelection::Specific(model) => self.entry_for_model(role, model).or_else(|| {
-                if role != ModelRole::Primary {
-                    self.entry_for_model(ModelRole::Primary, model)
+                if role != ModelRole::REPL {
+                    self.entry_for_model(ModelRole::REPL, model)
                 } else {
                     None
                 }
@@ -637,7 +637,7 @@ impl ModelsConfig {
             scribe: self.resolve_role_with_fallback(ModelRole::Scribe, fallback.clone()),
             coder: self.resolve_role_with_fallback(ModelRole::Coder, fallback.clone()),
             architect: self.resolve_role_with_fallback(ModelRole::Architect, fallback.clone()),
-            primary: self.resolve_role_with_fallback(ModelRole::Primary, fallback.clone()),
+            primary: self.resolve_role_with_fallback(ModelRole::REPL, fallback.clone()),
             reviewer: self.resolve_role_with_fallback(ModelRole::Reviewer, fallback),
             efforts: None,
             entries: None,
@@ -650,7 +650,7 @@ fn default_model_for_role(role: ModelRole) -> &'static str {
         ModelRole::Scribe => BUILTIN_DEFAULT_SCRIBE_MODEL,
         ModelRole::Coder => BUILTIN_DEFAULT_CODER_MODEL,
         ModelRole::Architect => BUILTIN_DEFAULT_ARCHITECT_MODEL,
-        ModelRole::Primary => BUILTIN_DEFAULT_PRIMARY_MODEL,
+        ModelRole::REPL => BUILTIN_DEFAULT_PRIMARY_MODEL,
         ModelRole::Reviewer => BUILTIN_DEFAULT_REVIEWER_MODEL,
     }
 }

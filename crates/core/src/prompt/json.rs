@@ -9,13 +9,13 @@
 use std::borrow::Cow;
 
 use crate::capabilities::{map_verify_on_success, map_verify_target, PromptRenderContext};
-use crate::edits::protocol::structured::StructuredEditProtocol;
+use crate::edits::protocol::structured::{StructuredEditProtocol, StructuredPayload};
 use crate::edits::protocol::TerminalOutcome;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
 use tauqe_protocol::{
-    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
-    PatchStrategy, ProjectConfig,
+    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome, PatchStrategy,
+    ProjectConfig,
 };
 
 use super::protocol::PromptProtocol;
@@ -153,37 +153,37 @@ impl PromptProtocol for JsonPromptProtocol {
     }
 
     fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand> {
-        let structured = StructuredEditProtocol;
+        // A structured round is one JSON object, and every control field below
+        // is read from this single decoding instead of re-parsing the response
+        // once per field.
+        let payload = StructuredPayload::parse(raw_text);
         let mut commands = Vec::new();
 
         // Conversational text with structured JSON markup removed. This path
         // serves every mode because each structured response carries `message`.
-        let text = structured.clean_assistant_text(raw_text);
+        let text = payload.clean_text();
         if !text.trim().is_empty() {
             commands.push(LlmCommand::Text { content: text });
         }
 
         // File edit operations decoded from the structured `changes` array.
-        match structured.parse_output(raw_text, context_paths) {
-            ModelResult::Edit { edits, outcome, .. } => {
-                if let Some(message) = outcome.error {
-                    commands.push(LlmCommand::ProtocolError { message });
-                }
+        match payload.change_set(context_paths) {
+            Ok(edits) => {
                 for operation in edits {
                     commands.push(LlmCommand::Edit { operation });
                 }
             }
-            ModelResult::Answer { .. } => {}
+            Err(message) => commands.push(LlmCommand::ProtocolError { message }),
         }
 
         // Research: context requests and repository searches.
-        for request in structured.parse_context_requests(raw_text) {
+        for request in payload.context_requests() {
             commands.push(LlmCommand::ContextRequest {
                 path: request.path,
                 access: request.access,
             });
         }
-        for search in structured.parse_repo_searches(raw_text) {
+        for search in payload.repo_searches() {
             commands.push(LlmCommand::RepoSearch {
                 path: search.path,
                 regex: search.regex,
@@ -192,16 +192,16 @@ impl PromptProtocol for JsonPromptProtocol {
 
         // Repository outline: the compact directory tree and targeted symbol
         // maps decoded from the structured `repo_dirs`/`repo_maps` fields.
-        if structured.parse_repo_dirs(raw_text) {
+        if payload.repo_dirs() {
             commands.push(LlmCommand::RepoDirs);
         }
-        for path in structured.parse_repo_maps(raw_text) {
+        for path in payload.repo_maps() {
             commands.push(LlmCommand::RepoMap { path });
         }
 
         // Directory content listings decoded from the structured `dir_lists`
         // field, falling back to `<dir_list>` control tags.
-        for request in structured.parse_dir_lists(raw_text) {
+        for request in payload.dir_lists() {
             commands.push(LlmCommand::DirList {
                 path: request.path,
                 recursive: request.recursive,
@@ -209,7 +209,7 @@ impl PromptProtocol for JsonPromptProtocol {
         }
 
         // Toolchain verification decoded from the structured `verify` field.
-        if let Some(request) = structured.parse_verify_request(raw_text) {
+        if let Some(request) = payload.verify_request() {
             commands.push(LlmCommand::Verify {
                 target: map_verify_target(request.target),
                 on_success: map_verify_on_success(request.on_success),
@@ -217,30 +217,30 @@ impl PromptProtocol for JsonPromptProtocol {
         }
 
         // Detected user language decoded from the structured `user_language` field.
-        if let Some(language) = structured.parse_user_language(raw_text) {
+        if let Some(language) = payload.user_language() {
             commands.push(LlmCommand::UserLanguage { language });
         }
 
         // Documentation topics decoded from the structured `doc_requests` field.
-        for topic in structured.parse_doc_requests(raw_text) {
+        for topic in payload.doc_requests() {
             commands.push(LlmCommand::DocRequest { topic });
         }
 
         // External project documents decoded from the structured
         // `outer_doc_requests` field, falling back to control tags.
-        for id in structured.parse_outer_doc_requests(raw_text) {
+        for id in payload.outer_doc_requests() {
             commands.push(LlmCommand::OuterDocRequest { id });
         }
 
         // Ephemeral working memory decoded from the structured `scratchpad` field.
-        if let Some(notes) = structured.parse_scratchpad(raw_text) {
+        if let Some(notes) = payload.scratchpad() {
             commands.push(LlmCommand::Scratchpad { notes });
         }
 
         // Terminal outcome decoded from the structured `outcome` field. A
-        // blocker is decoded through `parse_blocked` below so it is never
-        // reported twice.
-        if let Some(outcome) = structured.parse_terminal_outcome(raw_text) {
+        // blocker is decoded through `blocked` below so it is never reported
+        // twice.
+        if let Some(outcome) = payload.terminal_outcome() {
             match outcome {
                 TerminalOutcome::Success { commit_message } => {
                     commands.push(LlmCommand::Outcome {
@@ -262,13 +262,13 @@ impl PromptProtocol for JsonPromptProtocol {
         }
 
         // Semantic blocker decoded from the structured `blocked` field.
-        if let Some((reason, details)) = structured.parse_blocked(raw_text) {
+        if let Some((reason, details)) = payload.blocked() {
             commands.push(LlmCommand::Blocked { reason, details });
         }
 
         // Unconditional abort decoded from the structured `abort` field,
         // falling back to `<abort>` control tags.
-        if let Some((reason, recommendation)) = structured.parse_abort(raw_text) {
+        if let Some((reason, recommendation)) = payload.abort() {
             commands.push(LlmCommand::Abort {
                 reason,
                 recommendation,
@@ -280,7 +280,7 @@ impl PromptProtocol for JsonPromptProtocol {
         // A payload the DTO cannot hold is reported as a protocol error instead
         // of being silently dropped, so the bounded turn can repeat generation
         // with the decoding diagnostics attached.
-        match structured.parse_plan_updates(raw_text) {
+        match payload.plan_updates() {
             Ok(updates) => {
                 for update in updates {
                     commands.push(LlmCommand::Plan { update });
@@ -293,7 +293,7 @@ impl PromptProtocol for JsonPromptProtocol {
         // `review_update` field. The decision is a dialogue mutation, so it
         // travels as a typed command and the engine persists it against the
         // review session the turn is anchored on.
-        match structured.parse_review_update(raw_text) {
+        match payload.review_update() {
             Ok(Some(update)) => commands.push(LlmCommand::ReviewUpdate { update }),
             Ok(None) => {}
             Err(message) => commands.push(LlmCommand::ProtocolError { message }),
@@ -301,7 +301,7 @@ impl PromptProtocol for JsonPromptProtocol {
 
         // Typed project command invocations decoded from the structured
         // `custom_tools` field, falling back to `<custom_tool>` control tags.
-        for (name, args) in structured.parse_custom_tools(raw_text) {
+        for (name, args) in payload.custom_tools() {
             commands.push(LlmCommand::CustomTool { name, args });
         }
 

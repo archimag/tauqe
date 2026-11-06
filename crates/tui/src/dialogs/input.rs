@@ -1472,7 +1472,12 @@ pub(crate) async fn handle_dialog_event(
                 }
 
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {}
+                    // `Esc` always dismisses; the dismissal letter is a bare
+                    // press, so a command chord or the AltGr compose chord
+                    // leaves the picker open on its highlighted row
+                    // (Conventions §5.2).
+                    KeyCode::Esc => {}
+                    KeyCode::Char('q') if is_bare_press(key.modifiers) => {}
                     // The digit quick-select admits a bare press only, and only
                     // below the option count of the target: a command chord, the
                     // AltGr compose chord, and a digit past the last option leave
@@ -1517,7 +1522,14 @@ pub(crate) async fn handle_dialog_event(
             let code = translate_code(key.code, &st.tui_config.input);
             let help = &mut st.modals;
             match code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                // `Esc` always dismisses. The two dismissal letters are bare
+                // presses, so a command chord or the AltGr compose chord never
+                // closes the modal (Conventions §5.2).
+                KeyCode::Esc => {
+                    help.show_help = false;
+                    help.help_scroll = 0;
+                }
+                KeyCode::Char('?') | KeyCode::Char('q') if is_bare_press(key.modifiers) => {
                     help.show_help = false;
                     help.help_scroll = 0;
                 }
@@ -4545,11 +4557,143 @@ mod tests {
             .modals
             .confirm_review_analyze
             .as_ref()
-            .expect("dialog open");
+            .expect("a composed character never dismisses the dialog");
         assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
         assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
         assert!(!guard.review.analyzing);
         drop(guard);
-        assert!(conn.written().is_empty());
+        assert!(
+            conn.written().is_empty(),
+            "a composed character writes no request"
+        );
+    }
+
+    /// The dismissal letters of the Help modal are bare presses: a command
+    /// chord and the AltGr compose chord leave the modal open, while the bare
+    /// letters and `Esc` still dismiss it (Conventions §5.2).
+    #[tokio::test]
+    async fn help_modal_dismissal_letters_answer_only_to_a_bare_press() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            for character in ['q', '?'] {
+                let mut st = crate::app::test_state();
+                st.modals.show_help = true;
+                st.modals.help_scroll = 3;
+                let state = Arc::new(Mutex::new(st));
+                let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+                handle_dialog_event(
+                    KeyEvent::new(KeyCode::Char(character), modifiers),
+                    &state,
+                    &mut conn,
+                )
+                .await
+                .expect("in-memory dispatch never fails");
+
+                let guard = state.lock().await;
+                assert!(
+                    guard.modals.show_help,
+                    "{character:?} with {modifiers:?} must not dismiss Help"
+                );
+                assert_eq!(guard.modals.help_scroll, 3);
+                drop(guard);
+                assert!(conn.written().is_empty());
+            }
+        }
+
+        for character in ['q', '?'] {
+            let mut st = crate::app::test_state();
+            st.modals.show_help = true;
+            st.modals.help_scroll = 3;
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+
+            let guard = state.lock().await;
+            assert!(
+                !guard.modals.show_help,
+                "{character:?} on a bare press dismisses Help"
+            );
+            assert_eq!(guard.modals.help_scroll, 0);
+        }
+    }
+
+    /// The dismissal letter of the status picker is a bare press too: a command
+    /// chord leaves the picker open on the row the developer highlighted, while
+    /// the bare letter still closes it (Conventions §5.2).
+    #[tokio::test]
+    async fn status_dialog_dismissal_letter_answers_only_to_a_bare_press() {
+        fn picker() -> crate::app::StatusDialogState {
+            crate::app::StatusDialogState::new(
+                crate::app::StatusDialogTarget::PlanItem {
+                    plan_id: "plan-1".to_string(),
+                    item_id: "1".to_string(),
+                    item_title: "Step 1".to_string(),
+                    current_status: tauqe_protocol::PlanItemStatus::Todo,
+                },
+                2,
+            )
+        }
+
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let mut st = crate::app::test_state();
+            st.view_mode = ViewMode::Plans;
+            st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+            st.modals.status_dialog = Some(picker());
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Char('q'), modifiers),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+
+            let guard = state.lock().await;
+            let dialog = guard
+                .modals
+                .status_dialog
+                .as_ref()
+                .expect("a command chord never dismisses the picker");
+            assert_eq!(
+                dialog.selector.selected_index(),
+                2,
+                "the highlighted row survives the refused dismissal"
+            );
+            drop(guard);
+            assert!(conn.written().is_empty());
+        }
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.modals.status_dialog = Some(picker());
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert!(state.lock().await.modals.status_dialog.is_none());
     }
 }

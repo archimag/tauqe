@@ -928,3 +928,63 @@ fn an_uninspectable_target_admits_a_create() {
         "staging never touches disk"
     );
 }
+
+/// A file member mutates the staged state only after every admission and
+/// validation step succeeded, so a refusal leaves the effect of an earlier
+/// member intact instead of needing a snapshot of the path it addressed.
+#[test]
+fn a_refused_file_member_keeps_the_effect_of_an_earlier_member() {
+    let dir = repository();
+    let root = dir.path();
+
+    let edits = [
+        EditOperation::Create {
+            path: "src/a.rs".to_string(),
+            content: "pub fn a() {}\n".to_string(),
+        },
+        // The intervening member keeps the two operations on `src/a.rs` in
+        // separate members, so the refusal below addresses content an earlier
+        // member already staged.
+        EditOperation::Create {
+            path: "src/b.rs".to_string(),
+            content: "pub fn b() {}\n".to_string(),
+        },
+        EditOperation::Replace {
+            path: "src/a.rs".to_string(),
+            old_text: "pub fn missing() {}\n".to_string(),
+            new_text: "pub fn replaced() {}\n".to_string(),
+        },
+    ];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        1,
+        "only the replacement is refused: {:?}",
+        result.failed_files
+    );
+    let failure = result
+        .failed_files
+        .first()
+        .expect("the replacement is refused");
+    assert_eq!(failure.path, "src/a.rs");
+    assert_eq!(
+        staged_bytes(&result, "src/a.rs"),
+        &b"pub fn a() {}\n"[..],
+        "the refusal keeps the content the earlier member staged"
+    );
+    assert_eq!(staged_bytes(&result, "src/b.rs"), &b"pub fn b() {}\n"[..]);
+    assert_eq!(
+        result.successful_paths,
+        vec!["src/a.rs", "src/b.rs"],
+        "both earlier members keep their place in the report"
+    );
+    assert!(result.staged_state.deleted_paths.is_empty());
+}

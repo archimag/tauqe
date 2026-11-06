@@ -357,6 +357,31 @@ mod tests {
         ]
     }
 
+    /// Reproduces the spelling a repository path decodes to under the shared
+    /// separator rule: a doubled backslash names one literal byte, while a
+    /// single backslash is a separator.
+    ///
+    /// A rejection diagnostic names the decoded path, so the expectation of an
+    /// escaping-spelling case is derived here instead of by a blanket
+    /// replacement that would also turn the literal byte into a separator.
+    fn decoded_spelling(raw: &str) -> String {
+        let mut decoded = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                decoded.push(ch);
+                continue;
+            }
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                decoded.push('\\');
+            } else {
+                decoded.push('/');
+            }
+        }
+        decoded
+    }
+
     #[test]
     fn test_every_command_path_is_normalized_or_rejected() {
         // A benign spelling reaches the engine already normalized, so no
@@ -385,9 +410,11 @@ mod tests {
             }
         );
 
-        // An empty path, `.`, and `./` name the whole repository on both
-        // discovery variants that accept a subtree prefix.
-        for spelling in ["", ".", "./"] {
+        // A spelling made only of dot and separator segments names the whole
+        // repository on every discovery variant that accepts a subtree prefix,
+        // because the decision follows the decoded segment set rather than an
+        // enumerated list of root spellings.
+        for spelling in ["", ".", "./", "./.", "././", ".//"] {
             let listing: LlmCommand = serde_json::from_value(serde_json::json!({
                 "type": "dir_list",
                 "path": spelling,
@@ -414,6 +441,18 @@ mod tests {
                 LlmCommand::RepoSearch {
                     path: String::new(),
                     regex: "fn main".to_string(),
+                },
+                "spelling '{spelling}' must name the whole repository"
+            );
+            let map: LlmCommand = serde_json::from_value(serde_json::json!({
+                "type": "repo_map",
+                "path": spelling,
+            }))
+            .expect("a whole-repository map path must decode");
+            assert_eq!(
+                map,
+                LlmCommand::RepoMap {
+                    path: String::new(),
                 },
                 "spelling '{spelling}' must name the whole repository"
             );
@@ -473,8 +512,20 @@ mod tests {
         // One set of spellings covers every repository path the wire form
         // carries. A typed variant cannot silently drop itself, so the
         // rejection the search command applied must reach every one of them.
-        for spelling in ["../escape", "/etc/passwd", "a/../b", r"C:\Windows"] {
-            let expected = spelling.replace('\\', "/");
+        // A doubled leading backslash decodes to one literal backslash byte,
+        // which roots the spelling outside the repository, so this family
+        // belongs to the same set.
+        for spelling in [
+            "../escape",
+            "/etc/passwd",
+            "a/../b",
+            r"C:\Windows",
+            r"\\server\share",
+            r"\\etc\passwd",
+            r"\\?\C:\x",
+            r"\\",
+        ] {
+            let expected = decoded_spelling(spelling);
             for payload in path_payloads(spelling) {
                 let error = serde_json::from_value::<LlmCommand>(payload.clone())
                     .expect_err("an escaping repository path must be rejected");

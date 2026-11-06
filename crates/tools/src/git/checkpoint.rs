@@ -154,12 +154,14 @@ fn transaction_marker_path(dir: &Path) -> PathBuf {
     dir.join(TRANSACTION_MARKER_FILE)
 }
 
-/// Reports whether the recorded transaction base is still part of the history of
-/// the commit currently checked out.
-fn is_ancestor_of_head(dir: &Path, ancestor: &str, deadline: &GitDeadline) -> bool {
+/// Reports whether `ancestor` is part of the history of `descendant`.
+///
+/// Both revisions are addressed explicitly, so the check answers about the
+/// commit a proof was settled over instead of the moving `HEAD`.
+fn is_ancestor_of(dir: &Path, ancestor: &str, descendant: &str, deadline: &GitDeadline) -> bool {
     run_git_with_deadline(
         Some(dir),
-        &["merge-base", "--is-ancestor", ancestor, "HEAD"],
+        &["merge-base", "--is-ancestor", ancestor, descendant],
         deadline,
     )
     .is_ok()
@@ -167,16 +169,32 @@ fn is_ancestor_of_head(dir: &Path, ancestor: &str, deadline: &GitDeadline) -> bo
 
 /// Lists the full hashes of every commit `rev_range` resolves to.
 ///
-/// A range nothing resolves to answers with an empty list, so an unborn
-/// branch or an exhausted range is a valid negative answer rather than a
-/// failure the recovery would have to report.
-fn commit_listing(dir: &Path, rev_range: &str, deadline: &GitDeadline) -> Vec<String> {
-    run_git_with_deadline(Some(dir), &["log", "--format=%H", rev_range], deadline)
-        .unwrap_or_default()
+/// A range that resolves to no commit — an exhausted `{base}..HEAD` range —
+/// answers with an empty list, which is the one legitimately empty answer. A
+/// failed invocation propagates Git's diagnostic instead: the listing is the
+/// Tauqe-trailer proof recovery settles a transaction on, so a range that
+/// cannot be listed must refuse recovery rather than authorize it.
+fn commit_listing(dir: &Path, rev_range: &str, deadline: &GitDeadline) -> Result<Vec<String>> {
+    let listing = run_git_with_deadline(Some(dir), &["log", "--format=%H", rev_range], deadline)?;
+    Ok(listing
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
-        .collect()
+        .collect())
+}
+
+/// Renders the refusal of a settled transaction whose proof range could not be
+/// listed.
+///
+/// A transient or structural `git log` failure says nothing about the commits
+/// a transaction recorded, so it never enters the trailer proof as an empty
+/// range: recovery keeps the marker, rewrites no history, and a later startup
+/// retries the proof once the range can be listed.
+fn proof_listing_refusal(rev_range: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Skipped crash recovery: the proof range {rev_range} could not be listed \
+         ({error}); repository left untouched."
+    )
 }
 
 /// Persists the checkpoint of an open transaction so crash recovery can tell a
@@ -240,11 +258,13 @@ fn read_transaction_marker(dir: &Path) -> Option<CheckpointInfo> {
     serde_json::from_str(&content).ok()
 }
 
-/// Reads the subject line of the commit currently checked out.
+/// Reads the subject line of one specific commit.
 ///
-/// An unborn branch holds no commit at all, so it answers with an empty string.
-fn head_subject(dir: &Path, deadline: &GitDeadline) -> String {
-    run_git_with_deadline(Some(dir), &["log", "-1", "--format=%s"], deadline)
+/// The evidence is read from the commit the caller pinned, never from the moving
+/// `HEAD`, so a proof computed over it cannot observe a commit that landed after
+/// the pin was taken.
+fn commit_subject(dir: &Path, commit: &str, deadline: &GitDeadline) -> String {
+    run_git_with_deadline(Some(dir), &["log", "-1", "--format=%s", commit], deadline)
         .unwrap_or_default()
         .trim()
         .to_string()
@@ -264,20 +284,104 @@ fn resolve_head(dir: &Path, deadline: &GitDeadline) -> Option<String> {
     .filter(|head| !head.is_empty())
 }
 
-/// Resolves the hash of the parent of the commit currently checked out.
+/// Resolves the parent of one specific commit.
 ///
-/// An unborn branch and a repository-root commit both have no parent, so both
-/// answer with `None`.
-fn head_parent(dir: &Path, deadline: &GitDeadline) -> Option<String> {
+/// A repository-root commit and a revision that does not resolve both answer
+/// with `None`.
+fn commit_parent(dir: &Path, commit: &str, deadline: &GitDeadline) -> Option<String> {
+    let revision = format!("{commit}^");
     run_git_with_deadline(
         Some(dir),
-        &["rev-parse", "--verify", "--quiet", "HEAD^"],
+        &["rev-parse", "--verify", "--quiet", revision.as_str()],
         deadline,
     )
     .ok()
     .map(|parent| parent.trim().to_string())
     .filter(|parent| !parent.is_empty())
 }
+
+/// A refused rewrite: the repository no longer resolves the pinned identity.
+///
+/// A drift is a proof outcome, not a Git failure. It travels as a typed error
+/// so a caller can tell the two apart: crash recovery reports the drift as its
+/// skip diagnostic and keeps the marker for a later startup, while a genuine
+/// Git failure keeps propagating.
+#[derive(Debug)]
+struct HeadDrift {
+    /// The identity a proof was settled over.
+    pinned: Option<String>,
+    /// The identity the repository resolved instead.
+    observed: Option<String>,
+}
+
+impl HeadDrift {
+    /// Renders the drift as the skip diagnostic of crash recovery.
+    fn skip_diagnostic(&self) -> String {
+        format!(
+            "Skipped crash recovery: HEAD moved from {} to {} while the transaction was being \
+             proven; repository left untouched and the transaction marker is preserved for a \
+             later startup.",
+            describe_identity(self.pinned.as_deref()),
+            describe_identity(self.observed.as_deref()),
+        )
+    }
+}
+
+impl std::fmt::Display for HeadDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Refusing to rewrite history: HEAD moved from the pinned commit {} to {}; \
+             repository left untouched",
+            describe_identity(self.pinned.as_deref()),
+            describe_identity(self.observed.as_deref()),
+        )
+    }
+}
+
+impl std::error::Error for HeadDrift {}
+
+/// Renders a resolved identity for a diagnostic: a commit hash or the unborn
+/// state.
+fn describe_identity(identity: Option<&str>) -> &str {
+    identity.unwrap_or("the unborn state")
+}
+
+/// The drift of the repository against a pinned identity, when it moved.
+///
+/// `pinned` is the identity a proof was settled over: a commit hash, or `None`
+/// for a branch that held no commit. `None` is an identity like any other, so
+/// a branch that gained a commit since the proof has drifted exactly as a moved
+/// `HEAD` has.
+fn pinned_identity_drift(
+    dir: &Path,
+    pinned: Option<&str>,
+    deadline: &GitDeadline,
+) -> Option<HeadDrift> {
+    let observed = resolve_head(dir, deadline);
+    if observed.as_deref() == pinned {
+        return None;
+    }
+    Some(HeadDrift {
+        pinned: pinned.map(str::to_string),
+        observed,
+    })
+}
+
+/// Fails when the commit `HEAD` currently names is not the pinned commit.
+///
+/// A proof is computed over one commit identity, and the destructive step it
+/// authorizes has to act on that same commit. Re-asserting the identity
+/// immediately before the step turns a `HEAD` that moved in between into a typed
+/// refusal that rewrites no history, no index entry, and no working-tree byte,
+/// instead of a silent destruction of a commit no proof ever saw.
+fn assert_head_pinned(dir: &Path, pinned: &str, deadline: &GitDeadline) -> Result<()> {
+    match pinned_identity_drift(dir, Some(pinned), deadline) {
+        None => Ok(()),
+        Some(drift) => Err(anyhow::Error::new(drift)),
+    }
+}
+
 /// Unwinds the temporary checkpoint commit a transaction marker records.
 ///
 /// The subject prefix identifies a commit shaped like a temporary checkpoint,
@@ -298,13 +402,83 @@ fn head_parent(dir: &Path, deadline: &GitDeadline) -> Option<String> {
 /// so `HEAD~1` does not resolve and resetting to it would fail after the caller
 /// has already replaced the working tree. The unwind therefore recognizes a
 /// parentless checkpoint and returns the branch to the unborn state instead:
-/// the branch ref is deleted and the index is cleared, which leaves the
-/// checkpoint's files in the working tree exactly as they were before the turn —
-/// untracked on an unborn branch — while the temporary commit stops being
-/// reachable. Only a genuine Git failure propagates.
+/// the branch ref is deleted through the conditional `update-ref -d` and the
+/// index is cleared, which leaves the checkpoint's files in the working tree
+/// exactly as they were before the turn — untracked on an unborn branch — while
+/// the temporary commit stops being reachable.
+///
+/// Every piece of evidence is read from one pinned commit identity instead of
+/// the moving `HEAD`: the subject, the parent, and the recorded base the proof
+/// matches. That identity is re-asserted immediately before the destructive
+/// step, so a `HEAD` that moved while the unwind was resolved refuses the
+/// rewrite instead of dropping a commit no recorded base accounts for. Only a
+/// genuine Git failure — the detected drift included — propagates.
 pub fn unwind_checkpoint_if_present(dir: &Path, checkpoint: &CheckpointInfo) -> Result<bool> {
     let deadline = GitDeadline::default();
     unwind_checkpoint_if_present_with_deadline(dir, checkpoint, &deadline)
+}
+
+/// The pinned identity an authorized checkpoint unwind acts on.
+///
+/// The proof and the destructive step are separate units, so the action can
+/// re-assert the identity the proof settled on and a test can drive them across
+/// a `HEAD` that moved in between.
+struct PinnedUnwind {
+    /// The commit `HEAD` resolved to when the unwind was authorized.
+    head: String,
+    /// The parent of that commit, or `None` when it is a repository root.
+    parent: Option<String>,
+}
+
+/// Resolves the checkpoint commit an unwind would remove, pinned to one identity.
+///
+/// `None` reports that there is nothing to unwind: the branch is unborn, the
+/// commit `HEAD` names is not a temporary checkpoint, or the recorded base does
+/// not account for it under the rules of [`recorded_base_authorizes_unwind`].
+/// Every answer is computed from the one commit `HEAD` resolved to at entry, so a
+/// commit landing afterwards can never change what the proof observes.
+fn resolve_pinned_unwind(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    deadline: &GitDeadline,
+) -> Option<PinnedUnwind> {
+    let head = resolve_head(dir, deadline)?;
+    if !commit_subject(dir, &head, deadline).starts_with(CHECKPOINT_PREFIX) {
+        return None;
+    }
+    let parent = commit_parent(dir, &head, deadline);
+    if !recorded_base_authorizes_unwind(checkpoint, &head, parent.as_deref()) {
+        return None;
+    }
+    Some(PinnedUnwind { head, parent })
+}
+
+/// Unwinds the checkpoint commit an authorization pinned, after re-asserting it.
+///
+/// The destructive step acts on the pinned identity alone: a parented checkpoint
+/// resets to the explicit pinned parent instead of the moving `HEAD~1`, and a
+/// parentless root checkpoint deletes the branch ref through the conditional
+/// `update-ref -d HEAD <pinned>`, which Git refuses as soon as `HEAD` no longer
+/// names that commit. The index is cleared only after the deletion was accepted.
+fn unwind_pinned_head(dir: &Path, pinned: &PinnedUnwind, deadline: &GitDeadline) -> Result<()> {
+    assert_head_pinned(dir, &pinned.head, deadline)?;
+    match &pinned.parent {
+        Some(parent) => {
+            run_git_with_deadline(Some(dir), &["reset", parent.as_str()], deadline)
+                .context("Failed to unwind temporary checkpoint commit")?;
+        }
+        None => {
+            run_git_with_deadline(
+                Some(dir),
+                &["update-ref", "-d", "HEAD", pinned.head.as_str()],
+                deadline,
+            )
+            .context("Failed to delete the branch ref of a root checkpoint commit")?;
+            run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
+                .context("Failed to clear the index of a root checkpoint commit")?;
+        }
+    }
+    Ok(())
 }
 
 /// Unwinds the temporary checkpoint commit a transaction marker records, under
@@ -314,78 +488,116 @@ fn unwind_checkpoint_if_present_with_deadline(
     checkpoint: &CheckpointInfo,
     deadline: &GitDeadline,
 ) -> Result<bool> {
-    if !head_subject(dir, deadline).starts_with(CHECKPOINT_PREFIX) {
-        return Ok(false);
+    match resolve_pinned_unwind(dir, checkpoint, deadline) {
+        Some(pinned) => {
+            unwind_pinned_head(dir, &pinned, deadline)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    if !recorded_base_authorizes_unwind(dir, checkpoint, deadline) {
-        return Ok(false);
-    }
-    if head_parent(dir, deadline).is_some() {
-        run_git_with_deadline(Some(dir), &["reset", "HEAD~1"], deadline)
-            .context("Failed to unwind temporary checkpoint commit")?;
-    } else {
-        run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
-            .context("Failed to delete the branch ref of a root checkpoint commit")?;
-        run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
-            .context("Failed to clear the index of a root checkpoint commit")?;
-    }
-    Ok(true)
 }
 
-/// Reports whether the recorded transaction base names the checkpoint commit
-/// HEAD addresses.
+/// Reports whether the recorded transaction base accounts for the pinned commit.
 ///
 /// This is the only proof that authorizes a history rewrite, so every shape a
-/// marker can record is matched explicitly and anything else answers `false`.
+/// marker can record is matched explicitly against the pinned commit and its
+/// pinned parent, and anything else answers `false`.
 fn recorded_base_authorizes_unwind(
-    dir: &Path,
     checkpoint: &CheckpointInfo,
-    deadline: &GitDeadline,
+    head: &str,
+    parent: Option<&str>,
 ) -> bool {
-    let Some(head) = resolve_head(dir, deadline) else {
-        return false;
-    };
     match &checkpoint.base {
-        TransactionBase::Commit(base) if checkpoint.created_checkpoint_commit => &head == base,
-        TransactionBase::Commit(base) => {
-            head_parent(dir, deadline).as_deref() == Some(base.as_str())
-        }
-        TransactionBase::Unborn => head_parent(dir, deadline).is_none(),
+        TransactionBase::Commit(base) if checkpoint.created_checkpoint_commit => head == base,
+        TransactionBase::Commit(base) => parent == Some(base.as_str()),
+        TransactionBase::Unborn => parent.is_none(),
     }
 }
 
-/// Returns a branch that holds commits to the unborn state.
+/// The pinned identity an authorized return to the unborn state acts on.
 ///
-/// An unborn base has no commit to reset to, so returning the tree to it is
-/// its own operation: the paths the transaction's history tracks are
-/// collected, the branch ref is deleted, the index is emptied, exactly those
-/// paths are removed from the working tree, and the directories their
-/// removal emptied are pruned. Untracked files the transaction never
-/// committed survive, mirroring what `reset --hard` leaves alone on a born
-/// base.
+/// The tracked paths travel beside the commit they were listed from, so the
+/// removal can only ever touch the tree the proof observed.
+struct PinnedUnbornReturn {
+    /// The commit `HEAD` resolved to when the return began.
+    head: String,
+    /// The repository-relative paths that commit's tree tracks.
+    tracked: Vec<String>,
+}
+
+/// Resolves what a return to the unborn state would remove, pinned to one identity.
 ///
-/// A branch that is already unborn changes nothing, so the helper is safe
-/// whatever state a crash left behind.
-fn return_to_unborn(dir: &Path, deadline: &GitDeadline) -> Result<()> {
-    if resolve_head(dir, deadline).is_none() {
-        return Ok(());
-    }
-    let tracked = run_git_with_deadline(
+/// `None` reports a branch that already holds no commit, which is the state the
+/// return leaves behind. The tracked paths are listed from the pinned commit, so
+/// a commit landing afterwards can neither widen nor shift the set.
+fn resolve_pinned_unborn_return(
+    dir: &Path,
+    deadline: &GitDeadline,
+) -> Result<Option<PinnedUnbornReturn>> {
+    let Some(head) = resolve_head(dir, deadline) else {
+        return Ok(None);
+    };
+    let listing = run_git_with_deadline(
         Some(dir),
-        &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        &["ls-tree", "-r", "--name-only", "-z", head.as_str()],
         deadline,
     )
     .context("Failed to list the paths tracked by the transaction")?;
-    run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
-        .context("Failed to delete the branch ref of an unborn base")?;
+    let tracked = listing
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_string())
+        .collect();
+    Ok(Some(PinnedUnbornReturn { head, tracked }))
+}
+
+/// Returns the branch to the unborn state an authorization pinned.
+///
+/// The ref deletion is conditional on the pinned commit, so a `HEAD` that moved
+/// after the paths were listed refuses the rewrite before a single path leaves
+/// the working tree. Only an accepted deletion clears the index and removes the
+/// pinned tree's paths; untracked files the transaction never committed survive,
+/// mirroring what `reset --hard` leaves alone on a born base.
+fn return_pinned_to_unborn(
+    dir: &Path,
+    pinned: &PinnedUnbornReturn,
+    deadline: &GitDeadline,
+) -> Result<()> {
+    assert_head_pinned(dir, &pinned.head, deadline)?;
+    run_git_with_deadline(
+        Some(dir),
+        &["update-ref", "-d", "HEAD", pinned.head.as_str()],
+        deadline,
+    )
+    .context("Failed to delete the branch ref of an unborn base")?;
     run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
         .context("Failed to clear the index of an unborn base")?;
-    for entry in tracked.split('\0').filter(|entry| !entry.is_empty()) {
+    for entry in &pinned.tracked {
         let target = dir.join(entry);
         let _ = std::fs::remove_file(&target);
         crate::atomic_write::prune_empty_parents(dir, &target);
     }
     Ok(())
+}
+
+/// Returns a branch that holds commits to the unborn state.
+///
+/// An unborn base has no commit to reset to, so returning the tree to it is its
+/// own operation, resolved and acted on through one pinned identity
+/// ([`resolve_pinned_unborn_return`] and [`return_pinned_to_unborn`]): the paths
+/// the pinned commit's tree tracks are collected, the branch ref is deleted
+/// conditionally on that commit, the index is emptied, exactly those paths are
+/// removed from the working tree, and the directories their removal emptied are
+/// pruned. Untracked files the transaction never committed survive, mirroring
+/// what `reset --hard` leaves alone on a born base.
+///
+/// A branch that is already unborn changes nothing, so the helper is safe
+/// whatever state a crash left behind.
+fn return_to_unborn(dir: &Path, deadline: &GitDeadline) -> Result<()> {
+    match resolve_pinned_unborn_return(dir, deadline)? {
+        Some(pinned) => return_pinned_to_unborn(dir, &pinned, deadline),
+        None => Ok(()),
+    }
 }
 
 /// Scans the worktree for orphaned staging artifacts (`*.tauqe-tmp` and
@@ -641,6 +853,7 @@ fn cleanup_state_dir_staging_files(root: &Path) -> usize {
 
     cleaned
 }
+
 /// The index lock of the repository, resolved through Git.
 ///
 /// The lock does not always live at `<repository>/.git/index.lock`: a linked
@@ -891,43 +1104,74 @@ fn unstage_interrupted_capture(
     Ok(())
 }
 
+/// The diagnostic a capturing transaction reports when the repository state
+/// matches neither recoverable shape of an interrupted capture.
+const CAPTURE_MISMATCH_REFUSAL: &str =
+    "Skipped crash recovery: the capturing transaction does not match the repository state; repository left untouched.";
+
 /// Recovers a transaction whose marker still records the capturing phase.
 ///
-/// A capturing marker is durable before the developer's work becomes a
-/// checkpoint commit, so a crash leaves exactly one of two recoverable states:
-/// the commit never reached HEAD and the working tree still holds every change
-/// the capture was about to record, or the commit reached HEAD and only the
-/// rewrite that records it is missing. Both states are recognized against the
-/// recorded base — the commit HEAD still names, or the parent of the checkpoint
-/// commit — and every other shape is refused, mirroring the discipline of the
-/// established path.
-///
-/// A failure to unwind the checkpoint commit or to clear the marker propagates
-/// with the marker left in place, so a later startup resolves the same state
-/// again instead of continuing on top of an open transaction.
+/// The identity is resolved once here and the whole classification is settled
+/// over it, so the recovery acts on the commit the capture was proven against
+/// instead of the moving `HEAD`.
 fn recover_capturing_transaction(
     dir: &Path,
     checkpoint: &CheckpointInfo,
     reclaimed: ReclaimedOrphans,
     deadline: &GitDeadline,
 ) -> Result<Option<String>> {
-    let head = resolve_head(dir, deadline);
-    let subject = head_subject(dir, deadline);
-    let head_is_checkpoint = head.is_some() && subject.starts_with(CHECKPOINT_PREFIX);
-    let checkpoint_parent = if head_is_checkpoint {
-        head_parent(dir, deadline)
-    } else {
-        None
+    let pinned = resolve_head(dir, deadline);
+    recover_capturing_transaction_pinned(dir, checkpoint, pinned.as_deref(), reclaimed, deadline)
+}
+
+/// Recovers a capturing transaction against one pinned identity.
+///
+/// A capturing marker is durable before the developer's work becomes a
+/// checkpoint commit, so a crash leaves exactly one of two recoverable states:
+/// the commit never reached the pinned commit and the working tree still holds
+/// every change the capture was about to record, or the commit reached it and
+/// only the rewrite that records it is missing. Both states are recognized
+/// against the recorded base — the pinned commit itself, or the parent of the
+/// pinned checkpoint commit — and every other shape is refused, mirroring the
+/// discipline of the established path.
+///
+/// Every action below re-asserts the pinned identity immediately before it
+/// runs, so a repository that advanced after the crash is refused instead of
+/// rewritten: the index is never unstaged over a commit that landed, and the
+/// unwind never removes a checkpoint commit a later commit already descends
+/// from. A drift refusal preserves the marker for a later startup.
+///
+/// A failure to unwind the checkpoint commit or to clear the marker propagates
+/// with the marker left in place, so a later startup resolves the same state
+/// again instead of continuing on top of an open transaction.
+fn recover_capturing_transaction_pinned(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    pinned: Option<&str>,
+    reclaimed: ReclaimedOrphans,
+    deadline: &GitDeadline,
+) -> Result<Option<String>> {
+    let subject = match pinned {
+        Some(head) => commit_subject(dir, head, deadline),
+        None => String::new(),
+    };
+    let head_is_checkpoint = pinned.is_some() && subject.starts_with(CHECKPOINT_PREFIX);
+    let checkpoint_parent = match pinned {
+        Some(head) if head_is_checkpoint => commit_parent(dir, head, deadline),
+        _ => None,
     };
 
     // The capture crashed before it committed, so the working tree still holds
     // the developer's changes while the marker and the staged work of the
     // interrupted `git add -A` are stale.
     let crashed_before_commit = match &checkpoint.base {
-        TransactionBase::Commit(base) => head.as_deref() == Some(base.as_str()),
-        TransactionBase::Unborn => head.is_none(),
+        TransactionBase::Commit(base) => pinned == Some(base.as_str()),
+        TransactionBase::Unborn => pinned.is_none(),
     };
     if crashed_before_commit {
+        if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
+            return Ok(Some(drift.skip_diagnostic()));
+        }
         unstage_interrupted_capture(dir, &checkpoint.base, deadline)?;
         clear_transaction_marker(dir)?;
         return Ok(Some(with_reclaimed_orphans(
@@ -946,8 +1190,23 @@ fn recover_capturing_transaction(
             TransactionBase::Unborn => checkpoint_parent.is_none(),
         };
     if crashed_after_commit {
-        unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)
-            .context("Failed to unwind the checkpoint commit of an interrupted capture")?;
+        if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
+            return Ok(Some(drift.skip_diagnostic()));
+        }
+        match unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline) {
+            Ok(true) => {}
+            // The unwind resolves the identity once more before it rewrites
+            // anything, so a state it cannot prove on its own terms leaves the
+            // marker for a later startup instead of claiming a recovery.
+            Ok(false) => return Ok(Some(CAPTURE_MISMATCH_REFUSAL.to_string())),
+            Err(error) => {
+                if let Some(drift) = error.downcast_ref::<HeadDrift>() {
+                    return Ok(Some(drift.skip_diagnostic()));
+                }
+                return Err(error)
+                    .context("Failed to unwind the checkpoint commit of an interrupted capture");
+            }
+        }
         clear_transaction_marker(dir)?;
         return Ok(Some(with_reclaimed_orphans(
             "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
@@ -955,9 +1214,7 @@ fn recover_capturing_transaction(
         )));
     }
 
-    Ok(Some(
-        "Skipped crash recovery: the capturing transaction does not match the repository state; repository left untouched.".to_string(),
-    ))
+    Ok(Some(CAPTURE_MISMATCH_REFUSAL.to_string()))
 }
 
 /// Recovers repository state from an interrupted/crashed workflow.
@@ -973,14 +1230,23 @@ fn recover_capturing_transaction(
 /// it is resolved against HEAD and the recorded base instead of a commit
 /// range.
 ///
-/// When a settled marker is present, every commit the transaction recorded on top
-/// of its base must carry the Tauqe co-author trailer — for a born base, the
-/// commits between the base and HEAD, with the base still an ancestor of
-/// HEAD; for an unborn base, every commit reachable from HEAD. Otherwise
-/// recovery refuses and reports the reason instead of rewriting history. A
-/// successful recovery returns the tree to the recorded base and unwinds a
-/// temporary checkpoint commit so uncommitted developer changes are restored
-/// safely.
+/// When a settled marker is present, the whole proof is computed over one
+/// identity: `HEAD` is resolved once, and every evidence step addresses that
+/// pinned commit instead of the moving ref. Every commit the transaction
+/// recorded on top of its base must carry the Tauqe co-author trailer — for a
+/// born base, the commits between the base and the pinned commit, with the base
+/// still an ancestor of it; for an unborn base, every commit reachable from the
+/// pinned commit. A range that cannot be listed refuses the same way, with the
+/// marker preserved and no history rewritten, while an unborn `HEAD` —
+/// distinguished by resolving `HEAD`, never by a failed listing — is the one
+/// legitimately empty range. A foreign commit in the range refuses recovery and
+/// reports the reason instead of rewriting history. The identity is re-asserted
+/// immediately before every action the proof licenses, so a repository that
+/// advanced while the proof ran is refused instead of rewritten: a commit that
+/// landed in between is never destroyed by a reset or by a return to the unborn
+/// state no trailer check ever saw. A successful recovery returns the tree to
+/// the recorded base and unwinds a temporary checkpoint commit so uncommitted
+/// developer changes are restored safely.
 ///
 /// A marker that names a writer which is provably gone also authorizes
 /// reclaiming the index lock that writer left behind, because every recovery
@@ -1052,26 +1318,50 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         TransactionPhase::Established => {}
     }
 
+    // The whole proof is settled over one resolved identity. HEAD is resolved
+    // exactly once here, so every evidence step below addresses that same
+    // commit and the action the proof licenses can re-assert it immediately
+    // before it runs.
+    let pinned = resolve_head(dir, &deadline);
+
     // Collect the commits the transaction recorded on top of its base. They
     // must all be Tauqe-created; anything else means this is not a dangling
-    // Tauqe transaction and must be left alone.
+    // Tauqe transaction and must be left alone. A range that cannot be listed
+    // refuses recovery instead of entering the proof as an empty one, because
+    // the absence of evidence is not the evidence of an empty transaction.
     let commits = match &checkpoint.base {
-        TransactionBase::Commit(head) => {
+        TransactionBase::Commit(base) => {
             // The recorded base must still be part of the history of the
-            // commit that is currently checked out. After a manual branch
-            // switch the base can belong to another branch entirely, and
-            // resetting to it would discard commits that were never part of
-            // the transaction.
-            if !is_ancestor_of_head(dir, head, &deadline) {
-                return Ok(Some(format!(
-                    "Skipped crash recovery: recorded transaction base {head} is not an ancestor of HEAD; repository left untouched."
-                )));
+            // pinned commit. After a manual branch switch the base can belong
+            // to another branch entirely, and resetting to it would discard
+            // commits that were never part of the transaction.
+            match pinned.as_deref() {
+                Some(pinned_commit) if is_ancestor_of(dir, base, pinned_commit, &deadline) => {
+                    let rev_range = format!("{base}..{pinned_commit}");
+                    match commit_listing(dir, &rev_range, &deadline) {
+                        Ok(commits) => commits,
+                        Err(error) => return Ok(Some(proof_listing_refusal(&rev_range, &error))),
+                    }
+                }
+                _ => {
+                    return Ok(Some(format!(
+                        "Skipped crash recovery: recorded transaction base {base} is not an ancestor of HEAD; repository left untouched."
+                    )));
+                }
             }
-            commit_listing(dir, &format!("{head}..HEAD"), &deadline)
         }
         // An unborn base held no commit at all, so every commit reachable
-        // from HEAD was recorded by the transaction and enters the proof.
-        TransactionBase::Unborn => commit_listing(dir, "HEAD", &deadline),
+        // from the pinned commit was recorded by the transaction and enters
+        // the proof. An unborn pinned HEAD holds no range to list, so it is
+        // the one legitimately empty proof range; a pinned HEAD that resolves
+        // holds commits and has to be listed like any other proof range.
+        TransactionBase::Unborn => match pinned.as_deref() {
+            None => Vec::new(),
+            Some(pinned_commit) => match commit_listing(dir, pinned_commit, &deadline) {
+                Ok(commits) => commits,
+                Err(error) => return Ok(Some(proof_listing_refusal(pinned_commit, &error))),
+            },
+        },
     };
     for commit in &commits {
         let trailers = run_git_with_deadline(
@@ -1093,12 +1383,46 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         }
     }
 
-    let unwound_steps = commits.len();
+    settle_proved_transaction(
+        dir,
+        &checkpoint,
+        pinned.as_deref(),
+        commits.len(),
+        reclaimed,
+        &deadline,
+    )
+}
 
+/// Acts on a transaction whose proof is settled, refusing a moved repository.
+///
+/// The proof itself — the resolved identity, the listed commits, and their
+/// trailer verification — is computed by the caller over one pinned commit.
+/// Every action below re-asserts that identity immediately before it runs, so a
+/// repository that advanced while the proof was being settled is refused with
+/// the skip diagnostic instead of rewritten: a commit no trailer check ever saw
+/// is never destroyed by the reset or by the return to the unborn state.
+///
+/// Once the tree sits at the recorded base, the tolerance contract of a
+/// completed recovery applies: a failure to unwind the checkpoint commit or to
+/// clear the marker is reported in the diagnostic instead of aborting, because
+/// a later startup resolves the same state idempotently.
+fn settle_proved_transaction(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    pinned: Option<&str>,
+    unwound_steps: usize,
+    reclaimed: ReclaimedOrphans,
+    deadline: &GitDeadline,
+) -> Result<Option<String>> {
     // If there were no step commits and no checkpoint commit created, there is
-    // no transaction state to unwind. Resetting --hard in this case would destroy
-    // legitimate uncommitted working tree changes.
+    // no transaction state to unwind. Resetting --hard in this case would
+    // destroy legitimate uncommitted working tree changes. Closing the
+    // transaction still acts on the proven state, so the pinned identity is
+    // re-asserted before the marker is cleared.
     if unwound_steps == 0 && !checkpoint.created_checkpoint_commit {
+        if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
+            return Ok(Some(drift.skip_diagnostic()));
+        }
         clear_transaction_marker(dir)?;
         if reclaimed.is_empty() {
             return Ok(None);
@@ -1108,19 +1432,31 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
 
     // Return the tree to the recorded base and unwind a temporary checkpoint
     // commit so the developer's uncommitted changes return to the working
-    // tree. A born base resets to the recorded commit; an unborn base holds
-    // no commit to reset to, so the branch returns to the unborn state and
+    // tree. A born base resets to the recorded commit; an unborn base holds no
+    // commit to reset to, so the branch returns to the unborn state and
     // exactly the paths the transaction tracked leave the working tree. Both
     // leave untracked files alone, matching the previous recovery semantics.
+    if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
+        return Ok(Some(drift.skip_diagnostic()));
+    }
     match &checkpoint.base {
-        TransactionBase::Commit(head) => {
-            run_git_with_deadline(Some(dir), &["reset", "--hard", head], &deadline)
+        TransactionBase::Commit(base) => {
+            run_git_with_deadline(Some(dir), &["reset", "--hard", base], deadline)
                 .context("Failed to reset to the recorded transaction base")?;
         }
-        TransactionBase::Unborn => {
-            return_to_unborn(dir, &deadline)
-                .context("Failed to return the branch to its unborn base")?;
-        }
+        TransactionBase::Unborn => match return_to_unborn(dir, deadline) {
+            Ok(()) => {}
+            Err(error) => {
+                // The return resolves and re-asserts its own pinned identity, so
+                // a repository that moved inside that window is refused here
+                // with the same diagnostic, while a genuine Git failure
+                // propagates.
+                if let Some(drift) = error.downcast_ref::<HeadDrift>() {
+                    return Ok(Some(drift.skip_diagnostic()));
+                }
+                return Err(error).context("Failed to return the branch to its unborn base");
+            }
+        },
     }
     // The reset above has already replaced the pre-turn working tree, so a
     // failure to unwind the checkpoint commit must not abort with the marker
@@ -1130,7 +1466,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // so recovery completes.
     let mut unwind_error = None;
     if checkpoint.created_checkpoint_commit {
-        if let Err(err) = unwind_checkpoint_if_present_with_deadline(dir, &checkpoint, &deadline) {
+        if let Err(err) = unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline) {
             tracing::error!(
                 "Failed to unwind the checkpoint commit during recovery: {}",
                 err
@@ -1155,32 +1491,26 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         }
     };
 
-    if unwound_steps > 0 || checkpoint.created_checkpoint_commit {
-        let mut msg = format!(
-            "Recovered interrupted workflow: unwound {} step commit(s), restored checkpoint: {}",
-            unwound_steps, checkpoint.created_checkpoint_commit
-        );
-        if !reclaimed.is_empty() {
-            msg.push_str(&format!(", cleaned up {}", reclaimed.clause()));
-        }
-        if let Some(err) = unwind_error {
-            msg.push_str(&format!(
-                ", but the checkpoint commit could not be unwound ({err}); the pre-turn work \
-                 stays recoverable inside the `{CHECKPOINT_PREFIX}` commit at HEAD"
-            ));
-        }
-        if let Some(err) = clear_error {
-            msg.push_str(&format!(
-                ", but the transaction marker could not be cleared ({err}); a later startup \
-                 retries the recovery"
-            ));
-        }
-        Ok(Some(msg))
-    } else if !reclaimed.is_empty() {
-        Ok(Some(format!("Cleaned up {}.", reclaimed.clause())))
-    } else {
-        Ok(None)
+    let mut msg = format!(
+        "Recovered interrupted workflow: unwound {} step commit(s), restored checkpoint: {}",
+        unwound_steps, checkpoint.created_checkpoint_commit
+    );
+    if !reclaimed.is_empty() {
+        msg.push_str(&format!(", cleaned up {}", reclaimed.clause()));
     }
+    if let Some(err) = unwind_error {
+        msg.push_str(&format!(
+            ", but the checkpoint commit could not be unwound ({err}); the pre-turn work \
+             stays recoverable inside the `{CHECKPOINT_PREFIX}` commit at HEAD"
+        ));
+    }
+    if let Some(err) = clear_error {
+        msg.push_str(&format!(
+            ", but the transaction marker could not be cleared ({err}); a later startup \
+             retries the recovery"
+        ));
+    }
+    Ok(Some(msg))
 }
 
 /// Returns the ignore rules that hide the harness state and the credentials.
@@ -1191,14 +1521,19 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
 /// interrupted atomic write — can reach a checkpoint commit. The credential
 /// files at the repository root are named explicitly, and the two staging
 /// suffixes keep a crashed write out of the index until recovery reclaims it.
+///
+/// Every staging rule is derived from the marker constant that owns its
+/// spelling, so the exclusion installed here, the sibling-name parsers, and
+/// crash recovery name one set of artifacts: a marker the atomic-write policy
+/// renames can never leave the siblings it produces outside the rules.
 fn tauqe_ignore_rules() -> Vec<String> {
     vec![
         format!("{STATE_DIR}/"),
         format!("{STATE_DIR}/credentials.toml"),
         "credentials.toml".to_string(),
         ".credentials.toml".to_string(),
-        "*.tauqe-tmp*".to_string(),
-        "*.tauqe-bak*".to_string(),
+        format!("*{STAGING_TEMP_MARKER}*"),
+        format!("*{STAGING_BACKUP_MARKER}*"),
     ]
 }
 
@@ -1551,6 +1886,8 @@ pub fn create_step_commit_with_deadline(
 
     Ok(short_hash)
 }
+
+/// Closes a transaction whose change set holds no tracked path.
 ///
 /// A bounded turn can verify cleanly while every file it wrote lives outside
 /// Git: the `.tauqe/mockups/` sandbox is the documented case, because the
@@ -1645,6 +1982,7 @@ pub fn finalize_ai_commit_with_deadline(
 
     Ok(short_hash)
 }
+
 /// Creates an isolated AI commit containing only the files modified by the model.
 ///
 /// `hooks` is the hook policy the commit follows.

@@ -38,10 +38,10 @@ impl std::fmt::Display for ModelSelection {
 
 impl Default for ModelSelection {
     fn default() -> Self {
-        // `Primary` is the mandatory base role and the deterministic default
+        // `REPL` is the mandatory base role and the deterministic default
         // for every specialized role that omits its own list, so it is the
         // only safe implicit selection.
-        ModelSelection::Role(ModelRole::Primary)
+        ModelSelection::Role(ModelRole::REPL)
     }
 }
 
@@ -101,11 +101,11 @@ mod tests {
         );
         assert!(serde_json::from_str::<ModelRole>("\"senior\"").is_err());
 
-        let sel_role = ModelSelection::Role(ModelRole::Primary);
+        let sel_role = ModelSelection::Role(ModelRole::REPL);
         let sel_role_json = serde_json::to_string(&sel_role).unwrap();
-        assert_eq!(sel_role_json, "\"primary\"");
+        assert_eq!(sel_role_json, "\"repl\"");
         assert_eq!(
-            serde_json::from_str::<ModelSelection>("\"primary\"").unwrap(),
+            serde_json::from_str::<ModelSelection>("\"repl\"").unwrap(),
             sel_role
         );
 
@@ -133,10 +133,10 @@ mod tests {
     }
 
     #[test]
-    fn test_model_selection_default_is_primary_role() {
+    fn test_model_selection_default_is_repl_role() {
         assert_eq!(
             ModelSelection::default(),
-            ModelSelection::Role(ModelRole::Primary)
+            ModelSelection::Role(ModelRole::REPL)
         );
     }
 

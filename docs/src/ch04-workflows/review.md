@@ -518,7 +518,7 @@ ladder — so a classification and a refined horizon answer to one escalation ru
 An absent selection runs the base rung of the ladder, which is exactly how the
 automatic classification after a grouped audit runs: that contour has no developer to
 pick one. The base rung is always resolvable, because the Architect ladder inherits
-the whole `primary` list when a project declares no architect entries. A selection
+the whole `repl` list when a project declares no architect entries. A selection
 the Architect role does not carry is a typed refusal naming the requested entry
 (`INVALID_MODEL`), raised before any provider call, because a silent fallback to the
 base rung would classify the findings with a configuration nobody asked for.

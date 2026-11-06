@@ -289,8 +289,11 @@ pub async fn handle_history_key(
     let mut st = state.lock().await;
     let view_height = st.last_model_height;
     let content_width = st.history_view.content_width;
-    let total_lines = st.history_view.rendered_lines_count as u16;
-    let max_scroll = total_lines.saturating_sub(view_height);
+    // The scroll bound comes from the same saturating accessor the renderer
+    // uses, so a document longer than the `u16` viewport unit saturates
+    // instead of wrapping through a truncated cast and trapping the viewport
+    // short of its end (c-2).
+    let max_scroll = st.history_view.max_scroll(view_height);
 
     // Resolve the key through the single source of truth so input dispatch and
     // the generated Help never drift (c-1). Clearing the whole conversation
@@ -592,5 +595,32 @@ mod tests {
         let (clear, cancel, _button) = dispatch(key).await;
         assert!(!clear, "C-l must recenter and never clear history");
         assert!(!cancel);
+    }
+    /// A rendered document longer than the `u16` viewport unit must reach its
+    /// saturated bound instead of wrapping through a truncated cast, which
+    /// would re-arm `auto_scroll` far too early and trap the viewport short of
+    /// the end (c-2).
+    #[tokio::test]
+    async fn test_select_last_saturates_past_the_u16_viewport_unit() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::History;
+        st.last_model_height = 10;
+        st.history_view.rendered_lines_count = 70_000;
+        let expected = st.history_view.max_scroll(st.last_model_height);
+        assert_eq!(expected, u16::MAX, "the fixture exceeds the viewport unit");
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let key = KeyEvent::new(KeyCode::End, crossterm::event::KeyModifiers::NONE);
+        handle_history_key(key, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.history_view.scroll, expected,
+            "the last record is reached through the saturated bound"
+        );
+        assert!(guard.history_view.auto_scroll);
     }
 }

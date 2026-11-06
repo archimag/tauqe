@@ -15,7 +15,11 @@ use tokio::sync::{mpsc, watch, Notify};
 /// [`OutChannel::wait_for_headroom`] before it enqueues the next fragment, so the
 /// depth follows the writer's progress instead of the length of the operation. A
 /// dead sink still stops the daemon through [`OutChannel::sink_lost`].
-const BACKLOG_HIGH_WATER: usize = 8192;
+///
+/// The value is crate-visible because a handler test reproduces a stalled
+/// client by pre-filling the queue to exactly this depth before it drives the
+/// relay the depth is supposed to pace.
+pub(crate) const BACKLOG_HIGH_WATER: usize = 8192;
 
 /// Queue depth the writer must reach before a paused producer resumes.
 ///
@@ -32,8 +36,8 @@ const BACKLOG_LOW_WATER: usize = BACKLOG_HIGH_WATER / 8;
 /// the coalescing buffer from growing with the queue itself.
 const MAX_COALESCED_LINES: usize = 1024;
 
-/// Liveness and depth of the outbound transport, shared by every clone of
-/// [`OutChannel`] and by the writer that owns the output sink.
+/// Liveness, depth, and headroom pacing of the outbound transport, shared by
+/// every clone of [`OutChannel`] and by the writer that owns the output sink.
 struct OutboundState {
     /// Set once the sink can no longer publish a line.
     sink_lost: AtomicBool,
@@ -47,20 +51,35 @@ struct OutboundState {
     pending: AtomicUsize,
     /// Wakes the request loop when the sink dies.
     lost: Notify,
-    /// Releases a producer that paused at [`BACKLOG_HIGH_WATER`] once the writer
+    /// Releases the producers paused at [`BACKLOG_HIGH_WATER`] once the writer
     /// drained the queue back below [`BACKLOG_LOW_WATER`].
-    headroom: Notify,
+    ///
+    /// The value counts headroom recoveries, so the advance is a durable version
+    /// stamp instead of a permit handed to one waiter: every producer holding a
+    /// subscription observes it, however many of them are parked.
+    headroom: watch::Sender<u64>,
+    /// Set once no further line will be produced, so the writer may finish after
+    /// it published everything still queued.
+    shutdown: AtomicBool,
+    /// Wakes the writer parked on the queue when the shutdown is requested.
+    shutdown_wakeup: Notify,
 }
 
 impl OutboundState {
     fn new() -> Self {
+        // No receiver is kept for the headroom signal: a producer subscribes
+        // when it reaches the gate, and the writer advances the generation
+        // whether or not one is subscribed at this instant.
+        let (headroom, _) = watch::channel(0u64);
         Self {
             sink_lost: AtomicBool::new(false),
             loss_reported: AtomicBool::new(false),
             backlog_reported: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             lost: Notify::new(),
-            headroom: Notify::new(),
+            headroom,
+            shutdown: AtomicBool::new(false),
+            shutdown_wakeup: Notify::new(),
         }
     }
 
@@ -82,14 +101,41 @@ impl OutboundState {
         self.lost.notify_one();
     }
 
-    /// Accounts `lines` leaving the queue, re-arms the stall report once the
-    /// queue has drained, and releases the producers that paused above the
-    /// high-water mark.
+    /// Reports whether the transport was asked to finish after its queue drains.
+    fn is_shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Records the shutdown request and wakes the writer parked on the queue.
     ///
-    /// The depth falls before the wake-up is published, so a producer that read
-    /// the depth just before this batch left the queue cannot sleep through the
-    /// drain meant to release it: it finds the stored permit and re-checks the
-    /// depth immediately.
+    /// The flag is stored before the wake-up is published, so a writer that read
+    /// it just before this store cannot sleep through the request: it finds the
+    /// stored permit and re-checks the flag immediately.
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_wakeup.notify_one();
+    }
+
+    /// Resolves once the shutdown was requested.
+    async fn await_shutdown(&self) {
+        loop {
+            if self.is_shutdown_requested() {
+                return;
+            }
+            self.shutdown_wakeup.notified().await;
+        }
+    }
+
+    /// Accounts `lines` leaving the queue, re-arms the stall report once the
+    /// queue has drained, and advances the headroom generation that releases
+    /// every producer paused above the high-water mark.
+    ///
+    /// The depth falls before the generation advances, so a producer released by
+    /// this batch re-checks the depth and finds the queue already drained. The
+    /// advance is a version stamp every subscription observes instead of a
+    /// permit handed to one waiter, so one drain releases however many producers
+    /// are parked, and none of them can miss it by having observed the
+    /// high-water mark before it started waiting.
     fn release_pending(&self, lines: usize) {
         let remaining = self
             .pending
@@ -97,10 +143,9 @@ impl OutboundState {
             .saturating_sub(lines);
         if remaining < BACKLOG_LOW_WATER {
             self.backlog_reported.store(false, Ordering::Relaxed);
-            // Every producer already waiting re-checks the depth, and the stored
-            // permit covers the producer that starts waiting at this instant.
-            self.headroom.notify_waiters();
-            self.headroom.notify_one();
+            self.headroom.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
         }
     }
 }
@@ -189,6 +234,14 @@ impl OutChannel {
     /// the queue keeps every event in order — so the bound applies to the
     /// producer and never to the payload.
     ///
+    /// The gate is safe for any number of simultaneously paused producers. Each
+    /// producer subscribes to the headroom generation of the transport, and one
+    /// drain releases all of them: the writer records the recovery in the
+    /// generation instead of handing a permit to a single waiter, so a producer
+    /// that observed the high-water mark before it started waiting still
+    /// observes that drain. A queue that refills above the high-water mark parks
+    /// the producer again until the writer drains it once more.
+    ///
     /// Only a high-rate streaming contour calls this, so responses and control
     /// events keep flowing and the request loop stays responsive while a stream
     /// is throttled. The wait ends with the operation: a raised `cancel` signal
@@ -200,24 +253,55 @@ impl OutChannel {
         if *cancel.borrow() {
             return;
         }
-        let drained = async {
-            while self.state.pending.load(Ordering::Acquire) >= BACKLOG_HIGH_WATER {
-                self.state.headroom.notified().await;
+        // Subscribing before the first depth check stamps this receiver with the
+        // generation of that instant, so a drain the check itself still observes
+        // as missing is recorded on the receiver instead of being lost.
+        let mut generation = self.state.headroom.subscribe();
+        loop {
+            if self.state.pending.load(Ordering::Acquire) < BACKLOG_HIGH_WATER {
+                return;
             }
-        };
-        tokio::select! {
-            _ = drained => {}
-            _ = cancel.changed() => {}
+            tokio::select! {
+                advanced = generation.changed() => {
+                    if advanced.is_err() {
+                        // The generation signal is gone, so no drain can release
+                        // this producer any more; returning keeps it from parking
+                        // on a wakeup that can never arrive.
+                        return;
+                    }
+                }
+                changed = cancel.changed() => {
+                    // A raised signal ends the wait even while the client is
+                    // stalled, and so does an operation whose signal is gone.
+                    if changed.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
+    /// Asks the writer to finish once it published every queued line.
+    ///
+    /// Closing the queue is not an option: the daemon state and the history
+    /// forwarder hold senders for the whole session, so the queue never reaches
+    /// its end. An explicit request is the flush-or-close handshake instead —
+    /// the caller requests it and then joins the writer's handle, so the
+    /// terminal events of a cancelled operation reach a client that is still
+    /// reading. Returning from `main` without that join drops the runtime and
+    /// cancels the writer wherever it stands, truncating the stream.
+    pub fn shutdown(&self) {
+        self.state.request_shutdown();
+    }
     /// Enqueues one serialized line, recording a dead sink instead of
     /// discarding the send result.
     fn enqueue(&self, line: String) {
         // The request loop has not observed the loss yet, so a producer may
         // still reach this point; its line is dropped, and the loss itself was
-        // reported when it happened.
-        if self.state.is_sink_lost() {
+        // reported when it happened. A requested shutdown closes the transport
+        // the same way: the writer may already be gone, and a line published
+        // after the final flush cannot reach the client any more.
+        if self.state.is_sink_lost() || self.state.is_shutdown_requested() {
             return;
         }
 
@@ -255,20 +339,42 @@ impl OutboundWriter {
         self.run_with(tokio::io::stdout()).await;
     }
 
+    /// Awaits the next line to publish, or `None` once the queue ended or the
+    /// shutdown was requested and nothing is left to write.
+    ///
+    /// Everything already queued is written before the request is honoured, and
+    /// a line that arrives while the writer waits still wins the race, so a
+    /// shutdown never truncates a line a producer already handed over.
+    async fn next_line(&mut self) -> Option<String> {
+        loop {
+            if let Ok(line) = self.rx.try_recv() {
+                return Some(line);
+            }
+            if self.state.is_shutdown_requested() {
+                return None;
+            }
+
+            tokio::select! {
+                line = self.rx.recv() => return line,
+                _ = self.state.await_shutdown() => {}
+            }
+        }
+    }
     /// Implements [`OutboundWriter::run`] against an explicit sink, so a
-    /// deterministic test can exercise the failure path without touching the
-    /// real stdout of the process.
+    /// deterministic test can drive a real drain — or exercise the failure
+    /// path — without touching the real stdout of the process.
     ///
     /// Whatever is already queued when the writer wakes is coalesced into one
     /// sink write and one flush. A turn relays its deltas at token
     /// granularity, so a per-line write would pay a blocking-pool dispatch and
-    /// a line flush per delta, while a batch pays them once per burst.
-    async fn run_with<W>(mut self, mut sink: W)
+    /// a line flush per delta, while a batch pays them once per burst. The loop
+    /// ends when the queue closes or when a requested shutdown finds it empty.
+    pub(crate) async fn run_with<W>(mut self, mut sink: W)
     where
         W: AsyncWrite + Unpin,
     {
         let mut batch = String::new();
-        while let Some(line) = self.rx.recv().await {
+        while let Some(line) = self.next_line().await {
             batch.clear();
             batch.push_str(&line);
             let mut coalesced = 1;
@@ -578,5 +684,108 @@ mod tests {
         )
         .await
         .expect("a cancelled operation must not wait for the stalled client");
+    }
+
+    /// A shutdown request ends the writer and still publishes every line queued
+    /// before it: the drain of a cancelled operation ends with this handshake,
+    /// so a writer that stopped at the request would truncate the stream of the
+    /// client that is still reading the terminal events.
+    #[tokio::test]
+    async fn a_shutdown_request_flushes_the_queue_and_finishes_the_writer() {
+        let (out, rx) = OutChannel::new();
+        let names = [
+            "test/model/cancelled",
+            "test/plan/batch_finished",
+            "test/git/rolled_back",
+        ];
+        for name in names {
+            out.send_event(&event(name));
+        }
+
+        let sink = RecordingSink::default();
+        let writing = tokio::spawn(out.writer(rx).run_with(sink.clone()));
+        wait_for_drain(&out).await;
+
+        // An open queue keeps the writer alive for the whole session: only the
+        // shutdown request may end it, or the daemon would go deaf mid-session.
+        assert!(
+            !writing.is_finished(),
+            "a writer parked on an open queue must not finish on its own"
+        );
+
+        out.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), writing)
+            .await
+            .expect("a shutdown request must let the writer finish")
+            .expect("the writer task joins");
+
+        let published = sink.writes().concat();
+        let text = String::from_utf8_lossy(&published);
+        for name in names {
+            assert!(text.contains(name), "the shutdown flush dropped '{name}'");
+        }
+        assert_eq!(
+            out.state.pending.load(Ordering::Relaxed),
+            0,
+            "the flush must release every queued line"
+        );
+    }
+    /// Every producer paused at the high-water mark must be released by the
+    /// drain itself, even when the writer falls idle afterwards with the channel
+    /// still open: the recovery is a generation the transport records, not a
+    /// permit a single waiter consumes.
+    #[tokio::test]
+    async fn one_full_drain_releases_every_paused_producer() {
+        let (out, rx) = OutChannel::new();
+        for _ in 0..BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+
+        let spawn_paused = |channel: &OutChannel, cancel: &watch::Sender<bool>| {
+            let producer = channel.clone();
+            let mut cancel = cancel.subscribe();
+            tokio::spawn(async move {
+                producer.wait_for_headroom(&mut cancel).await;
+                producer.state.pending.load(Ordering::Relaxed)
+            })
+        };
+        let first = spawn_paused(&out, &cancel_tx);
+        let second = spawn_paused(&out, &cancel_tx);
+
+        // Both producers reach the gate before a single line leaves the queue,
+        // so the drain below is the only wakeup either of them can observe.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "every producer must pause while the backlog sits at the high-water mark"
+        );
+
+        let writing = tokio::spawn(out.writer(rx).run_with(tokio::io::sink()));
+        let paused = async move { (first.await, second.await) };
+        let released = tokio::time::timeout(Duration::from_secs(1), paused).await;
+        let depths = released.expect("the drain must release every paused producer");
+        let first_depth = depths.0.expect("the first producer task joins");
+        let second_depth = depths.1.expect("the second producer task joins");
+        for depth in [first_depth, second_depth] {
+            assert!(
+                depth < BACKLOG_LOW_WATER,
+                "a released producer must observe the drained depth, saw {depth}"
+            );
+        }
+        assert!(
+            !writing.is_finished(),
+            "the writer must stay idle with the channel open instead of ending"
+        );
+
+        // A producer whose first depth check happens after that drain reads the
+        // drained depth and never parks at all.
+        let mut late = cancel_tx.subscribe();
+        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&mut late))
+            .await
+            .expect("a producer that starts after the drain must not park");
+
+        writing.abort();
+        let _ = writing.await;
     }
 }

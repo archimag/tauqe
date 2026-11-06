@@ -58,6 +58,7 @@ fn git_deadline(dir: &Path, cancel: Option<watch::Receiver<bool>>) -> GitDeadlin
     let timeout_secs = crate::config::load_git_config(dir).timeout_secs;
     GitDeadline::with_timeout(timeout_secs).with_cancel(cancel)
 }
+
 /// Refuses a transaction step that begins after the turn was cancelled.
 ///
 /// The capture and the step commit both open with repository probes, and the

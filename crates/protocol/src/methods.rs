@@ -70,73 +70,47 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Enumerates every method constant so the contract test can pin the wire
-    /// names: each must be unique and must follow the
+    /// Derives the wire name of every method constant declared in this module's
+    /// own source, so a newly declared method is checked without being listed
+    /// here: each name must be unique and must follow the
     /// `<lowercase-namespace>/<camelCaseVerb>` convention.
-    fn all_methods() -> Vec<&'static str> {
-        vec![
-            CLIENT_INITIALIZE,
-            REPOSITORY_GET_STATE,
-            REPOSITORY_LIST_FILES,
-            REPOSITORY_INIT,
-            MODEL_ASK,
-            MODEL_CANCEL,
-            MODEL_CLEAR_HISTORY,
-            MODEL_SELECT,
-            MODEL_CURRENT,
-            MODEL_USAGE_RESET,
-            CONTEXT_GET,
-            CONTEXT_ADD,
-            CONTEXT_ADD_PATTERN,
-            CONTEXT_REMOVE,
-            CONTEXT_SET_ACCESS,
-            CONTEXT_CLEAR,
-            HISTORY_GET,
-            GIT_GET_DIFF,
-            GIT_SQUASH_PREVIEW,
-            GIT_SQUASH_GENERATE_MESSAGE,
-            GIT_SQUASH_APPLY,
-            CONFIG_GET,
-            CONFIG_SET,
-            CONFIG_RELOAD,
-            CONFIG_CREATE,
-            CREDENTIALS_SAVE,
-            CREDENTIALS_CREATE_STUB,
-            SYSTEM_STATUS,
-            REVIEW_START,
-            REVIEW_PREVIEW,
-            REVIEW_CANCEL,
-            REVIEW_LIST,
-            REVIEW_GET,
-            REVIEW_UPDATE_ITEM,
-            REVIEW_DELETE,
-            REVIEW_EXECUTE,
-            REVIEW_ANALYZE,
-            PLAN_LIST,
-            PLAN_GET,
-            PLAN_SAVE,
-            PLAN_UPDATE_ITEM,
-            PLAN_DELETE,
-            PLAN_SET_ACTIVE,
-            PLAN_CLEAR_HORIZON,
-            PLAN_EXECUTE,
-            PLAN_EXECUTE_PIPELINE,
-            PLAN_CREATE_PIPELINE,
-            PLAN_REFINE,
-            PLAN_REPLAN,
-            DISCUSSION_SET_FOCUS,
-            DISCUSSION_GET_FOCUS,
-            DISCUSSION_CLEAR_FOCUS,
-            LOCALE_GENERATE,
-            OUTER_DOCS_CACHE_LIST,
-            OUTER_DOCS_CACHE_REMOVE,
-        ]
+    fn declared_methods() -> Vec<&'static str> {
+        let source = include_str!("methods.rs");
+        // The test module is cut away first, so the fixtures below can never be
+        // mistaken for a declaration. The index comes from a matched ASCII
+        // marker, so the slice always lands on a character boundary.
+        let declarations = match source.find("#[cfg(test)]") {
+            Some(index) => &source[..index],
+            None => source,
+        };
+        declarations.lines().filter_map(wire_name_of).collect()
+    }
+
+    /// Returns the wire name declared by one `pub const NAME: &str = "...";`
+    /// line, or `None` for every other line.
+    fn wire_name_of(line: &str) -> Option<&str> {
+        let declaration = line.trim_start().strip_prefix("pub const ")?;
+        let (_, literal) = declaration.split_once(": &str = \"")?;
+        let (value, _) = literal.split_once('"')?;
+        Some(value)
     }
 
     #[test]
     fn test_method_names_are_unique_and_namespaced_camel_case() {
+        let methods = declared_methods();
+
+        // A derivation that silently matched nothing would make every assertion
+        // below vacuous, so it is anchored on the first and the last constant
+        // this module declares.
+        for anchor in [CLIENT_INITIALIZE, OUTER_DOCS_CACHE_REMOVE] {
+            assert!(
+                methods.contains(&anchor),
+                "derivation missed the declaration of '{anchor}'"
+            );
+        }
+
         let mut seen = HashSet::new();
-        for method in all_methods() {
+        for method in methods {
             assert!(
                 seen.insert(method),
                 "duplicate method wire name: '{method}'"

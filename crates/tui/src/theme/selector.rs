@@ -19,6 +19,7 @@ use ratatui::widgets::Paragraph;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::AppState;
+use crate::command::is_bare_press;
 use crate::components::modal::{
     modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
@@ -294,7 +295,15 @@ pub async fn handle_theme_selector_key(
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        // `Esc` always restores the original preset and closes. The dismissal
+        // letter is a bare press, so a command chord or the AltGr compose chord
+        // keeps the selector open with the previewed preset intact
+        // (Conventions §5.2).
+        KeyCode::Esc => {
+            let original = selector_state.original;
+            st.apply_theme_preset(original);
+        }
+        KeyCode::Char('q') if is_bare_press(key.modifiers) => {
             let original = selector_state.original;
             st.apply_theme_preset(original);
         }
@@ -459,5 +468,54 @@ mod tests {
             .selected_preset();
         assert_eq!(selected, expected);
         assert_eq!(state.lock().await.active_theme_preset, expected);
+    }
+
+    /// The dismissal letter of the theme selector is a bare press: a command
+    /// chord and the AltGr compose chord keep the selector open with the
+    /// previewed preset, while the bare letter restores the original (c-4,
+    /// Conventions §5.2).
+    #[tokio::test]
+    async fn command_modified_q_keeps_the_selector_open_with_the_preview() {
+        let mut st = test_state();
+        st.active_theme_preset = ThemePreset::TauqeDark;
+        st.open_theme_selector();
+        let state = Arc::new(Mutex::new(st));
+
+        press(&state, KeyCode::Char('n'), 5).await;
+        let previewed = {
+            let st = state.lock().await;
+            assert_eq!(st.active_theme_preset, ThemePreset::TauqeLight);
+            st.active_theme_preset
+        };
+
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let guard = state.lock().await;
+            handle_theme_selector_key(
+                KeyEvent::new(KeyCode::Char('q'), modifiers),
+                &state,
+                guard,
+                5,
+            )
+            .await;
+
+            let st = state.lock().await;
+            assert!(
+                st.modals.theme_selector.is_some(),
+                "{modifiers:?} must not dismiss the selector"
+            );
+            assert_eq!(
+                st.active_theme_preset, previewed,
+                "a refused dismissal keeps the previewed preset"
+            );
+        }
+
+        press(&state, KeyCode::Char('q'), 5).await;
+        let st = state.lock().await;
+        assert_eq!(st.active_theme_preset, ThemePreset::TauqeDark);
+        assert!(st.modals.theme_selector.is_none());
     }
 }

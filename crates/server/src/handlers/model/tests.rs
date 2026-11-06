@@ -25,6 +25,7 @@ use super::turn::{execute_model_turn, resolve_session_id, resolve_turn_protocol,
 use super::{
     handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
 };
+use crate::handlers::common::test_support::scratch_root;
 use crate::handlers::history::handle_history_get;
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
@@ -174,7 +175,8 @@ async fn model_select_rotates_the_session_confirmed_by_the_effective_model() {
 
     let (out, _rx) = crate::transport::OutChannel::new();
     let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+    let root = scratch_root("model-select-rotate");
+    let state = AppState::new(cfg, root.clone(), history_sender, out);
 
     let warm = state.session_uuid().await;
     let switched = handle_model_select(
@@ -201,6 +203,7 @@ async fn model_select_rotates_the_session_confirmed_by_the_effective_model() {
         state.session_uuid().await,
         "an unchanged effective model must keep the session"
     );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Plan mutation emitted through the XML transport: an update of an existing
@@ -529,19 +532,6 @@ async fn blank_prompt_is_rejected_without_touching_the_focus() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Creates a unique scratch repository root for a pre-flight integrity test.
-fn scratch_root(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tauqe-preflight-{tag}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("create the scratch repository root");
-    dir
 }
 
 /// Runs the deterministic pre-flight gate over a scratch repository that
@@ -922,7 +912,8 @@ async fn model_select_is_refused_while_an_operation_is_registered() {
 
     let (out, _rx) = crate::transport::OutChannel::new();
     let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+    let root = scratch_root("model-select-guard");
+    let state = AppState::new(cfg, root.clone(), history_sender, out);
 
     let operation = state
         .try_begin_operation()
@@ -950,6 +941,7 @@ async fn model_select_is_refused_while_an_operation_is_registered() {
 
     drop(operation);
     assert!(!state.is_operation_active());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Clearing the journal truncates `history.jsonl` and rotates the dialogue
@@ -1326,6 +1318,384 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
         state.try_begin_operation().is_ok(),
         "the slot must be reusable afterwards"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Provider that streams nothing, ignores the cancellation signal, and never
+/// returns on its own, so the only way the turn it serves can end is the
+/// last-resort reaping of a wedged workflow task.
+struct SilentlyParkedProvider {
+    /// Signals that the provider is parked inside its stream.
+    entered: mpsc::UnboundedSender<()>,
+}
+
+impl SilentlyParkedProvider {
+    /// Builds the provider together with the receiver that observes its stall.
+    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
+        let (entered, receiver) = mpsc::unbounded_channel();
+        (Self { entered }, receiver)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SilentlyParkedProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        _tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        // Nothing is relayed and the cancellation is never observed, so the
+        // workflow stays parked until the watchdog aborts it: exactly the turn
+        // that used to surface as a provider failure.
+        let _ = self.entered.send(());
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// A hard-cancelled turn whose workflow ignored the signal is reported as a
+/// cancellation, not as a provider failure.
+///
+/// The force-abort watchdog drops the wedged workflow task, so the turn's relay
+/// loop ends without a `Cancelled` event and the join yields an error. The
+/// raised cancel signal stays the authoritative classification — the rule every
+/// other seam applies — so a client that asked for the cancellation never
+/// receives a spurious `model/error` one watchdog cycle later, and a direct
+/// caller observes `is_cancelled` instead of a failure.
+#[tokio::test]
+async fn a_force_aborted_turn_is_reported_as_cancelled() {
+    use tauqe_core::workflow::DirectApplyPolicy;
+
+    let root = scratch_root("force-aborted-turn");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+    let (provider, mut entered) = SilentlyParkedProvider::new();
+    let injected: Arc<dyn LlmProvider> = Arc::new(provider);
+    *state.provider_override.lock().await = Some(injected);
+
+    let turn_state = Arc::clone(&state);
+    let turn = tokio::spawn(async move {
+        execute_model_turn(
+            &turn_state,
+            "Explain the repository".to_string(),
+            Box::new(DirectApplyPolicy::new()),
+            StepTurnOptions {
+                intent: TurnIntent::InteractiveRepl,
+                custom_selection: None,
+                plan_context: None,
+                work_context: None,
+                reasoning_effort: None,
+                marker: None,
+                session_id: None,
+                shared_operation: None,
+                phase_out: None,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("the turn must reach the provider")
+        .expect("the provider signals that it is parked");
+    state.cancel_active_operation();
+    state
+        .force_abort_active_operation(Duration::from_secs(10))
+        .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .expect("the aborted turn must return")
+        .expect("the turn task joins")
+        .expect("the turn reports the cancellation instead of a start failure");
+    assert!(
+        result.is_cancelled,
+        "the raised cancel signal must classify the turn as cancelled"
+    );
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Operation cancelled"),
+        "a cancelled turn carries the same payload as a cooperative cancellation"
+    );
+    assert!(
+        result.result.is_none(),
+        "an aborted turn produces no result"
+    );
+
+    let mut published = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line).expect("the transport writes JSON lines");
+        if let Some(method) = event.get("method").and_then(|method| method.as_str()) {
+            published.push(method.to_string());
+        }
+    }
+    assert!(
+        published
+            .iter()
+            .any(|method| method == tauqe_protocol::events::MODEL_CANCELLED),
+        "a cancelled turn must report model/cancelled: {published:?}"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|method| method == tauqe_protocol::events::MODEL_ERROR),
+        "a cancelled turn must never report model/error: {published:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A committed turn applies the change set it proposed and releases the
+/// transient context that served the decision.
+///
+/// The Auto layer is part of the stable prompt prefix exactly like a repository
+/// file, so the material discovery gathered for one decision must not survive
+/// the commit that made the decision durable: keeping it resident would charge
+/// every later request for a prompt prefix that no longer needs it. The
+/// dialogue session rotates with the prefix the release shrank, so the next
+/// round is never routed to a cache the dialogue no longer sends.
+#[tokio::test]
+async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_context() {
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_core::workflow::DirectApplyPolicy;
+    use tauqe_protocol::ContextAccess;
+
+    // The change set travels through the XML transport as the canonical
+    // unmarked search/replace grammar the decoder accepts.
+    const CHANGE_SET: &str = concat!(
+        "Rewriting the value.\n",
+        "<edits summary=\"Bump the value\">\n",
+        "  <edit path=\"target.rs\">\n",
+        "    <search>\n",
+        "pub fn value() -> i32 { 0 }\n",
+        "    </search>\n",
+        "    <replace>\n",
+        "pub fn value() -> i32 { 42 }\n",
+        "    </replace>\n",
+        "  </edit>\n",
+        "</edits>\n",
+    );
+
+    let root = scratch_root("turn-committed-release");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
+        .expect("write the edit target");
+    std::fs::write(root.join("discovered.rs"), "pub fn discovered() {}\n")
+        .expect("write the discovered file");
+    let fixtures = vec!["target.rs".to_string(), "discovered.rs".to_string()];
+    tauqe_core::git::cmd::stage_files(&root, &fixtures).expect("stage the fixtures");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixtures", false)
+        .expect("commit the fixtures");
+
+    let mut cfg = AppConfig::default();
+    cfg.repl.protocol = EditProtocolKind::Xml;
+    let (out, _rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(cfg, root.clone(), history_sender, out);
+    state
+        .context
+        .write()
+        .await
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("the edit target is editable");
+    state
+        .context
+        .write()
+        .await
+        .add_auto_file("discovered.rs", ContextAccess::ReadOnly)
+        .expect("the discovered file joins the transient context");
+    let script = [
+        MockResponse::text(CHANGE_SET),
+        MockResponse::text("<success commit_message=\"Bump the value\" />"),
+    ];
+    let provider = Arc::new(MockLlmProvider::scripted(script));
+    let injected: Arc<dyn LlmProvider> = provider.clone();
+    *state.provider_override.lock().await = Some(injected);
+    let warm_session = state.session_uuid().await;
+
+    let result = execute_model_turn(
+        &state,
+        "Bump the value to 42".to_string(),
+        Box::new(DirectApplyPolicy::new()),
+        StepTurnOptions {
+            intent: TurnIntent::InteractiveRepl,
+            custom_selection: None,
+            plan_context: None,
+            work_context: None,
+            reasoning_effort: None,
+            marker: None,
+            session_id: None,
+            shared_operation: None,
+            phase_out: None,
+        },
+    )
+    .await
+    .expect("the bounded turn runs");
+
+    assert!(
+        result.is_success(),
+        "the released turn must apply its change set: {:?}",
+        result.result
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("target.rs")).expect("read the edit target"),
+        "pub fn value() -> i32 { 42 }\n",
+        "the change set must reach the working tree"
+    );
+    assert!(
+        state.context.read().await.auto_files().is_empty(),
+        "a committed turn must release the transient context that served it"
+    );
+    assert!(
+        !state
+            .context
+            .read()
+            .await
+            .contains("discovered.rs")
+            .expect("the context resolves the discovered path"),
+        "the discovered file leaves the context with the decision"
+    );
+    assert!(
+        state
+            .context
+            .read()
+            .await
+            .contains("target.rs")
+            .expect("the context resolves the edit target"),
+        "the explicitly added file keeps its own entry"
+    );
+    assert_ne!(
+        warm_session,
+        state.session_uuid().await,
+        "a released prefix starts a fresh dialogue session"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Flips a flag when the owning task future is dropped, so a test can prove that
+/// a watchdog released the registration of a task that still ran and that the
+/// orphan died once its non-yielding stretch ended.
+struct WatchdogExitMarker(Arc<AtomicBool>);
+
+impl Drop for WatchdogExitMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A watchdog reap is bounded in both directions: it waits for the task it
+/// aborted, but never longer than the shared task-exit deadline, so a workflow
+/// wedged in a non-yielding stretch cannot pin the operation slot until process
+/// exit. Releasing the slot leaves the abort delivered, so the orphan dies at the
+/// next suspension point its stretch finally reaches.
+#[test]
+fn a_watchdog_reap_that_expires_releases_the_slot_of_a_pinned_task() {
+    let root = scratch_root("watchdog-reap-expiry");
+
+    // The wedged workflow owns a runtime of its own: its whole point is a stretch
+    // that never yields back to its scheduler, so it must not be able to pin the
+    // scheduler the confirmation runs on.
+    let wedged_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("the wedged runtime starts");
+    let confirmation_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the confirmation runtime starts");
+
+    let stretch_ends = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+
+    confirmation_runtime.block_on(async {
+        let state = state_over_root(root.clone());
+        let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
+        let task = {
+            let stretch_ends = Arc::clone(&stretch_ends);
+            let exited = Arc::clone(&exited);
+            wedged_runtime.spawn(async move {
+                let _marker = WatchdogExitMarker(Arc::clone(&exited));
+                let _ = entered_tx.send(());
+                // A non-yielding stretch: the task reaches no suspension point,
+                // so the abort cannot land while it spins.
+                while !stretch_ends.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                std::future::pending::<()>().await
+            })
+        };
+        entered_rx
+            .await
+            .expect("the wedged task must enter its non-yielding stretch");
+
+        // The deadline is resolved where the watchdog is spawned and applied by
+        // the confirmation inside it, so a compressed value keeps the expiry path
+        // deterministic.
+        crate::reap::with_task_exit_deadline(Duration::from_millis(50), async {
+            state.defer_abort_owning_operation(guard, task);
+        })
+        .await;
+
+        // The confirmation expires while the task is still pinned: the slot is
+        // released within the bound although the task provably never exited.
+        let mut released = false;
+        for _ in 0..500 {
+            if !state.is_operation_active() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the expired confirmation must release the operation slot"
+        );
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the wedged task provably never exited before the slot was released"
+        );
+
+        // The released slot admits the next operation instead of refusing every
+        // request until the process exits.
+        assert!(
+            state.try_begin_operation().is_ok(),
+            "the released slot must admit a new operation"
+        );
+
+        // The orphan keeps its abort delivered: it dies at the first suspension
+        // point its stretch reaches.
+        stretch_ends.store(true, Ordering::SeqCst);
+        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+            while !exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the orphaned task must die once its non-yielding stretch ends"
+        );
+    });
 
     let _ = std::fs::remove_dir_all(&root);
 }

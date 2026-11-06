@@ -10,6 +10,7 @@ use tauqe_protocol::{
 
 use crate::components::editor::PromptHistoryJob;
 use crate::components::model_selector::ModelSelector;
+use crate::components::selector::keep_selection_visible;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
 use crate::dialogs::pattern::PatternMatchMemo;
@@ -197,7 +198,7 @@ impl ModelChoice {
                 ModelRole::Scribe => roles.scribe.clone(),
                 ModelRole::Coder => roles.coder.clone(),
                 ModelRole::Architect => roles.architect.clone(),
-                ModelRole::Primary => roles.primary.clone(),
+                ModelRole::REPL => roles.primary.clone(),
                 ModelRole::Reviewer => roles.reviewer.clone(),
             }),
         }
@@ -260,7 +261,7 @@ pub struct SelectionDialogState {
 impl SelectionDialogState {
     pub fn new(entries: Vec<tauqe_protocol::ModelEntry>, selected_index: usize) -> Self {
         Self {
-            selector: ModelSelector::new(ModelRole::Primary, entries, selected_index),
+            selector: ModelSelector::new(ModelRole::REPL, entries, selected_index),
         }
     }
 }
@@ -950,20 +951,15 @@ impl OuterDocsCacheDialogState {
     }
 
     /// Keeps the highlight inside a window of `visible_rows` drawn rows.
+    ///
+    /// The tree keeps its offset between frames, so the window moves through
+    /// the shared [`keep_selection_visible`] from the offset it already holds.
     pub fn scroll_to_cursor(&mut self, visible_rows: usize) {
         let rows = self.rows().len();
-        let visible = visible_rows.max(1).min(rows.max(1));
         let cursor = self.cursor.min(rows.saturating_sub(1));
-        let scroll = usize::from(self.scroll);
-        let next = if cursor < scroll {
-            cursor
-        } else if cursor >= scroll.saturating_add(visible) {
-            cursor + 1 - visible
-        } else {
-            scroll
-        };
-        let max_scroll = rows.saturating_sub(visible);
-        self.scroll = u16::try_from(next.min(max_scroll)).unwrap_or(u16::MAX);
+        let next =
+            keep_selection_visible(usize::from(self.scroll), cursor, rows, visible_rows.max(1));
+        self.scroll = u16::try_from(next).unwrap_or(u16::MAX);
     }
 }
 /// Change set of one commit that the fullscreen inspector audits.
@@ -1148,11 +1144,13 @@ impl PathCompletion {
     pub fn selected_candidate(&self) -> Option<&str> {
         self.candidates.get(self.selected).map(String::as_str)
     }
-
     /// Index of the first candidate drawn in a window of `visible_rows` rows,
     /// keeping the highlight visible.
+    ///
+    /// The menu keeps no offset of its own, so the window is the shared
+    /// [`keep_selection_visible`] projected from scratch.
     pub fn visible_start(&self, visible_rows: usize) -> usize {
-        visible_start(self.selected, self.candidates.len(), visible_rows)
+        keep_selection_visible(0, self.selected, self.candidates.len(), visible_rows)
     }
 
     /// Replaces the candidate list, preserving the highlight while the list is
@@ -1238,24 +1236,6 @@ impl PathCompletion {
             self.selected = self.candidates.len() - 1;
         }
     }
-}
-
-/// Index of the first row of a window of `visible_rows` rows that keeps
-/// `selected` visible.
-///
-/// The completion menu and the path rows share this arithmetic, so neither
-/// surface re-derives its own scroll window.
-fn visible_start(selected: usize, len: usize, visible_rows: usize) -> usize {
-    if len == 0 || visible_rows == 0 {
-        return 0;
-    }
-    let height = visible_rows.min(len);
-    let max_start = len - height;
-    let mut start = 0;
-    if selected >= height {
-        start = selected + 1 - height;
-    }
-    start.min(max_start)
 }
 
 /// Directory prefixes of `directories` that continue `prefix` (c-5).
@@ -1537,8 +1517,11 @@ impl ReviewDialogState {
 
     /// Index of the first path row drawn in a window of `visible_rows` rows,
     /// keeping the active row visible.
+    ///
+    /// The rows keep no offset of their own, so the window is the shared
+    /// [`keep_selection_visible`] with no remembered offset.
     pub fn path_visible_start(&self, visible_rows: usize) -> usize {
-        visible_start(self.path_active, self.path_inputs.len(), visible_rows)
+        keep_selection_visible(0, self.path_active, self.path_inputs.len(), visible_rows)
     }
 
     /// Recomputes the directory completion of the active row (c-5).
@@ -3053,7 +3036,7 @@ mod tests {
             Some(ModelRef::openrouter("architect-model"))
         );
         assert_eq!(
-            choice.resolve(&ModelSelection::Role(ModelRole::Primary)),
+            choice.resolve(&ModelSelection::Role(ModelRole::REPL)),
             Some(ModelRef::openrouter("primary-model"))
         );
         assert_eq!(
@@ -3068,7 +3051,7 @@ mod tests {
         let primary_entry =
             tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-model"), None);
         state.model_choice = ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Primary),
+            selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
@@ -3107,7 +3090,7 @@ mod tests {
         ];
         let mut state = test_state();
         state.model_choice = ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Primary),
+            selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
@@ -3170,7 +3153,7 @@ mod tests {
 
         let mut state = test_state();
         state.model_choice = ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Primary),
+            selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
@@ -4070,7 +4053,7 @@ mod tests {
         // A wholesale replacement marks the snapshot stale, and the next frame
         // publishes the new catalog exactly once.
         st.set_model_choice(ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Primary),
+            selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(summary("Alias A")),
         });
         assert_ne!(st.model_display_revision, st.model_choice_revision);

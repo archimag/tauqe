@@ -439,16 +439,24 @@ pub(crate) async fn record_synthesis_history(
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Creates a unique scratch repository root for a handler regression test.
+    /// Creates a unique scratch repository root for a server regression test.
+    ///
+    /// The name is derived as `tauqe-<tag>-<pid>-<counter>`. The process id
+    /// isolates the parallel test processes `cargo nextest` runs, each of which
+    /// restarts its process-global counters; the atomic counter isolates the
+    /// concurrently running tests of one process under the threaded model of
+    /// `cargo test`. A name derived from the counter alone or from the clock
+    /// alone is a defect: under nextest it collides between processes, and two
+    /// colliding tests then share one directory and race on the files inside
+    /// it. The directory is created before the path is returned, so a caller
+    /// can write into it immediately.
     pub(crate) fn scratch_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("tauqe-{tag}-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create the scratch repository root");
         root
     }
@@ -597,5 +605,30 @@ mod tests {
 
         assert!(message.contains("tauqe.toml"), "{message}");
         assert!(!message.contains("[[workspace]]"), "{message}");
+    }
+
+    /// Two scratch roots derived in one process never coincide, and each name
+    /// carries the process id that isolates the parallel `cargo nextest`
+    /// processes from one another.
+    #[test]
+    fn test_scratch_root_derives_a_process_unique_name_per_call() {
+        let first = test_support::scratch_root("guard");
+        let second = test_support::scratch_root("guard");
+
+        assert!(first.is_dir(), "the scratch root must be created");
+        assert_ne!(first, second, "two calls must never share a scratch root");
+
+        let pid = std::process::id().to_string();
+        let name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the scratch root name is valid UTF-8");
+        assert!(
+            name.split('-').any(|part| part == pid.as_str()),
+            "the scratch root name must carry the process id: {name}"
+        );
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 }

@@ -83,9 +83,10 @@ fn abandon_turn_plans(plans: &[DiscussionPlanUpdate], reason: &str) -> PlanSettl
 
 /// Applies the turn's plan mutations and reports every repair and refusal.
 ///
-/// The whole batch runs under the storage lock of the plan engine and off the
-/// async executor thread, so the read-modify-write cycle of each mutation never
-/// interleaves with another task and never stalls the turn.
+/// The whole payload runs under the storage lock of the plan engine and off the
+/// async executor thread, as one transaction that reads each stored plan once, so
+/// the read-modify-write cycle of a mutation never interleaves with another task
+/// and never stalls the turn.
 async fn apply_turn_plans(
     repo_root: &Path,
     plans: &[DiscussionPlanUpdate],
@@ -97,24 +98,24 @@ async fn apply_turn_plans(
     let root = repo_root.to_path_buf();
     let plans_vec = plans.to_vec();
     match crate::blocking::run_blocking_async(move || {
+        // The whole payload settles as one storage transaction: the batch takes
+        // the storage lock and reads each stored plan once, instead of acquiring
+        // the lock and re-reading the repository for every mutation.
+        let outcomes =
+            PlanStorage::apply_discussion_plan_updates_with_mode(&root, &plans_vec, mode);
         let mut settlement = PlanSettlement::default();
-        for plan_update in &plans_vec {
-            let outcome =
-                PlanStorage::apply_discussion_plan_update_with_mode(&root, plan_update, mode);
+        for (plan_update, outcome) in plans_vec.iter().zip(outcomes) {
             for rejection in &outcome.errors {
                 tracing::warn!("Plan update rejected: {}", rejection.message);
             }
-            settlement.plan_errors.extend(outcome.errors);
             for warning in &outcome.warnings {
                 tracing::warn!("Plan mutation normalized: {}", warning);
             }
-            settlement.plan_warnings.extend(outcome.warnings);
             if plan_update.action == DiscussionPlanAction::Save && !outcome.applied.is_empty() {
                 settlement.plan_saved = true;
             }
-            for plan in outcome.applied {
-                let _ = PlanStorage::save_active_id(&root, Some(&plan.id));
-            }
+            settlement.plan_errors.extend(outcome.errors);
+            settlement.plan_warnings.extend(outcome.warnings);
         }
         settlement
     })

@@ -492,28 +492,11 @@ fn addressed_text(
 mod tests {
     use super::{AnchorEdit, StagingSimulator};
     use crate::edits::anchor::encode_anchor;
+    use crate::test_paths::scratch_dir;
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Creates a unique temporary directory for a single test case.
-    fn unique_test_dir() -> PathBuf {
-        let seq = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "tauqe-stream-blocking-{}-{}",
-            std::process::id(),
-            seq
-        ));
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        dir
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reads_files_and_moves_without_stalling_the_runtime() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "hello world").expect("write source file");
 
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
@@ -565,7 +548,7 @@ mod tests {
 
     #[test]
     fn anchored_batch_reports_the_replaced_ranges_of_the_snapshot() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\ngamma\n")
             .expect("write source file");
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
@@ -609,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_rejected_anchored_batch_leaves_the_staged_content_untouched() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\n").expect("write source file");
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
 
@@ -640,7 +623,7 @@ mod tests {
 
     #[test]
     fn a_seeded_snapshot_wins_over_the_file_on_disk() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\ngamma\n")
             .expect("write source file");
         // The change set starts from content an earlier attempt already staged,
@@ -668,7 +651,7 @@ mod tests {
 
     #[test]
     fn a_rangeless_replace_is_rejected_with_the_staging_classification() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\n").expect("write source file");
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
 
@@ -691,7 +674,7 @@ mod tests {
     }
     #[test]
     fn a_replacement_reports_the_lines_it_addresses() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\ngamma\n")
             .expect("write source file");
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
@@ -713,7 +696,7 @@ mod tests {
 
     #[test]
     fn an_indentation_shifted_replacement_reports_the_lines_it_addresses() {
-        let repo_root = unique_test_dir();
+        let repo_root = scratch_dir("stream-blocking");
         std::fs::write(
             repo_root.join("source.txt"),
             "impl Test {\n        fn run() {\n            let a = 1;\n        }\n}\n",

@@ -29,6 +29,7 @@ use tauqe_protocol::{
 use tokio::sync::mpsc;
 
 use crate::handlers::common::withdraw_streamed_attempt;
+use crate::reap::abort_and_reap;
 use crate::state::{next_operation_id, AppState};
 
 use super::analysis::run_review_post_analysis;
@@ -261,7 +262,7 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
     tokio::spawn(async move {
         let state = state_for_spawn;
         let op_id = op_id_for_spawn;
-        let cancel_rx = operation.cancel_receiver();
+        let mut cancel_rx = operation.cancel_receiver();
         // Open the shared usage ledger before the provider call: this audit
         // reports both the usage the provider returns and the duration the
         // harness measures, so every operation kind feeds one snapshot.
@@ -296,7 +297,19 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         let mut failure: Option<String> = None;
         let mut stream_cancelled = false;
 
+        // The relay is the highest-rate producer of the whole audit: the summary
+        // arrives at token granularity, so a client that keeps its pipe open but
+        // stopped reading pauses the relay here instead of growing the outbound
+        // queue for the rest of the review. Only the arms that break this loop
+        // are exempted, because they publish the terminal notice of the audit: a
+        // stall must never delay the cancellation or the failure it reports.
         while let Some(event) = rx.recv().await {
+            if !matches!(
+                event,
+                StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
+            ) {
+                state.out.wait_for_headroom(&mut cancel_rx).await;
+            }
             match event {
                 StreamEvent::ReasoningDelta(delta) => emit(
                     &state.out,
@@ -363,12 +376,32 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         let reported_usage = usage.unwrap_or_default();
         usage_guard.observe(&reported_usage).await;
         usage_guard.flush().await;
-        let usage_snapshot = state.usage.lock().await.clone();
+        let usage_snapshot = state.usage_snapshot().await;
+
+        // The consumed tokens are published before any early return, exactly as
+        // a review group publishes its own usage: an interrupted or failed audit
+        // is charged to the session, so the client observes that charge instead
+        // of watching the session cost grow with no event behind it. The session
+        // total comes from the authoritative ledger rather than a second,
+        // independently accumulated counter.
+        let session_total_cost = usage_snapshot.session.cost;
+        let cost = reported_usage.cost.unwrap_or(0.0);
+        emit(
+            &state.out,
+            events::MODEL_USAGE,
+            serde_json::to_value(ModelUsageEvent {
+                operation_id: op_id.clone(),
+                usage: reported_usage.clone(),
+                session_total_cost,
+                current_cost: Some(cost),
+            })
+            .ok(),
+        );
 
         let cancelled = *cancel_rx.borrow() || stream_cancelled;
 
         if cancelled {
-            stream_task.abort();
+            let _ = abort_and_reap(&op_id, "review-synthesis-stream", stream_task).await;
             emit(
                 &state.out,
                 events::REVIEW_CANCELLED,
@@ -377,7 +410,7 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
             return;
         }
         if let Some(message) = failure {
-            stream_task.abort();
+            let _ = abort_and_reap(&op_id, "review-synthesis-stream", stream_task).await;
             emit_error(&state.out, &op_id, message);
             return;
         }
@@ -528,22 +561,6 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         }
 
         let usage = reported_usage;
-        let cost = usage.cost.unwrap_or(0.0);
-        // The session total comes from the authoritative ledger rather than a
-        // second, independently accumulated counter.
-        let session_total_cost = usage_snapshot.session.cost;
-
-        emit(
-            &state.out,
-            events::MODEL_USAGE,
-            serde_json::to_value(ModelUsageEvent {
-                operation_id: op_id.clone(),
-                usage: usage.clone(),
-                session_total_cost,
-                current_cost: Some(cost),
-            })
-            .ok(),
-        );
         emit(
             &state.out,
             events::REVIEW_FINISHED,
@@ -856,7 +873,7 @@ async fn start_preset_review(
             cost: report.usage.cost,
         };
         let current_cost = report.usage.cost.unwrap_or(0.0);
-        let session_total_cost = state.usage.lock().await.session.cost;
+        let session_total_cost = state.usage_snapshot().await.session.cost;
         emit(
             &state.out,
             events::REVIEW_FINISHED,

@@ -141,6 +141,11 @@ pub fn plan_update_schema() -> &'static serde_json::Value {
 /// that owns it, so a nested tree of any depth validates against the very same
 /// contract as its root. Every field of `ConceptItem` and `PlanItem` appears
 /// exactly once, and the `status` enum is generated from [`PlanItemStatus`], so
+/// a variant the model gains or loses cannot drift away from the schema the
+/// model reads: the builder matches the enum exhaustively, and a test pins
+/// every generated spelling to the serde representation that travels on the
+/// wire.
+///
 /// The definitions are assembled once and served by a shared reference, so a
 /// consumer that embeds them clones the reference once instead of paying a
 /// per-call deep copy of both trees.
@@ -382,7 +387,13 @@ fn review_decision_status_enum() -> serde_json::Value {
 ///
 /// Guarantees that the `message` string property is listed first in `properties`
 /// and `required` so language models emit conversational text before plan
-/// updates or context requests. The ordering relies on `serde_json`'s
+/// updates or context requests. That order survives only because the protocol
+/// crate enables `serde_json`'s `preserve_order` feature (see
+/// `crates/protocol/Cargo.toml`), which switches JSON objects from a
+/// `BTreeMap` to an insertion-ordered `IndexMap`. Dropping that feature would
+/// silently re-sort `properties` alphabetically and push `message` out of
+/// first position.
+///
 /// The schema is assembled once and served by a shared reference, so the
 /// discussion request path composes its payload by borrowing this value instead
 /// of deep-copying the whole tree, `$defs` included.

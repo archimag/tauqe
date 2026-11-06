@@ -857,8 +857,7 @@ mode = "light"
 
     #[test]
     fn test_write_atomically_replaces_content_without_leftover_temp_files() {
-        let dir = std::env::temp_dir().join(format!("tauqe_cfg_atomic_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = crate::testing::scratch_dir("config-atomic");
         let path = dir.join("tui.toml");
 
         write_atomically(&path, "[input]\nlayout = \"none\"\n").expect("first write");
@@ -908,11 +907,7 @@ mode = "light"
     /// file beside `tui.toml`.
     #[test]
     fn test_write_atomically_reclaims_the_sibling_when_the_rename_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe_cfg_atomic_rename_fail_{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = crate::testing::scratch_dir("config-rename-fail");
         let path = dir.join("tui.toml");
         // An existing directory cannot be replaced by a file, so the rename
         // fails after the content was already staged.

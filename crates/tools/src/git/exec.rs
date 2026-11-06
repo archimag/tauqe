@@ -50,10 +50,6 @@ pub const TERMINATION_GRACE: Duration = Duration::from_millis(300);
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 
-/// The signal that carries no payload and only probes group membership.
-#[cfg(unix)]
-const SIG_EXISTENCE: i32 = 0;
-
 /// The wall-clock budget and the cancellation signal a Git child runs under.
 pub struct GitDeadline {
     timeout_secs: u64,
@@ -373,66 +369,59 @@ fn spawn_stdin_writer(
 /// the group then has `TERMINATION_GRACE` to disappear. Only a group that
 /// outlives that window is killed outright.
 ///
-/// The group is signalled while the direct child is still unreaped, so the
-/// leader's pid cannot have been recycled and every descendant the child
-/// spawned is addressed together with it. A platform without process groups
-/// kills the direct child alone.
+/// Every group signal is sent while the direct child is still unreaped. An
+/// unreaped child, live or zombie, keeps its pid reserved, so the kernel cannot
+/// recycle that pid into a new process group that a negative-pid signal would
+/// then destroy. A reap taken earlier to learn whether the group emptied would
+/// release exactly that anchor. A platform without process groups kills the
+/// direct child alone.
 fn terminate(child: &mut Child) {
     let pid = child.id();
     #[cfg(unix)]
+    wind_down_group(child, pid);
+    #[cfg(not(unix))]
     {
-        if wind_down_group(child, pid) {
-            return;
-        }
+        crate::toolchain::exec::kill_process_group(pid);
+        let _ = child.kill();
+        let _ = child.wait();
     }
+}
+
+/// Completes the Unix teardown of the child and its process group.
+///
+/// The group receives `SIGTERM` first, so Git and the hooks it runs can flush
+/// their state and remove the lock files they created. A signal that reaches no
+/// member ends the teardown at once: nothing is left to wind down, and no group
+/// signal follows the reap of the leader.
+///
+/// Otherwise the teardown spends the whole `TERMINATION_GRACE` window without
+/// reaping the leader, kills the group outright, and reaps the leader only
+/// after that forceful signal. The leader stays unreaped throughout, so its pid
+/// still reserves its process group and the negative-pid kill cannot reach an
+/// unrelated group that may have inherited a recycled pid.
+///
+/// The fast exit for a group that empties inside the window is deliberately
+/// given up: observing it required reaping the leader, because a zombie leader
+/// keeps its group alive and masks any probe of the group. The forceful signal
+/// is therefore decided blind, which is harmless to a group whose only member
+/// is the zombie leader.
+#[cfg(unix)]
+fn wind_down_group(child: &mut Child, pid: u32) {
+    if !signal_process_group(pid, SIGTERM) {
+        // No member of the group could be signalled, so nothing is left to
+        // wind down. Only the leader is left to be reaped.
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+
+    std::thread::sleep(TERMINATION_GRACE);
+    // The leader is still unreaped here, so its pid cannot have been recycled
+    // into an unrelated process group that the negative-pid signal would then
+    // destroy.
     crate::toolchain::exec::kill_process_group(pid);
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// Asks the whole process group to wind down and waits out the grace period.
-///
-/// Returns `true` when the group is gone and the direct child is reaped, so no
-/// forceful signal is needed, and `false` when a member outlived the grace
-/// period. The group is probed only after the leader is reaped, because a
-/// zombie leader keeps its group alive.
-#[cfg(unix)]
-fn wind_down_group(child: &mut Child, pid: u32) -> bool {
-    if !signal_process_group(pid, SIGTERM) {
-        // The group is already gone, so the leader is at most a zombie waiting
-        // to be reaped and a signal would only address a recycled pid.
-        let _ = child.try_wait();
-        return true;
-    }
-
-    let started = Instant::now();
-    let mut interval = POLL_FLOOR;
-    let mut reaped = false;
-    loop {
-        if !reaped {
-            match child.try_wait() {
-                Ok(Some(_)) => reaped = true,
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        group = pid,
-                        reason = %err,
-                        "git child status probe failed while its group was winding down"
-                    );
-                    return false;
-                }
-            }
-        }
-        if reaped && !signal_process_group(pid, SIG_EXISTENCE) {
-            return true;
-        }
-        let remaining = TERMINATION_GRACE.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return false;
-        }
-        std::thread::sleep(interval.min(remaining));
-        interval = (interval * 2).min(POLL_CEILING);
-    }
 }
 
 /// Signals every member of the process group led by `pid`.
@@ -649,6 +638,61 @@ mod tests {
         assert!(
             !lock.exists(),
             "the cancelled invocation left the lock behind"
+        );
+    }
+    /// A descendant that outlives the polite window is killed by the forceful
+    /// group signal, and the leader stays unreaped until after that signal.
+    ///
+    /// The leader exits on `SIGTERM` at once, so only its zombie keeps the
+    /// process group reserved. The descendant ignores the polite signal and
+    /// keeps writing a heartbeat, and must stop exactly when the forceful
+    /// signal reaches the group after the grace window; the teardown then reaps
+    /// the leader, so no zombie survives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_descendant_is_killed_after_the_grace_period_and_the_leader_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = dir.path().join("heartbeat.log");
+        let mut child = spawn_group_fixture(
+            dir.path(),
+            "trap 'exit 0' TERM; sh -c 'trap \"\" TERM; while :; do echo tick >> heartbeat.log; sleep 0.05; done' & : > ready; while :; do sleep 0.05; done",
+        );
+        assert!(
+            wait_for_file(&dir.path().join("ready")),
+            "the fixture never started"
+        );
+        assert!(
+            wait_for_file(&heartbeat),
+            "the descendant never wrote its heartbeat"
+        );
+
+        let started = Instant::now();
+        terminate(&mut child);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= TERMINATION_GRACE,
+            "the descendant was killed before its polite window expired: {elapsed:?}"
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the teardown left the leader unreaped"
+        );
+
+        // A write that was already in flight when the descendant died lands
+        // before the baseline, so the comparison observes only writes the
+        // teardown failed to stop.
+        std::thread::sleep(Duration::from_millis(150));
+        let size_at_kill = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        std::thread::sleep(TERMINATION_GRACE);
+        let size_later = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            size_at_kill, size_later,
+            "the descendant kept writing after the forceful group signal"
         );
     }
 }

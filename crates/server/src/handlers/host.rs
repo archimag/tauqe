@@ -493,6 +493,7 @@ impl ImplementationHost for ServerImplementationHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use tauqe_core::plan::storage::PlanStorage;
     use tauqe_protocol::model::TurnWorkItem;
     use tauqe_protocol::{Plan, PlanItem};
@@ -602,14 +603,7 @@ mod tests {
 
     #[test]
     fn the_active_step_declares_the_external_documents_it_preloads() {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-host-outer-docs-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("create the scratch repository root");
+        let root = scratch_root("host-outer-docs");
         let plan = Plan::from_parts(
             "outer-docs-plan".to_string(),
             "Outer Docs Plan".to_string(),
@@ -681,8 +675,9 @@ mod tests {
             plan_id: "absent".to_string(),
             step_id: None,
         };
-        let root = std::env::temp_dir().join("tauqe-host-absent-scope");
+        let root = scratch_root("host-absent-scope");
 
         assert!(ServerImplementationHost::declared_outer_docs(&scope, &queue, &root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

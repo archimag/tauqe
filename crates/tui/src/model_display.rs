@@ -170,7 +170,7 @@ fn collect_roles(summary: Option<&ModelRolesSummary>) -> HashMap<ModelRole, Mode
         (ModelRole::Scribe, &summary.scribe),
         (ModelRole::Coder, &summary.coder),
         (ModelRole::Architect, &summary.architect),
-        (ModelRole::Primary, &summary.primary),
+        (ModelRole::REPL, &summary.primary),
         (ModelRole::Reviewer, &summary.reviewer),
     ]
     .into_iter()
@@ -190,7 +190,7 @@ fn role_effort(summary: &ModelRolesSummary, role: ModelRole) -> Option<Reasoning
         ModelRole::Scribe => efforts.scribe,
         ModelRole::Coder => efforts.coder,
         ModelRole::Architect => efforts.architect,
-        ModelRole::Primary => efforts.primary,
+        ModelRole::REPL => efforts.primary,
         ModelRole::Reviewer => efforts.reviewer,
     }
 }
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(coder.effort, Some(ReasoningEffort::High));
         assert_eq!(entry_label(&coder), "DeepSeek Flash [high]");
 
-        let primary = role_entry(ModelRole::Primary).expect("primary entry");
+        let primary = role_entry(ModelRole::REPL).expect("primary entry");
         assert_eq!(primary.model, flash());
         assert_eq!(primary.effort, None);
         assert_eq!(entry_label(&primary), "Gemini Flash");

@@ -591,7 +591,7 @@ position.
 **Coder ladder escalation** is the parallel, intra-role mechanism for execution
 failures (*Model Roles and the Coder Ladder*). With `models.auto_level_up` enabled,
 a step that still fails after healing is rolled back to its pre-step checkpoint and
-re-asked on the same coder rung, up to `develop.max_tier_attempts` attempts; files
+re-asked on the same coder rung, up to `repl.max_tier_attempts` attempts; files
 found during discovery stay in context. Only an exhausted tier advances one rung, and
 the new rung starts with a fresh budget of its own. Escalation never crosses the role
 boundary, and it saturates: the last rung is the last attempt.
@@ -679,7 +679,6 @@ it, and the slot stays registered for as long as one of them runs.
 | `Tab` / `Space` | fold or unfold the selected section or node |
 | `a` | fold or unfold every plan and section |
 | `Enter` / `x` | execute the selected leaf, group, or plan, with confirmation |
-| `X` | start the plan pipeline over every ready plan |
 | `X` | start the plan pipeline over every ready plan |
 | `N` | open the two-phase plan creation dialog |
 | `d` | discuss the selected concept node, step, or the whole plan in Develop |

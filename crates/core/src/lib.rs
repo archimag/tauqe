@@ -25,6 +25,9 @@ pub mod providers;
 // transition lasts.
 pub use tauqe_tools::repomap;
 pub mod review;
+// Deterministic scratch paths shared by the unit tests of this crate.
+#[cfg(test)]
+pub(crate) mod test_paths;
 pub mod toolchain;
 pub mod workflow;
 

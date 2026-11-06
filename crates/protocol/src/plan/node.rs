@@ -7,7 +7,12 @@ use super::implementation::{id_key, PlanImplementation};
 use super::item::{ConceptItem, PlanItem, PlanItemStatus};
 
 /// Structured validation errors representing plan integrity violations.
+///
+/// The report is part of the exported wire contract, so its variants travel
+/// under snake_case tags like every other enum of the crate, instead of under
+/// their Rust-side PascalCase spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanValidationError {
     EmptyItemId,
     EmptyConceptId,
@@ -262,6 +267,63 @@ impl Plan {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlanValidationError;
+
+    /// The validation report is part of the exported wire contract, so its
+    /// shape is pinned variant by variant: an externally tagged enum whose
+    /// tags follow the snake_case convention every other exported enum uses.
+    ///
+    /// No consumer persisted a report before this shape existed, so the names
+    /// are fixed here before the first one could freeze another scheme.
+    #[test]
+    fn test_plan_validation_error_wire_tags_are_snake_case() {
+        let duplicate_item = PlanValidationError::DuplicateItemId("1".to_string());
+        let duplicate_concept = PlanValidationError::DuplicateConceptId("c-1".to_string());
+        let missing_dependency = PlanValidationError::MissingDependency {
+            item_id: "2".to_string(),
+            depends_on: "1".to_string(),
+        };
+        let self_dependency = PlanValidationError::SelfDependency("1".to_string());
+        let cyclic = PlanValidationError::CyclicDependency(vec!["A".to_string()]);
+        let missing_concept = PlanValidationError::MissingConceptRef {
+            item_id: "1".to_string(),
+            concept_ref: "c-1".to_string(),
+        };
+        let missing_files = PlanValidationError::MissingLeafFiles {
+            item_id: "1".to_string(),
+        };
+
+        let cases = [
+            (PlanValidationError::EmptyItemId, r#""empty_item_id""#),
+            (PlanValidationError::EmptyConceptId, r#""empty_concept_id""#),
+            (duplicate_item, r#"{"duplicate_item_id":"1"}"#),
+            (duplicate_concept, r#"{"duplicate_concept_id":"c-1"}"#),
+            (
+                missing_dependency,
+                r#"{"missing_dependency":{"item_id":"2","depends_on":"1"}}"#,
+            ),
+            (self_dependency, r#"{"self_dependency":"1"}"#),
+            (cyclic, r#"{"cyclic_dependency":["A"]}"#),
+            (
+                missing_concept,
+                r#"{"missing_concept_ref":{"item_id":"1","concept_ref":"c-1"}}"#,
+            ),
+            (missing_files, r#"{"missing_leaf_files":{"item_id":"1"}}"#),
+        ];
+
+        for (error, expected) in cases {
+            let encoded = serde_json::to_string(&error).unwrap();
+            assert_eq!(encoded, expected, "{error}");
+
+            // A client that persisted the report decodes it back unchanged.
+            let decoded: PlanValidationError = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, error);
         }
     }
 }

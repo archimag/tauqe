@@ -29,11 +29,11 @@ Autonomy is granted only inside a single bounded turn. The moment the turn concl
 TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model roles. Each role keeps a single mandate and never absorbs the responsibility of another:
 - **Architect** owns the *What*: high-level decomposition, system invariants, and conceptual boundaries. It produces plans and concept nodes, not concrete source lines.
 - **Coder** owns the *How*: minimal, coherent, compiling code changes that resolve one well-posed step.
-- **Primary** owns the interactive engineering dialogue and is the mandatory base role: its first entry is the idle active model and the deterministic default for every specialized role that omits its own list.
+- **Repl** owns the interactive engineering dialogue and is the mandatory base role: its first entry is the idle active model and the deterministic default for every specialized role that omits its own list.
 - **Reviewer** performs analytical, read-only inspection and emits findings; it never modifies files.
 - **Scribe** handles history compaction, turning long multi-turn transcripts into dense, lossless context.
 
-Each role is configured as an ordered list of model entries. `primary` is mandatory, and any specialized role without its own list inherits the full `primary` list.
+Each role is configured as an ordered list of model entries. `repl` is mandatory, and any specialized role without its own list inherits the full `repl` list.
 
 The Architect/Coder boundary is deliberately rigid. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Escalation stays intra-role: the *coder ladder* promotes execution to a stronger coder tier (a model paired with a reasoning effort) within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce.
 
@@ -55,7 +55,7 @@ The book is organized into five orthogonal parts. Each significant concept lives
 
 - **[Philosophy: The Semantic Harness](ch01-foundations/semantic-harness.md)** — Core mission, the literal harness metaphor, and the architectural comparison against agentic loops and manual context logisticians.
 - **[The Autonomous Bounded Turn FSM](ch01-foundations/bounded-turn-fsm.md)** — The deterministic finite-state turn: Research, in-memory staging, patch retry resilience, verification healing, and rollback.
-- **[Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)** — The mandatory primary role, specialized role lists, the coder and architect ladders, and decision immutability.
+- **[Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)** — The mandatory `repl` role, specialized role lists, the coder and architect ladders, and decision immutability.
 - **[Turn Scratchpad](ch01-foundations/turn-scratchpad.md)** — Turn-local working memory and its isolation from persisted history.
 
 ### Part II — Context Perception & Discovery

@@ -102,8 +102,32 @@ impl ReasoningState {
             .map_or(0, |head| head.matches('\n').count());
         self.text.drain(..cut);
         self.truncated_lines = self.truncated_lines.saturating_add(dropped_lines);
-        self.newline_count = self.newline_count.saturating_sub(dropped_lines);
-        self.tail_consumed = self.tail_consumed.saturating_sub(cut);
+        if cut < self.tail_consumed {
+            // The cut stops inside the prefix the rolling window already
+            // consumed, so every dropped line is one the counter recorded and
+            // the partial line `pending` is assembling starts after the cut.
+            self.newline_count = self.newline_count.saturating_sub(dropped_lines);
+            self.tail_consumed = self.tail_consumed.saturating_sub(cut);
+        } else {
+            self.restart_window();
+        }
+    }
+
+    /// Restarts the rolling window at the front of the retained text.
+    ///
+    /// A single delta can cross the retention cap on its own, and the trim it
+    /// triggers then reaches past the window cursor, so the whole committed
+    /// prefix falls out of the transcript. Its lines are already charged to
+    /// `truncated_lines`, hence the counter restarts from the retained text:
+    /// the committed lines, the partial line `pending` was assembling out of
+    /// dropped bytes, and the cursor itself all go with the prefix. Keeping
+    /// any of them would splice the dropped prefix into the first retained
+    /// line on the next fold and let the counters disagree with the transcript.
+    fn restart_window(&mut self) {
+        self.tail.clear();
+        self.pending.clear();
+        self.newline_count = 0;
+        self.tail_consumed = 0;
     }
 
     /// Byte offset of the first line boundary at or after `overflow`.
@@ -604,6 +628,53 @@ mod tests {
             state.total_lines(),
             repeats,
             "dropping the oldest lines must not reset the reasoning counter"
+        );
+    }
+
+    #[test]
+    fn oversized_delta_never_splices_the_dropped_prefix_into_the_window() {
+        let mut state = ReasoningState::new();
+        state.append_delta("dropped line\nstale partial line");
+        // A delta larger than half the cap crosses the retention threshold on
+        // its own, so the trim it triggers lands past the window cursor.
+        const BULK_LINE: &str = "retained line\n";
+        let bulk = BULK_LINE.repeat((REASONING_MAX_BYTES / BULK_LINE.len()) + 32);
+        state.append_delta(&bulk);
+
+        assert!(
+            state.truncated_lines() > 0,
+            "the bulk delta must trim the transcript"
+        );
+        let rendered = rendered_text(&state);
+        assert!(
+            !rendered.contains("stale partial"),
+            "the partial line assembled from dropped bytes must not survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("dropped line"),
+            "the live window must not show lines the trim dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("retained line"),
+            "the retained transcript must stay visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn oversized_delta_never_rewinds_the_line_counter() {
+        let mut state = ReasoningState::new();
+        state.append_delta("first line\nsecond line\n");
+        let before = state.total_lines();
+        assert_eq!(before, 2, "the short transcript holds two lines");
+
+        const BULK_LINE: &str = "fresh line\n";
+        let repeats = (REASONING_MAX_BYTES / BULK_LINE.len()) + 32;
+        state.append_delta(&BULK_LINE.repeat(repeats));
+
+        assert_eq!(
+            state.total_lines(),
+            before + repeats,
+            "the counter must report the whole reasoning, dropped prefix included"
         );
     }
 

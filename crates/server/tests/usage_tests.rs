@@ -134,19 +134,24 @@ fn expect_ok(response: Value) -> Value {
         .unwrap_or_else(|| panic!("the daemon answered without a result: {response}"))
 }
 
+/// Derives the scratch directory hosting one daemon run.
+///
+/// nextest executes every test in its own process with the counters reset, so
+/// the process id isolates the concurrently running test binaries, while the
+/// atomic counter isolates the tests that share a single process under
+/// `cargo test`.
+fn scratch_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tauqe-{tag}-{}-{unique}", std::process::id()))
+}
+
 /// Temporary git repository hosting one daemon run.
 struct TempRepo(PathBuf);
 
 impl TempRepo {
     fn new(label: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-usage-it-{}-{}-{}",
-            std::process::id(),
-            label,
-            unique
-        ));
+        let root = scratch_dir(&format!("usage-it-{label}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("the temporary repository is created");
         tauqe_core::git::init_repository(Some(&root), true).expect("the repository is initialized");

@@ -30,7 +30,7 @@ use self::projection::{
 pub use self::render::render_review_view;
 pub(crate) use self::tree::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
-    issue_type_badge, issue_type_style, location, measure_review_rows, model_badge,
+    issue_type_badge, issue_type_style, location, measure_review_rows_from, model_badge,
     plan_status_style,
 };
 
@@ -494,39 +494,30 @@ impl ReviewViewState {
     pub fn max_scroll(&self) -> u16 {
         let max = self
             .rendered_lines
-            .saturating_sub(self.view_height as usize);
+            .saturating_sub(usize::from(self.view_height));
         u16::try_from(max).unwrap_or(u16::MAX)
     }
 
-    /// Scrolls the viewport just enough to reveal the selected row.
-    ///
-    /// This is the only place that moves the viewport because of the cursor:
-    /// free scrolling (wheel, paging) belongs to the developer and is never
-    /// re-anchored on a redraw (c-1). A row that fits on one screen is revealed
-    /// in full from its top edge, and a row taller than the viewport keeps any
-    /// position already resting inside it, so its lower lines stay reachable
-    /// instead of being pinned to the first screenful (c-2).
+    /// Positions the viewport on the selected row so the cursor stays visible.
     pub fn scroll_to_selected(&mut self) {
-        let rows = self.flatten_rows();
-        if rows.is_empty() || self.view_height == 0 {
+        if self.view_height == 0 {
             return;
         }
-        let sel = self.selected_index.min(rows.len() - 1);
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let sel = self.selected_index.min(count - 1);
         self.selected_index = sel;
 
-        // The measuring walk shares every break decision with the renderer, so
-        // the selected row's bounds are read without materializing the document
-        // or re-cloning a single cached body (c-1, c-2).
-        let (offsets, rendered_lines) = measure_review_rows(
-            &rows,
-            sel,
-            self.content_width.max(10),
-            self.theme_mode,
-            &mut self.markdown_cache,
-        );
+        // The measuring walk shares every break decision with the renderer and
+        // stops on the selected row, so its bounds are read without
+        // materializing the projection, without walking the rows below it, and
+        // without re-cloning a single cached body (c-1, c-2).
+        let (offsets, measured_height) = self.measure_rows(sel, sel);
         let height = self.view_height as usize;
         let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(rendered_lines);
+        let end = offsets.get(sel + 1).copied().unwrap_or(measured_height);
         let scroll = self.scroll as usize;
 
         let new_scroll = if end.saturating_sub(start) <= height {
@@ -557,25 +548,47 @@ impl ReviewViewState {
     /// Positions the viewport around the selected review row using the three-beat
     /// Emacs `recenter-top-bottom` cycle (center -> top -> bottom).
     pub fn recenter_selected(&mut self) {
-        let rows = self.flatten_rows();
-        if rows.is_empty() || self.view_height == 0 {
+        if self.view_height == 0 {
             return;
         }
-        let sel = self.selected_index.min(rows.len().saturating_sub(1));
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let sel = self.selected_index.min(count - 1);
         self.selected_index = sel;
 
-        let (offsets, rendered_lines) = measure_review_rows(
-            &rows,
-            sel,
-            self.content_width.max(10),
-            self.theme_mode,
-            &mut self.markdown_cache,
-        );
+        // The cycle clamps its bottom beat against the document length, so this
+        // measurement walks the whole tree — still without materializing a
+        // single owned row (c-1, c-2).
+        let (offsets, rendered_lines) = self.measure_rows(sel, usize::MAX);
         let start = offsets.get(sel).copied().unwrap_or(0);
         let end = offsets.get(sel + 1).copied().unwrap_or(rendered_lines);
         self.scroll =
             self.recenter_state
                 .recenter(sel, start, end, rendered_lines, self.view_height);
+    }
+
+    /// Measured line offsets and total height of the review tree.
+    ///
+    /// The lazy row walk borrows the mirrored sessions, while the Markdown cache
+    /// the rows render their bodies through is owned by the same state, so the
+    /// cache is taken out for the duration of the walk and put back afterwards.
+    /// Measuring therefore never materializes a single owned row (c-1, c-2).
+    fn measure_rows(&mut self, selected: usize, last_index: usize) -> (Vec<usize>, usize) {
+        let width = self.content_width.max(10);
+        let theme_mode = self.theme_mode;
+        let mut cache = std::mem::take(&mut self.markdown_cache);
+        let measured = measure_review_rows_from(
+            |visit| self.walk_rows(&mut |index, row| visit(index, &row)),
+            selected,
+            last_index,
+            width,
+            theme_mode,
+            &mut cache,
+        );
+        self.markdown_cache = cache;
+        measured
     }
 
     /// Accordion-style navigation: moves to the next or previous finding,
@@ -675,7 +688,7 @@ impl ReviewViewState {
                     for issue in items {
                         all_nodes.push(ReviewNodeRef {
                             session_id: session.id.clone(),
-                            section_id: None,
+                            section_id: Some(group_id.clone()),
                             item_id: Some(issue.id),
                             step_id: None,
                             ancestor_steps: Vec::new(),
@@ -710,6 +723,8 @@ impl ReviewViewState {
                     n.session_id == session_id
                         && !n.plan_branch
                         && n.section_id.as_deref() == Some(group_id.as_str())
+                        && n.item_id.is_none()
+                        && n.step_id.is_none()
                 })
                 .unwrap_or(0),
             Some(VisibleReviewRow::GroupPlanHeader {
@@ -762,6 +777,7 @@ impl ReviewViewState {
             return;
         };
 
+        let cur_node = all_nodes.get(cur_idx).cloned();
         let target = all_nodes[target_idx].clone();
 
         // Every session folds except the one owning the target, whose path the
@@ -776,20 +792,29 @@ impl ReviewViewState {
             }
         }
 
+        let cur_session_id = cur_node.as_ref().map(|n| n.session_id.as_str());
+        let cur_section = cur_node.as_ref().and_then(|n| n.section_id.as_deref());
+        let target_section = target.section_id.as_deref();
+
+        // When switching between groups, collapse the previous group.
+        if cur_section != target_section {
+            if let (Some(cur_sess), Some(old_sec)) = (cur_session_id, cur_section) {
+                self.collapsed_groups.insert(group_key(cur_sess, old_sec));
+            }
+        }
+
         // Reveal the target path: its section and every container step in the
         // way must be unfolded, so the cursor can rest on the row it walked to.
-        let session_prefix = format!("{}:g:", target.session_id);
-        if let Some(section_id) = target.section_id.as_deref() {
+        if let Some(section_id) = target_section {
             self.collapsed_groups
                 .remove(&group_key(&target.session_id, section_id));
+
             // The branch header and every step of the plan live inside the
-            // branch, so the branch itself must be unfolded for either of them
-            // to render (concept #c-1).
-            self.collapsed_plan_branches
-                .remove(&plan_branch_key(&target.session_id, section_id));
-        } else if target.item_id.is_some() {
-            self.collapsed_groups
-                .retain(|key| !key.starts_with(&session_prefix));
+            // branch, so unfold the plan branch only when navigating to it or into its steps.
+            if target.plan_branch || target.step_id.is_some() {
+                self.collapsed_plan_branches
+                    .remove(&plan_branch_key(&target.session_id, section_id));
+            }
         }
 
         self.expanded_items.clear();
@@ -802,7 +827,8 @@ impl ReviewViewState {
                 self.expanded_items
                     .insert(subplan_key(&target.session_id, section_id, step_id));
             }
-        } else if let Some(item_id) = target.item_id {
+        }
+        if let Some(item_id) = target.item_id {
             self.expanded_items
                 .insert(format!("{}:{}", target.session_id, item_id));
         }
@@ -827,7 +853,7 @@ impl ReviewViewState {
                 (VisibleReviewRow::GroupHeader { group_id, .. }, Some(section), None, None) => {
                     group_id == section
                 }
-                (VisibleReviewRow::ReviewItem { item_id, .. }, None, Some(tid), None) => {
+                (VisibleReviewRow::ReviewItem { item_id, .. }, _, Some(tid), None) => {
                     *item_id == tid
                 }
                 (
@@ -1199,6 +1225,89 @@ mod tests {
             view.selected_row(),
             Some(VisibleReviewRow::GroupPlanHeader { ref group_id, .. }) if group_id == "arch"
         ));
+    }
+
+    #[test]
+    fn test_accordion_navigation_folds_old_group_on_boundary_and_preserves_intra_group_folds() {
+        let mut session = make_session("rev-groups", &[1, 2, 3]);
+        session.groups = vec![
+            ReviewGroup {
+                id: "grp-a".to_string(),
+                title: "Group A".to_string(),
+                kind: ReviewGroupKind::Architectural,
+                ..Default::default()
+            },
+            ReviewGroup {
+                id: "grp-b".to_string(),
+                title: "Group B".to_string(),
+                kind: ReviewGroupKind::Simple,
+                ..Default::default()
+            },
+        ];
+        session.items[0].group = Some("grp-a".to_string());
+        session.items[1].group = Some("grp-a".to_string());
+        session.items[2].group = Some("grp-b".to_string());
+
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // Collapse Group B initially.
+        view.toggle_group_expanded("rev-groups", "grp-b");
+        assert!(!view.is_group_expanded("rev-groups", "grp-b"));
+        assert!(view.is_group_expanded("rev-groups", "grp-a"));
+
+        // Position on finding 1 in Group A (row 0: session, row 1: grp-a, row 2: finding 1).
+        view.selected_index = 2;
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::ReviewItem { item_id: 1, .. })
+        ));
+
+        // Navigating forward to finding 2 stays in Group A:
+        // Group A remains expanded, Group B remains collapsed.
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::ReviewItem { item_id: 2, .. })
+        ));
+        assert!(view.is_group_expanded("rev-groups", "grp-a"));
+        assert!(
+            !view.is_group_expanded("rev-groups", "grp-b"),
+            "navigating within Group A must not expand collapsed Group B"
+        );
+        assert!(view.is_item_expanded("rev-groups", 2));
+        assert!(!view.is_item_expanded("rev-groups", 1));
+
+        // Navigating forward crosses into Group B:
+        // Group A collapses, Group B expands!
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::GroupHeader { ref group_id, .. }) if group_id == "grp-b"
+        ));
+        assert!(
+            !view.is_group_expanded("rev-groups", "grp-a"),
+            "crossing group boundary must collapse the old group"
+        );
+        assert!(
+            view.is_group_expanded("rev-groups", "grp-b"),
+            "crossing group boundary must expand the new group"
+        );
+
+        // Navigating backward returns to Group A:
+        // Group B collapses, Group A expands!
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::ReviewItem { item_id: 2, .. })
+        ));
+        assert!(view.is_group_expanded("rev-groups", "grp-a"));
+        assert!(
+            !view.is_group_expanded("rev-groups", "grp-b"),
+            "navigating backward to Group A must collapse Group B"
+        );
     }
 
     #[test]

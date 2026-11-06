@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use serde::Deserialize;
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{
     CapabilitySet, DirListRequest, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability,
@@ -61,27 +62,23 @@ impl StructuredEditProtocol {
             };
         }
 
-        let mut edits = Vec::new();
-
-        for change in &proposal.changes {
-            match change_to_operation(change, editable_paths) {
-                Ok(operation) => edits.push(operation),
-                Err(message) => {
-                    return ModelResult::Edit {
-                        summary: format!("Invalid change: {}", message),
-                        edits: Vec::new(),
-                        proposal: Some(proposal),
-                        outcome: EditOutcome {
-                            applied: false,
-                            error: Some(message),
-                            changed_files: Vec::new(),
-                            commit_hash: None,
-                            verification: None,
-                        },
-                    };
-                }
+        let edits = match change_to_operations(&proposal.changes, editable_paths) {
+            Ok(edits) => edits,
+            Err(message) => {
+                return ModelResult::Edit {
+                    summary: format!("Invalid change: {}", message),
+                    edits: Vec::new(),
+                    proposal: Some(proposal),
+                    outcome: EditOutcome {
+                        applied: false,
+                        error: Some(message),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
+                        verification: None,
+                    },
+                };
             }
-        }
+        };
 
         let summary = if !proposal.message.trim().is_empty() {
             let first_line = proposal
@@ -223,27 +220,12 @@ impl StructuredEditProtocol {
 
     /// Extracts context requests from a structured proposal.
     pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
-        parse_proposal(raw_text)
-            .map(|p| {
-                p.context_requests
-                    .into_iter()
-                    .map(|request| ContextRequest {
-                        path: request.path,
-                        access: request.access,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        StructuredPayload::parse(raw_text).context_requests()
     }
 
     /// Extracts repository search requests from a structured proposal or fallback tags.
     pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
-        if let Some(proposal) = parse_proposal(raw_text) {
-            if !proposal.repo_searches.is_empty() {
-                return proposal.repo_searches;
-            }
-        }
-        super::xml::tags::parse_repo_search_tags(raw_text)
+        StructuredPayload::parse(raw_text).repo_searches()
     }
 
     /// Extracts targeted repository map requests from a structured proposal,
@@ -253,36 +235,14 @@ impl StructuredEditProtocol {
     /// rule, so an empty string or `.` names the whole repository while a
     /// traversal path is dropped instead of escaping it.
     pub fn parse_repo_maps(&self, raw_text: &str) -> Vec<String> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(entries) = value.get("repo_maps").and_then(|field| field.as_array()) {
-                let maps: Vec<String> = entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str())
-                    .filter_map(normalize_repo_map_path)
-                    .collect();
-                if !maps.is_empty() {
-                    return maps;
-                }
-            }
-        }
-        super::xml::tags::parse_repo_map_tags(raw_text)
-            .iter()
-            .filter_map(|path| normalize_repo_map_path(path))
-            .collect()
+        StructuredPayload::parse(raw_text).repo_maps()
     }
 
     /// Reports whether the model requested the compact repository directory
     /// tree, falling back to XML control tags when the JSON field is absent or
     /// reports no request.
     pub fn parse_repo_dirs(&self, raw_text: &str) -> bool {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(requested) = value.get("repo_dirs").and_then(|field| field.as_bool()) {
-                if requested {
-                    return true;
-                }
-            }
-        }
-        super::xml::tags::parse_repo_dirs_tags(raw_text)
+        StructuredPayload::parse(raw_text).repo_dirs()
     }
 
     /// Extracts directory content listing requests from the structured
@@ -295,25 +255,7 @@ impl StructuredEditProtocol {
     /// keeps the listing shallow, so a malformed entry narrows the result
     /// rather than failing it.
     pub fn parse_dir_lists(&self, raw_text: &str) -> Vec<DirListRequest> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(entries) = value.get("dir_lists").and_then(|field| field.as_array()) {
-                let requests: Vec<DirListRequest> = entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let path = entry.get("path").and_then(|field| field.as_str())?;
-                        let recursive = entry
-                            .get("recursive")
-                            .and_then(|field| field.as_bool())
-                            .unwrap_or(false);
-                        DirListRequest::new(path, recursive).normalized()
-                    })
-                    .collect();
-                if !requests.is_empty() {
-                    return requests;
-                }
-            }
-        }
-        super::xml::tags::parse_dir_list_tags(raw_text)
+        StructuredPayload::parse(raw_text).dir_lists()
     }
 
     /// Extracts requested documentation topics from the canonical
@@ -329,27 +271,7 @@ impl StructuredEditProtocol {
     /// tolerant `DocTopic::All` fallback the DTO boundary resolves it to, while
     /// an element of any other non-string shape is skipped.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
-        if let Some(value) = parse_json_object(raw_text) {
-            for field in ["tauqe_doc_requests", "doc_requests"] {
-                let Some(entries) = value.get(field).and_then(|entries| entries.as_array()) else {
-                    continue;
-                };
-                let topics: Vec<DocTopic> = entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        // A `null` element resolves to the tolerant fallback at
-                        // the DTO boundary, so the raw reader keeps the request
-                        // the DTO would keep instead of dropping it.
-                        serde_json::Value::Null => Some(DocTopic::All),
-                        other => other.as_str().map(DocTopic::parse_lossy),
-                    })
-                    .collect();
-                if !topics.is_empty() {
-                    return topics;
-                }
-            }
-        }
-        super::xml::tags::parse_doc_request_tags(raw_text)
+        StructuredPayload::parse(raw_text).doc_requests()
     }
 
     /// Extracts requested external documents from the structured
@@ -363,41 +285,13 @@ impl StructuredEditProtocol {
     /// materializing a declared document twice is decided by the phase that owns
     /// the round.
     pub fn parse_outer_doc_requests(&self, raw_text: &str) -> Vec<String> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(entries) = value
-                .get("outer_doc_requests")
-                .and_then(|field| field.as_array())
-            {
-                let ids: Vec<String> = entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str())
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if !ids.is_empty() {
-                    return ids;
-                }
-            }
-        }
-        let Some(spec) = engine::tag_spec("outer_doc_request") else {
-            return Vec::new();
-        };
-        engine::attribute_values_with_fences(raw_text, spec, "id", &CodeFences::find(raw_text))
+        StructuredPayload::parse(raw_text).outer_doc_requests()
     }
 
     /// Extracts ephemeral scratchpad notes from a structured proposal,
     /// falling back to XML control tags when the JSON field is absent.
     pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
-        if let Some(proposal) = parse_proposal(raw_text) {
-            if let Some(notes) = proposal.scratchpad.as_deref() {
-                let trimmed = notes.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        super::xml::tags::extract_scratchpad(raw_text)
+        StructuredPayload::parse(raw_text).scratchpad()
     }
 
     /// Extracts the terminal outcome from a structured proposal, falling back
@@ -407,69 +301,13 @@ impl StructuredEditProtocol {
     /// ends the turn exactly like success or error, so the fallback surfaces it
     /// as [`TerminalOutcome::Blocked`].
     pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
-        if let Some(proposal) = parse_proposal(raw_text) {
-            if let Some(outcome) = proposal.outcome {
-                let status = outcome.status.trim().to_ascii_lowercase();
-                match status.as_str() {
-                    "success" => {
-                        let commit_message = outcome
-                            .commit_message
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|commit_message| !commit_message.is_empty())
-                            .map(str::to_string);
-                        return Some(TerminalOutcome::Success { commit_message });
-                    }
-                    "error" => {
-                        let message = outcome
-                            .message
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|message| !message.is_empty())
-                            .unwrap_or("Execution error")
-                            .to_string();
-                        return Some(TerminalOutcome::Error { message });
-                    }
-                    "skip" | "skipped" => {
-                        let reason = outcome
-                            .reason
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|reason| !reason.is_empty())
-                            .unwrap_or("Step skipped without a stated reason")
-                            .to_string();
-                        return Some(TerminalOutcome::Skip { reason });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        super::xml::tags::extract_terminal_outcome(raw_text)
+        StructuredPayload::parse(raw_text).terminal_outcome()
     }
 
     /// Extracts a semantic blocker from a structured proposal, falling back to
     /// XML control tags when the JSON field is absent or reports no blocker.
     pub fn parse_blocked(&self, raw_text: &str) -> Option<(String, Option<String>)> {
-        if let Some(proposal) = parse_proposal(raw_text) {
-            if let Some(blocked) = proposal.blocked {
-                if blocked.is_blocked {
-                    let reason = blocked.reason.trim();
-                    let reason = if reason.is_empty() {
-                        "Execution blocked".to_string()
-                    } else {
-                        reason.to_string()
-                    };
-                    let details = blocked
-                        .details
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|details| !details.is_empty())
-                        .map(str::to_string);
-                    return Some((reason, details));
-                }
-            }
-        }
-        super::xml::tags::extract_blocked(raw_text)
+        StructuredPayload::parse(raw_text).blocked()
     }
 
     /// Extracts a semantic abort from a structured proposal, falling back to
@@ -481,32 +319,7 @@ impl StructuredEditProtocol {
     /// (`recommendation`). A report that states neither keeps a deterministic
     /// default instead of stopping the turn without a cause.
     pub fn parse_abort(&self, raw_text: &str) -> Option<(String, String)> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(abort) = value.get("abort").and_then(|field| field.as_object()) {
-                let is_aborted = abort
-                    .get("is_aborted")
-                    .and_then(|field| field.as_bool())
-                    .unwrap_or(false);
-                if is_aborted {
-                    let reason = abort
-                        .get("reason")
-                        .and_then(|field| field.as_str())
-                        .map(str::trim)
-                        .filter(|reason| !reason.is_empty())
-                        .unwrap_or("Execution aborted")
-                        .to_string();
-                    let recommendation = abort
-                        .get("recommendation")
-                        .and_then(|field| field.as_str())
-                        .map(str::trim)
-                        .filter(|recommendation| !recommendation.is_empty())
-                        .unwrap_or("No recommendation was stated.")
-                        .to_string();
-                    return Some((reason, recommendation));
-                }
-            }
-        }
-        abort_invocations(raw_text).into_iter().next()
+        StructuredPayload::parse(raw_text).abort()
     }
 
     /// Extracts typed project command invocations from the structured
@@ -518,81 +331,21 @@ impl StructuredEditProtocol {
     /// the harness at execution time, so decoding never rejects an invocation
     /// the project itself may accept.
     pub fn parse_custom_tools(&self, raw_text: &str) -> Vec<(String, serde_json::Value)> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(entries) = value.get("custom_tools").and_then(|field| field.as_array()) {
-                let invocations: Vec<(String, serde_json::Value)> = entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let name = entry
-                            .get("name")
-                            .and_then(|field| field.as_str())
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty())?;
-                        let args = entry
-                            .get("args")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        Some((name.to_string(), args))
-                    })
-                    .collect();
-                if !invocations.is_empty() {
-                    return invocations;
-                }
-            }
-        }
-        custom_tool_invocations(raw_text)
+        StructuredPayload::parse(raw_text).custom_tools()
     }
 
     /// Extracts a verification request from the structured `verify` field,
     /// falling back to XML control tags when the JSON field is absent or
     /// reports `none`.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(verify) = value.get("verify").and_then(|field| field.as_object()) {
-                let target = verify
-                    .get("target")
-                    .and_then(|field| field.as_str())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase();
-                if !target.is_empty() && target != "none" {
-                    let target = match target.as_str() {
-                        "check" => VerifyTarget::Check,
-                        "test" => VerifyTarget::Test,
-                        "clippy" => VerifyTarget::Clippy,
-                        _ => VerifyTarget::All,
-                    };
-                    let on_success = match verify
-                        .get("on_success")
-                        .and_then(|field| field.as_str())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_ascii_lowercase()
-                        .as_str()
-                    {
-                        "silent" => VerifyOnSuccess::Silent,
-                        _ => VerifyOnSuccess::Report,
-                    };
-                    return Some(VerifyRequest { target, on_success });
-                }
-            }
-        }
-        super::xml::tags::extract_verify_request(raw_text)
+        StructuredPayload::parse(raw_text).verify_request()
     }
 
     /// Extracts the detected user language from the structured `user_language`
     /// field, falling back to XML control tags when the field is absent or
     /// blank.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(language) = value.get("user_language").and_then(|field| field.as_str()) {
-                let trimmed = language.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        super::xml::tags::extract_user_language(raw_text)
+        StructuredPayload::parse(raw_text).user_language()
     }
 
     /// Extracts plan creation or modification payloads from the structured
@@ -612,28 +365,7 @@ impl StructuredEditProtocol {
         &self,
         raw_text: &str,
     ) -> Result<Vec<tauqe_protocol::DiscussionPlanUpdate>, String> {
-        let payload = parse_json_object(raw_text)
-            .and_then(|value| value.get("plan_update").cloned())
-            .filter(|plan_update| !plan_update.is_null());
-        if let Some(plan_update) = payload {
-            let decoded: Result<tauqe_protocol::DiscussionPlanUpdate, _> =
-                serde_json::from_value(plan_update);
-            let update = decoded.map_err(|error| format!("invalid plan_update: {error}"))?;
-            return Ok(vec![update]);
-        }
-        let (tags, diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(raw_text);
-        // A `<plan>` control tag is the second vehicle of the same mutation, so a
-        // structurally malformed container is a present payload the reader
-        // refuses: it is reported through the single error channel of this reader
-        // instead of degrading into "no plan update", and the bounded turn turns
-        // it into a `ProtocolError` command so a later round can repair it.
-        if !diagnostics.is_empty() {
-            return Err(format!(
-                "invalid <plan> payload in the structured response: {}",
-                diagnostics.join("; ")
-            ));
-        }
-        Ok(tags.into_iter().map(plan_tag_to_update).collect())
+        StructuredPayload::parse(raw_text).plan_updates()
     }
 
     /// Extracts a decision recorded for one review finding.
@@ -649,27 +381,18 @@ impl StructuredEditProtocol {
         &self,
         raw_text: &str,
     ) -> Result<Option<tauqe_protocol::review::ReviewUpdateProposal>, String> {
-        let field = match parse_json_object(raw_text) {
-            Some(value) => value.get("review_update").cloned(),
-            None => None,
-        };
-        let Some(payload) = field.filter(|review_update| !review_update.is_null()) else {
-            return Ok(None);
-        };
-        let decoded: Result<tauqe_protocol::review::ReviewUpdateProposal, _> =
-            serde_json::from_value(payload);
-        let decision = decoded.map_err(|error| format!("invalid review_update: {error}"))?;
-        Ok(Some(decision))
+        StructuredPayload::parse(raw_text).review_update()
     }
 
     /// Cleans model output for presentation and history.
     pub fn clean_assistant_text(&self, raw_text: &str) -> String {
-        clean_raw_json_or_text(raw_text)
+        StructuredPayload::parse(raw_text).clean_text()
     }
 
     /// Parses raw model text into a `ModelResult`.
     pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
-        if let Some(proposal) = parse_proposal(raw_text) {
+        let payload = StructuredPayload::parse(raw_text);
+        if let Some(proposal) = payload.into_proposal() {
             return self.proposal_to_model_result(proposal, editable_paths);
         }
 
@@ -683,33 +406,25 @@ impl StructuredEditProtocol {
     }
 }
 
-/// Robustly parses raw model text into a generic JSON object, tolerating code
-/// fences and surrounding prose.
+/// Locates and decodes the single JSON object a structured response carries.
 ///
-/// UTF-8 Slicing Invariant:
-/// Offsets `start` and `end` are derived strictly from ASCII byte matches:
-/// - `find('{')` locates the ASCII byte `0x7B`, so both `start` and `start + 1`
-///   are valid UTF-8 boundaries.
-/// - `balanced_object_end` terminates on matching ASCII `}` (`0x7D`), returning
-///   `i + 1`, which is also a valid UTF-8 boundary.
+/// A response may be the bare object, an object inside a markdown code fence, or
+/// an object quoted in wrapper prose, so the text is stripped of its fence and
+/// walked once for the first balanced object that actually deserializes. Every
+/// offset the walk yields follows an ASCII delimiter, so neither the scan nor the
+/// slice it produces can split a multi-byte character.
 ///
-/// Thus `&raw[start..end]` and `raw[from..]` never split multi-byte characters.
-///
-/// The structured proposal DTO does not model every control field (verification,
-/// detected language, and plan updates travel through dedicated decoders), so
-/// these fields are read straight from the parsed object.
-fn parse_json_object(raw: &str) -> Option<serde_json::Value> {
-    let clean = strip_code_fence(raw);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(clean) {
-        return Some(value);
-    }
-
+/// The flag reports whether that object is the whole response rather than a
+/// fragment quoted inside prose, which decides whether a response with no
+/// conversational channel collapses to nothing or keeps its prose.
+fn decode_response_object(raw: &str) -> Option<(serde_json::Value, bool)> {
+    let body = strip_code_fence(raw);
     let mut from = 0;
-    while let Some(rel) = raw[from..].find('{') {
-        let start = from + rel;
-        if let Some(end) = balanced_object_end(raw, start) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw[start..end]) {
-                return Some(value);
+    while let Some(relative) = body.get(from..).and_then(|rest| rest.find('{')) {
+        let start = from + relative;
+        if let Some(end) = balanced_object_end(body, start) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body[start..end]) {
+                return Some((value, start == 0 && end == body.len()));
             }
         }
         from = start + 1;
@@ -717,10 +432,610 @@ fn parse_json_object(raw: &str) -> Option<serde_json::Value> {
     None
 }
 
-/// Deserializes a structured proposal from the parsed JSON object, ignoring
-/// unknown fields and tolerating any key order.
-fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
-    parse_json_object(raw).and_then(|value| serde_json::from_value(value).ok())
+/// Collects the conversational channel of every JSON object the response carries.
+///
+/// A structured turn concatenates the rounds it received, so one payload may
+/// carry several responses, and wrapper prose may quote an object a model
+/// explained. Each object's `message` is read in document order, and a blank
+/// channel is dropped so a silent round adds no separator of its own. A decoded
+/// object owns the braces inside it, so the walk resumes after the object
+/// instead of descending into its payload.
+fn collect_json_messages(raw: &str) -> Vec<String> {
+    let body = strip_code_fence(raw);
+    let mut messages = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = body.get(from..).and_then(|rest| rest.find('{')) {
+        let start = from + relative;
+        let Some(end) = balanced_object_end(body, start) else {
+            break;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body[start..end]) {
+            let channel = value.get("message").and_then(|field| field.as_str());
+            if let Some(message) = channel {
+                let trimmed = message.trim();
+                if !trimmed.is_empty() {
+                    messages.push(trimmed.to_string());
+                }
+            }
+            from = end;
+        } else {
+            from = start + 1;
+        }
+    }
+    messages
+}
+
+/// Validates every declared change against the files the turn may address.
+fn change_to_operations(
+    changes: &[StructuredChangeProposal],
+    editable_paths: &[String],
+) -> Result<Vec<EditOperation>, String> {
+    changes
+        .iter()
+        .map(|change| change_to_operation(change, editable_paths))
+        .collect()
+}
+
+/// Decodes the XML change set of a response that carries no structured one.
+///
+/// The structured contour answers in JSON, so an XML change set is the one case
+/// a response written in the other transport is still applied instead of being
+/// silently ignored. Its own rejection travels through the same channel.
+fn xml_change_set(raw: &str, editable_paths: &[String]) -> Result<Vec<EditOperation>, String> {
+    if !super::xml::has_xml_edit_tags(raw) {
+        return Ok(Vec::new());
+    }
+    match super::xml::XmlEditProtocol.parse_output(raw, editable_paths) {
+        ModelResult::Edit { edits, outcome, .. } => match outcome.error {
+            Some(message) => Err(message),
+            None => Ok(edits),
+        },
+        ModelResult::Answer { .. } => Ok(Vec::new()),
+    }
+}
+
+/// One decoded structured response.
+///
+/// A structured round answers with a single JSON object, and every control field
+/// of that answer is read from this one decoding: the text is stripped of its code
+/// fence and walked for its object once, the object is decoded once, and the typed
+/// proposal is deserialized from that decoded object instead of from the text
+/// again. The cost of a round therefore no longer multiplies by the number of
+/// control fields the answer carries, which a research, patch-retry, or
+/// verification-healing cycle repeats many times inside one bounded turn.
+///
+/// A reader borrows what it needs, so one payload serves the conversational
+/// channel, the discovery requests, the project tool invocations, the terminal
+/// outcome, and the change set. [`StructuredPayload::change_set`] validates the
+/// change set without consuming the payload; only the transport's own
+/// [`StructuredEditProtocol::parse_output`] takes the proposal away.
+pub struct StructuredPayload<'a> {
+    /// The response text the payload was decoded from.
+    raw: &'a str,
+    /// The decoded JSON object, when the response carries one.
+    ///
+    /// The typed proposal does not model every control field, so verification,
+    /// detected language, plan updates, review decisions, project tool
+    /// invocations, and the external document identifiers are read straight from
+    /// this object.
+    object: Option<serde_json::Value>,
+    /// The typed proposal deserialized from `object`.
+    proposal: Option<ModelResultProposal>,
+    /// Whether `object` is the whole response rather than an object quoted inside
+    /// wrapper prose.
+    whole_object: bool,
+}
+
+impl<'a> StructuredPayload<'a> {
+    /// Decodes one structured response.
+    pub fn parse(raw_text: &'a str) -> Self {
+        let (object, whole_object) = match decode_response_object(raw_text) {
+            Some((value, whole_object)) => (Some(value), whole_object),
+            None => (None, false),
+        };
+        // The proposal is deserialized from the decoded object rather than from
+        // the text, so the response is lexed once no matter how many of its
+        // fields the turn reads.
+        let proposal = object
+            .as_ref()
+            .and_then(|value| ModelResultProposal::deserialize(value).ok());
+        Self {
+            raw: raw_text,
+            object,
+            proposal,
+            whole_object,
+        }
+    }
+
+    /// The typed proposal the response decoded into.
+    ///
+    /// Reading it takes ownership of the payload, because the change-set result
+    /// of a turn carries the proposal itself.
+    fn into_proposal(self) -> Option<ModelResultProposal> {
+        self.proposal
+    }
+
+    /// The named field of the decoded object.
+    fn field(&self, name: &str) -> Option<&serde_json::Value> {
+        self.object.as_ref().and_then(|value| value.get(name))
+    }
+
+    /// The conversational channel of the decoded object.
+    ///
+    /// A response whose whole body is one object states its answer in `message`,
+    /// and so does an object quoted inside wrapper prose: the message is the
+    /// answer the round produced, while the prose around it is wrapper text.
+    fn message(&self) -> Option<&str> {
+        let message = self.field("message")?.as_str()?.trim();
+        if message.is_empty() {
+            return None;
+        }
+        Some(message)
+    }
+
+    /// Cleans the response for presentation and history.
+    ///
+    /// Every control tag is removed by the single parametric sanitizer, and a
+    /// payload that is itself one structured response collapses to its `message`
+    /// channel, so neither XML control tags nor JSON scaffolding can leak into
+    /// conversational text, session history, or the streamed interface. A
+    /// payload that is not one response keeps every channel it carries, in
+    /// document order, so the rounds a turn concatenated and the answer a model
+    /// wrapped in prose both survive cleaning.
+    pub fn clean_text(&self) -> String {
+        // A payload that is itself one structured response carries its whole
+        // conversational channel in `message`, and the object around it is
+        // protocol chrome, never an answer: collapsing the payload keeps raw
+        // wire markup out of session history and matches what the streaming
+        // filter showed the interface.
+        if self.whole_object {
+            return self
+                .message()
+                .map(strip_all_control_tags)
+                .unwrap_or_default();
+        }
+        // Such a payload may still carry answers: a turn concatenates the
+        // rounds it received, and wrapper prose surrounds an object a model
+        // quoted. Every channel is joined in document order, so cleaning drops
+        // no answer the response produced.
+        let messages = collect_json_messages(self.raw);
+        if !messages.is_empty() {
+            return strip_all_control_tags(&messages.join("\n\n"));
+        }
+        if super::xml::has_xml_edit_tags(self.raw) {
+            return super::xml::extract_conversational_text(self.raw);
+        }
+        strip_all_control_tags(self.raw)
+    }
+
+    /// Validates the declared change set against the files the turn may address.
+    ///
+    /// An answer that declares no change is valid: a round that only reports,
+    /// asks for context, or records a decision modifies no file.
+    pub fn change_set(&self, editable_paths: &[String]) -> Result<Vec<EditOperation>, String> {
+        let Some(proposal) = self.proposal.as_ref() else {
+            return xml_change_set(self.raw, editable_paths);
+        };
+        change_to_operations(&proposal.changes, editable_paths)
+    }
+
+    /// File context requests decoded from the `context_requests` field.
+    pub fn context_requests(&self) -> Vec<ContextRequest> {
+        self.proposal
+            .as_ref()
+            .map(|proposal| {
+                proposal
+                    .context_requests
+                    .iter()
+                    .map(|request| ContextRequest {
+                        path: request.path.clone(),
+                        access: request.access,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Repository search requests decoded from the `repo_searches` field,
+    /// falling back to `<repo_search>` control tags.
+    pub fn repo_searches(&self) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        if let Some(proposal) = self.proposal.as_ref() {
+            if !proposal.repo_searches.is_empty() {
+                return proposal.repo_searches.clone();
+            }
+        }
+        super::xml::tags::parse_repo_search_tags(self.raw)
+    }
+
+    /// Targeted repository map paths decoded from the `repo_maps` field,
+    /// falling back to `<repo_map>` control tags.
+    ///
+    /// Every entry is normalized through the shared `normalize_repo_map_path`
+    /// rule, so an empty string or `.` names the whole repository while a
+    /// traversal path is dropped instead of escaping it.
+    pub fn repo_maps(&self) -> Vec<String> {
+        if let Some(entries) = self.field("repo_maps").and_then(|field| field.as_array()) {
+            let maps: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .filter_map(normalize_repo_map_path)
+                .collect();
+            if !maps.is_empty() {
+                return maps;
+            }
+        }
+        super::xml::tags::parse_repo_map_tags(self.raw)
+            .iter()
+            .filter_map(|path| normalize_repo_map_path(path))
+            .collect()
+    }
+
+    /// Reports whether the response requested the compact repository directory
+    /// tree, falling back to `<repo_dirs>` control tags.
+    pub fn repo_dirs(&self) -> bool {
+        if let Some(requested) = self.field("repo_dirs").and_then(|field| field.as_bool()) {
+            if requested {
+                return true;
+            }
+        }
+        super::xml::tags::parse_repo_dirs_tags(self.raw)
+    }
+
+    /// Directory content listing requests decoded from the `dir_lists` field,
+    /// falling back to `<dir_list>` control tags.
+    ///
+    /// Every entry is normalized through [`DirListRequest::normalized`], so `.`
+    /// and `./` collapse to the repository root while a path that escapes the
+    /// repository is dropped instead of resolved. A missing `recursive` flag
+    /// keeps the listing shallow, so a malformed entry narrows the result rather
+    /// than failing it.
+    pub fn dir_lists(&self) -> Vec<DirListRequest> {
+        if let Some(entries) = self.field("dir_lists").and_then(|field| field.as_array()) {
+            let requests: Vec<DirListRequest> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let path = entry.get("path").and_then(|field| field.as_str())?;
+                    let recursive = entry
+                        .get("recursive")
+                        .and_then(|field| field.as_bool())
+                        .unwrap_or(false);
+                    DirListRequest::new(path, recursive).normalized()
+                })
+                .collect();
+            if !requests.is_empty() {
+                return requests;
+            }
+        }
+        super::xml::tags::parse_dir_list_tags(self.raw)
+    }
+
+    /// Documentation topics decoded from the canonical `tauqe_doc_requests`
+    /// field, falling back to the pre-canonical `doc_requests` spelling and then
+    /// to the documentation control tags.
+    ///
+    /// The canonical field is the one the strict response schema advertises, and
+    /// the pre-canonical spelling stays a permanent alias, so a cached response
+    /// written before the rename keeps decoding.
+    ///
+    /// A `null` element is a partial emission of one topic, so it yields the
+    /// tolerant `DocTopic::All` fallback the DTO boundary resolves it to, while
+    /// an element of any other non-string shape is skipped.
+    pub fn doc_requests(&self) -> Vec<DocTopic> {
+        for spelling in ["tauqe_doc_requests", "doc_requests"] {
+            let Some(entries) = self.field(spelling).and_then(|entries| entries.as_array()) else {
+                continue;
+            };
+            let topics: Vec<DocTopic> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    // A `null` element resolves to the tolerant fallback at the DTO
+                    // boundary, so the raw reader keeps the request the DTO would
+                    // keep instead of dropping it.
+                    serde_json::Value::Null => Some(DocTopic::All),
+                    other => other.as_str().map(DocTopic::parse_lossy),
+                })
+                .collect();
+            if !topics.is_empty() {
+                return topics;
+            }
+        }
+        super::xml::tags::parse_doc_request_tags(self.raw)
+    }
+
+    /// External document identifiers decoded from the `outer_doc_requests`
+    /// field, falling back to `<outer_doc_request>` control tags.
+    ///
+    /// Each entry names one document the project declares in `[[outer_docs]]`
+    /// rather than a cache path, so where the materialized copy lives stays a
+    /// harness detail. A blank identifier grants nothing and is dropped, exactly
+    /// as the tag form drops one, and repetition is preserved because
+    /// materializing a declared document twice is decided by the phase that owns
+    /// the round.
+    pub fn outer_doc_requests(&self) -> Vec<String> {
+        if let Some(entries) = self
+            .field("outer_doc_requests")
+            .and_then(|field| field.as_array())
+        {
+            let ids: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+        let Some(spec) = engine::tag_spec("outer_doc_request") else {
+            return Vec::new();
+        };
+        engine::attribute_values_with_fences(self.raw, spec, "id", &CodeFences::find(self.raw))
+    }
+
+    /// Ephemeral scratchpad notes decoded from the `scratchpad` field, falling
+    /// back to `<scratchpad>` control tags.
+    pub fn scratchpad(&self) -> Option<String> {
+        if let Some(notes) = self
+            .proposal
+            .as_ref()
+            .and_then(|proposal| proposal.scratchpad.as_deref())
+        {
+            let trimmed = notes.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        super::xml::tags::extract_scratchpad(self.raw)
+    }
+
+    /// Terminal outcome decoded from the `outcome` field, falling back to the
+    /// terminal-outcome control tags.
+    ///
+    /// A `<blocked>` tag is itself a terminal outcome: a broken precondition ends
+    /// the turn exactly like success or error, so the fallback surfaces it as
+    /// [`TerminalOutcome::Blocked`].
+    pub fn terminal_outcome(&self) -> Option<TerminalOutcome> {
+        if let Some(outcome) = self
+            .proposal
+            .as_ref()
+            .and_then(|proposal| proposal.outcome.as_ref())
+        {
+            let status = outcome.status.trim().to_ascii_lowercase();
+            match status.as_str() {
+                "success" => {
+                    let commit_message = outcome
+                        .commit_message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|commit_message| !commit_message.is_empty())
+                        .map(str::to_string);
+                    return Some(TerminalOutcome::Success { commit_message });
+                }
+                "error" => {
+                    let message = outcome
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .unwrap_or("Execution error")
+                        .to_string();
+                    return Some(TerminalOutcome::Error { message });
+                }
+                "skip" | "skipped" => {
+                    let reason = outcome
+                        .reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("Step skipped without a stated reason")
+                        .to_string();
+                    return Some(TerminalOutcome::Skip { reason });
+                }
+                _ => {}
+            }
+        }
+        super::xml::tags::extract_terminal_outcome(self.raw)
+    }
+
+    /// Semantic blocker decoded from the `blocked` field, falling back to
+    /// `<blocked>` control tags.
+    pub fn blocked(&self) -> Option<(String, Option<String>)> {
+        if let Some(blocked) = self
+            .proposal
+            .as_ref()
+            .and_then(|proposal| proposal.blocked.as_ref())
+        {
+            if blocked.is_blocked {
+                let reason = blocked.reason.trim();
+                let reason = if reason.is_empty() {
+                    "Execution blocked".to_string()
+                } else {
+                    reason.to_string()
+                };
+                let details = blocked
+                    .details
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|details| !details.is_empty())
+                    .map(str::to_string);
+                return Some((reason, details));
+            }
+        }
+        super::xml::tags::extract_blocked(self.raw)
+    }
+
+    /// Semantic abort decoded from the `abort` field, falling back to `<abort>`
+    /// control tags.
+    ///
+    /// An abort is not a blocker: it reports work the harness cannot perform at
+    /// all, so the payload carries both the concrete missing capability (`reason`)
+    /// and the exact command the developer must run (`recommendation`). A report
+    /// that states neither keeps a deterministic default instead of stopping the
+    /// turn without a cause.
+    pub fn abort(&self) -> Option<(String, String)> {
+        if let Some(abort) = self.field("abort").and_then(|field| field.as_object()) {
+            let is_aborted = abort
+                .get("is_aborted")
+                .and_then(|field| field.as_bool())
+                .unwrap_or(false);
+            if is_aborted {
+                let reason = abort
+                    .get("reason")
+                    .and_then(|field| field.as_str())
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or("Execution aborted")
+                    .to_string();
+                let recommendation = abort
+                    .get("recommendation")
+                    .and_then(|field| field.as_str())
+                    .map(str::trim)
+                    .filter(|recommendation| !recommendation.is_empty())
+                    .unwrap_or("No recommendation was stated.")
+                    .to_string();
+                return Some((reason, recommendation));
+            }
+        }
+        abort_invocations(self.raw).into_iter().next()
+    }
+
+    /// Typed project command invocations decoded from the `custom_tools` field,
+    /// falling back to `<custom_tool>` control tags.
+    ///
+    /// Each invocation names one command from the declared allowlist and carries
+    /// the typed argument object the declaration validates later in the turn.
+    /// Whether the name and its arguments are actually declared is decided by the
+    /// harness at execution time, so decoding never rejects an invocation the
+    /// project itself may accept.
+    pub fn custom_tools(&self) -> Vec<(String, serde_json::Value)> {
+        if let Some(entries) = self
+            .field("custom_tools")
+            .and_then(|field| field.as_array())
+        {
+            let invocations: Vec<(String, serde_json::Value)> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let name = entry
+                        .get("name")
+                        .and_then(|field| field.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())?;
+                    let args = entry
+                        .get("args")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    Some((name.to_string(), args))
+                })
+                .collect();
+            if !invocations.is_empty() {
+                return invocations;
+            }
+        }
+        custom_tool_invocations(self.raw)
+    }
+
+    /// Verification request decoded from the `verify` field, falling back to
+    /// `<verify>` control tags.
+    pub fn verify_request(&self) -> Option<VerifyRequest> {
+        if let Some(verify) = self.field("verify").and_then(|field| field.as_object()) {
+            let target = verify
+                .get("target")
+                .and_then(|field| field.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !target.is_empty() && target != "none" {
+                let target = match target.as_str() {
+                    "check" => VerifyTarget::Check,
+                    "test" => VerifyTarget::Test,
+                    "clippy" => VerifyTarget::Clippy,
+                    _ => VerifyTarget::All,
+                };
+                // The declared success policy keeps its permissive default: any
+                // spelling other than `silent` reports the outcome.
+                let declared = verify
+                    .get("on_success")
+                    .and_then(|field| field.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                let on_success = if declared == "silent" {
+                    VerifyOnSuccess::Silent
+                } else {
+                    VerifyOnSuccess::Report
+                };
+                return Some(VerifyRequest { target, on_success });
+            }
+        }
+        super::xml::tags::extract_verify_request(self.raw)
+    }
+
+    /// Detected user language decoded from the `user_language` field, falling
+    /// back to `<user_language>` control tags.
+    pub fn user_language(&self) -> Option<String> {
+        if let Some(language) = self.field("user_language").and_then(|field| field.as_str()) {
+            let trimmed = language.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        super::xml::tags::extract_user_language(self.raw)
+    }
+
+    /// Plan creation or modification payloads decoded from the `plan_update`
+    /// field, falling back to `<plan>` control tags.
+    ///
+    /// A `null` payload is the idle representation the strict schema declares for
+    /// a turn that leaves the plan untouched, so it yields no update. A payload
+    /// that cannot be deserialized into
+    /// [`tauqe_protocol::DiscussionPlanUpdate`] is reported as an error instead of
+    /// being swallowed: the caller turns it into a `ProtocolError` command, which
+    /// lets the bounded turn repeat generation with the decoding diagnostics
+    /// attached.
+    pub fn plan_updates(&self) -> Result<Vec<tauqe_protocol::DiscussionPlanUpdate>, String> {
+        let plan_update = self.field("plan_update");
+        if let Some(plan_update) = plan_update.filter(|plan_update| !plan_update.is_null()) {
+            let update = tauqe_protocol::DiscussionPlanUpdate::deserialize(plan_update)
+                .map_err(|error| format!("invalid plan_update: {error}"))?;
+            return Ok(vec![update]);
+        }
+        let (tags, diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(self.raw);
+        // A `<plan>` control tag is the second vehicle of the same mutation, so a
+        // structurally malformed container is a present payload the reader
+        // refuses: it is reported through the single error channel of this reader
+        // instead of degrading into "no plan update", and the bounded turn turns
+        // it into a `ProtocolError` command so a later round can repair it.
+        if !diagnostics.is_empty() {
+            return Err(format!(
+                "invalid <plan> payload in the structured response: {}",
+                diagnostics.join("; ")
+            ));
+        }
+        Ok(tags.into_iter().map(plan_tag_to_update).collect())
+    }
+
+    /// Decision recorded for one review finding, decoded from the `review_update`
+    /// field.
+    ///
+    /// The decision is a dialogue mutation rather than a code change: it states
+    /// the status the engineer settled on for one finding together with the
+    /// reasoning behind it. The field is declared nullable, so the idle form
+    /// records no decision. A payload that cannot be deserialized into
+    /// [`tauqe_protocol::review::ReviewUpdateProposal`] is reported as an error
+    /// instead of being swallowed, so the bounded turn can repeat generation with
+    /// the decoding diagnostics attached.
+    pub fn review_update(
+        &self,
+    ) -> Result<Option<tauqe_protocol::review::ReviewUpdateProposal>, String> {
+        let payload = self.field("review_update");
+        let Some(payload) = payload.filter(|review_update| !review_update.is_null()) else {
+            return Ok(None);
+        };
+        let decision = tauqe_protocol::review::ReviewUpdateProposal::deserialize(payload)
+            .map_err(|error| format!("invalid review_update: {error}"))?;
+        Ok(Some(decision))
+    }
 }
 
 /// Resolves one structured change into a concrete, validated edit operation.
@@ -835,76 +1150,7 @@ fn plan_tag_to_update(
 /// channel, so neither XML control tags nor JSON scaffolding can leak into
 /// conversational text, session history, or the streamed interface.
 pub fn clean_raw_json_or_text(raw: &str) -> String {
-    let msgs = extract_json_messages(raw);
-    if !msgs.is_empty() {
-        return strip_all_control_tags(&msgs.join("\n\n"));
-    }
-
-    if let Some(proposal) = parse_proposal(raw) {
-        if !proposal.message.trim().is_empty() {
-            return strip_all_control_tags(&proposal.message);
-        }
-    }
-
-    // A payload that is itself a single structured response carries its whole
-    // conversational channel in `message`, and the extraction above already
-    // found that channel empty. The JSON object around it is protocol chrome,
-    // never an answer: collapsing the payload keeps raw wire markup out of
-    // session history and matches what the streaming filter showed the
-    // interface. The strict whole-payload parse keeps prose that merely quotes
-    // a JSON object on the plain-text path below, so explaining the protocol
-    // inside a conversation never collapses an answer.
-    if serde_json::from_str::<serde_json::Value>(strip_code_fence(raw))
-        .is_ok_and(|value| value.is_object())
-    {
-        return String::new();
-    }
-
-    if super::xml::has_xml_edit_tags(raw) {
-        return super::xml::extract_conversational_text(raw);
-    }
-
-    strip_all_control_tags(raw)
-}
-
-/// Extracts conversational "message" strings from structured JSON output blocks.
-pub fn extract_json_messages(raw: &str) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = raw[from..].find('{') {
-        let start = from + rel;
-        if let Some(end) = balanced_object_end(raw, start) {
-            let slice = &raw[start..end];
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(slice) {
-                if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
-                    let trimmed = msg.trim();
-                    if !trimmed.is_empty()
-                        && (val.get("changes").is_some()
-                            || val.get("context_requests").is_some()
-                            || val.get("repo_searches").is_some()
-                            || val.get("repo_dirs").is_some()
-                            || val.get("repo_maps").is_some()
-                            || val.get("dir_lists").is_some()
-                            || val.get("tauqe_doc_requests").is_some()
-                            || val.get("doc_requests").is_some()
-                            || val.get("scratchpad").is_some()
-                            || val.get("outcome").is_some()
-                            || val.get("blocked").is_some()
-                            || val.get("verify").is_some()
-                            || val.get("user_language").is_some()
-                            || val.get("plan_update").is_some()
-                            || val.get("suggested_actions").is_some())
-                    {
-                        messages.push(trimmed.to_string());
-                    }
-                }
-            }
-            from = end;
-        } else {
-            from = start + 1;
-        }
-    }
-    messages
+    StructuredPayload::parse(raw).clean_text()
 }
 
 #[cfg(test)]
@@ -1352,17 +1598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_json_messages_multibyte_safety() {
-        let raw = "Текст до: {\"message\":\"Сообщение с кириллицей и экранированием \\\"кавычек\\\"\",\"changes\":[]}\nТекст после.";
-        let messages = extract_json_messages(raw);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0],
-            "Сообщение с кириллицей и экранированием \"кавычек\""
-        );
-    }
-
-    #[test]
     fn test_clean_collapses_a_silent_structured_round() {
         // A structured response whose only conversational channel is empty has
         // no prose to recover. Its JSON scaffolding is protocol chrome, never
@@ -1389,6 +1624,31 @@ mod tests {
         // never fires and the explanation survives verbatim.
         let prose = "A silent round is {\"message\":\"\",\"changes\":[]} in the journal.";
         assert_eq!(clean_raw_json_or_text(prose), prose);
+    }
+
+    #[test]
+    fn test_clean_joins_the_channels_of_concatenated_responses() {
+        // A turn concatenates the rounds it received, so one payload may carry
+        // several responses. Their conversational channels are joined in
+        // document order instead of only the first one surviving cleaning.
+        let rounds = concat!(
+            "{\"message\":\"Need file a.rs\",\"changes\":[]}\n\n",
+            "{\"message\":\"Updated file a.rs\",\"changes\":[]}",
+        );
+        assert_eq!(
+            clean_raw_json_or_text(rounds),
+            "Need file a.rs\n\nUpdated file a.rs"
+        );
+
+        // A silent round contributes no channel of its own and no separator.
+        let silent_then_answer = concat!(
+            "{\"message\":\"\",\"changes\":[]}\n\n",
+            "{\"message\":\"Updated file a.rs\",\"changes\":[]}",
+        );
+        assert_eq!(
+            clean_raw_json_or_text(silent_then_answer),
+            "Updated file a.rs"
+        );
     }
 
     #[test]

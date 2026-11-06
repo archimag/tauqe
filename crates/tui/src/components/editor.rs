@@ -1150,8 +1150,7 @@ mod tests {
 
     #[test]
     fn prompt_history_persists_multiline_to_disk_and_reloads() {
-        let temp_dir = std::env::temp_dir().join(format!("tauqe_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp_dir = crate::testing::scratch_dir("editor-history");
         let history_file = temp_dir.join("prompts.history");
 
         let mut editor = TextEditor::default();
@@ -1181,8 +1180,7 @@ mod tests {
         );
         assert_eq!(reloaded.history[2], "third prompt");
 
-        let _ = std::fs::remove_file(history_file);
-        let _ = std::fs::remove_dir(temp_dir);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -1271,8 +1269,7 @@ mod tests {
     /// the recording path.
     fn cap_rewrite_job_writes_a_private_atomic_file() {
         use std::os::unix::fs::PermissionsExt;
-        let temp_dir = std::env::temp_dir().join(format!("tauqe_atomic_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp_dir = crate::testing::scratch_dir("editor-atomic");
         let history_file = temp_dir.join("prompts.history");
 
         let mut editor = TextEditor {
@@ -1310,8 +1307,7 @@ mod tests {
     #[test]
     fn record_history_creates_private_file() {
         use std::os::unix::fs::PermissionsExt;
-        let temp_dir = std::env::temp_dir().join(format!("tauqe_perm_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp_dir = crate::testing::scratch_dir("editor-private");
         let history_file = temp_dir.join("prompts.history");
 
         let mut editor = TextEditor::default();
@@ -1408,8 +1404,8 @@ mod tests {
 
     #[test]
     fn prompt_history_resolves_under_the_per_user_state_home() {
-        let state_home = std::env::temp_dir().join("tauqe_test_state_home");
-        let home = std::env::temp_dir().join("tauqe_test_home");
+        let state_home = crate::testing::scratch_dir("editor-state-home");
+        let home = crate::testing::scratch_dir("editor-home");
 
         assert_eq!(
             resolve_prompt_history_path(Some(state_home.clone()), Some(home.clone())),
@@ -1424,6 +1420,8 @@ mod tests {
                     .join("prompts.history")
             )
         );
+        let _ = std::fs::remove_dir_all(&state_home);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A relative or absent state root must never be resolved against the
@@ -1431,7 +1429,7 @@ mod tests {
     /// inside a checkout that Git can stage.
     #[test]
     fn prompt_history_requires_an_absolute_state_root() {
-        let home = std::env::temp_dir().join("tauqe_test_home_absolute");
+        let home = crate::testing::scratch_dir("editor-home-absolute");
 
         assert_eq!(
             resolve_prompt_history_path(Some(PathBuf::from("state")), Some(home.clone())),
@@ -1447,5 +1445,6 @@ mod tests {
             None
         );
         assert_eq!(resolve_prompt_history_path(None, None), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

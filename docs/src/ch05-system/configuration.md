@@ -373,11 +373,11 @@ turn.
 
 ### 3.2 Semantic roles and the two ladders
 
-`[models]` maps responsibilities to models. `primary` is mandatory and lists at least
+`[models]` maps responsibilities to models. `repl` is mandatory and lists at least
 one entry; its first entry is the idle active model and the deterministic default
 everywhere a role is implied. `scribe` is a single utility model and defaults to the
-first `primary` entry. `coder`, `architect`, and `reviewer` are ordered lists, and an
-omitted list inherits the entire `primary` list, so a project never loses access to a
+first `repl` entry. `coder`, `architect`, and `reviewer` are ordered lists, and an
+omitted list inherits the entire `repl` list, so a project never loses access to a
 configured model merely because it did not repeat it.
 
 The provider catalog declares each model once. A catalog entry is either a bare

@@ -49,7 +49,7 @@ TAUQE does not invent a new engineering discipline for AI. It applies proven eng
   Turn complex objectives into structured architectures. Plans separate immutable system invariants (`concept`) from actionable steps (`items`). Completed steps and invariants remain frozen during execution—preventing the model from silently altering requirements when an implementation hits friction.
 
 - **Role Specialization & Economic Efficiency:**  
-  High-leverage planning and architectural design are assigned to frontier reasoning models (Architect), while concrete code edits run on faster, cost-effective models (Coder) with automated tier escalation on compiler failures.
+  The interactive engineering dialogue runs on the mandatory base role (`repl`); high-leverage planning and architectural design are assigned to frontier reasoning models (Architect), while concrete code edits run on faster, cost-effective models (Coder) with automated tier escalation on compiler failures.
 
 - **Integrated Code Review:**  
   Audit diffs and working trees directly inside the environment. Triage findings by severity (`TODO` / `FIXED` / `REJECTED`), debate trade-offs in structured discussions, and execute batch remediation with compiler verification.
@@ -88,9 +88,9 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 | Shortcut | View | Description |
 | :--- | :--- | :--- |
 | `Ctrl+1` | **REPL** | Conversational harness, streaming diffs, toolchain healing, and instant undo |
-| `Ctrl+2` | **Context** | Four-layer context manager (`Pinned`, `Refs`, `User`, `Auto`) with glob patterns |
+| `Ctrl+2` | **Plans** | Hierarchical task trees, deep refinement, and isolated step execution |
 | `Ctrl+3` | **Review** | Code audit sessions, finding triage, and autonomous batch fixes |
-| `Ctrl+4` | **Plans** | Hierarchical task trees, deep refinement, and isolated step execution |
+| `Ctrl+4` | **Context** | Four-layer context manager (`Pinned`, `OuterDocs`, `User`, `Auto`) with glob patterns |
 | `Ctrl+5` | **History** | Chronological session audit trail, token metrics, and commit inspect |
 
 ---

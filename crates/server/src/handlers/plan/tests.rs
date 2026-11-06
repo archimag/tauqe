@@ -2,9 +2,11 @@ use super::batch::{
     handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
     run_plan_batch, BatchOutcome, PlanBatchOptions,
 };
+use crate::handlers::common::test_support::scratch_root;
 use crate::handlers::common::turn_applied_edits;
 use crate::state::AppState;
 use crate::transport::OutChannel;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
@@ -15,15 +17,7 @@ use tauqe_protocol::{
 struct TestDir(std::path::PathBuf);
 impl TestDir {
     fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tauqe-test-plan-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::create_dir_all(&path);
-        Self(path)
+        Self(scratch_root("test-plan"))
     }
     fn path(&self) -> &std::path::Path {
         &self.0
@@ -4155,4 +4149,127 @@ async fn test_plan_refine_answers_cancelled_before_the_destructive_horizon_write
         entries.is_empty(),
         "an aborted horizon write must record no session history"
     );
+}
+
+/// Flips a flag when the owning task future is dropped, so the test can prove
+/// that the wedged task really stopped running instead of lingering detached.
+struct ExitMarker(Arc<AtomicBool>);
+
+impl Drop for ExitMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A hard cancel must survive a task that never confirms its exit: the stale
+/// registration is released within the shared task-exit deadline, the slot admits
+/// the next operation, and the superseded guard a wedged task still owns wipes
+/// nothing when it finally drops.
+#[test]
+fn test_abort_stalled_operation_releases_a_registration_that_never_confirms() {
+    let dir = TestDir::new();
+
+    // The wedged step owns a runtime of its own: its whole point is a stretch
+    // that never yields back to its scheduler, so the abort delivered to it
+    // can land only once that stretch ends.
+    let wedged_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("the wedged runtime starts");
+    let confirmation_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the confirmation runtime starts");
+
+    let stretch_ends = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+
+    confirmation_runtime.block_on(async {
+        let state = test_state(&dir);
+        let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
+        let operation_id = guard.id();
+        let task = {
+            let guard = Arc::clone(&guard);
+            let stretch_ends = Arc::clone(&stretch_ends);
+            let exited = Arc::clone(&exited);
+            wedged_runtime.spawn(async move {
+                let _guard = guard;
+                let _marker = ExitMarker(Arc::clone(&exited));
+                let _ = entered_tx.send(());
+                while !stretch_ends.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                std::future::pending::<()>().await
+            })
+        };
+        // The wedged step installs the handle a hard cancel targets, exactly as a
+        // running turn does when it spawns its workflow.
+        guard.set_abort_handle(task.abort_handle());
+        drop(guard);
+
+        // The abort is delivered only after the task provably reached its
+        // non-yielding stretch. Aborting a task before its first poll drops the
+        // future without ever running it, so the exit marker would never be
+        // constructed and the regression below would wait for an exit that was
+        // never pending.
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the wedged task must reach its non-yielding stretch")
+            .expect("the wedged task signals that its stretch began");
+
+        // The confirmation deadline is resolved in this task, so a compressed
+        // value keeps the expiry path deterministic.
+        let started = std::time::Instant::now();
+        crate::reap::with_task_exit_deadline(
+            std::time::Duration::from_millis(50),
+            state.abort_stalled_operation(operation_id),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the exit confirmation must be bounded"
+        );
+
+        assert!(
+            !state.is_operation_active(),
+            "the expired confirmation must release the stale registration"
+        );
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the wedged task provably never exited before the slot was released"
+        );
+
+        let fresh = state
+            .try_begin_operation()
+            .expect("the released slot must admit a new operation");
+        assert_ne!(fresh.id(), operation_id);
+
+        // The orphan dies at the first suspension point its stretch reaches and
+        // drops the superseded guard after the new operation registered.
+        stretch_ends.store(true, Ordering::SeqCst);
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the orphaned task must die once its non-yielding stretch ends"
+        );
+
+        // The id-checked release of the superseded guard leaves the newcomer's
+        // registration untouched.
+        assert!(
+            state.is_operation_active(),
+            "the superseded guard must never wipe a newer registration"
+        );
+        assert!(
+            state.try_begin_operation().is_err(),
+            "the newer registration must stay in force"
+        );
+        drop(fresh);
+    });
 }

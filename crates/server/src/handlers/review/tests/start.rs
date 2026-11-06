@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use super::super::{handle_review_cancel, handle_review_start};
-use super::{InterruptedAttemptProvider, TestDir};
+use super::{
+    await_published, stall_outbound_transport, InterruptedAttemptProvider, RecordingSink, TestDir,
+};
 
 use crate::state::AppState;
 use crate::transport::OutChannel;
@@ -390,5 +392,208 @@ async fn test_review_start_withdraws_the_aborted_attempt_before_the_retry() {
     assert_eq!(
         session.description.as_deref(),
         Some("The architecture is sound, but locking is racy.")
+    );
+}
+
+/// Collects the method of every event queued but not yet drained.
+///
+/// A drain consumes the queue, so a pacing test reads it once and inspects the
+/// methods afterwards: reading per method would discard every event the previous
+/// read did not match.
+fn queued_methods(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    let mut methods = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(method) = value.get("method").and_then(|method| method.as_str()) else {
+            continue;
+        };
+        methods.push(method.to_string());
+    }
+    methods
+}
+
+/// Gates the summary relay of a plain launch: a client that keeps its pipe open
+/// but stopped reading must pause the review stream instead of growing the
+/// outbound queue, and a writer that drains the queue must release it.
+#[tokio::test]
+async fn test_review_start_withholds_the_summary_until_the_outbound_queue_drains() {
+    let dir = TestDir::new();
+    std::fs::write(dir.path().join("file.rs"), "fn foo() {}\n").unwrap();
+
+    let summary = "The architecture is sound, but locking is racy.";
+    let payload = r#"{"summary":"The architecture is sound, but locking is racy.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let (out, rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+    state
+        .context
+        .write()
+        .await
+        .add_file("file.rs", ContextAccess::ReadOnly)
+        .unwrap();
+
+    // The client keeps its pipe open but stopped reading, so the queue already
+    // sits above the transport's high-water mark before the audit starts.
+    stall_outbound_transport(&state);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: None,
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(res.error.is_none(), "review start must succeed");
+
+    // The audit announces itself and then parks at the gate: the summary is never
+    // enqueued while the queue stays stalled, so nothing is persisted either.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        state.is_operation_active(),
+        "a stalled client must keep the audit paused instead of ending it"
+    );
+    assert!(
+        ReviewStorage::load_latest(dir.path()).unwrap().is_none(),
+        "a stalled audit must neither stream its summary nor persist its session"
+    );
+
+    // Draining the queue below the low-water mark releases the paused relay.
+    let sink = RecordingSink::default();
+    let writing = tokio::spawn(state.out.writer(rx).run_with(sink.clone()));
+    let published = await_published(&sink, events::REVIEW_FINISHED).await;
+    assert!(
+        published.contains(events::REVIEW_CONTENT_DELTA),
+        "the drained audit must publish the summary it held"
+    );
+    assert!(
+        published.contains(summary),
+        "the released summary must reach the client"
+    );
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("the released audit persists its session");
+    assert_eq!(session.description.as_deref(), Some(summary));
+
+    let mut released = false;
+    for _ in 0..500 {
+        if !state.is_operation_active() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "the completed audit must release the operation slot"
+    );
+
+    writing.abort();
+    let _ = writing.await;
+}
+
+/// A raised cancellation releases the stalled relay without a drain: an
+/// interrupted audit publishes its terminal notice instead of waiting for a
+/// reader that never returns.
+#[tokio::test]
+async fn test_review_start_cancellation_releases_the_stalled_relay() {
+    let dir = TestDir::new();
+    std::fs::write(dir.path().join("file.rs"), "fn foo() {}\n").unwrap();
+
+    let payload = r#"{"summary":"The architecture is sound, but locking is racy.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+    state
+        .context
+        .write()
+        .await
+        .add_file("file.rs", ContextAccess::ReadOnly)
+        .unwrap();
+
+    stall_outbound_transport(&state);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: None,
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(res.error.is_none(), "review start must succeed");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        state.is_operation_active(),
+        "the stalled audit keeps the operation slot"
+    );
+
+    // No writer ever drains the queue in this test, so the cancellation alone has
+    // to release the parked relay.
+    state.cancel_active_operation();
+
+    let mut released = false;
+    for _ in 0..500 {
+        if !state.is_operation_active() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "a cancelled audit must leave the gate without a drain"
+    );
+
+    // The queue is still open, so the notice the cancellation published is
+    // waiting there: the drain below observes what the released relay emitted.
+    let published = queued_methods(&mut rx);
+    // An interrupted audit is charged to the session, so the usage it consumed
+    // must reach the client instead of stopping at the ledger.
+    assert!(
+        published
+            .iter()
+            .any(|method| method.as_str() == events::MODEL_USAGE),
+        "a cancelled audit must publish the usage it consumed: {published:?}"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|method| method.as_str() == events::REVIEW_CANCELLED),
+        "a cancelled audit must publish its terminal notice: {published:?}"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|method| method.as_str() == events::REVIEW_FINISHED),
+        "a cancelled audit must not finish: {published:?}"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|method| method.as_str() == events::REVIEW_ERROR),
+        "cancellation must not be misreported as a review error: {published:?}"
+    );
+    assert!(
+        ReviewStorage::load_latest(dir.path()).unwrap().is_none(),
+        "a cancelled audit persists no session"
     );
 }

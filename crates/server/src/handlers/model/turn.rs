@@ -299,7 +299,7 @@ async fn prepare_turn(
     // model carries no role of its own and resolves against the mandatory base
     // role.
     let effort = reasoning_effort.or_else(|| {
-        app_config.resolve_selection_effort(role.unwrap_or(ModelRole::Primary), &selection)
+        app_config.resolve_selection_effort(role.unwrap_or(ModelRole::REPL), &selection)
     });
     // A display alias is catalog metadata of the model itself, so it is resolved
     // from the centralized provider catalog of the configuration rather than
@@ -878,9 +878,12 @@ async fn run_prepared_turn(
                         "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
                     );
                     // The task and this turn's operation registration move into
-                    // the watchdog together, so the slot is released only once
-                    // the task has truly exited. Returning here would hand a
-                    // half-unwound workflow back to the client.
+                    // the watchdog together, so returning here never hands a
+                    // half-unwound workflow back to the client. The watchdog
+                    // confirms the task's exit within the shared task-exit
+                    // deadline and releases the slot either way, so a task wedged
+                    // in a non-yielding stretch cannot pin the registration for
+                    // the daemon's lifetime.
                     state.defer_abort_owning_operation(Arc::clone(&operation), wf_task);
                 } else {
                     tracing::warn!(
@@ -915,7 +918,9 @@ async fn run_prepared_turn(
                         // registration: releasing the slot here would let a new
                         // turn register and then park on the session lock the
                         // zombie still holds, with no registered operation left
-                        // to cancel.
+                        // to cancel. The watchdog confirms the task's exit within
+                        // the shared task-exit deadline and releases the slot
+                        // either way, so the zombie can never pin it.
                         Err(_) => {
                             tracing::warn!(
                                 operation_id = %op_id,
@@ -1214,29 +1219,52 @@ async fn run_prepared_turn(
         Err(join_err) => {
             let snapshot = flush_usage(state, &mut usage_guard).await;
             emit_legacy_usage_event(state, &op_id).await;
-            // A panicked workflow task never reached its history adoption.
+            // A panicked or force-aborted workflow task never reached its
+            // history adoption, so the shared manager is rebuilt from the
+            // journal the turn may already have appended to.
             resync_history(state).await;
+            // A task that died without a result either panicked or was aborted,
+            // and the raised cancel signal decides which one the client is told
+            // about. The signal is the authoritative classification on every
+            // other seam, so a workflow that ignored it must not surface as a
+            // provider failure the model never produced.
+            let cancelled = *cancel_rx.borrow();
             if edit_events_sent && !edit_finished_sent {
-                send_edit_aborted(
-                    &state.out,
-                    &op_id,
-                    format!("Workflow task failed: {}", join_err),
-                );
+                let reason = if cancelled {
+                    "Operation cancelled before edits were applied".to_string()
+                } else {
+                    format!("Workflow task failed: {}", join_err)
+                };
+                send_edit_aborted(&state.out, &op_id, reason);
             }
-            state.out.send_event(&Event {
-                method: events::MODEL_ERROR.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id.clone(),
-                    "message": join_err.to_string(),
-                })),
-            });
+            let error = if cancelled {
+                tracing::warn!(
+                    operation_id = %op_id,
+                    error = %join_err,
+                    "Workflow task terminated after the operation was cancelled",
+                );
+                state.out.send_event(&Event {
+                    method: events::MODEL_CANCELLED.to_string(),
+                    params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
+                });
+                "Operation cancelled".to_string()
+            } else {
+                state.out.send_event(&Event {
+                    method: events::MODEL_ERROR.to_string(),
+                    params: Some(serde_json::json!({
+                        "operation_id": op_id.clone(),
+                        "message": join_err.to_string(),
+                    })),
+                });
+                join_err.to_string()
+            };
 
             (
                 ModelTurnResult {
                     operation_id: op_id,
                     result: None,
-                    is_cancelled: false,
-                    error: Some(join_err.to_string()),
+                    is_cancelled: cancelled,
+                    error: Some(error),
                     has_terminal_success: false,
                     blocked: None,
                     abort: None,
@@ -1603,7 +1631,7 @@ async fn flush_usage(state: &Arc<AppState>, guard: &mut Option<UsageGuard>) -> U
     if let Some(guard) = guard.take() {
         guard.flush().await;
     }
-    state.usage.lock().await.clone()
+    state.usage_snapshot().await
 }
 
 /// Mirrors the authoritative totals onto the legacy `model/usage` channel.
@@ -1612,7 +1640,7 @@ async fn flush_usage(state: &Arc<AppState>, guard: &mut Option<UsageGuard>) -> U
 /// clients that predate it reading the same numbers, including the in-flight
 /// operation while it is still running.
 pub(crate) async fn emit_legacy_usage_event(state: &Arc<AppState>, op_id: &str) {
-    let snapshot = state.usage.lock().await.clone();
+    let snapshot = state.usage_snapshot().await;
     let totals = snapshot.operation_totals().clone();
     state.out.send_event(&Event {
         method: events::MODEL_USAGE.to_string(),

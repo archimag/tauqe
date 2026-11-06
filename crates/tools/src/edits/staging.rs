@@ -221,7 +221,10 @@ fn trim_anchor_edit(
 /// narrows to no line of its own becomes a pure insertion, and the inserted
 /// fragment borrows the terminator of the line the range addressed, so an
 /// authored line that ends without a newline closes itself instead of merging
-/// with the line that follows it.
+/// with the line that follows it. A pure insertion occupies no line of its own,
+/// so it may share the line a replacement begins on: the fragment splices at
+/// the byte the replacement starts at, and the change set yields one result
+/// whatever order proposed the two.
 pub fn apply_anchor_edits(
     current: &str,
     edits: &[AnchorEdit<'_>],
@@ -319,7 +322,12 @@ pub fn apply_anchor_edits(
 
     // Two ranges that share a line would make the result depend on the order of
     // application, so the whole change set is validated before a byte moves.
-    ranges.sort_by_key(|range| range.start_line);
+    // The sort key carries the last line beside the first one, so ranges that
+    // begin on the same line keep one arrangement whatever order they were
+    // proposed in: a range that trims to a pure insertion occupies no line and
+    // sorts in front of the replacement beginning on that same line, which is
+    // how the two compose.
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
     for pair in ranges.windows(2) {
         let [first, second] = pair else {
             continue;
@@ -417,6 +425,47 @@ mod tests {
         // addressed by the line indices of the original snapshot.
         assert_eq!(forward, "l0\nMID\nL3\nl4\n");
         assert_eq!(backward, forward);
+    }
+
+    #[test]
+    fn an_insertion_on_a_replacement_start_line_composes_in_both_orders() {
+        let current = "a\nb\nc\n";
+        // The insertion resends the line it addresses, so it trims to a
+        // zero-width fragment in front of `b`, while the replacement rewrites
+        // that same line. The fragment splices at the byte the replacement
+        // starts at, so neither proposal order may reject the change set.
+        let insertion = Anchored::new(1, 1, "X\nb\n");
+        let replacement = Anchored::new(1, 1, "B\n");
+        let proposed = [insertion.as_edit(), replacement.as_edit()];
+        let reversed = [replacement.as_edit(), insertion.as_edit()];
+
+        let forward = apply_anchor_edits(current, &proposed, "a.rs").unwrap();
+        let backward = apply_anchor_edits(current, &reversed, "a.rs").unwrap();
+
+        assert_eq!(forward, "a\nX\nB\nc\n");
+        assert_eq!(backward, forward);
+    }
+
+    #[test]
+    fn an_insertion_inside_a_replaced_range_is_rejected_in_both_orders() {
+        let current = "l0\nl1\nl2\nl3\n";
+        // The fragment lands on a line the replacement rewrites, so the two
+        // edits would compose differently depending on which one applied
+        // first. The change set is refused whichever order proposed them.
+        let replacement = Anchored::new(0, 2, "L0\nMID\n");
+        let insertion = Anchored::new(1, 1, "X\nl1\n");
+        let straight = [replacement.as_edit(), insertion.as_edit()];
+        let reversed = [insertion.as_edit(), replacement.as_edit()];
+
+        for edits in [straight, reversed] {
+            assert!(
+                matches!(
+                    apply_anchor_edits(current, &edits, "a.rs"),
+                    Err(EditError::OverlappingAnchorRanges { .. })
+                ),
+                "an insertion inside a replaced range must be rejected"
+            );
+        }
     }
 
     #[test]

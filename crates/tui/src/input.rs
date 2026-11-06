@@ -374,6 +374,16 @@ async fn handle_key_event(
     }
 
     if modal_open {
+        // The raw quit chord is resolved before any dialog handler runs: an
+        // open modal owns the keyboard, so `Ctrl+Q` would otherwise be
+        // swallowed by the dialog and merely dismiss it. Quitting here behaves
+        // exactly as it does with no dialog open — immediately when nothing
+        // would be lost, and through the `ConfirmQuit` card, which outranks the
+        // dialog, when a draft is at stake. Every other resolved global command
+        // stays with the open modal (Conventions §5.5).
+        if matches!(command, Some(GlobalCommand::Quit)) {
+            return execute_global_command(GlobalCommand::Quit, state, server_writer).await;
+        }
         return crate::dialogs::input::handle_dialog_event(key, state, server_writer)
             .await
             .map(|handled| handled.unwrap_or(InputResult::Continue));
@@ -934,7 +944,6 @@ mod tests {
         st.modals.squash_dialog = Some(SquashDialogState::default());
 
         handle_paste(&mut st, "fix(tui): keep the wheel modal-scoped");
-
         let dialog = st
             .modals
             .squash_dialog
@@ -944,5 +953,92 @@ mod tests {
             dialog.message_editor.get_text(),
             "fix(tui): keep the wheel modal-scoped"
         );
+    }
+
+    /// The raw quit chord is resolved before any dialog handler runs: with a
+    /// read-only dialog open and no lossy work, `Ctrl+Q` exits the application
+    /// instead of merely dismissing the card (Conventions §5.5).
+    #[tokio::test]
+    async fn ctrl_q_quits_through_an_open_read_only_dialog() {
+        for surface in ["help", "status", "theme"] {
+            let mut st = crate::app::test_state();
+            match surface {
+                "help" => st.modals.show_help = true,
+                "status" => {
+                    st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
+                        crate::app::StatusDialogTarget::PlanItem {
+                            plan_id: "plan-1".to_string(),
+                            item_id: "1".to_string(),
+                            item_title: "Step 1".to_string(),
+                            current_status: tauqe_protocol::PlanItemStatus::Todo,
+                        },
+                        0,
+                    ));
+                }
+                _ => st.open_theme_selector(),
+            }
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            let res = handle_terminal_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+
+            assert_eq!(res, InputResult::Exit, "{surface} swallows no quit");
+            assert!(conn.written().is_empty(), "{surface} writes no request");
+        }
+    }
+
+    /// A draft keeps the quit behind the shared confirmation card, which
+    /// outranks the dialog that was open (Conventions §5.4, §5.5).
+    #[tokio::test]
+    async fn ctrl_q_with_a_draft_raises_the_quit_confirmation_over_a_dialog() {
+        let mut st = crate::app::test_state();
+        st.modals.show_help = true;
+        st.input_editor.insert_str("important draft");
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let res = handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert_eq!(res, InputResult::Continue);
+        let guard = state.lock().await;
+        assert!(guard.modals.confirm_quit);
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
+        assert_eq!(guard.active_modal(), Some(ActiveModal::ConfirmQuit));
+        assert!(guard.modals.show_help, "the dialog underneath stays open");
+    }
+
+    /// The preemption fires on the resolved chord, never on the bare letter: a
+    /// bare `q` with Help open only dismisses the modal (Conventions §5.2).
+    #[tokio::test]
+    async fn bare_q_with_help_open_dismisses_without_quitting() {
+        let mut st = crate::app::test_state();
+        st.modals.show_help = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let res = handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert_eq!(res, InputResult::Continue);
+        let guard = state.lock().await;
+        assert!(!guard.modals.show_help);
+        assert!(!guard.modals.confirm_quit);
     }
 }

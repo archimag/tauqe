@@ -236,24 +236,12 @@ fn archive_path(base: &Path, index: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::handlers::common::test_support::scratch_root;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     use time::macros::format_description;
     use time::OffsetDateTime;
-
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("tauqe-server-log-{tag}-{nanos}-{id}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn write_bytes(writer: &mut SizeRotatingWriter, len: usize, byte: u8) {
         writer.write_all(&vec![byte; len]).unwrap();
@@ -266,7 +254,7 @@ mod tests {
 
     #[test]
     fn rotation_moves_active_log_into_single_archive() {
-        let dir = unique_temp_dir("rotate");
+        let dir = scratch_root("server-log-rotate");
         let path = dir.join("server.log");
         let mut writer = SizeRotatingWriter::new(path.clone(), 100, 1).unwrap();
 
@@ -286,7 +274,7 @@ mod tests {
 
     #[test]
     fn rotation_never_accumulates_archives_beyond_the_limit() {
-        let dir = unique_temp_dir("archive-limit");
+        let dir = scratch_root("server-log-archive-limit");
         let path = dir.join("server.log");
         let mut writer = SizeRotatingWriter::new(path.clone(), 50, 1).unwrap();
 

@@ -350,28 +350,56 @@ pub(crate) fn compute_unified_review_lines(
     cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut renderer = ReviewLineRenderer::default();
-    walk_review_rows(rows, selected_idx, width, theme_mode, cache, &mut renderer);
+    walk_review_rows(
+        |visit| {
+            for (index, row) in rows.iter().enumerate() {
+                if !visit(index, row) {
+                    break;
+                }
+            }
+        },
+        selected_idx,
+        usize::MAX,
+        width,
+        theme_mode,
+        cache,
+        &mut renderer,
+    );
     (renderer.lines, renderer.offsets)
 }
 
-/// Measures the row offsets and the total height of the flattened Review rows
-/// without materializing a single line.
+/// Measures the row offsets and the total height of the Review tree without
+/// materializing a single line and without owning a single row.
 ///
-/// Every break decision is shared with [`compute_unified_review_lines`] through
-/// one row walk, and the summary lines are counted through
-/// [`wrapped_line_count`] instead of being wrapped into owned lines. A cached
-/// detail body already arrives wrapped to the target width, so it contributes
-/// its own length. Measured offsets therefore match the rendered frame exactly
+/// `source` drives the rows of the tree in render order, so the view measures
+/// its own lazy cursor walk instead of first collecting an owned projection of
+/// the whole tree. The walk stops on `last_index`, which lets the viewport read
+/// the bounds of one row without measuring the rows below it. Every break
+/// decision is shared with the renderer through one row walk, and the summary
+/// lines are counted through [`wrapped_line_count`] instead of being wrapped
+/// into owned lines, so the measured offsets match the rendered frame exactly
 /// while positioning the viewport costs no line allocation (c-2).
-pub(crate) fn measure_review_rows(
-    rows: &[VisibleReviewRow],
+pub(crate) fn measure_review_rows_from<S>(
+    source: S,
     selected_idx: usize,
+    last_index: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
-) -> (Vec<usize>, usize) {
+) -> (Vec<usize>, usize)
+where
+    S: FnMut(&mut dyn FnMut(usize, &VisibleReviewRow) -> bool),
+{
     let mut measure = ReviewLineMeasure::default();
-    walk_review_rows(rows, selected_idx, width, theme_mode, cache, &mut measure);
+    walk_review_rows(
+        source,
+        selected_idx,
+        last_index,
+        width,
+        theme_mode,
+        cache,
+        &mut measure,
+    );
     (measure.offsets, measure.height)
 }
 
@@ -383,10 +411,16 @@ pub(crate) fn measure_review_rows(
 /// summary line, and resolves every detail body through the Markdown cache.
 /// Rendering and measuring therefore observe one identical layout, and a
 /// navigation key reads the selected row's bounds without materializing the
-/// document (c-2).
+/// document (c-1, c-2).
+///
+/// `source` drives the rows of the tree in render order and lends each of them
+/// for the duration of its own visit, so an already-materialized projection and
+/// a lazy cursor walk feed the identical layout. The walk stops on `last_index`,
+/// which lets the viewport measure one row without walking the rows below it.
 fn walk_review_rows<V: TreeRowSink>(
-    rows: &[VisibleReviewRow],
+    mut source: impl FnMut(&mut dyn FnMut(usize, &VisibleReviewRow) -> bool),
     selected_idx: usize,
+    last_index: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
@@ -395,7 +429,7 @@ fn walk_review_rows<V: TreeRowSink>(
     let engine = current_engine();
     let palette = engine.palette();
 
-    for (idx, row) in rows.iter().enumerate() {
+    source(&mut |idx, row| {
         let is_selected = idx == selected_idx;
         // The blank separator between sessions belongs to the gap before a
         // header, so it is emitted before the offset of that row is recorded.
@@ -1022,7 +1056,9 @@ fn walk_review_rows<V: TreeRowSink>(
                 visitor.summary(branch_line, width);
             }
         }
-    }
+
+        idx < last_index
+    });
 }
 
 #[cfg(test)]
@@ -1200,9 +1236,16 @@ mod tests {
                 view.theme_mode,
                 &mut view.markdown_cache,
             );
-            let (measured, height) = measure_review_rows(
-                &rows,
+            let (measured, height) = measure_review_rows_from(
+                |visit| {
+                    for (index, row) in rows.iter().enumerate() {
+                        if !visit(index, row) {
+                            break;
+                        }
+                    }
+                },
                 selected,
+                usize::MAX,
                 60,
                 view.theme_mode,
                 &mut view.markdown_cache,

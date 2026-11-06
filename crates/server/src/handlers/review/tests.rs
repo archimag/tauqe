@@ -4,10 +4,14 @@
 //! repository, session, and provider fixtures they share are declared once here
 //! and imported by the suites. A suite imports them; it never copies them.
 
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use crate::handlers::common::test_support::scratch_root;
 use crate::state::AppState;
-use crate::transport::OutChannel;
+use crate::transport::{OutChannel, BACKLOG_HIGH_WATER};
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{IssueStatus, PlanItemStatus, ReviewItem, ReviewSession};
@@ -26,15 +30,7 @@ struct TestDir(std::path::PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tauqe-test-review-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::create_dir_all(&path);
-        Self(path)
+        Self(scratch_root("test-review"))
     }
     fn path(&self) -> &std::path::Path {
         &self.0
@@ -44,6 +40,68 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Sink that records every write the outbound writer publishes, so a pacing
+/// regression observes the relayed telemetry without touching the real stdout of
+/// the process.
+#[derive(Clone, Default)]
+pub(crate) struct RecordingSink {
+    published: Arc<Mutex<Vec<u8>>>,
+}
+
+impl RecordingSink {
+    /// Everything the writer published so far, decoded as UTF-8.
+    pub(crate) fn published(&self) -> String {
+        self.published
+            .lock()
+            .map(|published| String::from_utf8_lossy(&published).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl tokio::io::AsyncWrite for RecordingSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Ok(mut published) = self.published.lock() {
+            published.extend_from_slice(buf);
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Pre-fills the outbound queue one line above the transport's high-water mark,
+/// so a relay observes a client that keeps its pipe open but stopped reading its
+/// stream.
+pub(crate) fn stall_outbound_transport(state: &AppState) {
+    for _ in 0..=BACKLOG_HIGH_WATER {
+        crate::handlers::common::emit(&state.out, "test/filler", None);
+    }
+}
+
+/// Waits until the writer published a line containing `needle` and returns
+/// everything it published so far.
+pub(crate) async fn await_published(sink: &RecordingSink, needle: &str) -> String {
+    let mut published = String::new();
+    for _ in 0..600 {
+        published = sink.published();
+        if published.contains(needle) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    published
 }
 
 fn test_state(dir: &TestDir) -> Arc<AppState> {

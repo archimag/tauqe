@@ -10,9 +10,10 @@ use crate::app::{
     AppState, ConfirmDialogButton, SquashBaseMode, SquashConfirm, SquashDialogFocus,
     SquashDialogState,
 };
+use crate::command::is_bare_press;
 use crate::config::{MetaModifier, PrimaryModifier};
-use crate::input::{is_char_typing, InputResult};
-use crate::rpc::{send_request, RpcConnection};
+use crate::input::InputResult;
+use crate::rpc::{send_request, settle_squash_failure, RpcConnection};
 
 /// Side effect requested by a key press; performed after the state lock is released.
 enum SquashAction {
@@ -76,38 +77,52 @@ pub async fn handle_squash_key(
         }
         SquashAction::Close => st.modals.squash_dialog = None,
         SquashAction::Preview(base_ref) => {
-            drop(st);
             let params = GitSquashPreviewParams {
                 base_ref: Some(base_ref),
             };
-            send_request(
-                server_writer,
-                methods::GIT_SQUASH_PREVIEW,
-                serde_json::to_value(params)?,
-            )
-            .await?;
+            let params = serde_json::to_value(params)?;
+            drop(st);
+            dispatch(state, server_writer, methods::GIT_SQUASH_PREVIEW, params).await;
         }
         SquashAction::Generate(base_ref) => {
-            drop(st);
             let params = GitSquashGenerateMessageParams { base_ref };
-            send_request(
+            let params = serde_json::to_value(params)?;
+            drop(st);
+            dispatch(
+                state,
                 server_writer,
                 methods::GIT_SQUASH_GENERATE_MESSAGE,
-                serde_json::to_value(params)?,
+                params,
             )
-            .await?;
+            .await;
         }
         SquashAction::Apply(params) => {
+            let params = serde_json::to_value(params)?;
             drop(st);
-            send_request(
-                server_writer,
-                methods::GIT_SQUASH_APPLY,
-                serde_json::to_value(params)?,
-            )
-            .await?;
+            dispatch(state, server_writer, methods::GIT_SQUASH_APPLY, params).await;
         }
     }
     Ok(InputResult::Continue)
+}
+
+/// Dispatches one squash request after the state guard is released.
+///
+/// A write that never reaches the daemon produces no response, so the
+/// in-flight flag the press raised (`loading`, `generating_message`, or
+/// `applying`) would stay set and `handle_key` would refuse every later key:
+/// an applying card would be wedged for good. The failure therefore settles
+/// the dialog exactly as a refused request does and is reported in the
+/// interface instead of propagating as a dispatch error (c-3).
+async fn dispatch(
+    state: &Arc<Mutex<AppState>>,
+    server_writer: &mut RpcConnection,
+    method: &str,
+    params: serde_json::Value,
+) {
+    if let Err(error) = send_request(server_writer, method, params).await {
+        let mut st = state.lock().await;
+        settle_squash_failure(&mut st, &error.to_string());
+    }
 }
 
 fn handle_key(
@@ -142,6 +157,13 @@ fn handle_key(
     }
 }
 
+/// Resolves the apply or discard confirmation card.
+///
+/// The `y` / `n` accelerators and the `Enter` activation are bare presses: a
+/// press carrying a command modifier or the AltGr compose chord confirms and
+/// discards nothing, so a composed `y` can never commit the git-history rewrite
+/// and `Alt+Enter` can never fire the focused button (Conventions §3, §5.1,
+/// §5.2). `Esc` and the button walk stay unconditional.
 fn handle_confirm(
     dialog: &mut SquashDialogState,
     kind: SquashConfirm,
@@ -155,9 +177,11 @@ fn handle_confirm(
             };
             return SquashAction::None;
         }
-        KeyCode::Enter => dialog.confirm_button == ConfirmDialogButton::Confirm,
-        KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => true,
-        KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => false,
+        KeyCode::Enter if is_bare_press(key.modifiers) => {
+            dialog.confirm_button == ConfirmDialogButton::Confirm
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') if is_bare_press(key.modifiers) => true,
+        KeyCode::Char('n') | KeyCode::Char('N') if is_bare_press(key.modifiers) => false,
         KeyCode::Esc => false,
         _ => return SquashAction::None,
     };
@@ -230,10 +254,19 @@ fn handle_message_editor(
     SquashAction::None
 }
 
+/// Browses the dialog while no text field owns the keyboard.
+///
+/// Every letter and digit accelerator is a bare press: a command chord and the
+/// AltGr compose chord belong to the command surface or to a text buffer and
+/// never fire one, so `C-1` cannot dispatch a base preview and `Alt+G` cannot
+/// spend tokens on a generated message (Conventions §3, §5.1, §5.2). The
+/// dedicated arrows, `Esc`, `Tab`, and the paging keys stay unconditional, and
+/// the `C-Enter` / `C-S` apply request keeps its explicit command chord.
 fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) -> SquashAction {
+    let bare = is_bare_press(key.modifiers);
     match key.code {
         KeyCode::Esc => request_close(dialog),
-        KeyCode::Char('1') => {
+        KeyCode::Char('1') if bare => {
             let base = dialog.session_base.clone();
             switch_base(
                 dialog,
@@ -242,7 +275,7 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
                 &crate::i18n::active_t("dialog.squash.status_no_session_base"),
             )
         }
-        KeyCode::Char('2') => {
+        KeyCode::Char('2') if bare => {
             let base = dialog.upstream_base.clone();
             switch_base(
                 dialog,
@@ -251,7 +284,7 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
                 &crate::i18n::active_t("dialog.squash.status_no_upstream_base"),
             )
         }
-        KeyCode::Char('3') => {
+        KeyCode::Char('3') if bare => {
             dialog.custom_input_active = true;
             dialog.custom_editor.clear();
             dialog.custom_editor.insert_str(&dialog.base_ref);
@@ -265,8 +298,8 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
             };
             SquashAction::None
         }
-        KeyCode::Char('g') => begin_generate(dialog),
-        KeyCode::Char('e') | KeyCode::Char('m') => {
+        KeyCode::Char('g') if bare => begin_generate(dialog),
+        KeyCode::Char('e') | KeyCode::Char('m') if bare => {
             dialog.focus = SquashDialogFocus::MessageEditor;
             SquashAction::None
         }
@@ -274,32 +307,16 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
             request_apply_confirm(dialog);
             SquashAction::None
         }
-        KeyCode::Char(' ') | KeyCode::Enter => {
+        KeyCode::Char(' ') | KeyCode::Enter if bare => {
             if let Some(file) = dialog.files.get_mut(dialog.selected_file_index) {
                 file.expanded = !file.expanded;
             }
             SquashAction::None
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if dialog.focus == SquashDialogFocus::DiffView {
-                dialog.diff_scroll = dialog.diff_scroll.saturating_sub(1);
-            } else if dialog.selected_file_index > 0 {
-                dialog.selected_file_index -= 1;
-                dialog.diff_scroll = 0;
-            }
-            SquashAction::None
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if dialog.focus == SquashDialogFocus::DiffView {
-                dialog.diff_scroll = dialog.diff_scroll.saturating_add(1);
-            } else if !dialog.files.is_empty()
-                && dialog.selected_file_index + 1 < dialog.files.len()
-            {
-                dialog.selected_file_index += 1;
-                dialog.diff_scroll = 0;
-            }
-            SquashAction::None
-        }
+        KeyCode::Up => step_browse(dialog, false),
+        KeyCode::Char('k') if bare => step_browse(dialog, false),
+        KeyCode::Down => step_browse(dialog, true),
+        KeyCode::Char('j') if bare => step_browse(dialog, true),
         KeyCode::PageUp => {
             dialog.diff_scroll = dialog.diff_scroll.saturating_sub(10);
             SquashAction::None
@@ -310,6 +327,32 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
         }
         _ => SquashAction::None,
     }
+}
+
+/// Steps the browse cursor one file or scrolls the diff pane by one line.
+///
+/// The dedicated arrows and the bare `j` / `k` letters share this motion; the
+/// letter spelling is guarded at the call site, so a command chord or a composed
+/// character can never move the file cursor.
+fn step_browse(dialog: &mut SquashDialogState, forward: bool) -> SquashAction {
+    if dialog.focus == SquashDialogFocus::DiffView {
+        dialog.diff_scroll = if forward {
+            dialog.diff_scroll.saturating_add(1)
+        } else {
+            dialog.diff_scroll.saturating_sub(1)
+        };
+        return SquashAction::None;
+    }
+
+    let last = dialog.files.len().saturating_sub(1);
+    if forward && dialog.selected_file_index < last {
+        dialog.selected_file_index += 1;
+        dialog.diff_scroll = 0;
+    } else if !forward && dialog.selected_file_index > 0 {
+        dialog.selected_file_index -= 1;
+        dialog.diff_scroll = 0;
+    }
+    SquashAction::None
 }
 
 /// Closes immediately when there is nothing to lose, otherwise asks first.
@@ -399,6 +442,7 @@ fn request_apply_confirm(dialog: &mut SquashDialogState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::SquashFileItem;
 
     fn press(dialog: &mut SquashDialogState, code: KeyCode) -> SquashAction {
         handle_key(
@@ -417,6 +461,25 @@ mod tests {
             PrimaryModifier::Ctrl,
             MetaModifier::Alt,
         )
+    }
+
+    /// Presses a key carrying an arbitrary modifier set.
+    fn press_with(
+        dialog: &mut SquashDialogState,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> SquashAction {
+        handle_key(
+            dialog,
+            KeyEvent::new(code, modifiers),
+            PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
+        )
+    }
+
+    /// Presses a key carrying the AltGr compose chord.
+    fn press_compose(dialog: &mut SquashDialogState, code: KeyCode) -> SquashAction {
+        press_with(dialog, code, KeyModifiers::CONTROL | KeyModifiers::ALT)
     }
 
     fn ready_dialog() -> SquashDialogState {
@@ -552,5 +615,363 @@ mod tests {
         ));
         assert!(dialog.status_message.is_none());
         assert_eq!(dialog.confirm, None);
+    }
+    /// Asserts the press resolved to no dialog action at all.
+    ///
+    /// A command chord and an AltGr-composed character are never dialog
+    /// accelerators, so a guarded arm answers with `SquashAction::None` and
+    /// leaves every field of the dialog untouched.
+    fn assert_no_action(action: SquashAction) {
+        assert!(
+            matches!(action, SquashAction::None),
+            "a command chord or a composed character must not fire a dialog action"
+        );
+    }
+
+    /// Builds a staged file entry without a rendered diff.
+    fn squash_file(path: &str) -> SquashFileItem {
+        SquashFileItem {
+            path: path.to_string(),
+            diff: String::new(),
+            expanded: false,
+        }
+    }
+
+    /// Modifier sets a command surface must refuse: both command chords, the
+    /// AltGr compose chord they form together, and its shifted spelling.
+    fn non_bare_modifiers() -> [KeyModifiers; 4] {
+        [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ]
+    }
+
+    #[test]
+    fn command_and_compose_chords_never_switch_the_squash_base() {
+        for modifiers in non_bare_modifiers() {
+            for code in [KeyCode::Char('1'), KeyCode::Char('2'), KeyCode::Char('3')] {
+                let mut dialog = ready_dialog();
+                dialog.session_base = Some("origin/master".to_string());
+                dialog.upstream_base = Some("origin/main".to_string());
+                dialog.base_ref = "origin/master".to_string();
+
+                assert_no_action(press_with(&mut dialog, code, modifiers));
+                assert!(dialog.pending_base.is_none());
+                assert!(!dialog.loading);
+                assert!(!dialog.custom_input_active);
+                assert!(dialog.status_message.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn command_and_compose_chords_never_generate_a_message() {
+        for modifiers in non_bare_modifiers() {
+            let mut dialog = ready_dialog();
+            dialog.base_ref = "origin/master".to_string();
+
+            assert_no_action(press_with(&mut dialog, KeyCode::Char('g'), modifiers));
+            assert!(!dialog.generating_message);
+            assert!(dialog.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn compose_chord_never_applies_or_discards_the_confirmation() {
+        for (kind, code) in [
+            (SquashConfirm::Apply, KeyCode::Char('y')),
+            (SquashConfirm::Discard, KeyCode::Char('n')),
+        ] {
+            let mut dialog = ready_dialog();
+            dialog.base_ref = "origin/master".to_string();
+            dialog.message_editor.insert_str("feat: keep me");
+            dialog.confirm = Some(kind);
+            dialog.confirm_button = ConfirmDialogButton::Confirm;
+
+            assert_no_action(press_compose(&mut dialog, code));
+            assert_eq!(dialog.confirm, Some(kind));
+            assert_eq!(dialog.confirm_button, ConfirmDialogButton::Confirm);
+            assert!(!dialog.applying);
+            assert_eq!(dialog.message_editor.get_text(), "feat: keep me");
+        }
+    }
+
+    #[test]
+    fn command_modified_enter_never_confirms_the_rewrite() {
+        for modifiers in non_bare_modifiers() {
+            let mut dialog = ready_dialog();
+            dialog.base_ref = "origin/master".to_string();
+            dialog.message_editor.insert_str("feat: x");
+            dialog.confirm = Some(SquashConfirm::Apply);
+            dialog.confirm_button = ConfirmDialogButton::Confirm;
+
+            assert_no_action(press_with(&mut dialog, KeyCode::Enter, modifiers));
+            assert_eq!(dialog.confirm, Some(SquashConfirm::Apply));
+            assert_eq!(dialog.confirm_button, ConfirmDialogButton::Confirm);
+            assert!(!dialog.applying);
+        }
+    }
+
+    #[test]
+    fn bare_presses_keep_their_squash_actions() {
+        let mut dialog = ready_dialog();
+        dialog.session_base = Some("origin/master".to_string());
+        let _ = press(&mut dialog, KeyCode::Char('1'));
+        assert_eq!(
+            dialog.pending_base,
+            Some((SquashBaseMode::Session, "origin/master".to_string()))
+        );
+        assert!(dialog.loading);
+
+        let mut dialog = ready_dialog();
+        dialog.base_ref = "origin/master".to_string();
+        let _ = press(&mut dialog, KeyCode::Char('g'));
+        assert!(dialog.generating_message);
+
+        let mut dialog = ready_dialog();
+        dialog.files = vec![squash_file("a.rs")];
+        let _ = press(&mut dialog, KeyCode::Char(' '));
+        assert!(dialog.files[0].expanded);
+
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            let mut dialog = ready_dialog();
+            dialog.base_ref = "origin/master".to_string();
+            dialog.message_editor.insert_str("feat: x");
+            dialog.confirm = Some(SquashConfirm::Apply);
+            dialog.confirm_button = ConfirmDialogButton::Confirm;
+
+            let action = press(&mut dialog, code);
+            assert!(
+                matches!(action, SquashAction::Apply(params) if params.message == "feat: x"),
+                "a bare {code:?} on the focused Confirm button applies the rewrite"
+            );
+            assert!(dialog.applying);
+        }
+    }
+
+    #[test]
+    fn command_modified_letters_never_move_focus_or_the_cursor() {
+        for modifiers in non_bare_modifiers() {
+            for code in [KeyCode::Char('e'), KeyCode::Char('m')] {
+                let mut dialog = ready_dialog();
+                dialog.focus = SquashDialogFocus::FileList;
+
+                assert_no_action(press_with(&mut dialog, code, modifiers));
+                assert_eq!(dialog.focus, SquashDialogFocus::FileList);
+            }
+
+            // The cursor rests on the second row, so `k` has somewhere to go.
+            let mut dialog = ready_dialog();
+            dialog.files = vec![squash_file("a.rs"), squash_file("b.rs")];
+            dialog.selected_file_index = 1;
+            assert_no_action(press_with(&mut dialog, KeyCode::Char('k'), modifiers));
+            assert_eq!(dialog.selected_file_index, 1);
+
+            // `j` is checked from the first row of the same two files.
+            let mut dialog = ready_dialog();
+            dialog.files = vec![squash_file("a.rs"), squash_file("b.rs")];
+            assert_no_action(press_with(&mut dialog, KeyCode::Char('j'), modifiers));
+            assert_eq!(dialog.selected_file_index, 0);
+
+            // Inside the diff pane the same letters scroll the patch instead.
+            for code in [KeyCode::Char('j'), KeyCode::Char('k')] {
+                let mut dialog = ready_dialog();
+                dialog.focus = SquashDialogFocus::DiffView;
+                dialog.diff_scroll = 5;
+
+                assert_no_action(press_with(&mut dialog, code, modifiers));
+                assert_eq!(dialog.diff_scroll, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn command_modified_toggles_never_fold_a_file() {
+        for modifiers in non_bare_modifiers() {
+            let mut dialog = ready_dialog();
+            dialog.files = vec![squash_file("a.rs")];
+
+            assert_no_action(press_with(&mut dialog, KeyCode::Char(' '), modifiers));
+            assert!(!dialog.files[0].expanded);
+        }
+
+        // `Ctrl+Enter` is the documented apply request of the browse surface, so
+        // the fold guard is proved with the Alt and AltGr spellings that carry no
+        // other meaning there.
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ] {
+            let mut dialog = ready_dialog();
+            dialog.files = vec![squash_file("a.rs")];
+
+            assert_no_action(press_with(&mut dialog, KeyCode::Enter, modifiers));
+            assert!(!dialog.files[0].expanded);
+        }
+    }
+
+    /// Async sink whose every write fails, standing in for a server pipe that
+    /// closed before the press reached it.
+    struct BrokenPipeWriter;
+
+    impl tokio::io::AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server pipe closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Presses one key through the entry point the dialog dispatch calls, over
+    /// a transport whose every write fails.
+    async fn press_over_broken_pipe(
+        state: &Arc<Mutex<AppState>>,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> anyhow::Result<InputResult> {
+        let mut conn = RpcConnection::new(BrokenPipeWriter);
+        let guard = state.lock().await;
+        handle_squash_key(KeyEvent::new(code, modifiers), state, guard, &mut conn).await
+    }
+
+    /// Builds a state whose squash dialog awaits the apply confirmation of
+    /// `feat: x` on `origin/master`.
+    fn applying_state() -> Arc<Mutex<AppState>> {
+        let mut st = crate::app::test_state();
+        let mut dialog = ready_dialog();
+        dialog.base_ref = "origin/master".to_string();
+        dialog.message_editor.insert_str("feat: x");
+        dialog.confirm = Some(SquashConfirm::Apply);
+        dialog.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.squash_dialog = Some(dialog);
+        Arc::new(Mutex::new(st))
+    }
+
+    #[tokio::test]
+    async fn failed_apply_write_settles_the_dialog_and_keeps_the_message() {
+        let state = applying_state();
+
+        let result = press_over_broken_pipe(&state, KeyCode::Char('y'), KeyModifiers::NONE).await;
+        assert!(
+            result.is_ok(),
+            "a failed write is reported in the interface, not as a dispatch error"
+        );
+
+        {
+            let guard = state.lock().await;
+            let dialog = guard
+                .modals
+                .squash_dialog
+                .as_ref()
+                .expect("the dialog stays open so the message is not lost");
+            assert!(
+                !dialog.applying,
+                "a failed write must not latch the applying flag"
+            );
+            assert_eq!(dialog.message_editor.get_text(), "feat: x");
+            assert_eq!(
+                guard
+                    .active_notification()
+                    .map(|notification| notification.level),
+                Some(crate::app::NotificationLevel::Error)
+            );
+        }
+
+        // The card is usable again: the next `Esc` reaches the dialog and asks
+        // to discard the draft instead of being swallowed by the latch.
+        press_over_broken_pipe(&state, KeyCode::Esc, KeyModifiers::NONE)
+            .await
+            .expect("an in-memory dispatch never fails");
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .squash_dialog
+            .as_ref()
+            .expect("the dialog stays open");
+        assert_eq!(dialog.confirm, Some(SquashConfirm::Discard));
+    }
+
+    #[tokio::test]
+    async fn failed_preview_write_clears_the_loading_flag() {
+        let mut st = crate::app::test_state();
+        let mut dialog = ready_dialog();
+        dialog.session_base = Some("origin/master".to_string());
+        st.modals.squash_dialog = Some(dialog);
+        let state = Arc::new(Mutex::new(st));
+
+        press_over_broken_pipe(&state, KeyCode::Char('1'), KeyModifiers::NONE)
+            .await
+            .expect("an in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .squash_dialog
+            .as_ref()
+            .expect("the dialog stays open");
+        assert!(
+            !dialog.loading,
+            "a failed write must not latch the loading flag"
+        );
+        assert!(dialog.pending_base.is_none());
+        assert_eq!(
+            guard
+                .active_notification()
+                .map(|notification| notification.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_generate_write_clears_the_generating_flag() {
+        let mut st = crate::app::test_state();
+        let mut dialog = ready_dialog();
+        dialog.focus = SquashDialogFocus::MessageEditor;
+        dialog.base_ref = "origin/master".to_string();
+        st.modals.squash_dialog = Some(dialog);
+        let state = Arc::new(Mutex::new(st));
+
+        press_over_broken_pipe(&state, KeyCode::Char('g'), KeyModifiers::ALT)
+            .await
+            .expect("an in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .squash_dialog
+            .as_ref()
+            .expect("the dialog stays open");
+        assert!(
+            !dialog.generating_message,
+            "a failed write must not latch the generating flag"
+        );
+        assert_eq!(
+            guard
+                .active_notification()
+                .map(|notification| notification.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
     }
 }

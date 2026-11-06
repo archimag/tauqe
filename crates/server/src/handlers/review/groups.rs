@@ -51,6 +51,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::reap::abort_and_reap;
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{emit, offload_review, publish_review};
@@ -98,7 +99,7 @@ impl GroupAuditExecutor<'_> {
     async fn audit_group(
         &mut self,
         group: &ReviewGroup,
-        cancel_rx: &watch::Receiver<bool>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<usize, GroupFailure> {
         // The group audit expands its declared paths through the same shared
         // projection the plain launch and the read-only preview consume, so a
@@ -191,7 +192,19 @@ impl GroupAuditExecutor<'_> {
         let mut failure: Option<String> = None;
         let mut stream_cancelled = false;
 
+        // A group relays reasoning at token granularity, so a client that keeps
+        // its pipe open but stopped reading pauses the audit here instead of
+        // growing the outbound queue for the rest of the batch. Only the arms that
+        // break this loop are exempted, because they publish the terminal notice
+        // of the group: a stall must never delay the cancellation or the failure
+        // it reports. The cancellation receiver is lent mutably for this gate.
         while let Some(event) = rx.recv().await {
+            if !matches!(
+                event,
+                StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
+            ) {
+                self.state.out.wait_for_headroom(cancel_rx).await;
+            }
             match event {
                 StreamEvent::TextDelta(chunk) => {
                     // A group audit renders no live text, so the decoded delta is
@@ -243,7 +256,7 @@ impl GroupAuditExecutor<'_> {
         let reported_usage = usage.unwrap_or_default();
         usage_guard.observe(&reported_usage).await;
         usage_guard.flush().await;
-        let session_total_cost = self.state.usage.lock().await.session.cost;
+        let session_total_cost = self.state.usage_snapshot().await.session.cost;
         let current_cost = reported_usage.cost.unwrap_or(0.0);
         emit(
             &self.state.out,
@@ -258,11 +271,11 @@ impl GroupAuditExecutor<'_> {
         );
 
         if *cancel_rx.borrow() || stream_cancelled {
-            stream_task.abort();
+            let _ = abort_and_reap(&self.operation_id, "review-group-stream", stream_task).await;
             return Err(GroupFailure::Cancelled);
         }
         if let Some(message) = failure {
-            stream_task.abort();
+            let _ = abort_and_reap(&self.operation_id, "review-group-stream", stream_task).await;
             return Err(GroupFailure::Infrastructure(message));
         }
 
@@ -330,7 +343,7 @@ impl BatchStepExecutor for GroupAuditExecutor<'_> {
         &mut self,
         step: &BatchStep,
         _stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        mut cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
         // The slice is a shared reference with its own lifetime, so the lookup
         // result does not borrow the executor and `audit_group` can take `&mut self`.
@@ -342,7 +355,7 @@ impl BatchStepExecutor for GroupAuditExecutor<'_> {
             )));
         };
 
-        let outcome = match self.audit_group(group, &cancel_rx).await {
+        let outcome = match self.audit_group(group, &mut cancel_rx).await {
             Ok(findings) => {
                 emit_group_finished(self.state, &self.operation_id, group, findings, None);
                 BatchStepOutcome::succeeded()
@@ -527,6 +540,10 @@ pub(crate) async fn run_group_audits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
+    use crate::handlers::review::tests::{
+        await_published, stall_outbound_transport, RecordingSink,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::Value;
@@ -549,16 +566,19 @@ mod tests {
         }
     }
 
+    impl GroupFixture {
+        /// Takes the outbound queue receiver, leaving the receiver of a queue
+        /// that never receives, so a pacing regression can drive its own writer.
+        fn take_events(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+            let (_, placeholder) = tokio::sync::mpsc::unbounded_channel();
+            std::mem::replace(&mut self.events, placeholder)
+        }
+    }
+
     /// Builds a scratch repository holding one file per audit group, plus the
     /// daemon state bound to it.
     fn fixture(label: &str) -> GroupFixture {
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-review-groups-{}-{}-{}",
-            std::process::id(),
-            label,
-            crate::state::next_operation_id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch_root(&format!("review-groups-{label}"));
         std::fs::create_dir_all(root.join("alpha")).unwrap();
         std::fs::create_dir_all(root.join("beta")).unwrap();
         std::fs::write(root.join("alpha/a.rs"), "fn alpha() {}\n").unwrap();
@@ -887,5 +907,70 @@ mod tests {
             operation_id.starts_with("op-"),
             "the group delta names the operation it belongs to: {operation_id}"
         );
+    }
+    /// A group relays reasoning at token granularity, so it obeys the transport's
+    /// pacing contract: a client that keeps its pipe open but stopped reading must
+    /// pause the group audit instead of growing the outbound queue, and the drain
+    /// of that queue must release the paused group.
+    #[tokio::test]
+    async fn group_audit_backpressures_a_stalled_client_until_the_queue_drains() {
+        let mut fixture = fixture("pacing");
+        let session = session(vec![group("grp-alpha", "Alpha", &["alpha/"])]);
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let response = MockResponse::text(findings_payload("Alpha cloning"))
+            .with_reasoning("Inspecting the audited slice");
+        let provider = Arc::new(MockLlmProvider::scripted([response]));
+        *fixture.state.provider_override.lock().await = Some(provider);
+
+        // The client keeps its pipe open but stopped reading its stream.
+        stall_outbound_transport(&fixture.state);
+        let outbound = fixture.take_events();
+
+        let state = Arc::clone(&fixture.state);
+        let root = fixture.root.clone();
+        let operation = Arc::new(
+            state
+                .try_begin_operation()
+                .expect("the operation slot is free"),
+        );
+        let batch =
+            tokio::spawn(async move { run_group_audits(&state, &root, &session, operation).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !batch.is_finished(),
+            "a stalled client must pause the group audit"
+        );
+        let stalled = ReviewStorage::load_review(&fixture.root, "rev-groups")
+            .unwrap()
+            .expect("the session is stored");
+        assert!(
+            stalled.items.is_empty(),
+            "a stalled group appends no findings"
+        );
+
+        // Draining the queue below the low-water mark releases the paused relay.
+        let sink = RecordingSink::default();
+        let writing = tokio::spawn(fixture.state.out.writer(outbound).run_with(sink.clone()));
+        let published = await_published(&sink, events::REVIEW_REASONING_DELTA).await;
+        assert!(
+            published.contains("Inspecting the audited slice"),
+            "the drain must release the paused group relay"
+        );
+
+        let report = batch
+            .await
+            .expect("the batch task joins")
+            .expect("the group batch runs");
+        assert!(report.is_success());
+        let stored = ReviewStorage::load_review(&fixture.root, "rev-groups")
+            .unwrap()
+            .expect("the session is stored");
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].group.as_deref(), Some("grp-alpha"));
+
+        writing.abort();
+        let _ = writing.await;
     }
 }

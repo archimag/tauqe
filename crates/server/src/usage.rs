@@ -7,7 +7,7 @@
 //! so far, and what is the current operation spending right now?* — without
 //! replaying per-operation events.
 //!
-//! This module owns the single authoritative [`UsageTotalsSnapshot`] behind
+//! This module owns the single authoritative [`UsageLedger`] behind
 //! [`AppState::usage`]. An operation opens a [`UsageGuard`], reports the usage
 //! each provider call returns through [`UsageGuard::observe`], and closes the
 //! window with [`UsageGuard::flush`], which folds the operation into the
@@ -18,6 +18,15 @@
 //! `model/usageTotals` event, so a client renders one consistent snapshot
 //! instead of stitching counters together.
 //!
+//! Every window carries an identity that lives beside the snapshot under the
+//! same mutex, so the two can never disagree. The accounting layer itself
+//! therefore decides who may act on the in-flight scope: the heartbeat
+//! publishes only while the recorded identity is verifiably its own, and a
+//! flush folds only the window it still owns. Stopping the heartbeat task is a
+//! best-effort optimization on top of that guarantee, never its substitute: an
+//! abort lands only at the task's next suspension point, so a superseded task
+//! may still reach the lock once, and it must find itself dispossessed there.
+//!
 //! The project lifetime scope outlives the process. It accumulates every
 //! completed operation and is persisted in `<repo_root>/.tauqe/usage.json`,
 //! a directory Git ignores. The document is read once when the state is
@@ -27,6 +36,7 @@
 //! the blocking pool: the daemon runtime must never stall on the file system.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +163,104 @@ async fn persist_lifetime(state: &Arc<AppState>, lifetime: &UsageTotals, operati
     }
 }
 
+/// Identity of one usage accounting window.
+pub(crate) type WindowId = u64;
+
+/// Monotonic source of window identities.
+static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Mints the identity of the next accounting window.
+fn next_window_id() -> WindowId {
+    WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Authoritative accounting state of the daemon.
+///
+/// The snapshot and the identity of the window that owns its in-flight scope
+/// live under one mutex, so identity and window can never disagree. Ownership
+/// is the guarantee the accounting layer itself provides: the heartbeat, an
+/// observation, and a flush act on the in-flight scope only while the recorded
+/// identity is their own, so a window a successor already replaced can neither
+/// publish nor fold anything that belongs to that successor, whatever order the
+/// two tasks reach the lock in. The guarantee therefore never depends on the
+/// operation slot or on a task abort having taken effect.
+pub struct UsageLedger {
+    snapshot: UsageTotalsSnapshot,
+    window: Option<WindowId>,
+}
+
+impl UsageLedger {
+    /// Wraps the snapshot the daemon starts from.
+    ///
+    /// No window owns the in-flight scope before the first operation opens
+    /// one, so a fresh ledger carries the persisted project totals alone.
+    pub(crate) fn new(snapshot: UsageTotalsSnapshot) -> Self {
+        Self {
+            snapshot,
+            window: None,
+        }
+    }
+
+    /// Returns the authoritative snapshot.
+    pub(crate) fn snapshot(&self) -> &UsageTotalsSnapshot {
+        &self.snapshot
+    }
+
+    /// Returns the authoritative snapshot for the lifetime scopes to mutate.
+    pub(crate) fn snapshot_mut(&mut self) -> &mut UsageTotalsSnapshot {
+        &mut self.snapshot
+    }
+
+    /// Reports whether `window` still owns the in-flight scope.
+    pub(crate) fn owns(&self, window: WindowId) -> bool {
+        self.window == Some(window)
+    }
+
+    /// Opens a fresh window, discarding an abandoned in-flight scope.
+    ///
+    /// A window left behind by an operation that failed before flushing is
+    /// discarded here, and the identity minted for its successor is what makes
+    /// the abandoned heartbeat find itself dispossessed instead of publishing
+    /// the successor's state under its own identifier and clock.
+    fn begin(&mut self) -> WindowId {
+        let window = next_window_id();
+        self.window = Some(window);
+        self.snapshot.cur = Some(UsageTotals::default());
+        window
+    }
+
+    /// Adds one provider report to `window`'s in-flight totals.
+    ///
+    /// A window that no longer owns the scope reports nothing: its successor
+    /// installed its own in-flight totals, and folding a stale report into them
+    /// would attribute one operation's spend to another.
+    fn observe(&mut self, window: WindowId, usage: &UsageTotals) -> bool {
+        if !self.owns(window) {
+            return false;
+        }
+        self.snapshot
+            .cur
+            .get_or_insert_with(UsageTotals::default)
+            .accumulate(usage);
+        true
+    }
+
+    /// Closes `window`, returning the totals it observed.
+    ///
+    /// Only a window that still owns the scope is closed. Every other window is
+    /// absent for its guard, so the successor's in-flight totals are never
+    /// taken by a flush that finished after its own window was discarded.
+    fn close(&mut self, window: WindowId, elapsed_ms: u64) -> Option<UsageTotals> {
+        if !self.owns(window) {
+            return None;
+        }
+        self.window = None;
+        let mut completed = self.snapshot.cur.take().unwrap_or_default();
+        completed.duration_ms = completed.duration_ms.saturating_add(elapsed_ms);
+        Some(completed)
+    }
+}
+
 /// Encodes one snapshot publication for the wire.
 fn snapshot_event_params(
     operation_id: &str,
@@ -167,7 +275,7 @@ fn snapshot_event_params(
 
 /// Publishes the current snapshot to the client.
 async fn publish_snapshot(state: &AppState, operation_id: &str) {
-    let snapshot = state.usage.lock().await.clone();
+    let snapshot = state.usage_snapshot().await;
     state.out.send_event(&Event {
         method: events::MODEL_USAGE_TOTALS.to_string(),
         params: snapshot_event_params(operation_id, &snapshot),
@@ -191,9 +299,16 @@ const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 /// window is open, its heartbeat republishes the snapshot with the live
 /// in-flight duration, so a client renders a running clock for the current
 /// operation instead of a dash.
+///
+/// The guard carries the identity of the window it owns, and every operation it
+/// performs is checked against that identity under the accounting lock. The
+/// identifier it publishes with is therefore always the one that owns the
+/// in-flight scope it reports.
 pub struct UsageGuard {
     state: Arc<AppState>,
     operation_id: String,
+    /// Identity of the accounting window this guard owns.
+    window: WindowId,
     started: Instant,
     /// Live duration heartbeat of this window, silenced on flush and on drop.
     ticker: tokio::task::JoinHandle<()>,
@@ -213,14 +328,16 @@ impl Drop for UsageGuard {
 /// The published duration is derived, never stored: the authoritative
 /// `cur.duration_ms` stays zero until [`UsageGuard::flush`] folds in the final
 /// measurement, so a heartbeat can never leak into the session totals. The
-/// heartbeat holds the accounting lock across its synchronous send, which
-/// keeps it strictly ordered against flush: once flush has taken the window
-/// away under the same lock, the next heartbeat observes the absent window
-/// and exits, so no stale "still running" snapshot can be published after the
-/// final one. The cadence arrives as `tick`, so a test can compress it without
-/// touching the production default.
+/// heartbeat holds the accounting lock across its synchronous send and checks
+/// the window identity under that very lock, which keeps it strictly ordered
+/// against both the flush and the successor's `begin`: the moment the identity
+/// it was spawned with stops owning the in-flight scope it exits without
+/// publishing, so neither a closed window nor a replaced one can produce a
+/// stale "still running" snapshot. The cadence arrives as `tick`, so a test can
+/// compress it without touching the production default.
 fn spawn_live_duration_ticker(
     state: &Arc<AppState>,
+    window: WindowId,
     operation_id: &str,
     started: Instant,
     tick: Duration,
@@ -232,12 +349,16 @@ fn spawn_live_duration_ticker(
             tokio::time::sleep(tick).await;
             // The lock is held across the send because the send is
             // synchronous: the heartbeat stays strictly ordered against
-            // flush without ever awaiting on a locked window.
-            let usage = state.usage.lock().await;
-            if usage.cur.is_none() {
+            // flush without ever awaiting on a locked window. Ownership is
+            // read under the same lock, so a heartbeat whose window a
+            // successor already replaced observes that it no longer owns the
+            // in-flight scope and exits without publishing anything — least of
+            // all the successor's state under its own identifier and clock.
+            let ledger = state.usage.lock().await;
+            if !ledger.owns(window) {
                 break;
             }
-            let mut live = usage.clone();
+            let mut live = ledger.snapshot().clone();
             if let Some(cur) = live.cur.as_mut() {
                 cur.duration_ms = started.elapsed().as_millis() as u64;
             }
@@ -254,7 +375,9 @@ impl AppState {
     ///
     /// A window left behind by an operation that failed before flushing is
     /// discarded here, so one abandoned turn never inflates the in-flight
-    /// totals of the next one.
+    /// totals of the next one. The fresh window receives an identity of its
+    /// own, minted under the same lock that installs it, so the abandoned
+    /// heartbeat can never mistake the successor's totals for its own.
     pub async fn begin_usage(self: &Arc<Self>) -> UsageGuard {
         self.begin_usage_with_tick(LIVE_DURATION_TICK).await
     }
@@ -267,15 +390,16 @@ impl AppState {
     /// the daemon publishes with.
     async fn begin_usage_with_tick(self: &Arc<Self>, tick: Duration) -> UsageGuard {
         let operation_id = format!("op-{}", next_operation_id());
-        {
-            let mut snapshot = self.usage.lock().await;
-            snapshot.cur = Some(UsageTotals::default());
-        }
+        let window = {
+            let mut ledger = self.usage.lock().await;
+            ledger.begin()
+        };
         let started = Instant::now();
-        let ticker = spawn_live_duration_ticker(self, &operation_id, started, tick);
+        let ticker = spawn_live_duration_ticker(self, window, &operation_id, started, tick);
         let guard = UsageGuard {
             state: Arc::clone(self),
             operation_id,
+            window,
             started,
             ticker,
         };
@@ -292,10 +416,13 @@ impl AppState {
     /// client renders the same state the next restart will read.
     pub async fn reset_lifetime_usage(self: &Arc<Self>) -> UsageTotalsSnapshot {
         let snapshot = {
-            let mut guard = self.usage.lock().await;
-            guard.lifetime = UsageTotals::default();
-            guard.lifetime_operations = 0;
-            guard.clone()
+            let mut ledger = self.usage.lock().await;
+            {
+                let snapshot = ledger.snapshot_mut();
+                snapshot.lifetime = UsageTotals::default();
+                snapshot.lifetime_operations = 0;
+            }
+            ledger.snapshot().clone()
         };
         persist_lifetime(self, &snapshot.lifetime, snapshot.lifetime_operations).await;
         let operation_id = format!("reset-{}", next_operation_id());
@@ -325,7 +452,8 @@ impl AppState {
                 }
             };
         {
-            let mut snapshot = self.usage.lock().await;
+            let mut ledger = self.usage.lock().await;
+            let snapshot = ledger.snapshot_mut();
             snapshot.lifetime = loaded.0;
             snapshot.lifetime_operations = loaded.1;
         }
@@ -339,41 +467,66 @@ impl UsageGuard {
     ///
     /// A provider may answer with token counts only, a cost only, or nothing at
     /// all; the totals accumulate whatever was reported and stay additive
-    /// across the several calls a multi-round operation makes.
+    /// across the several calls a multi-round operation makes. A window that no
+    /// longer owns the in-flight scope records and publishes nothing, because
+    /// the totals installed under the lock belong to its successor.
     pub async fn observe(&self, usage: &ModelUsageInfo) {
-        {
-            let mut snapshot = self.state.usage.lock().await;
-            snapshot
-                .cur
-                .get_or_insert_with(UsageTotals::default)
-                .accumulate(&UsageTotals::from_usage(usage));
+        let applied = {
+            let mut ledger = self.state.usage.lock().await;
+            ledger.observe(self.window, &UsageTotals::from_usage(usage))
+        };
+        if applied {
+            self.publish().await;
+        } else {
+            tracing::warn!(
+                operation_id = self.operation_id.as_str(),
+                "Usage window was already replaced; the observation is discarded",
+            );
         }
-        self.publish().await;
     }
 
     /// Closes the window, folding the operation into both totals and persisting
     /// the project total.
     ///
+    ///
     /// The duration is measured by the harness rather than reported by the
     /// provider, so it reflects how long the operation actually held the
     /// developer's turn. The project lifetime is accumulated under the same
     /// lock as the session totals, so the two scopes can never disagree about
-    /// the operation that just finished. The heartbeat is silenced first, so
-    /// the final publish below is the last snapshot this operation can ever
+    /// the operation that just finished. The heartbeat is silenced first and
+    /// the window it was spawned with is closed under the same lock, so the
+    /// final publish below is the last snapshot this operation can ever
     /// produce.
+    ///
+    /// Only the window this guard owns is folded and cleared: a guard whose
+    /// window a successor already discarded treats its own scope as absent, so
+    /// it can neither take the successor's in-flight totals nor publish them
+    /// under an identifier they do not belong to.
     pub async fn flush(self) {
         self.ticker.abort();
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
-        let (lifetime, lifetime_operations) = {
-            let mut snapshot = self.state.usage.lock().await;
-            let mut completed = snapshot.cur.take().unwrap_or_default();
-            completed.duration_ms = completed.duration_ms.saturating_add(elapsed_ms);
-            snapshot.session.accumulate(&completed);
-            snapshot.prev = completed.clone();
-            snapshot.operations = snapshot.operations.saturating_add(1);
-            snapshot.lifetime.accumulate(&completed);
-            snapshot.lifetime_operations = snapshot.lifetime_operations.saturating_add(1);
-            (snapshot.lifetime.clone(), snapshot.lifetime_operations)
+        let folded = {
+            let mut ledger = self.state.usage.lock().await;
+            match ledger.close(self.window, elapsed_ms) {
+                Some(completed) => {
+                    let snapshot = ledger.snapshot_mut();
+                    snapshot.session.accumulate(&completed);
+                    snapshot.operations = snapshot.operations.saturating_add(1);
+                    snapshot.lifetime.accumulate(&completed);
+                    let operations = snapshot.lifetime_operations.saturating_add(1);
+                    snapshot.lifetime_operations = operations;
+                    snapshot.prev = completed;
+                    Some((snapshot.lifetime.clone(), operations))
+                }
+                None => None,
+            }
+        };
+        let Some((lifetime, lifetime_operations)) = folded else {
+            tracing::warn!(
+                operation_id = self.operation_id.as_str(),
+                "Usage window was already replaced; the flush folds nothing",
+            );
+            return;
         };
         // Persist before publishing: the announced snapshot then always
         // matches what a restarted daemon would load.
@@ -390,6 +543,7 @@ impl UsageGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
     use std::path::PathBuf;
     use tauqe_core::config::AppConfig;
@@ -409,16 +563,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<String>,
         PathBuf,
     ) {
-        // The root must stay unique across processes: nextest runs each test
-        // in its own process, where the process-local operation counter
-        // restarts, so a counter-only suffix makes every test process share
-        // one directory and race on `.tauqe/usage.json`.
-        let root = std::env::temp_dir().join(format!(
-            "tauqe-usage-{}-{}",
-            std::process::id(),
-            next_operation_id()
-        ));
-        let _ = std::fs::create_dir_all(&root);
+        let root = scratch_root("usage");
         let (out, rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
@@ -470,7 +615,7 @@ mod tests {
         second.observe(&usage(2, 3)).await;
         second.flush().await;
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 2);
         assert_eq!(snapshot.session.prompt_tokens, 112);
         assert_eq!(snapshot.session.completion_tokens, 48);
@@ -510,12 +655,12 @@ mod tests {
         let guard = state.begin_usage().await;
         guard.observe(&usage(3, 2)).await;
 
-        let in_flight = state.usage.lock().await.clone();
+        let in_flight = state.usage_snapshot().await;
         assert_eq!(in_flight.session.total_tokens, 0);
         assert_eq!(in_flight.operation_totals().total_tokens, 5);
 
         guard.flush().await;
-        let flushed = state.usage.lock().await.clone();
+        let flushed = state.usage_snapshot().await;
         assert!(flushed.cur.is_none());
         assert_eq!(flushed.session.total_tokens, 5);
         assert_eq!(flushed.prev.total_tokens, 5);
@@ -576,7 +721,7 @@ mod tests {
         // the full measured duration, never the heartbeat's derived one on
         // top of it.
         guard.flush().await;
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert!(snapshot.cur.is_none());
         assert_eq!(snapshot.prev.total_tokens, 5);
         assert!(
@@ -616,7 +761,7 @@ mod tests {
         assert_eq!(stored["lifetime_operations"].as_u64(), Some(1));
 
         let restarted = state_at(&root);
-        let snapshot = restarted.usage.lock().await.clone();
+        let snapshot = restarted.usage_snapshot().await;
         assert_eq!(snapshot.lifetime.total_tokens, 140);
         assert_eq!(snapshot.lifetime_operations, 1);
         assert!(
@@ -626,6 +771,130 @@ mod tests {
         assert_eq!(snapshot.operations, 0);
 
         drop(restarted);
+    }
+
+    /// A window a successor replaced must never publish again: the abandoned
+    /// heartbeat may still reach the accounting lock after its own abort was
+    /// requested, and the identity it carries is what makes it observe that the
+    /// in-flight totals now belong to another operation.
+    ///
+    /// Without that identity the heartbeat would publish the successor's window
+    /// under its own operation id and its own clock, so a client would render a
+    /// running operation that already ended.
+    #[tokio::test]
+    async fn an_abandoned_window_never_publishes_under_its_successor() {
+        // The windows run on a compressed tick, so the abandoned heartbeat
+        // really reaches the lock while the successor owns it.
+        const TEST_TICK: Duration = Duration::from_millis(20);
+        let (state, mut rx, root) = test_state();
+
+        let abandoned = state.begin_usage_with_tick(TEST_TICK).await;
+        let abandoned_id = abandoned.operation_id.clone();
+        abandoned.observe(&usage(100, 40)).await;
+
+        // The successor installs its own window while the abandoned guard is
+        // still alive: the abandoned totals are discarded with that window.
+        let successor = state.begin_usage_with_tick(TEST_TICK).await;
+        let successor_id = successor.operation_id.clone();
+        successor.observe(&usage(3, 2)).await;
+        while rx.try_recv().is_ok() {}
+
+        // The successor heartbeat proves itself while the abandoned heartbeat
+        // runs out its remaining ticks: every publication of that stretch must
+        // name the successor, and none may carry the abandoned identifier.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut successor_live = false;
+        let mut leaked = 0usize;
+        while !successor_live && std::time::Instant::now() < deadline {
+            while let Ok(raw) = rx.try_recv() {
+                let Some(event) = decode_usage_event(&raw) else {
+                    continue;
+                };
+                if event.operation_id == abandoned_id {
+                    leaked += 1;
+                    continue;
+                }
+                if event.operation_id == successor_id
+                    && event
+                        .snapshot
+                        .cur
+                        .as_ref()
+                        .is_some_and(|cur| cur.duration_ms > 0)
+                {
+                    successor_live = true;
+                }
+            }
+            if !successor_live {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            successor_live,
+            "the successor heartbeat must still publish its live duration"
+        );
+        assert_eq!(
+            leaked, 0,
+            "an abandoned window must never publish the successor's state"
+        );
+
+        // The successor's flush folds exactly the totals its own window
+        // observed; the abandoned observation was discarded with its window.
+        successor.flush().await;
+        let snapshot = state.usage_snapshot().await;
+        assert_eq!(snapshot.operations, 1, "only the successor flushed");
+        assert_eq!(snapshot.session.prompt_tokens, 3);
+        assert_eq!(snapshot.session.completion_tokens, 2);
+        assert_eq!(snapshot.session.total_tokens, 5);
+        assert_eq!(snapshot.prev.total_tokens, 5);
+        assert!(
+            snapshot.cur.is_none(),
+            "the successor's flush closes its own window"
+        );
+
+        drop(abandoned);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A flush closes only the window it still owns: a superseded guard can
+    /// neither take the successor's in-flight totals nor publish them under an
+    /// identifier they do not belong to.
+    #[tokio::test]
+    async fn a_superseded_flush_folds_only_its_own_window() {
+        // The production cadence is irrelevant here, so the heartbeat is parked
+        // far beyond the test to keep the published events deterministic.
+        const PARKED_TICK: Duration = Duration::from_secs(3600);
+        let (state, mut rx, root) = test_state();
+
+        let abandoned = state.begin_usage_with_tick(PARKED_TICK).await;
+        abandoned.observe(&usage(100, 40)).await;
+        let successor = state.begin_usage_with_tick(PARKED_TICK).await;
+        successor.observe(&usage(3, 2)).await;
+        while rx.try_recv().is_ok() {}
+
+        abandoned.flush().await;
+        let in_flight = state.usage_snapshot().await;
+        assert!(
+            in_flight.cur.is_some(),
+            "a superseded flush must leave the successor's window installed"
+        );
+        assert_eq!(
+            in_flight.operation_totals().total_tokens,
+            5,
+            "the successor's in-flight totals stay its own"
+        );
+        assert_eq!(in_flight.operations, 0, "a superseded flush counts nothing");
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded flush publishes nothing"
+        );
+
+        successor.flush().await;
+        let flushed = state.usage_snapshot().await;
+        assert!(flushed.cur.is_none());
+        assert_eq!(flushed.operations, 1);
+        assert_eq!(flushed.session.total_tokens, 5);
+        assert_eq!(flushed.prev.total_tokens, 5);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -656,8 +925,7 @@ mod tests {
     /// zero and the next flush rewrites the document.
     #[test]
     fn unreadable_telemetry_falls_back_to_empty_totals() {
-        let root =
-            std::env::temp_dir().join(format!("tauqe-usage-corrupt-{}", next_operation_id()));
+        let root = scratch_root("usage-corrupt");
         let _ = std::fs::create_dir_all(root.join(TELEMETRY_DIR));
         std::fs::write(telemetry_path(&root), "{ not telemetry").unwrap();
 
@@ -674,14 +942,12 @@ mod tests {
     #[tokio::test]
     async fn rebinding_adopts_the_telemetry_of_the_new_repository() {
         let (state, _rx, first_root) = test_state();
-        let second_root =
-            std::env::temp_dir().join(format!("tauqe-usage-rebind-{}", next_operation_id()));
-        let _ = std::fs::create_dir_all(&second_root);
+        let second_root = scratch_root("usage-rebind");
 
         let guard = state.begin_usage().await;
         guard.observe(&usage(10, 5)).await;
         guard.flush().await;
-        assert_eq!(state.usage.lock().await.lifetime.total_tokens, 15);
+        assert_eq!(state.usage_snapshot().await.lifetime.total_tokens, 15);
 
         // The second repository already carries its own, much smaller,
         // telemetry document.
@@ -700,7 +966,7 @@ mod tests {
             .expect("context mutation runs");
         state.reload_usage_lifetime().await;
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.lifetime.total_tokens, 10);
         assert_eq!(snapshot.lifetime_operations, 1);
         assert_eq!(

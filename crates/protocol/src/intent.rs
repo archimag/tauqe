@@ -436,21 +436,57 @@ mod tests {
     }
     #[test]
     fn test_regime_profile_maps_every_intent() {
+        // The exhaustive match is the completeness gate: a new variant stops this
+        // test from compiling until its regime profile is declared here.
+        for intent in ALL {
+            let expected = match intent {
+                TurnIntent::InteractiveRepl => CapabilityProfile::interactive_repl(),
+                TurnIntent::PlanDiscussion => CapabilityProfile::discussion(),
+                TurnIntent::ReviewDiscussion => CapabilityProfile::review_discussion(),
+                TurnIntent::IsolatedStep => CapabilityProfile::isolated_step(),
+                TurnIntent::ArchitectSynthesis => CapabilityProfile::architect_research(),
+            };
+            assert_eq!(
+                intent.regime_profile(),
+                expected,
+                "intent {intent:?} must map to its declared profile"
+            );
+        }
+    }
+
+    /// Counts the variants the `TurnIntent` declaration enumerates itself.
+    fn declared_variant_count() -> usize {
+        let source = include_str!("intent.rs");
+        // The test module is cut away first, so the fixtures below can never be
+        // mistaken for a declaration. The index comes from a matched ASCII
+        // marker, so the slice always lands on a character boundary.
+        let declaration = match source.find("#[cfg(test)]") {
+            Some(index) => &source[..index],
+            None => source,
+        };
+        let Some((_, body)) = declaration.split_once("pub enum TurnIntent {") else {
+            return 0;
+        };
+        // Every variant is a unit variant on its own line.
+        body.lines()
+            .take_while(|line| line.trim() != "}")
+            .filter(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with("//") && !line.starts_with('#')
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_intent_enumeration_lists_every_declared_variant() {
+        // `ALL` drives every exhaustive sweep of this module, so a variant that
+        // is declared but never listed would silently escape all of them. The
+        // source scan makes the enumeration check itself instead of trusting a
+        // hand-maintained array.
         assert_eq!(
-            TurnIntent::InteractiveRepl.regime_profile(),
-            CapabilityProfile::interactive_repl()
-        );
-        assert_eq!(
-            TurnIntent::PlanDiscussion.regime_profile(),
-            CapabilityProfile::discussion()
-        );
-        assert_eq!(
-            TurnIntent::IsolatedStep.regime_profile(),
-            CapabilityProfile::isolated_step()
-        );
-        assert_eq!(
-            TurnIntent::ArchitectSynthesis.regime_profile(),
-            CapabilityProfile::architect_research()
+            declared_variant_count(),
+            ALL.len(),
+            "ALL must list every variant declared on TurnIntent"
         );
     }
 

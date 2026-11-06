@@ -1211,25 +1211,30 @@ mod tests {
     #[test]
     fn test_model_result_proposal_repo_searches_normalize_paths() {
         // The proposal applies the same repository-path rules as every sibling
-        // discovery list: a `./` prefix collapses, `.` names the whole
-        // repository, and escaping spellings are dropped instead of reaching
-        // the engine.
+        // discovery list: a `./` prefix collapses, a dot composition names the
+        // whole repository through the derived segment rule, and escaping
+        // spellings are dropped instead of reaching the engine.
         let raw = r#"{
             "message": "Search the subsystem",
             "changes": [],
             "repo_searches": [
                 {"path": "./crates/core", "regex": "fn run"},
                 {"path": ".", "regex": "pub fn"},
+                {"path": "./.", "regex": "trait LlmProvider"},
                 {"path": "../escape", "regex": "secret"},
                 {"path": "/etc/passwd", "regex": "root"}
             ]
         }"#;
         let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
-        assert_eq!(proposal.repo_searches.len(), 2);
+        assert_eq!(proposal.repo_searches.len(), 3);
         assert_eq!(proposal.repo_searches[0].path, "crates/core");
         assert_eq!(proposal.repo_searches[0].regex, "fn run");
         assert!(proposal.repo_searches[1].path.is_empty());
         assert_eq!(proposal.repo_searches[1].regex, "pub fn");
+        // A dot composition an enumerated root list would miss reaches the
+        // same whole-repository root as the bare `.` above.
+        assert!(proposal.repo_searches[2].path.is_empty());
+        assert_eq!(proposal.repo_searches[2].regex, "trait LlmProvider");
     }
 
     #[test]
@@ -1289,7 +1294,11 @@ mod tests {
                 "/etc/passwd",
                 "",
                 ".",
-                "a/../b.rs"
+                "a/../b.rs",
+                "\\\\server\\share",
+                "\\\\etc\\passwd",
+                "\\\\?\\C:\\x",
+                "\\\\"
             ]
         }"#;
         let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
@@ -1297,8 +1306,8 @@ mod tests {
         // declared them: `./` collapses, backslashes become separators, a
         // trailing slash is dropped, a backtick-wrapped path is cleaned by the
         // shared normalizer, and a repeated spelling stays a duplicate. The
-        // traversal, absolute, empty, and intermediate-`..` entries are dropped
-        // instead of being forwarded.
+        // traversal, absolute, empty, intermediate-`..`, and leading
+        // literal-backslash entries are dropped instead of being forwarded.
         assert_eq!(
             proposal.context_drops,
             vec![

@@ -407,13 +407,7 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
         Some(methods::GIT_SQUASH_PREVIEW)
         | Some(methods::GIT_SQUASH_GENERATE_MESSAGE)
         | Some(methods::GIT_SQUASH_APPLY) => {
-            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
-                dialog.loading = false;
-                dialog.generating_message = false;
-                dialog.applying = false;
-                dialog.pending_base = None;
-            }
-            st.notify_error(active_t("notify.rpc_error").replace("{}", message));
+            settle_squash_failure(st, message);
         }
         Some(methods::LOCALE_GENERATE) => {
             if let Some(dialog) = st.modals.locale_dialog.as_mut() {
@@ -446,6 +440,24 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
         }
         _ => st.notify_error(active_t("notify.rpc_error").replace("{}", message)),
     }
+}
+
+/// Settles the squash dialog a request that failed left behind.
+///
+/// The dialog stays open carrying its commit message, so neither a request
+/// the daemon refused nor a transport write that never reached it may keep
+/// the in-flight flags its press raised: `applying` alone makes `handle_key`
+/// ignore every later key, which would wedge the card for good (c-3). Both
+/// paths report the failure through the same notification, so a closed pipe
+/// reads exactly like a refusal.
+pub(crate) fn settle_squash_failure(st: &mut AppState, message: &str) {
+    if let Some(dialog) = st.modals.squash_dialog.as_mut() {
+        dialog.loading = false;
+        dialog.generating_message = false;
+        dialog.applying = false;
+        dialog.pending_base = None;
+    }
+    st.notify_error(active_t("notify.rpc_error").replace("{}", message));
 }
 
 /// Projects a failed turn onto the interface: the status becomes an error, the

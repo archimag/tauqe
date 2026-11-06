@@ -2240,6 +2240,224 @@ fn test_unwind_removes_the_checkpoint_commit_its_marker_records() {
     );
 }
 
+#[test]
+fn test_pinned_evidence_answers_about_the_pinned_commit_after_head_advances() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // A dirty tree captures the developer's work in a checkpoint commit, which
+    // is the commit the evidence below is pinned to.
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(checkpoint.created_checkpoint_commit);
+    let pinned = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(pinned, base);
+
+    // A commit lands afterwards, so HEAD no longer names the pinned commit.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    assert_eq!(
+        commit_subject(path, &pinned, &deadline),
+        format!("{CHECKPOINT_PREFIX} uncommitted user changes")
+    );
+    assert_eq!(commit_parent(path, &pinned, &deadline), Some(base.clone()));
+    // The initial commit is the repository root, so it pins no parent.
+    assert_eq!(commit_parent(path, &base, &deadline), None);
+
+    // The readers answer about the commit they are handed, never about the
+    // moving `HEAD`, so the drifted commit is read by its own hash.
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(drifted, pinned);
+    assert_eq!(
+        commit_subject(path, &drifted, &deadline),
+        "fix: developer commit"
+    );
+    assert_eq!(commit_parent(path, &drifted, &deadline), Some(pinned));
+}
+
+#[test]
+fn test_assert_head_pinned_detects_a_moved_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    let pinned = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let deadline = GitDeadline::default();
+
+    // The identity a proof settled on is accepted while HEAD still names it.
+    assert_head_pinned(path, &pinned, &deadline).unwrap();
+
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    // A commit that landed after the pin refuses the rewrite instead of being
+    // silently dropped.
+    let error =
+        assert_head_pinned(path, &pinned, &deadline).expect_err("a moved HEAD must be refused");
+    assert!(error.to_string().contains("HEAD moved"), "{error}");
+
+    // A branch that holds no commit resolves nothing, so the pin fails too.
+    let unborn = tempfile::tempdir().unwrap();
+    let unborn_path = unborn.path();
+    crate::git::state::init_repository(Some(unborn_path), false, GitHooks::Bypass).unwrap();
+    assert!(
+        assert_head_pinned(unborn_path, &pinned, &deadline).is_err(),
+        "an unborn HEAD resolves nothing to re-assert"
+    );
+}
+
+#[test]
+fn test_pinned_unwind_refuses_a_head_that_moved_after_the_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A dirty tree captures the developer's work in a checkpoint commit, which
+    // the unwind proof pins before the destructive step runs.
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "uncommitted work").unwrap();
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(checkpoint.created_checkpoint_commit);
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_pinned_unwind(path, &checkpoint, &deadline)
+        .expect("the checkpoint commit is authorized for the unwind");
+
+    // A commit lands between the proof and the destructive step.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged_before =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+
+    let error = unwind_pinned_head(path, &pinned, &deadline)
+        .expect_err("a HEAD that moved after the proof must refuse the unwind");
+    assert!(error.to_string().contains("HEAD moved"), "{error}");
+    assert!(
+        error.downcast_ref::<HeadDrift>().is_some(),
+        "the refusal must stay typed so recovery can report its skip diagnostic"
+    );
+
+    // The drifted commit survives at HEAD, and no history, index entry, or
+    // working-tree byte was rewritten.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(path.join("later.txt")).unwrap(),
+        "later work"
+    );
+    assert_eq!(fs::read_to_string(&user_file).unwrap(), "uncommitted work");
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap(),
+        staged_before
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_pinned_unborn_return_refuses_a_head_that_moved_after_the_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    // The turn records its work in a step commit on a branch that held no
+    // commit before it, which is the state the return below pins.
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_pinned_unborn_return(path, &deadline)
+        .unwrap()
+        .expect("the branch holds a commit to return from");
+    assert_eq!(pinned.tracked, vec!["ai_work.txt".to_string()]);
+
+    // A commit lands between the listing and the destructive step.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let error = return_pinned_to_unborn(path, &pinned, &deadline)
+        .expect_err("a HEAD that moved after the listing must refuse the return");
+    assert!(error.to_string().contains("HEAD moved"), "{error}");
+
+    // The branch still holds the drifted commit, no path was removed, and the
+    // index still records both files.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(path.join("ai_work.txt")).unwrap(),
+        "ai step modification"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("later.txt")).unwrap(),
+        "later work"
+    );
+    let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+    assert!(tracked.contains("ai_work.txt"), "{tracked}");
+    assert!(tracked.contains("later.txt"), "{tracked}");
+}
+
 /// Writes an executable `pre-commit` hook into the repository.
 #[cfg(unix)]
 fn install_pre_commit_hook(dir: &std::path::Path, script: &str) {
@@ -2393,4 +2611,481 @@ fn test_recover_stale_index_lock_reclaims_only_a_lock_that_outlived_its_budget()
         &GitDeadline::with_timeout(0)
     ));
     assert!(!lock.exists());
+}
+
+/// Corrupts the commit object `rev` resolves to.
+///
+/// The revision keeps resolving to its hash — `rev-parse` answers from the ref
+/// and only checks that the object file exists — while every command that
+/// parses the object fails. A recovery proof that depends on listing such a
+/// revision therefore observes a resolvable `HEAD` and an unestablished range.
+fn corrupt_commit_object(dir: &std::path::Path, rev: &str) {
+    let hash = crate::git::cmd::run_git(Some(dir), &["rev-parse", rev])
+        .unwrap()
+        .trim()
+        .to_string();
+    let (prefix, rest) = hash.split_at(2);
+    let object = format!("objects/{prefix}/{rest}");
+    let relative =
+        crate::git::cmd::run_git(Some(dir), &["rev-parse", "--git-path", object.as_str()])
+            .unwrap()
+            .trim()
+            .to_string();
+    let object_path = dir.join(relative);
+    assert!(
+        object_path.is_file(),
+        "the fixture must address a loose commit object: {}",
+        object_path.display()
+    );
+    // Git stores loose objects read-only, so the corrupt payload replaces the
+    // file entry instead of overwriting it: withdrawing the entry takes the
+    // directory permission, not a write bit on the object itself.
+    fs::remove_file(&object_path).unwrap();
+    fs::write(&object_path, "corrupted commit object").unwrap();
+}
+
+#[test]
+fn test_settled_unborn_proof_clears_the_marker_of_a_branch_still_unborn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    // The marker records a transaction that opened on an unborn branch and the
+    // branch still holds no commit, so the proof range is legitimately empty
+    // and needs no listing at all.
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Unborn,
+            phase: TransactionPhase::Established,
+            writer_pid: None,
+        },
+    )
+    .unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    assert!(recovery.is_none(), "{recovery:?}");
+
+    assert!(head_is_unborn(path));
+    assert!(read_transaction_marker(path).is_none());
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+}
+
+#[test]
+fn test_settled_proof_refuses_when_the_range_cannot_be_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The marker describes a transaction that opened on an unborn branch while
+    // the branch now holds a commit, so the proof has to list it. Corrupting
+    // that commit keeps HEAD resolvable while `git log` fails to read it.
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "valuable uncommitted edits").unwrap();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Unborn,
+            phase: TransactionPhase::Established,
+            writer_pid: None,
+        },
+    )
+    .unwrap();
+    corrupt_commit_object(path, "HEAD");
+
+    // The fixture reproduces the exposed state exactly: HEAD still resolves,
+    // while the listing of its history fails.
+    let resolves =
+        crate::git::cmd::run_git(Some(path), &["rev-parse", "--verify", "--quiet", "HEAD"]);
+    assert!(resolves.is_ok(), "HEAD must keep resolving: {resolves:?}");
+    assert!(
+        crate::git::cmd::run_git(Some(path), &["log", "--format=%H", "HEAD"]).is_err(),
+        "the listing of a corrupted history must fail"
+    );
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(message.contains("could not be listed"), "{message}");
+
+    // A proof that cannot be established authorizes nothing: the marker
+    // survives for a later attempt, and neither the branch nor the working
+    // tree was rewritten.
+    assert!(read_transaction_marker(path).is_some());
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "valuable uncommitted edits"
+    );
+}
+
+/// The reclamation report of a recovery case that found no orphaned artifact.
+fn nothing_reclaimed() -> ReclaimedOrphans {
+    ReclaimedOrphans {
+        staging_files: 0,
+        index_lock: false,
+    }
+}
+
+#[test]
+fn test_settled_proof_refuses_a_born_reset_when_the_repository_advanced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A clean tree opens the transaction without a checkpoint commit, and the
+    // step commit is the verified progress of the interrupted turn.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(!checkpoint.created_checkpoint_commit);
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_head(path, &deadline);
+    assert!(
+        pinned.is_some(),
+        "the proof is settled over a resolved commit"
+    );
+
+    // A commit lands between the proof and the action it licenses.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged_before =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+
+    let refused = settle_proved_transaction(
+        path,
+        &checkpoint,
+        pinned.as_deref(),
+        1,
+        nothing_reclaimed(),
+        &deadline,
+    )
+    .unwrap();
+
+    let message = refused.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(message.contains("HEAD moved"), "{message}");
+
+    // The commit that landed survives, and no history, index entry, or
+    // working-tree byte was rewritten.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(path.join("later.txt")).unwrap(),
+        "later work"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("ai_work.txt")).unwrap(),
+        "ai step modification"
+    );
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap(),
+        staged_before
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_settled_proof_refuses_the_unborn_return_when_the_repository_advanced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    // The transaction opens on the unborn base, and the step commit below is
+    // the verified progress that would be returned to the unborn state.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(checkpoint.base, TransactionBase::Unborn);
+    assert!(!checkpoint.created_checkpoint_commit);
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_head(path, &deadline);
+    assert!(pinned.is_some(), "the step commit resolves the branch");
+
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let refused = settle_proved_transaction(
+        path,
+        &checkpoint,
+        pinned.as_deref(),
+        1,
+        nothing_reclaimed(),
+        &deadline,
+    )
+    .unwrap();
+
+    let message = refused.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(message.contains("HEAD moved"), "{message}");
+
+    // The branch keeps the commit that landed, and the paths the transaction
+    // tracked stay in the working tree instead of being removed.
+    assert!(!head_is_unborn(path));
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(path.join("ai_work.txt")).unwrap(),
+        "ai step modification"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("later.txt")).unwrap(),
+        "later work"
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_capturing_recovery_refuses_the_unstage_when_the_repository_advanced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+
+    // The capturing marker is durable while the work still sits uncommitted in
+    // the working tree, and the interrupted capture already staged it.
+    ensure_tauqe_ignored(path).unwrap();
+    let checkpoint = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Commit(base.clone()),
+        phase: TransactionPhase::Capturing,
+        writer_pid: None,
+    };
+    write_transaction_marker(path, &checkpoint).unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_head(path, &deadline);
+    assert_eq!(pinned.as_deref(), Some(base.as_str()));
+
+    // A commit lands after the crash, so HEAD no longer names the recorded base.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let status_before = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
+
+    let refused = recover_capturing_transaction_pinned(
+        path,
+        &checkpoint,
+        pinned.as_deref(),
+        nothing_reclaimed(),
+        &deadline,
+    )
+    .unwrap();
+
+    let message = refused.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(message.contains("HEAD moved"), "{message}");
+
+    // The commit that landed survives, the developer's bytes stay in the
+    // working tree, and the index is left exactly as the crash left it.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap(),
+        status_before
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_capturing_recovery_refuses_the_unwind_when_the_repository_advanced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    fs::write(path.join("tracked.txt"), "committed content\n").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "tracked.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "chore: add the tracked file",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(path.join("tracked.txt"), "developer edit\n").unwrap();
+
+    let checkpoint = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Commit(base),
+        phase: TransactionPhase::Capturing,
+        writer_pid: None,
+    };
+    write_transaction_marker(path, &checkpoint).unwrap();
+
+    // The capture committed the work but crashed before the marker recorded it.
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} uncommitted user changes"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_head(path, &deadline);
+    let checkpoint_commit = pinned.clone().expect("the checkpoint commit resolves");
+
+    // A commit lands on top of the checkpoint commit after the crash.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let refused = recover_capturing_transaction_pinned(
+        path,
+        &checkpoint,
+        pinned.as_deref(),
+        nothing_reclaimed(),
+        &deadline,
+    )
+    .unwrap();
+
+    let message = refused.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(message.contains("HEAD moved"), "{message}");
+
+    // The checkpoint commit and the commit that landed on top of it both stay
+    // reachable, and the marker authorizes a later startup to redo the proof.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    let parent = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD^"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(parent, checkpoint_commit);
+    assert_eq!(
+        fs::read_to_string(path.join("tracked.txt")).unwrap(),
+        "developer edit\n"
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+/// The installed exclude rules cover the artifacts the staging policy writes.
+///
+/// The candidate names carry the marker constants themselves, so a rule that
+/// restated a suffix on its own would stop covering a sibling the atomic-write
+/// policy renamed, and the orphan of a crashed write would reach the next
+/// checkpoint commit.
+#[test]
+fn test_staging_sibling_names_are_ignored_by_the_installed_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    ensure_tauqe_ignored(path).unwrap();
+
+    let pid = std::process::id();
+    let candidates = vec![
+        format!("source.rs{STAGING_TEMP_MARKER}.{pid}.1"),
+        format!("source.rs{STAGING_BACKUP_MARKER}.{pid}.2"),
+        // The earlier fixed-name policy left siblings without a writer
+        // attribution, and crash recovery still reclaims them.
+        format!("source.rs{STAGING_TEMP_MARKER}"),
+        format!("source.rs{STAGING_BACKUP_MARKER}"),
+    ];
+
+    let ignored = crate::git::cmd::run_git_check_ignore(path, &candidates).unwrap();
+    for candidate in &candidates {
+        assert!(
+            ignored.iter().any(|entry| entry == candidate),
+            "{candidate} must be covered by the installed exclude rules: {ignored:?}"
+        );
+    }
 }

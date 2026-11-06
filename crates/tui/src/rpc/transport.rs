@@ -360,15 +360,8 @@ mod tests {
     async fn dropping_the_child_handle_kills_the_spawned_process() {
         use std::os::unix::process::CommandExt;
 
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let heartbeat = std::env::temp_dir().join(format!(
-            "tauqe-spawn-probe-{}-{}.log",
-            std::process::id(),
-            unique
-        ));
+        let probe_dir = crate::testing::scratch_dir("spawn-probe");
+        let heartbeat = probe_dir.join("heartbeat.log");
 
         // The probe appends a heartbeat every 50ms until it is terminated.
         let script = format!(
@@ -399,7 +392,7 @@ mod tests {
             .map(|meta| meta.len())
             .unwrap_or(0);
 
-        let _ = std::fs::remove_file(&heartbeat);
+        let _ = std::fs::remove_dir_all(&probe_dir);
         assert_eq!(
             size_at_drop, size_later,
             "the spawned process kept running after its handle was dropped"

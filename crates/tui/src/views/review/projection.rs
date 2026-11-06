@@ -353,28 +353,55 @@ impl ReviewViewState {
         }
     }
 
+    /// Collects the visible rows of the tree in render order.
+    ///
+    /// The projection is owned because the renderer draws every row. A path that
+    /// needs one row or only the row count uses `selected_row` or `row_count`,
+    /// so the navigation hot path never builds the whole projection (c-2).
     pub fn flatten_rows(&self) -> Vec<VisibleReviewRow> {
         let mut rows = Vec::new();
+        self.walk_rows(&mut |_, row| {
+            rows.push(row);
+            true
+        });
+        rows
+    }
+
+    /// Walks the visible rows in render order, handing each row together with
+    /// its index to `visit` and stopping as soon as `visit` returns `false`.
+    ///
+    /// This walk is the single source of row order: `flatten_rows` collects it,
+    /// `selected_row` stops at the cursor, and the viewport measurement stops on
+    /// the row it measures. None of them can drift from another, and none of
+    /// them materializes a row it does not use (c-2).
+    pub(super) fn walk_rows(&self, visit: &mut dyn FnMut(usize, VisibleReviewRow) -> bool) {
+        let mut index = 0usize;
         for session in self.effective_sessions() {
             let is_expanded = self.is_session_expanded(&session.id);
-            rows.push(self.session_header_row(session.as_ref(), is_expanded));
+            let header = self.session_header_row(session.as_ref(), is_expanded);
+            if !Self::emit_row(&mut *visit, &mut index, header) {
+                return;
+            }
             if !is_expanded {
                 continue;
             }
             if let Some(desc) = session.description.as_deref() {
                 let trimmed = desc.trim();
                 if !trimmed.is_empty() {
-                    rows.push(VisibleReviewRow::SessionSummary {
+                    let summary = VisibleReviewRow::SessionSummary {
                         session_id: session.id.clone(),
                         description: trimmed.to_string(),
                         is_expanded: self.is_summary_expanded(&session.id),
-                    });
+                    };
+                    if !Self::emit_row(&mut *visit, &mut index, summary) {
+                        return;
+                    }
                 }
             }
             for bucket in self.group_buckets(session.as_ref()) {
                 let group_expanded = self.is_group_expanded(&session.id, &bucket.id);
                 let has_plan = !bucket.subplan.is_empty();
-                rows.push(VisibleReviewRow::GroupHeader {
+                let header = VisibleReviewRow::GroupHeader {
                     session_id: session.id.clone(),
                     group_id: bucket.id.clone(),
                     kind: bucket.kind,
@@ -385,7 +412,10 @@ impl ReviewViewState {
                     findings_count: bucket.items.len(),
                     has_plan,
                     is_expanded: group_expanded,
-                });
+                };
+                if !Self::emit_row(&mut *visit, &mut index, header) {
+                    return;
+                }
                 if !group_expanded {
                     continue;
                 }
@@ -397,7 +427,7 @@ impl ReviewViewState {
                 if has_plan {
                     let (total, done) = bucket.progress;
                     let branch_expanded = self.is_plan_branch_expanded(&session.id, &bucket.id);
-                    rows.push(VisibleReviewRow::GroupPlanHeader {
+                    let branch = VisibleReviewRow::GroupPlanHeader {
                         session_id: session.id.clone(),
                         group_id: bucket.id.clone(),
                         title: active_t("review.group_plan_branch").to_string(),
@@ -405,26 +435,46 @@ impl ReviewViewState {
                         total,
                         subplan_architect: bucket.subplan_architect,
                         is_expanded: branch_expanded,
-                    });
-                    if branch_expanded {
-                        self.flatten_subplan_rows(
+                    };
+                    if !Self::emit_row(&mut *visit, &mut index, branch) {
+                        return;
+                    }
+                    if branch_expanded
+                        && !self.walk_subplan_rows(
                             &session.id,
                             &bucket.id,
                             bucket.subplan,
                             0,
-                            &mut rows,
-                        );
+                            &mut index,
+                            &mut *visit,
+                        )
+                    {
+                        return;
                     }
                 }
                 for stored in bucket.items {
                     let issue = ReviewIssue::from(stored.clone());
-                    self.push_item_rows(&session.id, &issue, &mut rows);
+                    if !self.emit_item_row(&session.id, &issue, &mut index, &mut *visit) {
+                        return;
+                    }
                 }
             }
         }
-        rows
     }
 
+    /// Hands one row to the walk visitor and reports whether the walk continues.
+    ///
+    /// Every branch of the projection emits its rows through this single point,
+    /// so the index a consumer sees always matches render order.
+    fn emit_row(
+        visit: &mut dyn FnMut(usize, VisibleReviewRow) -> bool,
+        index: &mut usize,
+        row: VisibleReviewRow,
+    ) -> bool {
+        let current = *index;
+        *index += 1;
+        visit(current, row)
+    }
     /// Builds the header row of one session from its aggregate statistics.
     fn session_header_row(&self, session: &ReviewSession, is_expanded: bool) -> VisibleReviewRow {
         let count = |status: IssueStatus| {
@@ -456,17 +506,18 @@ impl ReviewViewState {
         }
     }
 
-    /// Appends one finding row of a group.
+    /// Emits one finding row of a group.
     ///
     /// The finding never owns subplan rows: the unified plan belongs to its
     /// group and is projected once under the group header (concept #c-5).
-    fn push_item_rows(
+    fn emit_item_row(
         &self,
         session_id: &str,
         issue: &ReviewIssue,
-        rows: &mut Vec<VisibleReviewRow>,
-    ) {
-        rows.push(VisibleReviewRow::ReviewItem {
+        index: &mut usize,
+        visit: &mut dyn FnMut(usize, VisibleReviewRow) -> bool,
+    ) -> bool {
+        let row = VisibleReviewRow::ReviewItem {
             session_id: session_id.to_string(),
             item_id: issue.id,
             title: issue.title.clone(),
@@ -481,7 +532,8 @@ impl ReviewViewState {
             note: issue.note.clone(),
             is_expanded: self.is_item_expanded(session_id, issue.id),
             focused: self.is_item_focused(session_id, issue.id),
-        });
+        };
+        Self::emit_row(visit, index, row)
     }
 
     /// Groups of one session in render order.
@@ -597,19 +649,20 @@ impl ReviewViewState {
             .collect()
     }
 
-    /// Flattens the unified plan of a group into interactive step rows.
+    /// Walks the unified plan of a group into interactive step rows.
     ///
     /// Top-level steps always follow an expanded group header; nested steps
     /// appear only after their container step is expanded, so the tree stays
     /// dense until the developer drills into a step (concept #c-5).
-    fn flatten_subplan_rows(
+    fn walk_subplan_rows(
         &self,
         session_id: &str,
         group_id: &str,
         steps: &[PlanItem],
         depth: usize,
-        out: &mut Vec<VisibleReviewRow>,
-    ) {
+        index: &mut usize,
+        visit: &mut dyn FnMut(usize, VisibleReviewRow) -> bool,
+    ) -> bool {
         for step in steps {
             let has_children = !step.children.is_empty();
             let has_details = step
@@ -628,7 +681,7 @@ impl ReviewViewState {
                 .unwrap_or(false);
             let is_expanded = self.is_subplan_item_expanded(session_id, group_id, &step.id);
 
-            out.push(VisibleReviewRow::SubplanItem {
+            let row = VisibleReviewRow::SubplanItem {
                 session_id: session_id.to_string(),
                 group_id: group_id.to_string(),
                 step_id: step.id.clone(),
@@ -645,18 +698,32 @@ impl ReviewViewState {
                 has_children,
                 is_expandable: has_children || has_details || has_meta || has_blocked_reason,
                 is_expanded,
-            });
+            };
+            if !Self::emit_row(&mut *visit, index, row) {
+                return false;
+            }
 
-            if has_children && is_expanded {
-                self.flatten_subplan_rows(session_id, group_id, &step.children, depth + 1, out);
+            if has_children
+                && is_expanded
+                && !self.walk_subplan_rows(
+                    session_id,
+                    group_id,
+                    &step.children,
+                    depth + 1,
+                    index,
+                    &mut *visit,
+                )
+            {
+                return false;
             }
         }
+        true
     }
 
     /// Number of subplan step rows a group plan contributes to the tree.
     ///
     /// Counts every step plus, while a container step is expanded, the steps of
-    /// its children, mirroring `flatten_subplan_rows` branch for branch.
+    /// its children, mirroring `walk_subplan_rows` branch for branch.
     fn count_subplan_rows(&self, session_id: &str, group_id: &str, steps: &[PlanItem]) -> usize {
         let mut count = 0;
         for step in steps {
@@ -725,9 +792,23 @@ impl ReviewViewState {
         }
     }
 
+    /// The row under the cursor, cloned on its own.
+    ///
+    /// The walk stops at the cursor instead of collecting the whole tree, so
+    /// reading the selected row costs one row rather than every visible one
+    /// (c-2).
     pub fn selected_row(&self) -> Option<VisibleReviewRow> {
-        let rows = self.flatten_rows();
-        rows.get(self.selected_index).cloned()
+        let target = self.selected_index;
+        let mut selected = None;
+        self.walk_rows(&mut |index, row| {
+            if index == target {
+                selected = Some(row);
+                false
+            } else {
+                true
+            }
+        });
+        selected
     }
 }
 

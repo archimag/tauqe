@@ -61,6 +61,7 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
     use tauqe_protocol::{methods, RequestId, UiHistoryKind};
 
@@ -68,15 +69,7 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "tauqe-test-history-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::create_dir_all(&path);
-            Self(path)
+            Self(scratch_root("history"))
         }
 
         fn path(&self) -> &std::path::Path {

@@ -483,6 +483,7 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
     use tauqe_protocol::RequestId;
 
@@ -534,14 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_verification_passes_without_toolchain() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-preflight-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("preflight");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let verdict = run_preflight_verification(&dir, cancel_rx).await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -553,14 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_verification_rejects_invalid_config() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-preflight-invalid-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("preflight-invalid");
         // Verification is declarative: a declaration that only assigns model
         // roles is complete, so the gate passes it instead of inventing a
         // toolchain the project never declared.
@@ -599,14 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_verification_accepts_valid_config() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-preflight-valid-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("preflight-valid");
         std::fs::write(
             dir.join("tauqe.toml"),
             "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
@@ -632,14 +612,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_preflight_verification_is_torn_down_by_a_cancel_signal() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-preflight-cancel-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("preflight-cancel");
         std::fs::write(
             dir.join("tauqe.toml"),
             "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
@@ -682,14 +655,7 @@ mod tests {
     /// have every one of those managers swapped underneath it.
     #[tokio::test]
     async fn test_client_initialize_is_refused_while_an_operation_is_registered() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-initialize-exclusive-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("initialize-exclusive");
         tauqe_core::git::init_repository(Some(&dir), true).unwrap();
 
         let (out, _rx) = OutChannel::new();
@@ -787,14 +753,7 @@ mod tests {
     /// of letting the first capture fail inside the queue.
     #[tokio::test]
     async fn test_preflight_verification_refuses_a_locked_index() {
-        let dir = std::env::temp_dir().join(format!(
-            "tauqe-test-preflight-locked-index-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = scratch_root("preflight-locked-index");
         tauqe_core::git::init_repository(Some(&dir), true).unwrap();
         std::fs::write(dir.join(".git").join("index.lock"), "").unwrap();
 

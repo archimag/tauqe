@@ -88,10 +88,10 @@ confirmation — all draw their rows through the same selector. One list state, 
 navigation, one positional quick-select, one scroll window, and one click-to-index
 translation serve every surface, so a picker row and a dialog row can never disagree
 about which rung `Enter` dispatches or which model a click selects. The picker differs
-only in the role it presents (`primary`) and in its card chrome.
+only in the role it presents (`repl`) and in its card chrome.
 
 **The picker presents the configured ladder exclusively.** It lists exactly the tiers
-declared under `[models.primary]`, each shown as `model [effort]`, and it offers no path
+declared under `[models.repl]`, each shown as `model [effort]`, and it offers no path
 into the provider's full catalog. A model that is not part of the configuration is added
 to `tauqe.toml`, never improvised inside a turn: turning a configuration decision into an
 incidental keystroke would let one picker visit bypass the ladder the harness is built
@@ -99,7 +99,7 @@ around. Activating a row sends the whole tier — the model together with its re
 depth — and reopening the picker highlights the rung the developer picked, matched by both
 coordinates with a fallback to the first entry of the same model. When the role assignment
 has not reached the client yet the picker stays closed and says why, because an empty
-primary list is a missing configuration rather than an invitation to guess (see
+`repl` list is a missing configuration rather than an invitation to guess (see
 *Configuration and Project Preparation*).
 
 ### 2.2 The turn as a document
@@ -365,6 +365,13 @@ description.
 - `Esc` dismisses a dialog and takes its cancel path. `Ctrl+G` is normalized to `Esc`
   once, before any handler runs, so the Emacs `keyboard-quit` chord behaves identically
   everywhere without a per-handler binding and without a `SIGINT` handler.
+- The raw `Ctrl+Q` quit chord is resolved before any dialog handler runs and
+  preempts modal dispatch, so an open card never costs the advertised quit an
+  extra press: with no lossy work the application exits immediately, and with a
+  draft at stake the confirmation card opens above the dialog. Every other
+  resolved global command stays with the open modal. The dismissal letters
+  remain bare presses: a command chord or the AltGr compose chord never
+  dismisses Help, the status picker, or the theme selector.
 - Confirmation dialogs accept `y` / `Y` to confirm immediately and `n` / `N`, `q`, or
   `Esc` to cancel. Those letters are bare presses: a press carrying `Ctrl`, `Alt`,
   or the AltGr compose chord confirms nothing and dismisses nothing, so no yank
@@ -570,7 +577,7 @@ declaration, and never touches the working tree.
 - **It is not a per-view dialect.** Five views share one verb matrix and one navigation
   minimum.
 - **It is not a model catalog browser.** It lists the tiers configured under
-  `[models.primary]`; a model outside that ladder belongs in `tauqe.toml`, not in a
+  `[models.repl]`; a model outside that ladder belongs in `tauqe.toml`, not in a
   picker opened mid-turn.
 - **It is not a function-key interface.** No `F1`..`F12` binding exists, and none may be
   added.

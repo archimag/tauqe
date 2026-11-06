@@ -5,7 +5,7 @@ use tauqe_protocol::{
     DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus, PlanRejection,
 };
 
-use super::{PlanApplicationOutcome, PlanMutationMode, PlanStorage};
+use super::{PlanApplicationOutcome, PlanBatchSnapshot, PlanMutationMode, PlanStorage};
 
 /// How a `save` action reconciles the item list of an already-stored plan.
 ///
@@ -28,14 +28,15 @@ enum SaveItemsReplacement {
 ///
 /// The two contracts differ only in where the result of the shared barrier goes:
 /// [`MutationCommit::Persist`] writes the validated document, while
-/// [`MutationCommit::Probe`] keeps it in the in-memory view of the batch and
-/// discards it. Because both run the very same preparation and validation, the
-/// verdict of a probe is the verdict of the application it predicts.
+/// [`MutationCommit::Probe`] keeps it in the snapshot of the batch and discards
+/// it. Because both run the very same preparation and validation against that
+/// snapshot, the verdict of a probe is the verdict of the application it
+/// predicts.
 #[derive(Debug, Clone, Copy)]
 enum MutationCommit {
     /// The mutation is written to storage.
     Persist,
-    /// The mutation is validated and applied to the batch view only.
+    /// The mutation is validated and recorded in the batch snapshot only.
     Probe,
 }
 
@@ -45,74 +46,46 @@ impl MutationCommit {
         matches!(self, Self::Persist)
     }
 
-    /// Applies one validated plan under this contract.
+    /// Applies one validated plan under this contract and returns the document
+    /// the batch now carries.
     ///
     /// A persisted plan also becomes the active plan when the repository has none,
     /// so a client always has a marker to render; the probe writes neither the
-    /// document nor the marker. Both advance the batch view, because every later
+    /// document nor the marker. Both advance the snapshot, because every later
     /// mutation of the batch must resolve against the plan this one produced.
     fn commit(
         self,
         repo_root: &Path,
-        all_plans: &mut Vec<Plan>,
+        snapshot: &mut PlanBatchSnapshot,
         plan: &Plan,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Plan> {
         match self {
-            Self::Persist => {
-                PlanStorage::save_plan_unlocked(repo_root, plan)?;
-                if let Ok(None) = PlanStorage::load_active_id_unlocked(repo_root) {
-                    let _ = PlanStorage::save_active_id_unlocked(repo_root, Some(&plan.id));
-                }
-                PlanStorage::refresh_batch_snapshot(repo_root, all_plans);
-            }
+            Self::Persist => PlanStorage::save_plan_in_snapshot_unlocked(repo_root, snapshot, plan),
             Self::Probe => {
                 // The barrier runs and nothing reaches the disk, so the validated
-                // document replaces the stored one in the batch view alone.
-                PlanStorage::prepare_plan_unlocked(repo_root, plan)?;
-                remember_prepared_plan(all_plans, plan);
+                // document replaces the stored one in the snapshot alone.
+                let prepared = PlanStorage::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
+                snapshot.remember(prepared.plan.clone(), prepared.target_file);
+                Ok(prepared.plan)
             }
         }
-        Ok(())
     }
 
     /// Removes one plan under this contract and reports whether it was removed.
     ///
-    /// The probe decides over the batch view, which was read from storage under
-    /// the same lock, so it reaches the verdict the removal reaches without
-    /// unlinking a file.
-    fn delete(self, repo_root: &Path, all_plans: &mut Vec<Plan>, id: &str) -> anyhow::Result<bool> {
+    /// The probe decides over the snapshot, which was read from storage under the
+    /// same lock, so it reaches the verdict the removal reaches without unlinking
+    /// a file.
+    fn delete(
+        self,
+        repo_root: &Path,
+        snapshot: &mut PlanBatchSnapshot,
+        id: &str,
+    ) -> anyhow::Result<bool> {
         match self {
-            Self::Persist => {
-                let removed = PlanStorage::delete_plan_unlocked(repo_root, id)?;
-                if removed {
-                    PlanStorage::refresh_batch_snapshot(repo_root, all_plans);
-                }
-                Ok(removed)
-            }
-            Self::Probe => {
-                let known = all_plans
-                    .iter()
-                    .any(|plan| plan.id.eq_ignore_ascii_case(id));
-                if known {
-                    all_plans.retain(|plan| !plan.id.eq_ignore_ascii_case(id));
-                }
-                Ok(known)
-            }
+            Self::Persist => PlanStorage::delete_plan_in_snapshot_unlocked(repo_root, snapshot, id),
+            Self::Probe => Ok(snapshot.remove(id).is_some()),
         }
-    }
-}
-
-/// Records a validated plan in the batch view without touching storage.
-///
-/// The view is keyed by plan identity exactly as storage is: a plan the batch
-/// already carries is replaced, and a plan it does not carry is appended.
-fn remember_prepared_plan(all_plans: &mut Vec<Plan>, plan: &Plan) {
-    match all_plans
-        .iter_mut()
-        .find(|stored| stored.id.eq_ignore_ascii_case(&plan.id))
-    {
-        Some(stored) => *stored = plan.clone(),
-        None => all_plans.push(plan.clone()),
     }
 }
 
@@ -261,23 +234,6 @@ impl PlanStorage {
         })
     }
 
-    /// Refreshes the repository view a plan batch resolves its tags against.
-    ///
-    /// The batch applies every tag it accumulated, and each mutation is durable
-    /// before the next tag is resolved. Reloading after each of them keeps the
-    /// view equal to disk, so a later tag that names a plan an earlier tag of the
-    /// same batch saved resolves against that plan instead of against the state
-    /// that existed before the batch began.
-    fn refresh_batch_snapshot(repo_root: &Path, snapshot: &mut Vec<Plan>) {
-        match Self::load_all_unlocked(repo_root) {
-            Ok(plans) => *snapshot = plans,
-            // A view the disk cannot answer keeps its previous content, so the
-            // later tag falls back to its own exact on-disk lookup instead of
-            // resolving against an empty repository.
-            Err(err) => tracing::warn!(error = %err, "Failed to refresh the plan batch snapshot"),
-        }
-    }
-
     /// Lock-free core of [`Self::apply_parsed_plans`]; the caller must hold the storage lock.
     fn apply_parsed_plans_unlocked(
         repo_root: &Path,
@@ -286,10 +242,10 @@ impl PlanStorage {
         replacement: SaveItemsReplacement,
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
-        let mut all_plans = Self::load_all_unlocked(repo_root).unwrap_or_default();
-        Self::apply_tags_with_view_unlocked(
+        let mut snapshot = PlanBatchSnapshot::load_unlocked(repo_root).unwrap_or_default();
+        Self::apply_tags_with_snapshot_unlocked(
             repo_root,
-            &mut all_plans,
+            &mut snapshot,
             parsed,
             errors,
             replacement,
@@ -298,17 +254,18 @@ impl PlanStorage {
         )
     }
 
-    /// Applies plan tags against an explicit plan view under an explicit commit contract.
+    /// Applies plan tags against the snapshot of the batch under an explicit
+    /// commit contract.
     ///
-    /// The view is the repository snapshot of the batch. [`MutationCommit::Persist`]
-    /// refreshes it from disk after every mutation, while [`MutationCommit::Probe`]
-    /// advances it in memory because nothing was written; both therefore resolve a
-    /// later tag of the same batch against the plan the batch itself produced, which
-    /// is what keeps the verdict of the probe and the verdict of the application one
-    /// verdict.
-    fn apply_tags_with_view_unlocked(
+    /// The snapshot is the single repository read of the batch. Both contracts
+    /// advance it in memory — the persist contract with the document it wrote and
+    /// the probe with the document it validated — so a later tag of the same batch
+    /// resolves against the plan the batch itself produced without re-reading a
+    /// stored document, and the verdict of the probe stays the verdict of the
+    /// application.
+    fn apply_tags_with_snapshot_unlocked(
         repo_root: &Path,
-        all_plans: &mut Vec<Plan>,
+        snapshot: &mut PlanBatchSnapshot,
         parsed: Vec<ParsedPlanTag>,
         errors: Vec<String>,
         replacement: SaveItemsReplacement,
@@ -363,7 +320,7 @@ impl PlanStorage {
                         continue;
                     }
                     let already_exists =
-                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, all_plans.as_slice())
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, snapshot.plans())
                             .is_some()
                             || applied
                                 .iter()
@@ -389,7 +346,7 @@ impl PlanStorage {
                         continue;
                     }
                     let matched_plan =
-                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, all_plans.as_slice())
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, snapshot.plans())
                             .cloned();
                     let mut plan = matched_plan.unwrap_or_else(|| {
                         Plan::from_parts(
@@ -437,12 +394,12 @@ impl PlanStorage {
                     }
                     plan.implementation.refresh_parent_statuses();
                     plan.updated_at = now;
-                    match commit.commit(repo_root, all_plans, &plan) {
-                        Ok(()) => {
+                    match commit.commit(repo_root, snapshot, &plan) {
+                        Ok(stored) => {
                             // A probe applies nothing, so only a persisted batch
                             // reports the plan as its applied mutation.
                             if commit.persists() {
-                                applied.push(plan);
+                                applied.push(stored);
                             }
                             warnings.append(&mut tag_warnings);
                         }
@@ -455,26 +412,23 @@ impl PlanStorage {
                     }
                 }
                 "update" => {
-                    let matched_plan = match crate::plan::matcher::resolve_plan(
-                        &tag.id,
-                        all_plans.as_slice(),
-                        None,
-                    ) {
-                        crate::plan::matcher::PlanResolution::Found(p) => Some(p.clone()),
-                        crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
-                            let candidate_ids: Vec<String> =
-                                candidates.iter().map(|p| format!("'{}'", p.id)).collect();
-                            errors.push(PlanRejection::payload_defect(format!(
-                                "Cannot update plan '{}': ambiguous match, candidates: {}",
-                                tag.id,
-                                candidate_ids.join(", ")
-                            )));
-                            continue;
-                        }
-                        crate::plan::matcher::PlanResolution::NotFound => {
-                            Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
-                        }
-                    };
+                    let matched_plan =
+                        match crate::plan::matcher::resolve_plan(&tag.id, snapshot.plans(), None) {
+                            crate::plan::matcher::PlanResolution::Found(p) => Some(p.clone()),
+                            crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
+                                let candidate_ids: Vec<String> =
+                                    candidates.iter().map(|p| format!("'{}'", p.id)).collect();
+                                errors.push(PlanRejection::payload_defect(format!(
+                                    "Cannot update plan '{}': ambiguous match, candidates: {}",
+                                    tag.id,
+                                    candidate_ids.join(", ")
+                                )));
+                                continue;
+                            }
+                            crate::plan::matcher::PlanResolution::NotFound => {
+                                Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
+                            }
+                        };
 
                     if let Some(mut plan) = matched_plan {
                         if let Some(t) = tag.title {
@@ -598,10 +552,10 @@ impl PlanStorage {
                         // rules the single write path already enforces.
 
                         plan.updated_at = now;
-                        match commit.commit(repo_root, all_plans, &plan) {
-                            Ok(()) => {
+                        match commit.commit(repo_root, snapshot, &plan) {
+                            Ok(stored) => {
                                 if commit.persists() {
-                                    applied.push(plan);
+                                    applied.push(stored);
                                 }
                                 warnings.append(&mut tag_warnings);
                             }
@@ -614,7 +568,7 @@ impl PlanStorage {
                         }
                     } else {
                         let available: Vec<String> =
-                            all_plans.iter().map(|p| p.id.clone()).collect();
+                            snapshot.plans().iter().map(|p| p.id.clone()).collect();
                         let hint = if available.is_empty() {
                             "no plans exist in storage".to_string()
                         } else {
@@ -631,10 +585,10 @@ impl PlanStorage {
                     // id introduced moments ago resolves to its own stored artifact
                     // instead of addressing a stale alias.
                     let target_id =
-                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, all_plans.as_slice())
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, snapshot.plans())
                             .map(|p| p.id.clone())
                             .unwrap_or_else(|| tag.id.clone());
-                    match commit.delete(repo_root, all_plans, &target_id) {
+                    match commit.delete(repo_root, snapshot, &target_id) {
                         Ok(true) => {}
                         Ok(false) => {
                             errors.push(PlanRejection::payload_defect(format!(
@@ -683,43 +637,99 @@ impl PlanStorage {
         )
     }
 
-    /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage under a specific [`PlanMutationMode`].
+    /// Applies a batch of structured discussion updates as one storage transaction.
+    ///
+    /// The whole batch runs under one lock with one repository read: every update
+    /// resolves against the plan the batch already produced, and the snapshot
+    /// advances in memory instead of being re-read from disk after each mutation.
+    /// A turn carrying `k` mutations over `n` stored plans therefore reads each
+    /// stored plan once instead of `O(k·n)` times.
+    ///
+    /// The outcomes are aligned with `updates`, so one mutation reports exactly the
+    /// refusals, the repairs, and the document the single-update entry point
+    /// reports for it.
+    pub fn apply_discussion_plan_updates_with_mode(
+        repo_root: &Path,
+        updates: &[DiscussionPlanUpdate],
+        mode: PlanMutationMode,
+    ) -> Vec<PlanApplicationOutcome> {
+        // The lock wait, the repository read, and every atomic write of the batch
+        // run off the async executor thread, so a slow disk never stalls the
+        // bounded turn, provider streaming, or RPC handling.
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::apply_discussion_plan_updates_unlocked(repo_root, updates, mode)
+        })
+    }
+
+    /// Lock-free core of [`Self::apply_discussion_plan_updates_with_mode`]; the
+    /// caller must hold the storage lock.
+    fn apply_discussion_plan_updates_unlocked(
+        repo_root: &Path,
+        updates: &[DiscussionPlanUpdate],
+        mode: PlanMutationMode,
+    ) -> Vec<PlanApplicationOutcome> {
+        if updates.is_empty() {
+            return Vec::new();
+        }
+        // One repository read serves the whole batch: the snapshot records the
+        // document and the file of every stored plan, and it advances in memory
+        // because every mutation writes through it under the same lock.
+        let mut snapshot = PlanBatchSnapshot::load_unlocked(repo_root).unwrap_or_default();
+        let mut outcomes = Vec::with_capacity(updates.len());
+        let mut last_applied: Option<Plan> = None;
+        for update in updates {
+            // The identity decision is shared with the probe, so a refusal of the
+            // resolution itself keeps the classification it was born with.
+            let resolved =
+                Self::resolve_discussion_update_unlocked(repo_root, update, snapshot.plans());
+            let parsed_tag = match resolved {
+                Ok(tag) => tag,
+                Err(rejection) => {
+                    outcomes.push(PlanApplicationOutcome {
+                        applied: Vec::new(),
+                        errors: vec![rejection],
+                        warnings: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+            // The structured discussion command is the explicit architect path: its
+            // typed, deliberate item list (including an explicit empty list) fully
+            // replaces the stored plan.
+            let outcome = Self::apply_tags_with_snapshot_unlocked(
+                repo_root,
+                &mut snapshot,
+                vec![parsed_tag],
+                Vec::new(),
+                SaveItemsReplacement::Replace,
+                mode,
+                MutationCommit::Persist,
+            );
+            if let Some(plan) = outcome.applied.last() {
+                last_applied = Some(plan.clone());
+            }
+            outcomes.push(outcome);
+        }
+        // The last applied mutation leaves its plan active, so a batch settles the
+        // active-plan marker exactly as applying its mutations one after another
+        // did.
+        if let Some(plan) = last_applied {
+            let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
+        }
+        outcomes
+    }
+
+    /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage
+    /// under a specific [`PlanMutationMode`].
     pub fn apply_discussion_plan_update_with_mode(
         repo_root: &Path,
         update: &DiscussionPlanUpdate,
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
-        // Resolution and application share one lock scope, and that whole scope
-        // runs off the async executor thread: the read-modify-write cycle waits
-        // neither on the executor thread nor for a stalled disk.
-        crate::blocking::run_blocking(move || {
-            // Resolve the target plan and the effective action under the same lock
-            // that guards the follow-up mutation, so a concurrent task cannot create
-            // or swap the active plan between resolution and application.
-            let _guard = Self::lock();
-            let all_plans = Self::load_all_unlocked(repo_root).unwrap_or_default();
-            let parsed_tag =
-                match Self::resolve_discussion_update_unlocked(repo_root, update, &all_plans) {
-                    Ok(tag) => tag,
-                    Err(rejection) => {
-                        return PlanApplicationOutcome {
-                            applied: Vec::new(),
-                            errors: vec![rejection],
-                            warnings: Vec::new(),
-                        };
-                    }
-                };
-            // The structured discussion command is the explicit architect path: its
-            // typed, deliberate item list (including an explicit empty list) fully
-            // replaces the stored plan.
-            Self::apply_parsed_plans_unlocked(
-                repo_root,
-                vec![parsed_tag],
-                Vec::new(),
-                SaveItemsReplacement::Replace,
-                mode,
-            )
-        })
+        Self::apply_discussion_plan_updates_with_mode(repo_root, std::slice::from_ref(update), mode)
+            .pop()
+            .unwrap_or_default()
     }
 
     /// Validates a batch of structured discussion updates without persisting anything.
@@ -752,27 +762,28 @@ impl PlanStorage {
         if updates.is_empty() {
             return PlanApplicationOutcome::default();
         }
-        // The probe advances the view itself, because nothing is written: a later
-        // mutation of the batch resolves against the plan the probe already
+        // The probe advances the snapshot itself, because nothing is written: a
+        // later mutation of the batch resolves against the plan the probe already
         // validated, exactly as the application resolves it against the plan it
         // stored.
-        let mut all_plans = Self::load_all_unlocked(repo_root).unwrap_or_default();
+        let mut snapshot = PlanBatchSnapshot::load_unlocked(repo_root).unwrap_or_default();
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         for update in updates {
             // The identity decision is shared with the application, so a refusal of
             // the resolution itself keeps the classification it was born with.
             let parsed_tag =
-                match Self::resolve_discussion_update_unlocked(repo_root, update, &all_plans) {
+                match Self::resolve_discussion_update_unlocked(repo_root, update, snapshot.plans())
+                {
                     Ok(tag) => tag,
                     Err(rejection) => {
                         errors.push(rejection);
                         continue;
                     }
                 };
-            let probe = Self::apply_tags_with_view_unlocked(
+            let probe = Self::apply_tags_with_snapshot_unlocked(
                 repo_root,
-                &mut all_plans,
+                &mut snapshot,
                 vec![parsed_tag],
                 Vec::new(),
                 SaveItemsReplacement::Replace,
@@ -1132,7 +1143,6 @@ Step 1 is done:
         let dup_res = PlanStorage::apply_plan_tags(root, duplicates);
         assert!(dup_res.applied.is_empty());
         assert_eq!(dup_res.errors.len(), 1);
-        assert_eq!(dup_res.errors.len(), 1);
         assert_eq!(dup_res.errors[0].kind, PlanRejectionKind::PayloadDefect);
         assert!(dup_res.errors[0]
             .message
@@ -1147,7 +1157,6 @@ Step 1 is done:
 "#;
         let dangling_res = PlanStorage::apply_plan_tags(root, dangling);
         assert!(dangling_res.applied.is_empty());
-        assert_eq!(dangling_res.errors.len(), 1);
         assert_eq!(dangling_res.errors.len(), 1);
         assert_eq!(
             dangling_res.errors[0].kind,
@@ -2066,6 +2075,53 @@ Step 1 is done:
         assert_eq!(
             stored.implementation.find_item("1").unwrap().title,
             "Renamed step"
+        );
+    }
+    /// The batch entry point settles a whole payload as one storage transaction:
+    /// every update resolves against the plan an earlier update produced, and the
+    /// last applied mutation stays active.
+    #[test]
+    fn test_batch_entry_point_settles_a_payload_as_one_transaction() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let save_a = probe_payload("batch-a", vec![probe_leaf("1", "src/a1.rs")]);
+        let rename_a = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Update,
+            id: Some("batch-a".to_string()),
+            title: None,
+            description: None,
+            concept: Vec::new(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Renamed step".to_string(),
+                ..Default::default()
+            }],
+        };
+        let save_b = probe_payload("batch-b", vec![probe_leaf("1", "src/b1.rs")]);
+
+        let outcomes = PlanStorage::apply_discussion_plan_updates_with_mode(
+            root,
+            &[save_a, rename_a, save_b],
+            PlanMutationMode::Discussion,
+        );
+        assert_eq!(outcomes.len(), 3);
+        for outcome in &outcomes {
+            assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
+            assert_eq!(outcome.applied.len(), 1);
+        }
+
+        // The update resolved against the plan the same batch created.
+        let stored = PlanStorage::load_plan(root, "batch-a").unwrap().unwrap();
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().title,
+            "Renamed step"
+        );
+        assert!(PlanStorage::load_plan(root, "batch-b").unwrap().is_some());
+        // The last applied mutation leaves the active-plan marker behind.
+        assert_eq!(
+            PlanStorage::load_active_id(root).unwrap(),
+            Some("batch-b".to_string())
         );
     }
 }

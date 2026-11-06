@@ -553,28 +553,56 @@ pub(crate) fn compute_unified_plan_lines(
     cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut renderer = PlanLineRenderer::default();
-    walk_plan_rows(rows, selected_idx, width, theme_mode, cache, &mut renderer);
+    walk_plan_rows(
+        |visit| {
+            for (index, row) in rows.iter().enumerate() {
+                if !visit(index, row) {
+                    break;
+                }
+            }
+        },
+        selected_idx,
+        usize::MAX,
+        width,
+        theme_mode,
+        cache,
+        &mut renderer,
+    );
     (renderer.lines, renderer.offsets)
 }
 
-/// Measures the row offsets and the total height of the flattened Plans rows
-/// without materializing a single line.
+/// Measures the row offsets and the total height of the Plans tree without
+/// materializing a single line and without owning a single row.
 ///
-/// Every break decision is shared with [`compute_unified_plan_lines`] through one
-/// row walk, and the short summary lines are counted through
-/// [`wrapped_line_count`] instead of being wrapped into owned lines. A cached
-/// detail body already arrives wrapped to the target width, so it contributes its
-/// own length. Measured offsets therefore match the rendered frame exactly while
-/// positioning the viewport costs no line allocation (c-2).
-pub(crate) fn measure_plan_rows(
-    rows: &[VisiblePlanRow],
+/// `source` drives the rows of the tree in render order, so the view measures
+/// its own lazy cursor walk instead of first collecting an owned projection of
+/// every row up to the cursor. The walk stops on `last_index`, which lets the
+/// viewport read the bounds of one row without measuring the rows below it.
+/// Every break decision is shared with the renderer through one row walk, and
+/// the short summary lines are counted through [`wrapped_line_count`] instead of
+/// being wrapped into owned lines. Measured offsets therefore match the rendered
+/// frame exactly while positioning the viewport costs no row allocation (c-2).
+pub(crate) fn measure_plan_rows_from<S>(
+    source: S,
     selected_idx: usize,
+    last_index: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
-) -> (Vec<usize>, usize) {
+) -> (Vec<usize>, usize)
+where
+    S: FnMut(&mut dyn FnMut(usize, &VisiblePlanRow) -> bool),
+{
     let mut measure = PlanLineMeasure::default();
-    walk_plan_rows(rows, selected_idx, width, theme_mode, cache, &mut measure);
+    walk_plan_rows(
+        source,
+        selected_idx,
+        last_index,
+        width,
+        theme_mode,
+        cache,
+        &mut measure,
+    );
     (measure.offsets, measure.height)
 }
 
@@ -585,10 +613,16 @@ pub(crate) fn measure_plan_rows(
 /// the separator between plans, records where each row starts, builds every
 /// summary line, and resolves every detail body through the Markdown cache.
 /// Rendering and measuring therefore observe one identical layout, and no
-/// consumer can drift from another (c-2).
+/// consumer can drift from another (c-1, c-2).
+///
+/// `source` drives the rows of the tree in render order and lends each of them
+/// for the duration of its own visit, so an already-materialized projection and
+/// a lazy cursor walk feed the identical layout. The walk stops on `last_index`,
+/// which lets the viewport measure one row without walking the rows below it.
 fn walk_plan_rows<V: TreeRowSink>(
-    rows: &[VisiblePlanRow],
+    mut source: impl FnMut(&mut dyn FnMut(usize, &VisiblePlanRow) -> bool),
     selected_idx: usize,
+    last_index: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
@@ -597,7 +631,7 @@ fn walk_plan_rows<V: TreeRowSink>(
     let engine = current_engine();
     let palette = engine.palette();
 
-    for (idx, row) in rows.iter().enumerate() {
+    source(&mut |idx, row| {
         let is_selected = idx == selected_idx;
         // The blank separator between plans belongs to the gap before a plan
         // header, so it is emitted before the offset of that row is recorded.
@@ -921,7 +955,9 @@ fn walk_plan_rows<V: TreeRowSink>(
                 );
             }
         }
-    }
+
+        idx < last_index
+    });
 }
 
 #[cfg(test)]

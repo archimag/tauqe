@@ -272,16 +272,16 @@ pub(crate) fn stage_and_validate_edits_inner(
         if failures.refuse_if_claimed(paths) {
             continue;
         }
-        // Every member records the state of the paths it addresses immediately
-        // before it applies, so a refusal restores exactly the state that member
-        // found. A file member snapshots the body of its own path; a move member
-        // records the membership of every pair it relocates instead, because its
-        // transfer only permutes the staged keys and its inversion therefore moves
-        // the content back instead of cloning a body per addressed path. A
+        // Every member that can change the state records what it is about to
+        // replace, so a refusal restores exactly the state that member found. A
+        // move member records the membership of every pair it relocates, because
+        // its transfer only permutes the staged keys and its inversion therefore
+        // moves the content back instead of cloning a body per addressed path. A
         // replacement addressed to a rename destination is rolled back to the
         // renamed content either way, instead of the opening state of the attempt,
         // in which the destination did not exist yet and the moved content would be
-        // lost.
+        // lost. A file member records nothing, because it mutates the state only
+        // after every admission and validation step succeeded.
         let rollback = MemberRollback::capture(unit, &state);
         let applied = apply_staging_unit(
             repo_root,
@@ -330,46 +330,6 @@ pub(crate) fn stage_and_validate_edits_inner(
         successful_paths,
         successful_edits,
         failed_files: failures.entries,
-    }
-}
-
-/// The state one path held before a staging member touched it.
-///
-/// A rejected member is restored to this snapshot, so an operation that succeeded
-/// in an earlier member keeps its effect: a replacement that follows a rename is
-/// rolled back to the renamed content, not to the opening state of the attempt.
-struct PathSnapshot {
-    content: Option<Vec<u8>>,
-    deleted: bool,
-}
-
-impl PathSnapshot {
-    /// Captures the state `path` currently holds.
-    fn capture(staged: &StagedEditsState, path: &str) -> Self {
-        Self {
-            content: staged.staged_files.get(path).cloned(),
-            deleted: staged.deleted_paths.contains(path),
-        }
-    }
-
-    /// Puts `path` back into the captured state.
-    fn restore(&self, staged: &mut StagedEditsState, path: &str) {
-        match &self.content {
-            Some(content) => {
-                staged
-                    .staged_files
-                    .insert(path.to_string(), content.clone());
-                staged.deleted_paths.remove(path);
-            }
-            None => {
-                staged.staged_files.remove(path);
-                if self.deleted {
-                    staged.deleted_paths.insert(path.to_string());
-                } else {
-                    staged.deleted_paths.remove(path);
-                }
-            }
-        }
     }
 }
 
@@ -434,25 +394,29 @@ impl<'a> MovePairSnapshot<'a> {
 
 /// The state a staging member restores when it is refused.
 ///
-/// A file member rewrites content in place, so it snapshots the body of the path
-/// it addresses. A move member only permutes the keys of the staged map, so it
-/// records the membership of every pair it relocates and inverts the permutation
+/// A file member needs no snapshot: it resolves every admission and validation
+/// step before it mutates the state, so a refusal leaves the state exactly as
+/// the member found it and the path keeps the content an earlier member staged
+/// for it. A move member only permutes the keys of the staged map, so it records
+/// the membership of every pair it relocates and inverts the permutation
 /// instead: a subtree move copies no file body on the success path, and its
 /// rejection moves the staged content back between the same keys.
 enum MemberRollback<'a> {
-    /// The content snapshot of the path a file member rewrites.
-    File(String, PathSnapshot),
+    /// A file member that failed before it touched the state.
+    Untouched,
     /// The prior membership of the pairs a move member relocates.
     Pairs(Vec<MovePairSnapshot<'a>>),
 }
 
 impl<'a> MemberRollback<'a> {
     /// Records the state `unit` is about to change.
+    ///
+    /// A file member records nothing: it mutates the state only after every
+    /// admission and validation step succeeded, so its refusal has no partial
+    /// effect to undo.
     fn capture(unit: &'a StagingUnit<'_>, state: &StagedEditsState) -> Self {
         match unit {
-            StagingUnit::File { path, .. } => {
-                Self::File(path.clone(), PathSnapshot::capture(state, path))
-            }
+            StagingUnit::File { .. } => Self::Untouched,
             StagingUnit::Move { from, to, .. } => {
                 Self::Pairs(vec![MovePairSnapshot::capture(state, from, to)])
             }
@@ -468,7 +432,7 @@ impl<'a> MemberRollback<'a> {
     /// Puts every path the refused member addressed back into the captured state.
     fn restore(&self, state: &mut StagedEditsState) {
         match self {
-            Self::File(path, snapshot) => snapshot.restore(state, path),
+            Self::Untouched => {}
             Self::Pairs(pairs) => {
                 // A source of one pair can also be the destination of another,
                 // and the content of the earlier pair travels through it. The
@@ -772,6 +736,8 @@ fn apply_staging_unit(
                     )
                 })?;
             }
+            // The state is touched only now that every admission and validation
+            // step succeeded, so a refusal above leaves it exactly as it was.
             match staged {
                 Some(content) => {
                     state

@@ -888,6 +888,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_paths::scratch_dir;
 
     fn summarize(events: &[StreamEvent]) -> (String, Vec<String>) {
         let mut text = String::new();
@@ -923,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_early_detection_active_file_streaming() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-early");
         let mut filter = JsonStreamFilter::new(vec!["crates/foo.rs".to_string()], root);
         let chunk1 = r#"{"message":"Hello","changes":[{"op":"replace","path":"crates/foo.rs""#;
         let events1 = filter.push_chunk(chunk1);
@@ -947,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_json_stream_filter_partial_chunks_no_panic() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-partial");
         let mut filter = JsonStreamFilter::new(vec!["test.rs".to_string()], root);
 
         let full_json = r#"{"message":"Rust is great","changes":[],"context_requests":[],"suggested_actions":[]}"#;
@@ -968,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_message_after_changes_streams_both() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-after-changes");
         let mut filter = JsonStreamFilter::new(vec![], root);
         let json = r#"{"changes":[{"op":"create","path":"a.rs","old_text":"","new_text":"","content":"let m = \"message\";\n"}],"message":"Done here","context_requests":[],"suggested_actions":[]}"#;
         let mut events = Vec::new();
@@ -997,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_json_stream_filter_markdown_wrapper_no_panic() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-markdown");
         let mut filter = JsonStreamFilter::new(vec!["test.rs".to_string()], root);
 
         let wrapped = "```json\n{\"message\": \"Hello!\", \"changes\": []}\n```";
@@ -1009,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_no_edit_started_for_empty_changes_streams_full_message() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-no-edits");
         let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root);
         let json = r#"{"message":"Nothing to change here.","changes":[]}"#;
         let mut events = Vec::new();
@@ -1033,7 +1034,7 @@ mod tests {
 
     #[test]
     fn test_early_detection_requires_known_edit_op() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-known-op");
 
         // An unrecognized operation in an incomplete element must not start
         // early edit reporting, avoiding a false positive.
@@ -1060,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_json_edit_response_streams_across_all_split_points() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-split-points");
         let input = r#"{"message":"Hi","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"}]}"#;
         let boundaries: Vec<usize> = input
             .char_indices()
@@ -1102,7 +1103,7 @@ mod tests {
 
     #[test]
     fn test_json_stream_filter_message_surrogate_pair_emoji() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-surrogate");
         let mut filter = JsonStreamFilter::new(vec![], root);
         let json = r#"{"message":"Hi \uD83D\uDE00!","changes":[]}"#;
         let mut events = Vec::new();
@@ -1122,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_backtick_plain_text_falls_back_to_passthrough() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-backtick");
         let mut filter = JsonStreamFilter::new(vec![], root);
         let text = "`foo` is a plain text reply that must not be swallowed by the JSON filter.";
 
@@ -1142,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_short_backtick_plain_text_flushed_on_finish() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-short-backtick");
         let mut filter = JsonStreamFilter::new(vec![], root);
         let text = "`hi`";
 
@@ -1162,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_backtick_plain_text_streams_across_chunks() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-backtick-chunks");
         let mut filter = JsonStreamFilter::new(vec![], root);
         let text = "`cargo build` produced output that is a plain text answer, not JSON.";
 
@@ -1184,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_multiple_replaces_same_file_accumulate_hunks() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-multi-replace");
         let input = r#"{"message":"Go","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"},{"op":"replace","path":"a.rs","old_text":"y","new_text":"z"}]}"#;
         let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
         let mut filter =
@@ -1239,7 +1240,7 @@ mod tests {
 
     #[test]
     fn test_stream_events_identical_char_by_char_and_whole() {
-        let root = std::env::temp_dir();
+        let root = scratch_dir("json-identical");
         let input = r#"{"message":"Hello","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"},{"op":"replace","path":"a.rs","old_text":"y","new_text":"z"}]}"#;
         let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
 
@@ -1311,11 +1312,10 @@ mod tests {
     #[test]
     fn test_anchored_replace_previews_the_range_it_replaces() {
         let path = "crates/foo.rs";
-        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\ngamma\n".to_string(),
-            )]));
+        let root = scratch_dir("json-anchor-preview");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\ngamma\n".to_string())]),
+        );
         let input = serde_json::json!({
             "message": "Rewrite the middle line",
             "changes": [anchored_change(path, 1, 1, "BETA\n")],
@@ -1372,11 +1372,10 @@ mod tests {
     #[test]
     fn test_anchored_entries_of_one_file_apply_as_one_batch() {
         let path = "a.rs";
-        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\ngamma\n".to_string(),
-            )]));
+        let root = scratch_dir("json-anchor-batch");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\ngamma\n".to_string())]),
+        );
         let input = serde_json::json!({
             "message": "Rewrite two ranges",
             "changes": [
@@ -1411,11 +1410,10 @@ mod tests {
     #[test]
     fn test_anchored_entry_beyond_the_file_reports_the_staging_rejection() {
         let path = "a.rs";
-        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\n".to_string(),
-            )]));
+        let root = scratch_dir("json-anchor-beyond");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\n".to_string())]),
+        );
         let input = serde_json::json!({
             "message": "Rewrite",
             "changes": [anchored_change(path, 4, 4, "x\n")],
@@ -1448,13 +1446,14 @@ mod tests {
             "{\"op\":\"create\",\"path\":\"a.rs\",\"to\":\"\",",
             "\"start\":\"\",\"end\":\"\",\"content\":\"BETA"
         );
+        let root = scratch_dir("json-truncated-changes");
         let boundaries: Vec<usize> = truncated
             .char_indices()
             .map(|(idx, _)| idx)
             .chain(std::iter::once(truncated.len()))
             .collect();
         for split in boundaries {
-            let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir());
+            let mut filter = JsonStreamFilter::new(vec![path.to_string()], root.clone());
             let mut events = filter.push_chunk(&truncated[..split]);
             events.extend(filter.push_chunk(&truncated[split..]));
             events.extend(Box::new(filter).finish());
@@ -1506,8 +1505,8 @@ mod tests {
             .collect();
         let chars: Vec<char> = input.chars().collect();
 
-        let mut filter =
-            JsonStreamFilter::new(paths, std::env::temp_dir()).with_staged_contents(staged);
+        let root = scratch_dir("json-late-message");
+        let mut filter = JsonStreamFilter::new(paths, root).with_staged_contents(staged);
         let started = std::time::Instant::now();
         let mut events = Vec::new();
         for chunk in chars.chunks(5) {
@@ -1541,11 +1540,10 @@ mod tests {
     #[test]
     fn test_replacement_reports_the_lines_it_addresses() {
         let path = "a.rs";
-        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
-            .with_staged_contents(HashMap::from([(
-                path.to_string(),
-                "alpha\nbeta\ngamma\n".to_string(),
-            )]));
+        let root = scratch_dir("json-replacement");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\ngamma\n".to_string())]),
+        );
         let input = serde_json::json!({
             "message": "Rewrite",
             "changes": [{

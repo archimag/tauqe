@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
 use tauqe_protocol::{errors, LocaleGenerateParams, ModelRole, ProviderKind, Request, Response};
 
+use crate::reap::{abort_and_reap, await_bounded, Awaited};
 use crate::state::AppState;
 use crate::usage::UsageGuard;
 
@@ -138,34 +139,53 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     // its handle yields a join error, which must surface as a cancellation
     // instead of a model failure.
     if *cancel_rx.borrow() || cancelled {
-        stream_task.abort();
-        let _ = stream_task.await;
+        // The cancelled stream is reaped through the shared bounded task-exit
+        // confirmation (`crate::reap::abort_and_reap`, governed by the task-exit
+        // deadline), so a provider call that never reaches a suspension point
+        // cannot outlive the response.
+        let _ = abort_and_reap(&op_id, "locale-generation-stream", stream_task).await;
         close_locale_usage(state, usage_guard, &op_id).await;
         return Response::err(req.id, errors::CANCELLED, "Locale generation was cancelled");
     }
     if let Some(message) = stream_error {
         // The stream reported a terminal error, but its task has not necessarily
-        // returned yet: it is aborted and reaped here exactly as the
-        // cancellation branch above does, so no provider call outlives the
-        // response after the operation slot has been released.
-        stream_task.abort();
-        let _ = stream_task.await;
+        // returned yet: it is reaped through the shared bounded task-exit
+        // confirmation (`crate::reap::abort_and_reap`, governed by the task-exit
+        // deadline) exactly as the cancellation branch above does, so no provider
+        // call outlives the response after the operation slot has been released.
+        let _ = abort_and_reap(&op_id, "locale-generation-stream", stream_task).await;
         close_locale_usage(state, usage_guard, &op_id).await;
         return Response::err(req.id, errors::MODEL_ERROR, message);
     }
-    match stream_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
+    // A completed stream is awaited through the shared bounded task-exit
+    // confirmation (`crate::reap::await_bounded`, governed by the task-exit
+    // deadline): a task that never reaches a suspension point after its last event
+    // is classified as a typed stream failure carrying the recorded diagnostic
+    // instead of parking the request.
+    match await_bounded(&op_id, "locale-generation-stream", stream_task).await {
+        Awaited::Joined(Ok(Ok(()))) => {}
+        Awaited::Joined(Ok(Err(err))) => {
             close_locale_usage(state, usage_guard, &op_id).await;
             return Response::err(req.id, errors::MODEL_ERROR, err.to_string());
         }
-        Err(join_err) => {
+        Awaited::Joined(Err(join_err)) => {
             close_locale_usage(state, usage_guard, &op_id).await;
             return Response::err(
                 req.id,
                 errors::MODEL_ERROR,
                 format!("Locale generation stream task failed: {}", join_err),
             );
+        }
+        Awaited::Orphaned => {
+            // The confirmation expired, so the abandoned task is still running: the
+            // response carries the recorded expiry diagnostic instead of a result the
+            // provider never delivered.
+            close_locale_usage(state, usage_guard, &op_id).await;
+            let message = format!(
+                "Locale generation stream task did not stop within the {} ms task-exit deadline",
+                crate::reap::task_exit_deadline().as_millis()
+            );
+            return Response::err(req.id, errors::MODEL_ERROR, message);
         }
     }
 
@@ -456,7 +476,7 @@ mod tests {
         // A failed call still closes its window exactly once, so the next
         // operation starts from a clean ledger instead of inheriting an
         // abandoned in-flight window.
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 1);
         assert!(snapshot.cur.is_none());
         assert!(!state.is_operation_active(), "the slot is released");
@@ -520,7 +540,7 @@ mod tests {
         let result = parse_result(response);
         assert_eq!(result.translations["tab.review"], "Обзор");
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 1, "one terminal flush per call");
         assert!(snapshot.cur.is_none(), "the flush closes the window");
         assert_eq!(snapshot.session.total_tokens, 28);
@@ -568,7 +588,7 @@ mod tests {
             errors::CANCELLED
         );
 
-        let snapshot = state.usage.lock().await.clone();
+        let snapshot = state.usage_snapshot().await;
         assert_eq!(snapshot.operations, 1, "a cancelled call flushes once");
         assert!(snapshot.cur.is_none(), "cancellation closes the window");
         assert_eq!(snapshot.session.total_tokens, 6);
@@ -750,5 +770,113 @@ mod tests {
             !state.is_operation_active(),
             "the operation slot is released"
         );
+    }
+    /// Provider double that delivers its terminal stream events and then closes the
+    /// channel before parking the task inside a non-yielding stretch, modeling a
+    /// call whose event loop already ended while its own task keeps running.
+    struct WedgedAfterTerminalProvider {
+        /// Set by the test to let the parked task reach a suspension point.
+        released: Arc<AtomicBool>,
+        /// Set once the parked task reaches its own end.
+        exited: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for WedgedAfterTerminalProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            tx: tokio::sync::mpsc::Sender<StreamEvent>,
+            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            // The payload and the channel close first, so the handler's event loop
+            // ends and reaches its completed-stream await while this task is still
+            // running. The abort such an await would otherwise rely on lands only at
+            // a suspension point, and the stretch below reaches none.
+            let _ = tx
+                .send(StreamEvent::TextDelta("{\"translations\": []}".to_string()))
+                .await;
+            drop(tx);
+            while !self.released.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            self.exited.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A stream whose task never yields after its last event is abandoned at the
+    /// shared task-exit deadline: the request still resolves, the response carries
+    /// the recorded expiry diagnostic, and the operation slot is released.
+    ///
+    /// This is the completed-stream hazard of the locale handler — the task itself
+    /// is still running, so the handler can neither classify its result nor wait for
+    /// it without a bound. The journal record of the expiry is emitted by the shared
+    /// primitive, which its own suite covers; here the diagnostic is asserted where
+    /// the handler carries it to the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandons_a_wedged_stream_task_at_the_task_exit_deadline() {
+        // The parked task occupies a worker of its own, so the runtime keeps enough
+        // threads for the handler and for the bounded confirmation to run.
+        let deadline = std::time::Duration::from_millis(50);
+
+        let released = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(WedgedAfterTerminalProvider {
+            released: Arc::clone(&released),
+            exited: Arc::new(AtomicBool::new(false)),
+        });
+        let exited = Arc::clone(&provider.exited);
+        let provider_handle: Arc<dyn LlmProvider> = provider;
+        let state = state_with_provider(provider_handle).await;
+
+        let catalog = params(vec![item("tab.review", "Review", None)]);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::reap::with_task_exit_deadline(
+                deadline,
+                handle_locale_generate(request(&catalog), &state),
+            ),
+        )
+        .await
+        .expect("the request must resolve once the task-exit deadline expires");
+
+        let err = response
+            .error
+            .expect("the abandoned stream must not succeed");
+        assert_eq!(err.code, errors::MODEL_ERROR);
+        assert!(
+            err.message.contains("50 ms task-exit deadline"),
+            "the response must carry the expiry diagnostic: {}",
+            err.message
+        );
+        assert!(
+            !state.is_operation_active(),
+            "the operation slot is released"
+        );
+        assert!(
+            state.usage_snapshot().await.cur.is_none(),
+            "the abandoned stream still closes its usage window"
+        );
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the abandoned task provably never exited before the response"
+        );
+
+        // The handle was released deliberately and no second kill is attempted: the
+        // abandoned task ends at the first suspension point its stretch reaches.
+        released.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the abandoned task must end once its stretch ends");
     }
 }

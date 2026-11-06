@@ -43,12 +43,21 @@ mid-turn leaves synthetic commits at the tip of the branch.
    process that still runs describes a live transaction, so recovery preserves it
    and rewrites nothing until that writer has exited, while a marker that names
    no writer keeps the earlier behavior. The phase the marker records then
-   selects the second proof: a settled transaction must show a commit range
-   created entirely by the harness — for a born base, every commit between the
-   recorded base and HEAD, with the base still an ancestor of HEAD; for an unborn
-   base, every commit reachable from HEAD — while a marker still recording a
-   capture in progress is resolved against HEAD and the recorded base alone,
-   because the capture it describes has not produced a range yet.
+   selects the second proof, and every proof is settled over one pinned
+   identity: `HEAD` is resolved once, every evidence step addresses that commit,
+   and the identity is re-asserted immediately before every action the proof
+   licenses, so a repository that advanced in between is refused instead of
+   rewritten. A settled transaction must show a commit range created entirely
+   by the harness — for a born base, every commit between the recorded base and
+   the pinned commit, with the base still an ancestor of it; for an unborn base,
+   every commit reachable from the pinned commit — while a marker still
+   recording a capture in progress is resolved against the pinned commit and the
+   recorded base alone, because the capture it describes has not produced a
+   range yet. The proof has to be established, never assumed: a range whose
+   listing fails refuses recovery and preserves the marker, so an unobtainable
+   listing never enters the proof as an empty one, while an unborn `HEAD` —
+   distinguished by resolving `HEAD`, never by a failed listing — is the one
+   legitimately empty range.
 7. **No Git child outlives the turn.** Every invocation runs under the
    `[git].timeout_secs` budget inside its own process group, and the checkpoint
    capture and the step commit also observe the turn's cancellation signal.
@@ -293,10 +302,25 @@ A checkpoint commit normally has the pre-turn base as its parent, and the unwind
 moves the branch back to it. When the transaction opened on an unborn branch the
 checkpoint has no parent at all, because it is the repository root, so resetting
 to `HEAD~1` cannot work. The unwind recognizes that shape and returns the branch
-to the unborn state instead: `git update-ref -d HEAD` deletes the branch ref and
-`git read-tree --empty` clears the index. The developer's captured files stay in
-the working tree exactly as before the turn — untracked on an unborn branch —
-and the temporary checkpoint commit simply stops being reachable.
+to the unborn state instead: `git update-ref -d HEAD <pinned>` deletes the
+branch ref, and `git read-tree --empty` clears the index. The developer's
+captured files stay in the working tree exactly as before the turn — untracked
+on an unborn branch — and the temporary checkpoint commit simply stops being
+reachable.
+
+Both destructive helpers act on one pinned identity rather than on the moving
+`HEAD`. The unwind resolves `HEAD` once at entry and reads the subject, the
+parent, and the recorded-base proof from that commit; immediately before the
+destructive step it re-asserts that `HEAD` still names it, resets a parented
+checkpoint to the explicit pinned parent hash, and deletes a root checkpoint's
+branch ref through the conditional `git update-ref -d HEAD <pinned>`, which Git
+refuses as soon as `HEAD` moved. Only an accepted deletion clears the index. The
+unborn return follows the same rule: it lists the tracked paths from the pinned
+commit's tree and deletes the branch ref conditionally on that commit, so a
+moved `HEAD` refuses before a single path leaves the working tree. A `HEAD` that
+moved while either helper was being resolved is a typed refusal that rewrites no
+history, no index entry, and no working-tree byte — the commit that landed
+survives at `HEAD` instead of being silently dropped.
 
 The result is the exact pre-turn state: the same commits, the same uncommitted
 changes, and no temporary files.
@@ -320,27 +344,39 @@ Recovery runs at startup and is deliberately conservative:
    earlier revision — proves nothing about ownership and keeps the previous
    behavior;
 4. a marker still recording the `capturing` phase describes a crash inside the
-   capture itself and is resolved against HEAD and the recorded base instead of
-   a commit range: a HEAD that still equals the base means no checkpoint commit
-   was created, so the index returns to the recorded base — undoing the
-   `git add -A` the capture ran before it crashed — the working tree is left
-   untouched, and the marker is cleared;
+   capture itself and is resolved against the pinned commit and the recorded
+   base instead of a commit range: a pinned commit that still equals the base
+   means no checkpoint commit was created, so the index returns to the recorded
+   base — undoing the `git add -A` the capture ran before it crashed — the
+   working tree is left untouched, and the marker is cleared;
    a checkpoint commit whose parent equals the base — for an unborn base, a
    checkpoint commit that is the repository root — means the capture committed
    but crashed before the rewrite that records it, so that commit is unwound,
-   returning the captured work to the working tree; any other shape is refused;
-5. otherwise the settled marker's recorded base decides the proof range: for a
-   born base, every commit between the base and HEAD, and the base must still be
-   an ancestor of HEAD or recovery refuses and reports the reason; for an
-   unborn base, every commit reachable from HEAD;
+   returning the captured work to the working tree; any other shape is refused.
+   Both actions re-assert the pinned identity immediately before they run, so a
+   commit that landed after the crash is refused with the skip diagnostic
+   instead of being unstaged over or unwound beneath;
+5. otherwise the settled marker's recorded base decides the proof range,
+   computed over one pinned identity: `HEAD` is resolved once, and for a born
+   base every commit between the base and the pinned commit enters the proof,
+   with the base still an ancestor of it or recovery refuses and reports the
+   reason; for an unborn base, every commit reachable from the pinned commit. A
+   range the listing cannot enumerate refuses recovery the same way, naming the
+   range and Git's diagnostic with the marker preserved, so an unestablished
+   listing never counts as an empty range: an unborn `HEAD`, answered by
+   resolving `HEAD` before any listing runs, is the one legitimately empty proof
+   range;
 6. every commit in that range must carry the co-author trailer; a foreign
    commit makes recovery refuse instead of rewriting history;
-7. if there are no step commits and no checkpoint commit, the marker is
-   cleared;
-8. otherwise the tree is returned to the base — a hard reset to the recorded
-   commit for a born base, a return to the unborn state that removes exactly
-   the tracked paths for an unborn one — the marker is cleared, and the
-   checkpoint commit is unwound.
+7. if there are no step commits and no checkpoint commit, the pinned identity
+   is re-asserted and the marker is cleared;
+8. otherwise the pinned identity is re-asserted immediately before the action,
+   and the tree is returned to the base — a hard reset to the recorded commit
+   for a born base, a return to the unborn state that removes exactly the
+   tracked paths for an unborn one — the marker is cleared, and the checkpoint
+   commit is unwound. A repository that advanced while the proof ran is refused
+   with the skip diagnostic, leaving `HEAD`, the marker, the index, and the
+   working tree untouched.
 
 Recovery therefore restores an interrupted turn without ever discarding commits
 the harness did not create, and it is total: once the destructive reset has run,
@@ -450,7 +486,14 @@ crash recovery, which distinguishes a capture that committed from one that did n
   marker exists so an interrupted turn can be recovered, not so a process can
   keep working.
 - **It is not safe by assumption on crash.** Recovery refuses when a born base
-  is not an ancestor or when the proof range contains a foreign commit.
+  is not an ancestor, when the proof range cannot be listed, or when that range
+  contains a foreign commit. An unestablished listing is never an empty proof
+  range; only an unborn `HEAD`, established by resolving `HEAD`, is.
+- **It is not a recovery of a repository that advanced during the proof.** The
+  identity the proof settled on is re-asserted immediately before every action
+  it licenses, so a commit that landed in between refuses the recovery instead
+  of being reset away or unstaged over: the marker survives and a later startup
+  redoes the proof.
 - **It is not a recovery of a live writer's transaction.** A marker attributed to
   a process that still runs is skipped with the marker preserved, and no branch
   is reset; only a provably gone writer, or a marker that names none, authorizes
