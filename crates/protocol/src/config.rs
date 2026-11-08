@@ -368,7 +368,7 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("primary-model"),
+                repl: ModelRef::openrouter("repl-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: None,

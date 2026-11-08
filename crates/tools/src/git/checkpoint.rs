@@ -269,7 +269,29 @@ fn commit_subject(dir: &Path, commit: &str, deadline: &GitDeadline) -> String {
         .trim()
         .to_string()
 }
-
+/// Reports whether one specific commit carries the Tauqe co-author trailer.
+///
+/// The probe answers about the commit it is handed, never about the moving
+/// `HEAD`, so a proof computed over a pinned commit observes exactly that
+/// commit. Both the settled-transaction proof of crash recovery and the base
+/// return of finalization read their range through this one helper, so the two
+/// can never disagree about which commits the harness created. A probe Git
+/// cannot answer reports no trailer, which refuses a commit the proof cannot
+/// vouch for.
+fn commit_carries_tauqe_trailer(dir: &Path, commit: &str, deadline: &GitDeadline) -> bool {
+    let trailers = run_git_with_deadline(
+        Some(dir),
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Co-authored-by)",
+            commit,
+        ],
+        deadline,
+    )
+    .unwrap_or_default();
+    trailers.contains("Tauqe AI")
+}
 /// Resolves the full hash of the commit currently checked out.
 ///
 /// An unborn branch holds no commit to resolve, which is the `None` answer.
@@ -1364,18 +1386,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         },
     };
     for commit in &commits {
-        let trailers = run_git_with_deadline(
-            Some(dir),
-            &[
-                "log",
-                "-1",
-                "--format=%(trailers:key=Co-authored-by)",
-                commit,
-            ],
-            &deadline,
-        )
-        .unwrap_or_default();
-        if !trailers.contains("Tauqe AI") {
+        if !commit_carries_tauqe_trailer(dir, commit, &deadline) {
             return Ok(Some(format!(
                 "Skipped crash recovery: commit {} in the recorded transaction range was not created by Tauqe AI; repository left untouched.",
                 commit
@@ -1695,6 +1706,37 @@ fn verify_protected_paths_ignored(dir: &Path, deadline: &GitDeadline) -> Result<
     );
 }
 
+/// Refuses a capture that would overwrite a live writer's transaction marker.
+///
+/// The marker is the single artifact crash recovery acts on, so a capture never
+/// replaces one that describes a transaction another process is still
+/// driving: that writer may be mid-capture, mid-step, or mid-finalization, and
+/// a capture of this process would leave its work behind a marker that no
+/// longer names it.
+///
+/// The ownership decision is the one the recovery gate and the staging-sibling
+/// sweep apply, read through the same helper, and the refusal is the one an
+/// isolated commit raises. A marker this process wrote itself keeps the
+/// previous behavior, because no other process could have opened it; a marker
+/// attributed to a provably dead writer and an unattributed legacy marker keep
+/// it as well, and the first is what a startup recovery resolves.
+fn refuse_owned_transaction_marker(dir: &Path) -> Result<()> {
+    let Some(checkpoint) = read_transaction_marker(dir) else {
+        return Ok(());
+    };
+    let own_pid = std::process::id();
+    let Some(writer_pid) = live_writer(checkpoint.writer_pid) else {
+        return Ok(());
+    };
+    if writer_pid == own_pid {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(LiveTransactionWriter {
+        writer_pid,
+        step: "open a transaction",
+    }))
+}
+
 /// Creates a safe checkpoint of uncommitted changes before applying AI modifications.
 ///
 /// A tree holding uncommitted work is captured in two phases: the marker that
@@ -1704,6 +1746,10 @@ fn verify_protected_paths_ignored(dir: &Path, deadline: &GitDeadline) -> Result<
 /// instead of leaving the captured work inside a commit nothing names.
 ///
 /// `hooks` is the hook policy the temporary checkpoint commit follows.
+///
+/// A capture never opens over a transaction another live writer owns: the
+/// existing marker refuses it before the ignore rules are installed, before the
+/// repository is probed, and before the marker is written.
 pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> {
     let deadline = GitDeadline::default();
     create_checkpoint_with_deadline(dir, hooks, &deadline)
@@ -1716,6 +1762,12 @@ pub fn create_checkpoint_with_deadline(
     hooks: GitHooks,
     deadline: &GitDeadline,
 ) -> Result<CheckpointInfo> {
+    // A capture overwrites the marker, so the ownership gate runs first: the
+    // refusal precedes the ignore-rule installation, the repository probes,
+    // and the first marker write, leaving any live transaction exactly as it
+    // was.
+    refuse_owned_transaction_marker(dir)?;
+
     // The ignore rules are the only mechanism that keeps the credential file out
     // of `git add -A`, so a failure to install them aborts the checkpoint instead
     // of committing the API key into a temporary commit.
@@ -1887,6 +1939,58 @@ pub fn create_step_commit_with_deadline(
     Ok(short_hash)
 }
 
+/// An open transaction that blocked a step another live writer owns.
+///
+/// The refusal is typed, mirroring the drift refusal of the recovery paths, so
+/// a caller can tell a marker another live transaction owns apart from a Git
+/// failure without inspecting an error message. `step` names the work the live
+/// transaction blocked, so one type renders both the refusal of an isolated
+/// commit and the refusal of a capture.
+#[derive(Debug)]
+struct LiveTransactionWriter {
+    /// The process id the marker records as its writer.
+    writer_pid: u32,
+    /// The work the live transaction blocked, rendered into the refusal.
+    step: &'static str,
+}
+
+impl std::fmt::Display for LiveTransactionWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Refusing to {}: the transaction writer (pid {}) is still running; repository left \
+             untouched and the transaction marker is preserved",
+            self.step, self.writer_pid
+        )
+    }
+}
+
+impl std::error::Error for LiveTransactionWriter {}
+
+/// Clears the transaction marker of a transaction the caller did not open.
+///
+/// An isolated commit never opens a transaction, so it may only clear a marker
+/// that no live writer owns. The ownership decision is the one the recovery gate
+/// and the staging-sibling sweep apply, read through the same helper: a marker
+/// that is absent, a marker attributed to a provably dead writer, and an
+/// unattributed legacy marker all keep the previous clearing behavior, while a
+/// marker a live writer owns is preserved for the transaction that opened it,
+/// which its own rollback or a later startup recovery resolves.
+///
+/// The gate runs before any staging and any commit, so a refusal leaves `HEAD`,
+/// the index, the working tree, and the marker exactly as they were.
+fn clear_unowned_transaction_marker(dir: &Path) -> Result<()> {
+    if let Some(checkpoint) = read_transaction_marker(dir) {
+        if let Some(writer_pid) = live_writer(checkpoint.writer_pid) {
+            return Err(anyhow::Error::new(LiveTransactionWriter {
+                writer_pid,
+                step: "create an isolated commit",
+            }));
+        }
+    }
+    clear_transaction_marker(dir)
+}
+
 /// Closes a transaction whose change set holds no tracked path.
 ///
 /// A bounded turn can verify cleanly while every file it wrote lives outside
@@ -1896,19 +2000,106 @@ pub fn create_step_commit_with_deadline(
 /// checkpoint commit is rolled back into the working tree, which keeps the
 /// developer's uncommitted work, and the empty hash reports that no commit was
 /// created.
+///
+/// The marker belongs to the transaction the caller opened, so it is cleared
+/// without the ownership gate an isolated commit applies.
 fn close_transaction_without_changes(
     dir: &Path,
-    checkpoint: Option<&CheckpointInfo>,
+    checkpoint: &CheckpointInfo,
     deadline: &GitDeadline,
 ) -> Result<String> {
-    let created = checkpoint.filter(|checkpoint| checkpoint.created_checkpoint_commit);
-    if let Some(checkpoint) = created {
+    if checkpoint.created_checkpoint_commit {
         let _ = unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)?;
     }
     clear_transaction_marker(dir)?;
     Ok(String::new())
 }
+/// Resolves the identity a finalization returns the branch from, proving the
+/// recorded transaction base still accounts for it.
+///
+/// A born base is proven exactly as crash recovery proves a settled
+/// transaction: the commit `HEAD` names must resolve, the recorded base must
+/// still be an ancestor of it, and every commit in the `base..pinned` range must
+/// carry the Tauqe co-author trailer. A range that cannot be listed refuses the
+/// same way, so an unestablished listing never counts as an empty range. An
+/// unborn base proves nothing here, because its branch holds no commit to
+/// descend from; the pinned commit is only the target of the conditional
+/// deletion the action performs.
+///
+/// Every refusal precedes all mutation: the branch, the index, the working
+/// tree, and the transaction marker the turn opened stay exactly as they were,
+/// so a commit that landed concurrently, the transaction's own commits, and the
+/// artifact a later recovery needs all survive a refused finalization.
+fn resolve_pinned_finalize_return(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    deadline: &GitDeadline,
+) -> Result<Option<String>> {
+    let head = resolve_head(dir, deadline);
+    let TransactionBase::Commit(base) = &checkpoint.base else {
+        return Ok(head);
+    };
 
+    let Some(pinned) = head.as_deref() else {
+        bail!(
+            "Refusing to finalize: the recorded transaction base {base} cannot be returned to \
+             because HEAD holds no commit; repository left untouched"
+        );
+    };
+    if !is_ancestor_of(dir, base, pinned, deadline) {
+        bail!(
+            "Refusing to finalize: recorded transaction base {base} is not an ancestor of HEAD; \
+             repository left untouched"
+        );
+    }
+    let rev_range = format!("{base}..{pinned}");
+    let commits = commit_listing(dir, &rev_range, deadline).with_context(|| {
+        format!("Refusing to finalize: the proof range {rev_range} could not be listed")
+    })?;
+    for commit in &commits {
+        if !commit_carries_tauqe_trailer(dir, commit, deadline) {
+            bail!(
+                "Refusing to finalize: commit {commit} in the recorded transaction range was not \
+                 created by Tauqe AI; repository left untouched"
+            );
+        }
+    }
+    Ok(head)
+}
+
+/// Returns the branch to the recorded base an authorization pinned.
+///
+/// The born base re-asserts the pinned commit immediately before the soft
+/// reset, so a `HEAD` that moved while the proof ran is a typed refusal that
+/// rewrites no history, no index entry, and no working-tree byte. The unborn
+/// base deletes the branch ref through the conditional `update-ref -d HEAD
+/// <pinned>` form, whose `<oldvalue>` operand makes Git itself refuse the
+/// deletion as soon as `HEAD` names another commit. The index is left untouched
+/// either way, so the step commits stay staged work.
+fn perform_pinned_finalize_return(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    pinned: Option<&str>,
+    deadline: &GitDeadline,
+) -> Result<()> {
+    match (&checkpoint.base, pinned) {
+        (TransactionBase::Commit(base), Some(head)) => {
+            assert_head_pinned(dir, head, deadline)?;
+            run_git_with_deadline(Some(dir), &["reset", "--soft", base.as_str()], deadline)
+                .context("Failed to soft reset to checkpoint base")?;
+        }
+        (TransactionBase::Commit(_), None) => bail!(
+            "Refusing to finalize: HEAD holds no commit the recorded transaction base could be \
+             returned to; repository left untouched"
+        ),
+        (TransactionBase::Unborn, Some(head)) => {
+            run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD", head], deadline)
+                .context("Failed to soft reset to the unborn checkpoint base")?;
+        }
+        (TransactionBase::Unborn, None) => {}
+    }
+    Ok(())
+}
 /// Squashes all intermediate step commits into a single final AI commit.
 ///
 /// A change set without a single tracked path — one that lives entirely in the
@@ -1929,6 +2120,14 @@ pub fn finalize_ai_commit(
 
 /// Squashes the intermediate step commits into one AI commit under the supplied
 /// wall-clock budget.
+///
+/// The base return that opens the squash is proven and pinned before it acts:
+/// the identity `HEAD` names is resolved once, the recorded base must still
+/// account for it, and the destructive step re-asserts that identity before it
+/// moves a ref — a conditional ref deletion for an unborn base, a re-asserted
+/// soft reset for a born one. A refusal precedes all mutation, so a commit that
+/// landed concurrently, the transaction's own commits, and the marker a later
+/// recovery needs all survive a refused finalization.
 pub fn finalize_ai_commit_with_deadline(
     dir: &Path,
     checkpoint: &CheckpointInfo,
@@ -1938,26 +2137,19 @@ pub fn finalize_ai_commit_with_deadline(
     deadline: &GitDeadline,
 ) -> Result<String> {
     if changed_files.is_empty() {
-        return close_transaction_without_changes(dir, Some(checkpoint), deadline);
+        return close_transaction_without_changes(dir, checkpoint, deadline);
     }
 
-    // 1. Soft-reset back to the checkpoint base, so every step commit becomes
-    //    staged work. An unborn base holds no commit to reset to: deleting
-    //    the branch ref leaves the index untouched, so the step commits
-    //    collapse into staged work and the final commit becomes the single
-    //    squashed root instead of an empty commit on top of the last step.
-    match &checkpoint.base {
-        TransactionBase::Commit(head) => {
-            run_git_with_deadline(Some(dir), &["reset", "--soft", head], deadline)
-                .context("Failed to soft reset to checkpoint base")?;
-        }
-        TransactionBase::Unborn => {
-            if resolve_head(dir, deadline).is_some() {
-                run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
-                    .context("Failed to soft reset to the unborn checkpoint base")?;
-            }
-        }
-    }
+    // 1. Return the branch to the recorded base, so every step commit becomes
+    //    staged work. The proof and the action are separate units: the identity
+    //    is resolved and proven once, and the destructive step then acts on that
+    //    pinned commit alone, exactly as the crash-recovery paths of this module
+    //    do. An unborn base holds no commit to reset to: deleting the branch ref
+    //    leaves the index untouched, so the step commits collapse into staged
+    //    work and the final commit becomes the single squashed root instead of
+    //    an empty commit on top of the last step.
+    let pinned = resolve_pinned_finalize_return(dir, checkpoint, deadline)?;
+    perform_pinned_finalize_return(dir, checkpoint, pinned.as_deref(), deadline)?;
 
     // 2. If checkpoint commit was created, unwind it so user uncommitted changes stay in working tree
     if checkpoint.created_checkpoint_commit {
@@ -1997,6 +2189,13 @@ pub fn create_ai_commit(
 }
 
 /// Creates an isolated AI commit under the supplied wall-clock budget.
+///
+/// An isolated commit opens no transaction of its own, so it clears the
+/// transaction marker only when no live writer owns it: a marker attributed to a
+/// process that still runs refuses the commit before anything is staged, while an
+/// absent marker, a marker attributed to a provably dead writer, and an
+/// unattributed legacy marker keep the previous clearing behavior. A change set
+/// that holds no tracked path closes the same way and reports the empty hash.
 pub fn create_ai_commit_with_deadline(
     dir: &Path,
     changed_files: &[String],
@@ -2004,17 +2203,20 @@ pub fn create_ai_commit_with_deadline(
     hooks: GitHooks,
     deadline: &GitDeadline,
 ) -> Result<String> {
+    // An isolated commit holds no transaction of its own, so it may only clear a
+    // marker no live writer owns. The gate runs before any staging and any
+    // commit, so a refusal leaves HEAD, the index, the working tree, and the
+    // marker of the open transaction untouched for its own rollback or a later
+    // startup recovery.
+    clear_unowned_transaction_marker(dir)?;
+
     if changed_files.is_empty() {
-        return close_transaction_without_changes(dir, None, deadline);
+        return Ok(String::new());
     }
 
-    // An isolated commit holds no transaction marker, so no recorded base
-    // authorizes removing a temporary checkpoint commit from the branch: a
-    // commit of that shape stays in the history, exactly as a hand-written one
-    // would.
-
-    clear_transaction_marker(dir)?;
-
+    // No recorded base authorizes removing a temporary checkpoint commit from
+    // the branch: a commit of that shape stays in the history, exactly as a
+    // hand-written one would.
     stage_files_with_deadline(dir, changed_files, deadline)?;
 
     let commit_message = format!("{}\n\n{}", summary.trim(), TAUQE_CO_AUTHOR_TRAILER);

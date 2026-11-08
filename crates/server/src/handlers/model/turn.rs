@@ -18,14 +18,15 @@ use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
-    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
-    EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent, LlmCapability,
-    ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
-    ResponseError, ReviewItem, ReviewSession, ReviewUpdatedEvent, TurnIntent,
+    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditHunkEvent,
+    EditOutcome, Event, GitCommitCreatedEvent, LlmCapability, ModelEscalatedEvent,
+    ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort, ResponseError, ReviewItem,
+    ReviewSession, ReviewUpdatedEvent, TurnIntent,
 };
 use tokio::sync::watch;
 
 use crate::handlers::common::withdraw_streamed_attempt;
+use crate::handlers::edit_cycle::{EditCycle, EditTermination};
 use crate::handlers::offload;
 use crate::state::{next_operation_id, AppState, OperationGuard};
 use crate::transport::OutChannel;
@@ -150,7 +151,7 @@ fn build_configured_provider(
 
 /// Grace period granted to a workflow task to unwind cooperatively after a
 /// cancellation or stream error before a supervisor force-aborts it.
-pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 // Turn-scoped override of [`CANCEL_UNWIND_GRACE`].
 //
 // The last-resort path of a turn is bounded by two consecutive expiries of the
@@ -164,7 +165,7 @@ tokio::task_local! {
 
 /// Resolves the unwind grace currently in force for this turn.
 #[cfg(test)]
-fn unwind_grace() -> std::time::Duration {
+pub(crate) fn unwind_grace() -> std::time::Duration {
     UNWIND_GRACE_OVERRIDE
         .try_with(|value| *value)
         .unwrap_or(CANCEL_UNWIND_GRACE)
@@ -175,7 +176,7 @@ fn unwind_grace() -> std::time::Duration {
 /// Production always waits out [`CANCEL_UNWIND_GRACE`]; only a test may scope a
 /// shorter value to the task tree that drives the turn.
 #[cfg(not(test))]
-fn unwind_grace() -> std::time::Duration {
+pub(crate) fn unwind_grace() -> std::time::Duration {
     CANCEL_UNWIND_GRACE
 }
 
@@ -222,7 +223,8 @@ pub(crate) fn build_apply_policy(
 /// registers the cancellable active operation. `is_batch` marks turns that run
 /// as members of a batch supervisor so clients can suppress per-step signals.
 /// The declared `work_context` travels unchanged into `model/started` and the
-/// turn's journal record, so the running work is reported from typed fields.///
+/// turn's journal record, so the running work is reported from typed fields.
+///
 /// The collaborators are intentionally threaded as separate parameters: every
 /// turn entry point supplies exactly the subset it owns, so a wrapper struct
 /// would only restate the same fields without removing a single argument.
@@ -561,24 +563,28 @@ async fn run_prepared_turn(
     operation.set_abort_handle(wf_task.abort_handle());
 
     let mut raw_streamed_text = String::new();
-    // Open the shared usage window for this turn. Every provider call reports
-    // into it, and only the terminal flush folds it into the session totals, so
+    // Open the shared usage window for this turn under the identifier the turn
+    // already published in `model/started`. Every provider call reports into it,
+    // and only the terminal flush folds it into the session totals, so
     // intermediate usage events can never be counted twice.
-    let mut usage_guard = Some(state.begin_usage().await);
-    let mut edit_events_sent = false;
-    let mut edit_finished_sent = false;
+    let mut usage_guard = Some(state.begin_usage(&op_id).await);
+    // The relay opens the edit cycle on the first edit event and answers for
+    // closing it on every exit; a path that bypasses it is closed by the
+    // handle's drop guard.
+    let edit_cycle = EditCycle::new(state.out.clone(), op_id.clone());
     let mut is_cancelled = false;
     let mut is_error = false;
     let mut stream_error_msg = None;
 
     while let Some(event) = rx.recv().await {
+        // The transport owns the pacing classification, so the relay applies it
+        // once for every variant: a terminal notice publishes immediately while
+        // telemetry waits for the writer to catch up, so a client that stopped
+        // reading pauses the stream here instead of growing daemon memory for
+        // the rest of the turn.
+        state.out.pace_event(&event, &mut cancel_rx).await;
         match event {
             StreamEvent::ReasoningDelta(delta) => {
-                // Reasoning arrives at token granularity, so the relay paces
-                // itself against the outbound queue: a client that stopped
-                // reading pauses the stream here instead of growing daemon
-                // memory for the rest of the turn.
-                state.out.wait_for_headroom(&mut cancel_rx).await;
                 state.out.send_event(&Event {
                     method: events::MODEL_REASONING_DELTA.to_string(),
                     params: Some(serde_json::json!({
@@ -590,7 +596,6 @@ async fn run_prepared_turn(
             StreamEvent::TextDelta(delta) => {
                 // The answer passes through the same gate as reasoning, so the
                 // accumulated answer and the client copy pause together.
-                state.out.wait_for_headroom(&mut cancel_rx).await;
                 raw_streamed_text.push_str(&delta);
                 state.out.send_event(&Event {
                     method: events::MODEL_TEXT_DELTA.to_string(),
@@ -607,17 +612,10 @@ async fn run_prepared_turn(
                 });
             }
             StreamEvent::EditStarted => {
-                edit_events_sent = true;
-                state.out.send_event(&Event {
-                    method: events::EDIT_STARTED.to_string(),
-                    params: serde_json::to_value(EditStartedEvent {
-                        operation_id: op_id.clone(),
-                    })
-                    .ok(),
-                });
+                edit_cycle.open();
             }
             StreamEvent::EditFileStarted { path, op_type } => {
-                edit_events_sent = true;
+                edit_cycle.open();
                 state.out.send_event(&Event {
                     method: events::EDIT_FILE_STARTED.to_string(),
                     params: serde_json::to_value(EditFileStartedEvent {
@@ -794,18 +792,12 @@ async fn run_prepared_turn(
                 // so far belongs to the aborted attempt, so the client discards
                 // it and this turn stops carrying it as assistant text. The
                 // withdrawal itself is shared with every other stream contour.
+                edit_cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None);
                 withdraw_streamed_attempt(&state.out, &op_id, || raw_streamed_text.clear());
             }
             StreamEvent::Done => {}
             StreamEvent::Cancelled => {
-                if edit_events_sent && !edit_finished_sent {
-                    send_edit_aborted(
-                        &state.out,
-                        &op_id,
-                        "Operation cancelled before edits were applied".to_string(),
-                    );
-                    edit_finished_sent = true;
-                }
+                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
                 state.out.send_event(&Event {
                     method: events::MODEL_CANCELLED.to_string(),
                     params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
@@ -814,14 +806,11 @@ async fn run_prepared_turn(
                 break;
             }
             StreamEvent::Error(err) => {
-                if edit_events_sent && !edit_finished_sent {
-                    send_edit_aborted(
-                        &state.out,
-                        &op_id,
-                        format!("Operation failed before edits were applied: {}", err),
-                    );
-                    edit_finished_sent = true;
-                }
+                close_failed(
+                    &edit_cycle,
+                    EditTermination::ProviderError,
+                    format!("Operation failed before edits were applied: {}", err),
+                );
                 state.out.send_event(&Event {
                     method: events::MODEL_ERROR.to_string(),
                     params: Some(serde_json::json!({
@@ -1023,15 +1012,11 @@ async fn run_prepared_turn(
                 ..
             } = wf_result.result
             {
-                state.out.send_event(&Event {
-                    method: events::EDIT_FINISHED.to_string(),
-                    params: serde_json::to_value(EditFinishedEvent {
-                        operation_id: op_id.clone(),
-                        outcome: outcome.clone(),
-                    })
-                    .ok(),
-                });
-                edit_finished_sent = true;
+                // The cycle closes with the typed outcome of the application
+                // attempt — its classification and its named error alike —
+                // before any terminal event of the turn is published.
+                edit_cycle.open();
+                edit_cycle.close_outcome(termination_of(&wf_result), outcome.clone());
 
                 if let Some(hash) = &outcome.commit_hash {
                     state.out.send_event(&Event {
@@ -1119,14 +1104,11 @@ async fn run_prepared_turn(
                 });
             }
 
-            if should_report_aborted_edits(edit_events_sent, edit_finished_sent, &wf_result.result)
-            {
-                send_edit_aborted(
-                    &state.out,
-                    &op_id,
-                    "Edits were streamed but no edit result was produced".to_string(),
-                );
-            }
+            // A turn that ended with an answer while edit events were open
+            // produced no change set: the cycle still closes, unapplied, before
+            // the terminal result is published.
+            let termination = termination_of(&wf_result);
+            edit_cycle.close_unapplied(termination, Vec::new(), None);
 
             state.out.send_event(&Event {
                 method: events::MODEL_RESULT.to_string(),
@@ -1164,10 +1146,13 @@ async fn run_prepared_turn(
                 state.reset_session_uuid().await;
             }
 
-            let has_terminal_success =
-                tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text).is_some()
-                    || tauqe_core::edits::protocol::xml::extract_success(&wf_result.assistant_text)
-                        .is_some();
+            // The FSM already classified the turn, so its verdict leads here; the
+            // text scans keep covering turns whose terminal tag never reached the
+            // packed outcome, such as an applied edit that closed with one.
+            let has_terminal_success = wf_result.has_terminal_success
+                || tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text).is_some()
+                || tauqe_core::edits::protocol::xml::extract_success(&wf_result.assistant_text)
+                    .is_some();
 
             let turn_error = match &wf_result.result {
                 tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
@@ -1192,9 +1177,11 @@ async fn run_prepared_turn(
         Ok(Err(err)) => {
             let snapshot = flush_usage(state, &mut usage_guard).await;
             emit_legacy_usage_event(state, &op_id).await;
-            if edit_events_sent && !edit_finished_sent {
-                send_edit_aborted(&state.out, &op_id, format!("Workflow failed: {}", err));
-            }
+            close_failed(
+                &edit_cycle,
+                EditTermination::ProviderError,
+                format!("Workflow failed: {}", err),
+            );
             state.out.send_event(&Event {
                 method: events::MODEL_ERROR.to_string(),
                 params: Some(serde_json::json!({
@@ -1229,13 +1216,14 @@ async fn run_prepared_turn(
             // other seam, so a workflow that ignored it must not surface as a
             // provider failure the model never produced.
             let cancelled = *cancel_rx.borrow();
-            if edit_events_sent && !edit_finished_sent {
-                let reason = if cancelled {
-                    "Operation cancelled before edits were applied".to_string()
-                } else {
-                    format!("Workflow task failed: {}", join_err)
-                };
-                send_edit_aborted(&state.out, &op_id, reason);
+            if cancelled {
+                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+            } else {
+                close_failed(
+                    &edit_cycle,
+                    EditTermination::Aborted,
+                    format!("Workflow task failed: {}", join_err),
+                );
             }
             let error = if cancelled {
                 tracing::warn!(
@@ -1654,32 +1642,19 @@ pub(crate) async fn emit_legacy_usage_event(state: &Arc<AppState>, op_id: &str) 
     });
 }
 
-pub(super) fn should_report_aborted_edits(
-    edit_events_sent: bool,
-    edit_finished_sent: bool,
-    result: &tauqe_protocol::ModelResult,
-) -> bool {
-    if !edit_events_sent || edit_finished_sent {
-        return false;
-    }
-    !matches!(result, tauqe_protocol::ModelResult::Answer { .. })
-}
-
-fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
-    out.send_event(&Event {
-        method: events::EDIT_FINISHED.to_string(),
-        params: serde_json::to_value(EditFinishedEvent {
-            operation_id: op_id.to_string(),
-            outcome: EditOutcome {
-                applied: false,
-                error: Some(error),
-                changed_files: Vec::new(),
-                commit_hash: None,
-                verification: None,
-            },
-        })
-        .ok(),
-    });
+/// Closes the edit cycle as unapplied, carrying the failure that ended it.
+///
+/// The typed `termination` classifies the ending; `reason` is the detail the
+/// closing reports to the client. A cycle that is not open stays untouched.
+fn close_failed(cycle: &EditCycle, termination: EditTermination, reason: String) {
+    cycle.close_outcome(
+        termination,
+        EditOutcome {
+            applied: false,
+            error: Some(reason),
+            ..EditOutcome::default()
+        },
+    );
 }
 
 /// Projects a completed turn onto the typed plan-mutation fields of the
@@ -1694,6 +1669,28 @@ fn plan_mutation_fields(
     result: &tauqe_core::workflow::WorkflowExecutionResult,
 ) -> (Vec<tauqe_protocol::PlanRejection>, Vec<String>) {
     (result.plan_errors.clone(), result.plan_warnings.clone())
+}
+
+/// Classifies why a completed turn leaves its edit cycle unapplied.
+///
+/// The reason is read from the typed state the engine already settled — the
+/// cancellation flag, the blocker, the abort report, and the protocol-failure
+/// fact — and never from any text, so every ending that finds the cycle open
+/// closes it with a stated reason. A semantic ending outranks a protocol
+/// violation: a turn that was cancelled, blocked, or aborted reports that
+/// ending even when its last proposal also violated the edit protocol.
+fn termination_of(result: &tauqe_core::workflow::WorkflowExecutionResult) -> EditTermination {
+    if result.is_cancelled {
+        EditTermination::Cancelled
+    } else if result.blocked.is_some() {
+        EditTermination::Blocked
+    } else if result.abort.is_some() {
+        EditTermination::Aborted
+    } else if result.protocol_failure.is_some() {
+        EditTermination::ProtocolFailure
+    } else {
+        EditTermination::Completed
+    }
 }
 
 #[cfg(test)]
@@ -1711,9 +1708,12 @@ mod tests {
                 text: String::new(),
             },
             assistant_text: String::new(),
+            is_cancelled: false,
+            has_terminal_success: false,
             blocked: None,
             skip_reason: None,
             abort: None,
+            protocol_failure: None,
             plan_saved: false,
             plan_errors,
             plan_warnings,
@@ -1753,5 +1753,64 @@ mod tests {
 
         assert!(rejections.is_empty());
         assert!(warnings.is_empty());
+    }
+    #[test]
+    fn test_termination_of_reads_the_typed_state() {
+        let mut result = turn_result(Vec::new(), Vec::new());
+        assert_eq!(termination_of(&result), EditTermination::Completed);
+
+        result.blocked = Some("the invariant cannot hold".to_string());
+        assert_eq!(termination_of(&result), EditTermination::Blocked);
+
+        result.is_cancelled = true;
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::Cancelled,
+            "a cancellation outranks every other ending"
+        );
+    }
+    /// The typed protocol-failure fact of a turn is what classifies an
+    /// unapplied cycle, and a semantic ending outranks it: only a turn that
+    /// ended for no other stated reason is reported as a protocol violation.
+    #[test]
+    fn test_termination_of_maps_the_protocol_failure_fact() {
+        let mut result = turn_result(Vec::new(), Vec::new());
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::Completed,
+            "a turn without a stated ending keeps the fallback"
+        );
+
+        result.protocol_failure = Some("unclosed <edit>".to_string());
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::ProtocolFailure,
+            "the typed fact classifies the ending without reading its wording"
+        );
+
+        result.blocked = Some("the invariant cannot hold".to_string());
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::Blocked,
+            "a semantic block outranks the protocol violation"
+        );
+
+        result.blocked = None;
+        result.abort = Some(tauqe_core::workflow::fsm::AbortReport {
+            reason: "host capability missing".to_string(),
+            recommendation: "install the missing package".to_string(),
+        });
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::Aborted,
+            "an abort outranks the protocol violation"
+        );
+
+        result.is_cancelled = true;
+        assert_eq!(
+            termination_of(&result),
+            EditTermination::Cancelled,
+            "a cancellation outranks every other ending"
+        );
     }
 }

@@ -87,7 +87,8 @@ repository able to authorize itself would have no boundary at all.
    as is, and the harness never refreshes it, transfers it again, or rewrites it.
 7. **A document is reached through one jail.** `{id}` answers the root document, and
    `{id}/{relative}` resolves below the directory that holds it. A parent directory, an
-   absolute path, a backslash, an empty segment, and a foreign scheme are refused before a
+   absolute path, a backslash, an empty segment, a percent-encoded segment, and a foreign
+   scheme are refused before a
    byte moves.
 8. **The context addresses a document by its logical path.** The OuterDocs layer stores a
    document under its mount point and resolves that name against the cache root whenever it
@@ -224,7 +225,9 @@ would mount two documents at one path.
 A document below the root is requested by the identifier `{id}/{relative}`, whatever the
 link inside the root text looks like. `{id}/{relative}` is held to the same cleanliness: an
 empty segment, a `.` or `..` segment, a backslash, a foreign scheme, and an absolute path
-all leave the declared root and are refused before a byte moves.
+all leave the declared root and are refused before a byte moves. The escape character
+of a percent encoding is refused the same way, because a host that decodes its path
+would resolve a segment such as `%2e%2e` above the root this jail validated.
 
 ### 2.5 Two trees, one direction
 

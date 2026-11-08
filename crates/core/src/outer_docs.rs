@@ -95,15 +95,29 @@ pub fn logical_path(path: &str) -> Option<&str> {
 pub const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Reports whether `path` is a clean repository-relative path written with `/`.
+/// Reports whether `path` is a clean repository-relative path written with `/`.
 ///
 /// The declaration is portable, so the rule is stated on the raw segments: an
 /// empty path, an empty segment (which covers an absolute path, a doubled
 /// separator, and a trailing separator), a `.` or `..` segment, a backslash, a
-/// NUL, and a `:` (which would smuggle a URL scheme or a drive letter) are all
-/// rejected. The platform path then answers the remaining question, whether the
-/// result could still name an absolute location.
+/// NUL, a `%`, and a `:` (which would smuggle a URL scheme or a drive letter)
+/// are all rejected. The platform path then answers the remaining question,
+/// whether the result could still name an absolute location.
+///
+/// The `%` is rejected because it is the escape character of the percent
+/// decoding a remote host may apply to the address the path becomes. A segment
+/// such as `%2e%2e` is not the literal `..` this jail inspects, yet a host that
+/// decodes its path resolves it above the declared root. Refusing the escape
+/// character keeps the bytes the jail validated and the bytes the host resolves
+/// identical, so the rule is closed under decoding without the harness decoding
+/// anything itself.
 pub fn is_clean_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.contains('\\') || path.contains('\0') || path.contains(':') {
+    if path.is_empty()
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains('%')
+        || path.contains(':')
+    {
         return false;
     }
     let portable = path
@@ -628,7 +642,7 @@ fn ensure_inside_root(doc: &OuterDoc, relative: &str) -> Result<(), MaterializeE
         return Ok(());
     }
     Err(MaterializeError::Delivery(format!(
-        "the request `{id}/{relative}` leaves the declared root `{id}`: a documented request addresses the root document or a clean relative path below its directory, never a parent directory, an absolute path, or another scheme",
+        "the request `{id}/{relative}` leaves the declared root `{id}`: a documented request addresses the root document or a clean relative path below its directory, never a parent directory, an absolute path, a percent-encoded segment, or another scheme",
         id = doc.id
     )))
 }
@@ -716,6 +730,10 @@ mod tests {
             "vendor\\api.md",
             "https://example.com/x.md",
             "vendor//api.md",
+            "vendor/%2e%2e/secret.md",
+            "%2e%2e/secret.md",
+            "vendor/%2E/api.md",
+            "vendor/%2fapi.md",
         ] {
             assert!(!is_clean_relative_path(path), "{path} must be rejected");
         }
@@ -842,6 +860,7 @@ mod tests {
             "mylib/notes/../../secret.md",
             "mylib//etc/passwd.md",
             "/etc/passwd.md",
+            "mylib/%2e%2e/secret.md",
         ] {
             let error = registry
                 .materialize_declared(dir.path(), request, MAX_DOCUMENT_BYTES, None)

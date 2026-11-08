@@ -374,7 +374,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         // byte, so a cancellation delivered before the stream starts still
         // closes exactly one accounted operation.
         let op_id = format!("op-{}", crate::state::next_operation_id());
-        let usage_guard = state.begin_usage().await;
+        let usage_guard = state.begin_usage(&op_id).await;
         let cancel_rx = operation.cancel_receiver();
         // The signal is also observed after the event loop, so a provider that
         // stops streaming on cancellation without reporting it is still

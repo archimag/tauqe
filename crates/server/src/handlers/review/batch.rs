@@ -48,11 +48,12 @@ use tauqe_core::workflow::implementation::{
 };
 use tauqe_protocol::{
     errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, IssueType, ModelSelection,
-    Request, Response, ResponseError, ReviewBatchFinishedEvent, ReviewExecuteParams, ReviewItem,
-    ReviewSession,
+    Request, Response, ResponseError, ReviewBatchFinishedEvent, ReviewExecuteParams,
+    ReviewExecuteTarget, ReviewItem, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::handlers::common::spawn_escalation_relay;
 use crate::handlers::host::ServerImplementationHost;
 use crate::handlers::PreflightVerdict;
 use crate::state::{AppState, OperationGuard};
@@ -504,21 +505,30 @@ fn resolve_group_selection(
     })
 }
 
-/// Resolves the members a finding-scoped request runs.
+/// Resolves the members one session-scoped target runs.
+///
+/// The target states which queue the request addresses, so the resolver only
+/// decides the members: a group runs its unified horizon, a finding runs the
+/// single-finding validation, an explicit selection keeps the client order, and
+/// a session target runs the implicit queue of the whole session. Only a
+/// cross-session run names no session, and it is accumulated from the stored
+/// sessions instead of being resolved against one of them.
 fn resolve_finding_selection(
     session: &ReviewSession,
     review_id: &str,
-    params: &ReviewExecuteParams,
+    target: &ReviewExecuteTarget,
 ) -> ResolvedSelection {
     let member_of = |item_id: u32| format!("{}:{}", review_id, item_id);
-    match params.item_id {
-        Some(item_id) => {
-            if params.item_ids.is_some() {
-                return Err(response_error(
-                    errors::INVALID_PARAMS,
-                    "item_ids cannot be combined with item_id",
-                ));
-            }
+    match target {
+        ReviewExecuteTarget::AllSessions => Err(response_error(
+            errors::INVALID_PARAMS,
+            "A cross-session target is resolved from the stored sessions, not from one session",
+        )),
+        ReviewExecuteTarget::Group(group) => {
+            resolve_group_selection(session, review_id, &group.group_id)
+        }
+        ReviewExecuteTarget::Finding(finding) => {
+            let item_id = finding.item_id;
             let item = match session.find_item(item_id) {
                 Some(item) => item,
                 None => {
@@ -570,57 +580,55 @@ fn resolve_finding_selection(
                 }),
             }
         }
-        None => match params.item_ids.as_deref() {
-            Some(selected) => {
-                for id in selected {
-                    if let Some(item) = session.find_item(*id) {
-                        if let Some(group_id) = architectural_group_of(session, item) {
-                            return Err(response_error(
-                                errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
-                                format!(
-                                    "Review item #{} is a symptom of architectural group '{}' and cannot be executed on its own; execute the group instead",
-                                    item.id, group_id
-                                ),
-                            ));
-                        }
-                        if is_unplanned_architecture_finding(session, item) {
-                            return Err(unplanned_architecture_error(item));
-                        }
+        ReviewExecuteTarget::Findings(findings) => {
+            for id in &findings.item_ids {
+                if let Some(item) = session.find_item(*id) {
+                    if let Some(group_id) = architectural_group_of(session, item) {
+                        return Err(response_error(
+                            errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
+                            format!(
+                                "Review item #{} is a symptom of architectural group '{}' and cannot be executed on its own; execute the group instead",
+                                item.id, group_id
+                            ),
+                        ));
+                    }
+                    if is_unplanned_architecture_finding(session, item) {
+                        return Err(unplanned_architecture_error(item));
                     }
                 }
-                let ids = resolve_session_queue(session, selected);
-                if ids.is_empty() {
-                    return Err(response_error(
-                        errors::NOTHING_TO_EXECUTE,
-                        "No TODO findings to execute in this review session",
-                    ));
-                }
-                let members = ids.iter().map(|id| member_of(*id)).collect();
-                Ok(ResolvedQueue {
-                    members,
-                    addressed: ids,
-                    deferred: 0,
-                })
             }
-            None => {
-                let queues = accumulate_implicit_queues(std::slice::from_ref(session));
-                if queues.members.is_empty() {
-                    return Err(response_error(
-                        errors::NOTHING_TO_EXECUTE,
-                        empty_queue_message(
-                            "in this review session",
-                            queues.pending_architecture,
-                            queues.deferred,
-                        ),
-                    ));
-                }
-                Ok(ResolvedQueue {
-                    members: queues.members,
-                    addressed: queues.addressed,
-                    deferred: queues.deferred,
-                })
+            let ids = resolve_session_queue(session, &findings.item_ids);
+            if ids.is_empty() {
+                return Err(response_error(
+                    errors::NOTHING_TO_EXECUTE,
+                    "No TODO findings to execute in this review session",
+                ));
             }
-        },
+            let members = ids.iter().map(|id| member_of(*id)).collect();
+            Ok(ResolvedQueue {
+                members,
+                addressed: ids,
+                deferred: 0,
+            })
+        }
+        ReviewExecuteTarget::Session(_) => {
+            let queues = accumulate_implicit_queues(std::slice::from_ref(session));
+            if queues.members.is_empty() {
+                return Err(response_error(
+                    errors::NOTHING_TO_EXECUTE,
+                    empty_queue_message(
+                        "in this review session",
+                        queues.pending_architecture,
+                        queues.deferred,
+                    ),
+                ));
+            }
+            Ok(ResolvedQueue {
+                members: queues.members,
+                addressed: queues.addressed,
+                deferred: queues.deferred,
+            })
+        }
     }
 }
 
@@ -804,7 +812,12 @@ pub(super) async fn run_review_batch_with_options(
         .map(|member_id| BatchStep::new(member_id.clone(), member_label(member_id)))
         .collect();
 
-    let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
+    let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1);
+    let operation_id = format!("op-{}", operation.id());
+    // The relay drains the batch channel for the whole run, so the executor
+    // never parks on a full queue and every promotion reaches the client under
+    // the operation of the batch.
+    let relay = spawn_escalation_relay(state.out.clone(), operation_id.clone(), stream_rx);
     // The whole batch shares one operation and one cancel channel: a cancel
     // delivered between members is honored instead of being lost, and the slot
     // stays registered for the batch's entire lifetime.
@@ -828,6 +841,17 @@ pub(super) async fn run_review_batch_with_options(
     let report = BatchExecution::new()
         .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
         .await;
+
+    // The last sender closes the batch channel, so the relay publishes the
+    // promotions of the run before the terminal report leaves.
+    drop(stream_tx);
+    if let Err(err) = relay.await {
+        tracing::warn!(
+            operation_id = operation_id.as_str(),
+            error = %err,
+            "review batch escalation relay terminated unexpectedly"
+        );
+    }
 
     let executed_count = report.executed.len();
     let total_count = report.scheduled;
@@ -890,7 +914,7 @@ pub(super) async fn run_review_batch_with_options(
         &state.out,
         events::REVIEW_BATCH_FINISHED,
         serde_json::to_value(ReviewBatchFinishedEvent {
-            operation_id: format!("op-{}", operation.id()),
+            operation_id,
             summary: BatchFinishSummary {
                 owner_id: owner_id.to_string(),
                 status,
@@ -940,77 +964,13 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
 
-    // The addressing dichotomy: a request names either an architectural
-    // group or findings, never both. The refusal happens before any session
-    // is loaded, so a rejected request can never leave a batch half started.
-    if params.group_id.is_some() && (params.item_id.is_some() || params.item_ids.is_some()) {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "group_id cannot be combined with item_id or item_ids",
-        );
-    }
-
-    let (owner_id, queue) = match params.review_id.as_deref() {
-        Some(review_id) => {
-            let load_root = repo_root.clone();
-            let load_id = review_id.to_string();
-            let session = match offload_review(move || {
-                ReviewStorage::load_review(&load_root, &load_id)
-            })
-            .await
-            {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return Response::err(
-                        req.id,
-                        errors::NOT_FOUND,
-                        format!("Review session '{}' not found", review_id),
-                    )
-                }
-                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
-            };
-
-            let selection = match params.group_id.as_deref() {
-                Some(group_id) => resolve_group_selection(&session, review_id, group_id),
-                None => resolve_finding_selection(&session, review_id, &params),
-            };
-            let queue = match selection {
-                Ok(queue) => queue,
-                Err(err) => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(err),
-                    }
-                }
-            };
-            // A single sub-step of a horizon is never addressed on its own: the
-            // implementation pipeline executes the whole remaining horizon of the
-            // entity it is given, so a partial target has no meaning here. The
-            // entity resolves first, so a group that still poses an open question
-            // is refused by its readiness gate before that target is validated.
-            if params.step_id.is_some() {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_PARAMS,
-                    "step_id cannot be targeted: the implementation horizon of the addressed review entity is executed as a whole",
-                );
-            }
-            (review_id.to_string(), queue)
-        }
-        None => {
-            if params.item_id.is_some()
-                || params.item_ids.is_some()
-                || params.group_id.is_some()
-                || params.step_id.is_some()
-            {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_PARAMS,
-                    "item_id, item_ids, group_id, and step_id cannot be specified when review_id is omitted",
-                );
-            }
+    // The addressing dichotomy is a property of the payload: a request names
+    // exactly one target, so this handler never inspects a field combination and
+    // never refuses one. A payload that names two targets, or that still names
+    // the retired `step_id`, fails to decode above instead of reaching this
+    // point.
+    let (owner_id, queue) = match &params.target {
+        ReviewExecuteTarget::AllSessions => {
             let list_root = repo_root.clone();
             let sessions = match offload_review(move || ReviewStorage::load_all(&list_root)).await {
                 Ok(s) => s,
@@ -1036,6 +996,43 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                     deferred: queues.deferred,
                 },
             )
+        }
+        target => {
+            let Some(review_id) = target.review_id() else {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Review execute target names no review session",
+                );
+            };
+            let load_root = repo_root.clone();
+            let load_id = review_id.to_string();
+            let session = match offload_review(move || {
+                ReviewStorage::load_review(&load_root, &load_id)
+            })
+            .await
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Response::err(
+                        req.id,
+                        errors::NOT_FOUND,
+                        format!("Review session '{}' not found", review_id),
+                    )
+                }
+                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
+            };
+            let queue = match resolve_finding_selection(&session, review_id, target) {
+                Ok(queue) => queue,
+                Err(err) => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(err),
+                    }
+                }
+            };
+            (review_id.to_string(), queue)
         }
     };
     let ResolvedQueue {
@@ -1078,17 +1075,17 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         }
     }
 
-    // Execution hands control to the Coder role: the discussion focus is
-    // reset unconditionally so no discussion anchor survives into code
-    // generation.
+    // Execution hands control to the Coder role: the discussion focus is reset
+    // unconditionally so no discussion anchor survives into code generation.
     state.clear_discussion_focus().await;
 
+    let review_id = params.target.review_id().map(str::to_string);
     let model_selection = params.model.clone();
     let developer_instructions = params.instructions.clone();
     let response = Response::ok(
         req.id,
         serde_json::json!({
-            "review_id": params.review_id,
+            "review_id": review_id,
             "item_ids": addressed,
             "operation_id": format!("op-{}", operation.id()),
         }),
@@ -1171,7 +1168,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 mod tests {
     use super::*;
     use tauqe_core::workflow::batch::{BatchStepReport, BatchUsage};
-    use tauqe_protocol::{ModelRef, ReviewIssue};
+    use tauqe_protocol::{ModelRef, ReviewFindingTarget, ReviewFindingsTarget, ReviewIssue};
 
     /// Builds a finding of the given semantic category.
     fn typed_finding(
@@ -1409,30 +1406,27 @@ mod tests {
             architecture_finding(3, IssueStatus::Fixed, None),
         ]);
 
-        let targeted = ReviewExecuteParams {
-            review_id: Some("rev-queue".to_string()),
-            item_id: Some(1),
-            ..Default::default()
-        };
+        let targeted = ReviewExecuteTarget::Finding(ReviewFindingTarget {
+            review_id: "rev-queue".to_string(),
+            item_id: 1,
+        });
         let err = resolve_finding_selection(&session, "rev-queue", &targeted)
             .expect_err("an unplanned architecture finding is refused");
         assert_eq!(err.code, errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED);
         assert!(err.message.contains("post-analysis"));
 
-        let selected = ReviewExecuteParams {
-            review_id: Some("rev-queue".to_string()),
-            item_ids: Some(vec![2, 1]),
-            ..Default::default()
-        };
+        let selected = ReviewExecuteTarget::Findings(ReviewFindingsTarget {
+            review_id: "rev-queue".to_string(),
+            item_ids: vec![2, 1],
+        });
         let err = resolve_finding_selection(&session, "rev-queue", &selected)
             .expect_err("the whole selection is refused");
         assert_eq!(err.code, errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED);
 
-        let finished = ReviewExecuteParams {
-            review_id: Some("rev-queue".to_string()),
-            item_id: Some(3),
-            ..Default::default()
-        };
+        let finished = ReviewExecuteTarget::Finding(ReviewFindingTarget {
+            review_id: "rev-queue".to_string(),
+            item_id: 3,
+        });
         let err = resolve_finding_selection(&session, "rev-queue", &finished)
             .expect_err("a finished finding is not re-executed");
         assert_eq!(err.code, errors::NOTHING_TO_EXECUTE);

@@ -61,7 +61,10 @@
 //! would send them to a host the source itself named. `allow_private_network` is
 //! the single escape hatch, and it belongs to the workspace entry, never to the
 //! repository. Resolving a name is delivery work and lives beside the transfer,
-//! so this module only classifies the addresses it is handed.
+//! so this module only classifies the addresses it is handed. An IPv6 address
+//! that embeds an IPv4 address, whether in the mapped `::ffff:a.b.c.d` form or
+//! in the deprecated compatible `::a.b.c.d` form, is classified by the address
+//! it embeds, so neither spelling reaches a block a plain IPv4 URL cannot.
 
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -543,10 +546,28 @@ fn is_public_v4(address: Ipv4Addr) -> bool {
     octets[0] != 0 && !(octets[0] == 100 && (64..=127).contains(&octets[1])) && octets[0] < 240
 }
 
+/// Returns the IPv4 address the deprecated `::a.b.c.d` form embeds.
+///
+/// The compatible form carries the address in the same low 32 bits as the
+/// mapped `::ffff:a.b.c.d` form, but `Ipv6Addr::to_ipv4_mapped` reads only the
+/// mapped one, and the general `Ipv6Addr::to_ipv4` that read both is
+/// deprecated. The classification therefore reads the octets directly, so a
+/// stack that still honors the compatible form cannot reach a host this module
+/// never classified.
+fn compatible_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    let [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, a, b, c, d] = address.octets() else {
+        return None;
+    };
+    Some(Ipv4Addr::new(a, b, c, d))
+}
+
 /// Reports whether an IPv6 address belongs to the public Internet.
 fn is_public_v6(address: Ipv6Addr) -> bool {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return is_public_v4(mapped);
+    }
+    if let Some(compatible) = compatible_ipv4(address) {
+        return is_public_v4(compatible);
     }
     if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
         return false;
@@ -782,6 +803,26 @@ local_roots = ["/srv/docs"]
     }
 
     #[test]
+    fn test_an_ipv4_compatible_target_needs_the_declaration() {
+        let url = reqwest::Url::parse("http://[::127.0.0.1]:8080/llm.txt").unwrap();
+        let closed = RefsTrust::for_workspace(Path::new("/work/project"), Vec::new(), false);
+        let refusal = closed
+            .check_remote_url(&url)
+            .expect_err("a compatible loopback target needs the declaration");
+        assert!(
+            matches!(refusal, TrustRefusal::NonPublicNetwork { .. }),
+            "unexpected classification: {refusal:?}"
+        );
+        assert!(
+            refusal.reason().contains("non-public address"),
+            "unexpected reason: {}",
+            refusal.reason()
+        );
+
+        let open = RefsTrust::for_workspace(Path::new("/work/project"), Vec::new(), true);
+        assert!(open.check_remote_url(&url).is_ok());
+    }
+    #[test]
     fn test_a_url_carrying_credentials_is_refused() {
         let url = reqwest::Url::parse("https://user:secret@example.com/llm.txt").unwrap();
         let trust = RefsTrust::for_workspace(Path::new("/work/project"), Vec::new(), true);
@@ -884,6 +925,10 @@ local_roots = ["/srv/docs"]
             "2001:db8::1",
             "64:ff9b::7f00:1",
             "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "::10.1.2.3",
+            "::169.254.169.254",
+            "::192.168.0.7",
         ] {
             let ip: IpAddr = address.parse().unwrap();
             assert!(!is_public_address(ip), "{address} must not count as public");
@@ -897,6 +942,7 @@ local_roots = ["/srv/docs"]
             "8.8.8.8",
             "93.184.216.34",
             "2606:4700:4700::1111",
+            "::93.184.216.34",
         ] {
             let ip: IpAddr = address.parse().unwrap();
             assert!(is_public_address(ip), "{address} must count as public");

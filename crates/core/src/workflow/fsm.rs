@@ -48,8 +48,8 @@ use kernel::{
 };
 use plans::{settle_plans, TurnQualification};
 use proposal::{
-    extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, ProposalStep,
-    TurnState,
+    extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, protocol_failure,
+    ProposalStep, TurnState,
 };
 use staging::{run_staging_phase, StagingPhase};
 use tools::{run_custom_tool_phase, CustomToolPhase};
@@ -69,6 +69,15 @@ pub struct FsmTurnOutcome {
     /// supervisor can move the step to `Blocked` and surface the diagnostic
     /// without running a patch retry or healing cycle.
     pub blocked: Option<String>,
+    /// Diagnostic of the edit-protocol violation that closed the turn without an
+    /// applied change set.
+    ///
+    /// The fact is typed beside its diagnostic, exactly like `blocked`: it exists
+    /// only when the model violated the edit protocol, so a consumer classifies
+    /// the ending by presence and never by the wording of the error the turn
+    /// reports. The change set is never applied on that path, which is what
+    /// separates the fact from a patch that merely failed to match a line.
+    pub protocol_failure: Option<String>,
     /// Whether the model emitted an explicit terminal success signal
     /// (`<success>`).
     ///
@@ -160,6 +169,7 @@ impl FsmTurnOutcome {
             },
             is_cancelled: true,
             blocked: None,
+            protocol_failure: None,
             abort: None,
             has_terminal_success: false,
             plan_saved: false,
@@ -577,8 +587,10 @@ fn record_plan_warnings(history_manager: &mut HistoryManager, outcome: &FsmTurnO
 ///
 /// The step profile is the single source of truth for what an isolated step may
 /// do: plan authoring is excluded because the plan is immutable while the step
-/// runs, and documentation requests are excluded because a step implements an
-/// approved design inside the codebase instead of reasoning about the harness.
+/// runs, documentation requests are excluded because a step implements an
+/// approved design inside the codebase instead of reasoning about the harness,
+/// and toolchain verification is excluded because the harness owns a step's
+/// verification and runs it deterministically.
 /// Intersecting the advertised surface with that profile keeps the narrowing
 /// protocol-agnostic — no caller branches on a protocol name or on a concrete
 /// protocol type — and a capability the protocol never advertises is simply
@@ -1442,11 +1454,17 @@ async fn finish_patch_failure(
         TurnQualification::disqualified("no change set could be staged"),
     )
     .await;
-    finish_turn(
+    let mut outcome = finish_turn(
         std::mem::take(&mut ctx.accumulated_text),
         result,
         settlement,
-    )
+    );
+    // A change set that never converged because the model violated the edit
+    // protocol is a typed fact of the turn: the diagnostic it is reported with
+    // explains the violation, while the classification travels beside the result
+    // instead of being re-derived from that wording.
+    outcome.protocol_failure = protocol_failure(current_protocol_errors);
+    outcome
 }
 
 /// Finalizes the turn when no edits were successfully staged.
@@ -2070,7 +2088,7 @@ mod tests {
         // refused before any provider request is spent.
         std::fs::write(
             root.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n",
         )
         .unwrap();
 
@@ -2117,11 +2135,15 @@ mod tests {
         assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanCreation));
         assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanUpdate));
         assert!(xml.contains(tauqe_protocol::LlmCapability::FileEdits));
+        // The harness owns a step's verification, so the FSM narrowing must
+        // never advertise the verification capability to an unattended step.
+        assert!(!xml.contains(tauqe_protocol::LlmCapability::ToolchainVerify));
 
         let structured =
             isolated_step_capabilities(&crate::prompt::json::JsonPromptProtocol::edits());
         assert_eq!(structured, xml);
         assert!(structured.contains(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(!structured.contains(tauqe_protocol::LlmCapability::ToolchainVerify));
     }
 
     #[tokio::test]
@@ -2321,6 +2343,11 @@ mod tests {
             }
             other => panic!("expected a failed change set, got {other:?}"),
         }
+
+        assert!(
+            outcome.protocol_failure.is_none(),
+            "a patch failure is not a protocol violation"
+        );
 
         assert_eq!(
             provider.requests().len(),

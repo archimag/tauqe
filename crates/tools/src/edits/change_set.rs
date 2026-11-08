@@ -563,6 +563,27 @@ fn destination_occupied(staged: &StagedEditsState, repo_root: &Path, path: &str)
     repo_root.join(path).exists()
 }
 
+/// Refuses a write destination whose parent chain an existing non-directory
+/// blocks.
+///
+/// A destination can be created only beneath a chain of directories, so a path
+/// under a regular file fails at the disk commit with `ENOTDIR` after the whole
+/// change set already applied. The question is asked while the change set is
+/// still purely in memory, so the refusal is the typed, per-member answer of the
+/// attempt and names the component that blocks the destination.
+fn admit_parent_chain(repo_root: &Path, path: &str) -> Result<(), StagingRejection> {
+    let Some(blocked_by) = crate::paths::blocking_ancestor(repo_root, path) else {
+        return Ok(());
+    };
+    Err(rejection(
+        path,
+        EditError::ParentNotDirectory {
+            path: path.to_string(),
+            blocked_by,
+        },
+    ))
+}
+
 /// Groups a change set into the atomic members of a staging attempt.
 ///
 /// Consecutive operations on the same normalized path form one member, which is
@@ -719,6 +740,9 @@ fn apply_staging_unit(
             });
             if writes {
                 admit_write(path, ignore_answer).map_err(|error| rejection(path, error))?;
+                // A destination the disk commit could never create is refused
+                // here, while the change set is still purely in memory.
+                admit_parent_chain(repo_root, path)?;
             }
             let staged = stage_file_edits(repo_root, context_paths, path, operations, state)
                 .map_err(|error| rejection(path, error))?;
@@ -761,6 +785,7 @@ fn apply_staging_unit(
             }
             admit_move_destination(repo_root, to, ignore_answer)
                 .map_err(|error| rejection(to, error))?;
+            admit_parent_chain(repo_root, to)?;
             stage_move(repo_root, context_paths, from, to, state)
         }
         StagingUnit::DirMove {
@@ -798,14 +823,15 @@ fn apply_staging_unit(
                     EditError::DestinationExists(path.to_string()),
                 ));
             }
-            // Every destination is a write target, so the batched ignore answer
-            // and the repository-root containment both apply to it exactly as
-            // they do to an explicit write. Both are resolved here, once per
-            // file, before the first file of the subtree stages; the loop below
-            // then only transfers content.
+            // Every destination is a write target, so the batched ignore
+            // answer, the repository-root containment, and the parent chain all
+            // apply to it exactly as they do to an explicit write. All three
+            // are resolved here, once per file, before the first file of the
+            // subtree stages; the loop below then only transfers content.
             for file in files {
                 admit_move_destination(repo_root, &file.to, ignore_answer)
                     .map_err(|error| rejection(&file.to, error))?;
+                admit_parent_chain(repo_root, &file.to)?;
             }
             // The subtree moves as one member: the caller recorded the membership
             // of every pair before this member applied, so a refusal below moves

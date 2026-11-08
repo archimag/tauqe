@@ -398,6 +398,7 @@ pub(super) fn finish_turn(
         result,
         is_cancelled: false,
         blocked: None,
+        protocol_failure: None,
         abort: None,
         has_terminal_success: false,
         plan_saved: settlement.plan_saved,

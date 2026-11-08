@@ -85,55 +85,140 @@ pub struct EditProposal {
     pub edits: Vec<EditOperation>,
 }
 
+/// One entry of a change set: its operation, its target, and its payload.
+///
+/// The `op` property arrives as a plain spelling, because parsing it is fallible
+/// and an error raised inside the field deserializer would discard the whole
+/// `changes` array. A recognized spelling becomes [`Self::op`]; an unrecognized
+/// one leaves that field at the default replacement and is recorded verbatim in
+/// [`Self::unrecognized_op`], so the entry survives decoding while the
+/// diagnostic that finally rejects it still names the operation the response
+/// declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ChangeProposalWire", into = "ChangeProposalWire")]
 pub struct StructuredChangeProposal {
-    #[serde(
-        default = "default_change_op",
-        deserialize_with = "deserialize_change_op"
-    )]
+    /// Operation the entry declares.
+    ///
+    /// An unrecognized spelling falls back to the default replacement instead of
+    /// failing the decode, and [`Self::unrecognized_op`] keeps that spelling, so
+    /// the fallback never hides what the response declared.
     pub op: EditFileOp,
+    /// The `op` spelling the shared parser rejected, kept verbatim.
+    ///
+    /// `None` means [`Self::op`] is the spelling the response declared. When it
+    /// is set, [`Self::to_edit_operation_typed`] reports the rejection of
+    /// [`EditFileOp`]'s own parser, so the diagnostic names the operation that
+    /// was emitted instead of the replacement the tolerant decode substituted.
+    pub unrecognized_op: Option<String>,
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Inclusive anchor that opens the replaced line range.
     ///
     /// Both bounds are present only when the active patch strategy addresses a
     /// range by its opaque anchors; a search/replace proposal leaves them
     /// empty and keeps carrying the replaced text in `old_text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
     /// Inclusive anchor that closes the replaced line range.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
 }
 
+/// Operation an entry declares when its `op` property is absent or `null`.
 fn default_change_op() -> EditFileOp {
     EditFileOp::Replace
 }
 
-/// Deserializes a change operation tolerantly.
+/// Wire representation of one change entry.
 ///
-/// A known operation is parsed case-insensitively with surrounding whitespace
-/// ignored. An unrecognized operation falls back to the default `replace`
-/// instead of failing the whole proposal, so a single malformed entry still
-/// surfaces as a precise, recoverable conversion error in
-/// [`StructuredChangeProposal::to_edit_operation`] rather than discarding the
-/// entire response.
-fn deserialize_change_op<'de, D>(deserializer: D) -> Result<EditFileOp, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw
-        .as_deref()
-        .and_then(|s| s.parse::<EditFileOp>().ok())
-        .unwrap_or(EditFileOp::Replace))
+/// The `op` property stays a plain spelling here, so the fallible parse happens
+/// once, in the conversion to [`StructuredChangeProposal`], where a rejected
+/// spelling is recorded instead of aborting the decode of the whole change set.
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangeProposalWire {
+    /// Declared operation spelling; absent and `null` name the default.
+    #[serde(default)]
+    op: Option<String>,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end: Option<String>,
+}
+
+impl From<ChangeProposalWire> for StructuredChangeProposal {
+    fn from(wire: ChangeProposalWire) -> Self {
+        let ChangeProposalWire {
+            op,
+            path,
+            to,
+            old_text,
+            new_text,
+            content,
+            start,
+            end,
+        } = wire;
+        // An absent or blank spelling names the default operation, a recognized
+        // spelling names itself, and only a spelling the shared parser rejects
+        // is recorded. It is recorded trimmed, because that is the form the
+        // parser and its diagnostic both address.
+        let (op, unrecognized_op) = match op.as_deref().map(str::trim) {
+            None | Some("") => (default_change_op(), None),
+            Some(declared) => match declared.parse::<EditFileOp>() {
+                Ok(operation) => (operation, None),
+                Err(_) => (default_change_op(), Some(declared.to_string())),
+            },
+        };
+        Self {
+            op,
+            unrecognized_op,
+            path,
+            to,
+            old_text,
+            new_text,
+            content,
+            start,
+            end,
+        }
+    }
+}
+
+impl From<StructuredChangeProposal> for ChangeProposalWire {
+    fn from(proposal: StructuredChangeProposal) -> Self {
+        let StructuredChangeProposal {
+            op,
+            unrecognized_op,
+            path,
+            to,
+            old_text,
+            new_text,
+            content,
+            start,
+            end,
+        } = proposal;
+        // The declared spelling wins over the substitute, so an unrecognized
+        // operation survives the round trip as the spelling it was instead of
+        // being rewritten into the replacement the decode picked for it.
+        Self {
+            op: Some(unrecognized_op.unwrap_or_else(|| op.as_str().to_string())),
+            path,
+            to,
+            old_text,
+            new_text,
+            content,
+            start,
+            end,
+        }
+    }
 }
 /// Why a structured change cannot become an edit operation.
 ///
@@ -210,7 +295,18 @@ impl StructuredChangeProposal {
     /// The decision made here never differs from the one of
     /// [`Self::to_edit_operation`]: only the rejection a caller observes is
     /// typed, so the strategy-dependent one can be reworded elsewhere.
+    ///
+    /// An entry that declared an operation the shared parser rejected is
+    /// rejected first, with that parser's own diagnostic: the entry names no
+    /// operation, so no path, range, or payload rule of the active strategy can
+    /// explain it, and the message must name what the response declared instead
+    /// of the replacement the tolerant decode substituted.
     pub fn to_edit_operation_typed(&self) -> Result<EditOperation, ChangeConversionError> {
+        if let Some(declared) = self.unrecognized_op.as_deref() {
+            if let Err(message) = declared.parse::<EditFileOp>() {
+                return Err(ChangeConversionError::Other(message));
+            }
+        }
         let path = normalize_repo_path(&self.path).map_err(ChangeConversionError::Other)?;
         if let (Some(start), Some(end)) = (self.start.as_deref(), self.end.as_deref()) {
             let start = start.trim();
@@ -547,6 +643,7 @@ mod tests {
     fn proposal(op: EditFileOp, path: &str) -> StructuredChangeProposal {
         StructuredChangeProposal {
             op,
+            unrecognized_op: None,
             path: path.to_string(),
             to: None,
             old_text: None,
@@ -1221,5 +1318,79 @@ mod tests {
         // derived root never widens acceptance beyond the decoded structure.
         assert!(decode_repo_path("../escape.rs").is_err());
         assert!(decode_repo_path("C:/Windows").is_err());
+    }
+
+    #[test]
+    fn test_unrecognized_operation_is_reported_instead_of_the_fallback() {
+        // A malformed operation keeps its entry instead of failing the whole
+        // change set, and the spelling it declared is recorded beside the
+        // substitute the tolerant decode picked.
+        let decoded: Vec<StructuredChangeProposal> = serde_json::from_str(
+            r#"[{"op":"frobnicate","path":"src/a.rs"},
+                {"op":"create","path":"src/b.rs","content":"fn b() {}\n"}]"#,
+        )
+        .expect("a malformed operation must not discard the change set");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].op, EditFileOp::Replace);
+        assert_eq!(decoded[0].unrecognized_op.as_deref(), Some("frobnicate"));
+        assert_eq!(decoded[1].op, EditFileOp::Create);
+        assert_eq!(decoded[1].unrecognized_op, None);
+
+        // The rejection names the operation the response declared, in the
+        // wording of the shared parser, instead of the replacement the fallback
+        // substituted.
+        let rejection = decoded[0]
+            .to_edit_operation_typed()
+            .expect_err("an unrecognized operation must be rejected");
+        assert_eq!(
+            rejection,
+            ChangeConversionError::Other(
+                "Unknown change operation 'frobnicate'. Expected replace, create, delete, move, move_dir, or overwrite"
+                    .to_string()
+            )
+        );
+        assert_eq!(rejection.path(), None);
+        assert_eq!(decoded[0].to_edit_operation(), Err(rejection.to_string()));
+
+        // A recorded spelling the shared parser accepts states no defect, so
+        // the typed operation stays authoritative.
+        let mut accepted = proposal(EditFileOp::Create, "src/c.rs");
+        accepted.content = Some("fn c() {}\n".to_string());
+        accepted.unrecognized_op = Some("create".to_string());
+        assert!(matches!(
+            accepted.to_edit_operation_typed(),
+            Ok(EditOperation::Create { .. })
+        ));
+    }
+
+    #[test]
+    fn test_unrecognized_operation_survives_the_wire_round_trip() {
+        // The wire form declares the spelling the response emitted, so a stored
+        // transcript or a forwarded event keeps the diagnostic precise instead
+        // of degrading into the replacement the decode picked.
+        let decoded: StructuredChangeProposal =
+            serde_json::from_str(r#"{"op":" FROBNICATE ","path":"src/a.rs"}"#)
+                .expect("an unrecognized operation must decode");
+        assert_eq!(decoded.op, EditFileOp::Replace);
+        assert_eq!(decoded.unrecognized_op.as_deref(), Some("FROBNICATE"));
+
+        let json = serde_json::to_string(&decoded).unwrap();
+        assert!(json.contains(r#""op":"FROBNICATE""#), "{json}");
+        assert!(!json.contains("unrecognized_op"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<StructuredChangeProposal>(&json).unwrap(),
+            decoded
+        );
+
+        // A recognized operation keeps serializing its canonical spelling and
+        // records no rejected spelling.
+        let mut created = proposal(EditFileOp::Create, "src/b.rs");
+        created.content = Some("fn b() {}\n".to_string());
+        let json = serde_json::to_string(&created).unwrap();
+        assert!(json.contains(r#""op":"create""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<StructuredChangeProposal>(&json).unwrap(),
+            created
+        );
     }
 }

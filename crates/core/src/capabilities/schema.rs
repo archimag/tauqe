@@ -373,11 +373,13 @@ pub(crate) fn plan_update_fragment() -> Value {
 /// Shared definitions referenced by the structured plan payload.
 ///
 /// A plan is a tree: concept nodes and implementation steps nest their own
-/// kind, so their schemas cannot be inlined into the fragment without the
-/// fragment containing itself. The definitions come from the authoritative
-/// builder of `crates/protocol` and are lifted to the root of the composed
-/// schema. The builder serves its cached definitions by reference, so lifting
-/// them into the composed schema takes the one owned copy composition needs.
+/// kind, but strict Structured Output mode rejects a definition that
+/// references itself. The authoritative builder of `crates/protocol` therefore
+/// unrolls the tree into one acyclic definition per depth level, and a
+/// consumer lifts those definitions to the root of its composed schema, which
+/// is where their `#/$defs/<Name>` references resolve. The builder serves its
+/// cached definitions by reference, so lifting them into the composed schema
+/// takes the one owned copy composition needs.
 pub(crate) fn plan_update_definitions() -> Value {
     tauqe_protocol::discussion::schema::plan_schema_definitions().clone()
 }
@@ -540,6 +542,8 @@ mod tests {
 
     #[test]
     fn the_plan_fragment_forwards_the_authoritative_protocol_schema() {
+        use tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH;
+
         let fragment = plan_update_fragment();
         let plan_update = &fragment["plan_update"];
 
@@ -572,54 +576,68 @@ mod tests {
             ["action", "concept", "description", "id", "items", "title"]
         );
 
-        // A plan tree cannot inline itself, so the nested shapes travel as
-        // shared definitions referenced by pointer, forwarded verbatim instead
-        // of being sliced out of a sibling schema.
+        // The plan tree cannot reference itself, so the nested shapes travel as
+        // unrolled shared definitions referenced by pointer, forwarded verbatim
+        // instead of being sliced out of a sibling schema.
         let definitions = plan_update_definitions();
         assert_eq!(
             &definitions,
             tauqe_protocol::discussion::schema::plan_schema_definitions()
         );
-        let names = definitions
+        let map = definitions
             .as_object()
             .expect("the plan definitions are an object");
-        assert_eq!(names.len(), 2);
-        assert!(names.contains_key("ConceptItem"));
-        assert!(names.contains_key("PlanItem"));
+        assert_eq!(map.len(), 2 * PLAN_TREE_DEPTH);
         assert_eq!(
             object["properties"]["concept"]["items"]["$ref"],
-            "#/$defs/ConceptItem"
+            "#/$defs/ConceptItemL1"
         );
         assert_eq!(
             object["properties"]["items"]["items"]["$ref"],
-            "#/$defs/PlanItem"
+            "#/$defs/PlanItemL1"
         );
 
-        // Each definition requires exactly the fields it declares and nests its
-        // own kind through `children`, so a tree of any depth is described by
-        // the contract of its root instead of a flattened sibling shape.
-        for name in ["ConceptItem", "PlanItem"] {
-            let node = &definitions[name];
-            assert_eq!(node["additionalProperties"], serde_json::json!(false));
-            assert_eq!(node["properties"]["children"]["type"], "array", "{name}");
-            assert_eq!(
-                node["properties"]["children"]["items"]["$ref"],
-                serde_json::json!(format!("#/$defs/{name}"))
-            );
+        // Each unrolled level requires exactly the fields it declares, chains
+        // `children` to the next level of its own kind, and seals the array at
+        // the deepest level, so the tree is described by an acyclic chain
+        // instead of a self-referencing definition.
+        for kind in ["ConceptItem", "PlanItem"] {
+            for level in 1..=PLAN_TREE_DEPTH {
+                let name = format!("{kind}L{level}");
+                let node = map
+                    .get(name.as_str())
+                    .unwrap_or_else(|| panic!("the unrolled tree declares {name}"));
+                assert_eq!(node["additionalProperties"], serde_json::json!(false));
+                assert_eq!(node["properties"]["children"]["type"], "array", "{name}");
+                if level < PLAN_TREE_DEPTH {
+                    assert_eq!(
+                        node["properties"]["children"]["items"]["$ref"],
+                        format!("#/$defs/{kind}L{}", level + 1),
+                        "{name} chains to the next level of its own kind"
+                    );
+                } else {
+                    // The deepest level seals the tree, so the chain ends where
+                    // the schema says it ends.
+                    assert_eq!(
+                        node["properties"]["children"]["maxItems"],
+                        serde_json::json!(0)
+                    );
+                }
 
-            let declared: std::collections::BTreeSet<&str> = node["properties"]
-                .as_object()
-                .expect("the definition declares its fields")
-                .keys()
-                .map(String::as_str)
-                .collect();
-            let required: std::collections::BTreeSet<&str> = node["required"]
-                .as_array()
-                .expect("the definition requires its fields")
-                .iter()
-                .filter_map(|field| field.as_str())
-                .collect();
-            assert_eq!(declared, required, "{name} requires what it declares");
+                let declared: std::collections::BTreeSet<&str> = node["properties"]
+                    .as_object()
+                    .expect("the definition declares its fields")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                let required: std::collections::BTreeSet<&str> = node["required"]
+                    .as_array()
+                    .expect("the definition requires its fields")
+                    .iter()
+                    .filter_map(|field| field.as_str())
+                    .collect();
+                assert_eq!(declared, required, "{name} requires what it declares");
+            }
         }
     }
 

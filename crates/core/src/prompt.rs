@@ -1612,6 +1612,9 @@ mod tests {
         assert!(step["properties"].get("tauqe_doc_requests").is_none());
         assert!(step["properties"].get("doc_requests").is_none());
         assert!(step["properties"].get("changes").is_some());
+        // Toolchain verification belongs to the harness for a step, so the
+        // strict step schema declares no verification channel either.
+        assert!(step["properties"].get("verify").is_none());
     }
 
     #[test]

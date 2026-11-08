@@ -14,6 +14,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::app::capture::{CaptureSite, QuitGuardReason};
 use crate::app::{AppState, ConfirmDialogButton};
 use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
@@ -58,31 +59,58 @@ pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, state: &AppState)
 }
 
 /// Presentation parameters for the quit confirmation.
+///
+/// The card names the work a quit would discard by reading the one derivation
+/// the exit guard itself consults — `AppState::quit_guard_reason` — so the
+/// decision to raise the card and the activity it reports can never disagree,
+/// and a newly declared capturing editor reaches both surfaces at once
+/// (Conventions §5.4, #31).
 pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
     let engine = current_engine();
     let palette = engine.palette();
-    let activity = if state.review.running {
-        active_t("dialog.confirm_quit.activity_review")
-    } else if state.model.is_busy() {
-        active_t("dialog.confirm_quit.activity_model")
-    } else if !state.input_editor.is_empty() {
-        active_t("dialog.confirm_quit.activity_draft")
-    } else if state
-        .modals
-        .squash_dialog
-        .as_ref()
-        .is_some_and(|d| d.applying)
-    {
-        active_t("dialog.confirm_quit.activity_squash_applying")
-    } else if state
-        .modals
-        .squash_dialog
-        .as_ref()
-        .is_some_and(|d| !d.message_editor.is_empty())
-    {
-        active_t("dialog.confirm_quit.activity_squash_message")
-    } else {
-        active_t("dialog.confirm_quit.activity_default")
+    let activity = match state.quit_guard_reason() {
+        Some(QuitGuardReason::ReviewRunning) => active_t("dialog.confirm_quit.activity_review"),
+        Some(QuitGuardReason::ModelBusy) => active_t("dialog.confirm_quit.activity_model"),
+        Some(QuitGuardReason::SquashApplying) => {
+            active_t("dialog.confirm_quit.activity_squash_applying")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::ReplPrompt)) => {
+            active_t("dialog.confirm_quit.activity_draft")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::SquashCommitMessage)) => {
+            active_t("dialog.confirm_quit.activity_squash_message")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::SquashCustomBaseRef)) => {
+            active_t("dialog.confirm_quit.activity_squash_custom_base")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::ReviewLaunchPrompt)) => {
+            active_t("dialog.confirm_quit.activity_review_launch_prompt")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::ReviewLaunchPath)) => {
+            active_t("dialog.confirm_quit.activity_review_launch_path")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::PlanRefineInstructions)) => {
+            active_t("dialog.confirm_quit.activity_plan_refine")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::PlanCreateDirectives)) => {
+            active_t("dialog.confirm_quit.activity_plan_create")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::ReviewExecuteDirectives)) => {
+            active_t("dialog.confirm_quit.activity_review_execute")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::DiscussionPrompt)) => {
+            active_t("dialog.confirm_quit.activity_discussion_prompt")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::LocaleLanguage)) => {
+            active_t("dialog.confirm_quit.activity_locale")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::ContextPathInput)) => {
+            active_t("dialog.confirm_quit.activity_context_path")
+        }
+        Some(QuitGuardReason::Editor(CaptureSite::OnboardingInput)) => {
+            active_t("dialog.confirm_quit.activity_onboarding")
+        }
+        None => active_t("dialog.confirm_quit.activity_default"),
     };
 
     let body_lines = vec![
@@ -194,13 +222,12 @@ fn group_plan_steps(state: &AppState, review_id: Option<&str>, group_id: &str) -
 ///
 /// The card covers the binary shapes only — a session queue, the cross-session
 /// batch, and the unified plan of one architectural group — while a single
-/// targeted finding or one group step is a form dialog with its own Coder
-/// selector (`crate::dialogs::render::execute_review`) (c-4, c-5).
+/// targeted finding is a form dialog with its own Coder selector and
+/// directives editor (`crate::dialogs::render::execute_review`) (c-4, c-5).
 pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
     let target = state.modals.confirm_execute_review.as_ref()?;
-    // A single targeted finding or one step of a group plan is a form dialog
-    // with its own Coder selector and directives editor, never a binary card
-    // (c-4, c-5, Conventions §6).
+    // A single targeted finding is a form dialog with its own Coder selector
+    // and directives editor, never a binary card (c-4, c-5, Conventions §6).
     if target.is_single_target() {
         return None;
     }
@@ -208,11 +235,10 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
     let palette = engine.palette();
 
     let is_all_sessions = target.review_id.is_none();
-    // A group target without a step addresses the unified plan of one
-    // architectural group: one root cause is fixed by one coherent change set,
-    // so the card confirms that single plan instead of a per-finding queue
-    // (c-1, c-4, c-5).
-    let is_group_plan = target.group_id.is_some() && target.step_id.is_none();
+    // A group target addresses the unified plan of one architectural group: one
+    // root cause is fixed by one coherent change set, so the card confirms that
+    // single plan instead of a per-finding queue (c-1, c-4, c-5).
+    let is_group_plan = target.group_id.is_some();
     let title = if is_all_sessions {
         active_t("dialog.execute_review.title_all")
     } else if is_group_plan {
@@ -1476,7 +1502,6 @@ mod tests {
             "All Review Sessions".to_string(),
             "All remaining TODO findings across all sessions (2 items)".to_string(),
             None,
-            None,
             vec![
                 review_issue(1, tauqe_protocol::IssueType::Bug),
                 review_issue(2, tauqe_protocol::IssueType::Quality),
@@ -1952,15 +1977,13 @@ mod tests {
         }
     }
 
-    /// Confirmation targeting the whole unified plan of one architectural group,
-    /// or one step of it when `step_id` is set.
-    fn group_confirmation(step_id: Option<&str>) -> crate::app::ConfirmExecuteReviewState {
+    /// Confirmation targeting the whole unified plan of one architectural group.
+    fn group_confirmation() -> crate::app::ConfirmExecuteReviewState {
         crate::app::ConfirmExecuteReviewState::new(
             Some("rev-group".to_string()),
             "Session rev-group".to_string(),
             "Unified auth guard".to_string(),
             None,
-            step_id.map(str::to_string),
             Vec::new(),
             Vec::new(),
         )
@@ -1992,7 +2015,7 @@ mod tests {
                 ..plan_item("1", "Container", tauqe_protocol::PlanItemStatus::Todo)
             }],
         )];
-        st.modals.confirm_execute_review = Some(group_confirmation(None));
+        st.modals.confirm_execute_review = Some(group_confirmation());
 
         let params = execute_review_params(&st).expect("the group plan renders the card");
         assert_eq!(params.title, "Execute Architecture Group");
@@ -2022,7 +2045,7 @@ mod tests {
     fn test_execute_review_params_group_plan_announces_the_jit_projection() {
         let mut st = crate::app::test_state();
         st.review.sessions = vec![session_with_group("arch-auth", Vec::new())];
-        st.modals.confirm_execute_review = Some(group_confirmation(None));
+        st.modals.confirm_execute_review = Some(group_confirmation());
 
         let params = execute_review_params(&st).expect("the group plan renders the card");
         let joined = params
@@ -2035,18 +2058,8 @@ mod tests {
         assert!(!joined.contains("queued in the unified plan"), "{joined}");
     }
 
-    /// A single step of a group plan keeps the explicit Coder form, so the
-    /// binary card is never built for it (c-4, c-5).
-    #[test]
-    fn test_execute_review_params_skip_the_group_step_point_form() {
-        let mut st = crate::app::test_state();
-        st.modals.confirm_execute_review = Some(group_confirmation(Some("1.1")));
-
-        assert!(execute_review_params(&st).is_none());
-    }
-
     /// A session queue that holds exactly one finding stays a queue: only an
-    /// explicitly targeted finding or group step opens the point form (c-4).
+    /// explicitly targeted finding opens the point form (c-4).
     #[test]
     fn test_execute_review_params_keep_a_one_finding_queue_binary() {
         let mut st = crate::app::test_state();
@@ -2054,7 +2067,6 @@ mod tests {
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "All remaining TODO findings (1 items)".to_string(),
-            None,
             None,
             vec![review_issue(1, tauqe_protocol::IssueType::Bug)],
             Vec::new(),
@@ -2147,5 +2159,237 @@ mod tests {
             card.contains(&tail),
             "the trailing note must stay inside the card, tail {tail:?}:\n{card}"
         );
+    }
+    /// The quit card names the input the exit guard protects: both read one
+    /// derivation, so every guarded reason renders its own activity line and a
+    /// typed draft never falls through to the generic default (#31,
+    /// Conventions §5.4).
+    #[test]
+    fn test_confirm_quit_activity_names_every_guarded_input() {
+        use crate::app::capture::{CaptureSite, QuitGuardReason};
+        use crate::app::{
+            ConfirmExecuteReviewState, LocaleDialogState, PromptModalState, PromptModalTarget,
+            ReviewDialogState, SquashDialogState,
+        };
+        use crate::views::plans::{PlanCreateDialogState, PlanRefineDialogState};
+        use crate::views::repl::TurnStatus;
+
+        fn editor_with(text: &str) -> crate::editor::InputEditor {
+            let mut editor = crate::editor::InputEditor::default();
+            editor.insert_str(text);
+            editor
+        }
+
+        fn card_lines(st: &AppState) -> Vec<String> {
+            let params = confirm_quit_params(st);
+            let body = params.body_lines;
+            body.iter().map(|line| line.to_string()).collect()
+        }
+
+        fn assert_activity(st: &AppState, reason: QuitGuardReason, key: &str) {
+            assert_eq!(
+                st.quit_guard_reason(),
+                Some(reason),
+                "the scenario must trip the guarded reason"
+            );
+            let expected = active_t(key);
+            let default = active_t("dialog.confirm_quit.activity_default");
+            let lines = card_lines(st);
+            let named = lines
+                .iter()
+                .filter(|line| line.as_str() == expected.as_str())
+                .count();
+            let fallback = lines
+                .iter()
+                .filter(|line| line.as_str() == default.as_str())
+                .count();
+            assert_eq!(named, 1, "the card names {key} once: {lines:?}");
+            assert_eq!(fallback, 0, "the default line was rendered: {lines:?}");
+        }
+
+        // A running review.
+        let mut st = crate::app::test_state();
+        st.review.running = true;
+        let key = "dialog.confirm_quit.activity_review";
+        assert_activity(&st, QuitGuardReason::ReviewRunning, key);
+
+        // A bounded turn in flight.
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Thinking;
+        let key = "dialog.confirm_quit.activity_model";
+        assert_activity(&st, QuitGuardReason::ModelBusy, key);
+
+        // The REPL prompt draft.
+        let mut st = crate::app::test_state();
+        st.input_editor.insert_str("draft prompt");
+        let key = "dialog.confirm_quit.activity_draft";
+        assert_activity(&st, QuitGuardReason::Editor(CaptureSite::ReplPrompt), key);
+
+        // A squash commit that is being applied.
+        let mut st = crate::app::test_state();
+        st.modals.squash_dialog = Some(SquashDialogState {
+            applying: true,
+            ..Default::default()
+        });
+        let key = "dialog.confirm_quit.activity_squash_applying";
+        assert_activity(&st, QuitGuardReason::SquashApplying, key);
+
+        // The squash commit message.
+        let mut st = crate::app::test_state();
+        st.modals.squash_dialog = Some(SquashDialogState {
+            message_editor: editor_with("feat(tui): name the input"),
+            ..Default::default()
+        });
+        let key = "dialog.confirm_quit.activity_squash_message";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::SquashCommitMessage),
+            key,
+        );
+
+        // The custom squash base reference.
+        let mut st = crate::app::test_state();
+        st.modals.squash_dialog = Some(SquashDialogState {
+            custom_editor: editor_with("origin/main"),
+            custom_input_active: true,
+            ..Default::default()
+        });
+        let key = "dialog.confirm_quit.activity_squash_custom_base";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::SquashCustomBaseRef),
+            key,
+        );
+
+        // The review-launch instructions prompt.
+        let mut st = crate::app::test_state();
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
+        dialog.prompt_editor.insert_str("focus on error handling");
+        st.modals.review_dialog = Some(dialog);
+        let key = "dialog.confirm_quit.activity_review_launch_prompt";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::ReviewLaunchPrompt),
+            key,
+        );
+
+        // The review-launch target paths.
+        let mut st = crate::app::test_state();
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
+        dialog.path_inputs[0].insert_str("crates/tui/");
+        st.modals.review_dialog = Some(dialog);
+        let key = "dialog.confirm_quit.activity_review_launch_path";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::ReviewLaunchPath),
+            key,
+        );
+
+        // The plan-refinement instructions.
+        let mut st = crate::app::test_state();
+        let mut dialog =
+            PlanRefineDialogState::new("plan-1".to_string(), "Plan 1".to_string(), Vec::new());
+        dialog
+            .instructions_editor
+            .insert_str("split the second step");
+        st.modals.refine_dialog = Some(dialog);
+        let key = "dialog.confirm_quit.activity_plan_refine";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::PlanRefineInstructions),
+            key,
+        );
+
+        // The plan-creation directives.
+        let mut st = crate::app::test_state();
+        let mut dialog = PlanCreateDialogState::new(Vec::new());
+        dialog.directives_editor.insert_str("add a retry budget");
+        st.modals.create_dialog = Some(dialog);
+        let key = "dialog.confirm_quit.activity_plan_create";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::PlanCreateDirectives),
+            key,
+        );
+
+        // The single-target review-execution directives.
+        let mut st = crate::app::test_state();
+        let mut dialog = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Finding 1".to_string(),
+            Some(1),
+            vec![review_issue(1, tauqe_protocol::IssueType::Bug)],
+            Vec::new(),
+        );
+        dialog.instructions_editor.insert_str("guard the header");
+        st.modals.confirm_execute_review = Some(dialog);
+        let key = "dialog.confirm_quit.activity_review_execute";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::ReviewExecuteDirectives),
+            key,
+        );
+
+        // The discussion message of the prompt modal.
+        let mut st = crate::app::test_state();
+        let mut dialog = PromptModalState::new(PromptModalTarget::Plan {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            focused_items: Vec::new(),
+        });
+        dialog.prompt_editor.insert_str("what about the budget?");
+        st.modals.prompt_modal = Some(dialog);
+        let key = "dialog.confirm_quit.activity_discussion_prompt";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::DiscussionPrompt),
+            key,
+        );
+
+        // The interface language field.
+        let mut st = crate::app::test_state();
+        let mut dialog = LocaleDialogState::default();
+        dialog.language_editor.insert_str("French");
+        st.modals.locale_dialog = Some(dialog);
+        let key = "dialog.confirm_quit.activity_locale";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::LocaleLanguage),
+            key,
+        );
+
+        // The inline Context path input.
+        let mut st = crate::app::test_state();
+        st.context_view.adding_file = true;
+        st.context_view.add_input.insert_str("crates/");
+        let key = "dialog.confirm_quit.activity_context_path";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::ContextPathInput),
+            key,
+        );
+
+        // The onboarding setup field.
+        let mut st = crate::app::test_state();
+        st.onboarding.input_active = true;
+        st.onboarding.input_buffer.insert_str("sk-or-secret");
+        let key = "dialog.confirm_quit.activity_onboarding";
+        assert_activity(
+            &st,
+            QuitGuardReason::Editor(CaptureSite::OnboardingInput),
+            key,
+        );
+
+        // With nothing at stake the card keeps its generic line.
+        let idle = crate::app::test_state();
+        assert_eq!(idle.quit_guard_reason(), None);
+        let default = active_t("dialog.confirm_quit.activity_default");
+        let lines = card_lines(&idle);
+        let shown = lines
+            .iter()
+            .filter(|line| line.as_str() == default.as_str())
+            .count();
+        assert_eq!(shown, 1, "the idle card keeps the default line");
     }
 }

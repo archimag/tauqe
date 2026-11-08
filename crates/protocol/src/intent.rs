@@ -130,12 +130,10 @@ impl TurnIntent {
     ///   dialogue head shared by every interactive contour, without plan
     ///   mutation.
     /// - [`TurnIntent::PlanDiscussion`] keeps the discussion profile: the
-    ///   dialogue head plus the plan mutation the regime authorizes.
-    /// - [`TurnIntent::ReviewDiscussion`] keeps the review-discussion profile:
-    ///   the shared dialogue head plus the decision the regime authorizes.
-    /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile and drops
-    ///   toolchain verification, because the harness owns verification for a
-    ///   step deterministically.
+    /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile, which
+    ///   already excludes toolchain verification because the harness owns
+    ///   verification for a step deterministically, so the narrowing is a pure
+    ///   intersection like every other intent.
     ///
     /// The isolated-step profile carries neither plan authoring nor
     /// documentation requests: a step executes an approved design inside the
@@ -154,8 +152,7 @@ impl TurnIntent {
             Self::ReviewDiscussion => {
                 Self::intersect(capabilities, &CapabilitySet::review_discussion())
             }
-            Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step())
-                .without(LlmCapability::ToolchainVerify),
+            Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step()),
             Self::ArchitectSynthesis => {
                 Self::intersect(capabilities, &CapabilitySet::architect_research())
             }
@@ -418,11 +415,12 @@ mod tests {
 
     #[test]
     fn test_narrow_capabilities_isolated_step_matches_the_step_profile() {
-        // The narrowing is an intersection with the regime profile followed by
-        // the single harness-owned removal. A base carrying the whole advertised
-        // surface therefore reaches exactly the step profile minus toolchain
-        // verification, while a narrower base reaches a subset of it.
-        let expected = CapabilitySet::isolated_step().without(LlmCapability::ToolchainVerify);
+        // The narrowing is a pure intersection with the regime profile, exactly
+        // as for every other intent. A base carrying the whole advertised
+        // surface therefore reaches exactly the step profile, which already
+        // excludes toolchain verification, while a narrower base reaches a
+        // subset of it.
+        let expected = CapabilitySet::isolated_step();
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
         let full = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
         assert_eq!(full.as_slice(), expected.as_slice());

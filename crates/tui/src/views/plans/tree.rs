@@ -533,34 +533,34 @@ impl TreeRowSink for PlanLineMeasure {
     }
 }
 
-/// Renders the flattened Plans rows into lines and their row offsets.
+/// Renders the visible Plans rows into lines and their row offsets.
 ///
-/// Each row contributes its summary line plus, when expanded, a detail block
-/// that renders at the level of its children. The returned offsets map a row
-/// index onto its first rendered line, so scrolling and selection stay aligned
-/// with the wrapping of a variable-height tree.
+/// `source` drives the rows of the tree in render order and lends each of them
+/// for the duration of its own visit, so a frame renders straight from the
+/// view's lazy cursor walk instead of materializing an owned projection of
+/// every row first (c-2). Each row contributes its summary line plus, when
+/// expanded, a detail block that renders at the level of its children. The
+/// returned offsets map a row index onto its first rendered line, so scrolling
+/// and selection stay aligned with the wrapping of a variable-height tree.
 ///
 /// The Markdown detail blocks of concepts and steps come from `cache` instead of
 /// being parsed afresh: a frame that only moved the cursor or scrolled reuses the
 /// lines already rendered for the unchanged description, while a changed
 /// description, indent, width, or palette re-renders exactly that one body
 /// (c-1, c-3).
-pub(crate) fn compute_unified_plan_lines(
-    rows: &[VisiblePlanRow],
+pub(crate) fn render_plan_lines_from<S>(
+    source: S,
     selected_idx: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> (Vec<Line<'static>>, Vec<usize>)
+where
+    S: FnMut(&mut dyn FnMut(usize, &VisiblePlanRow) -> bool),
+{
     let mut renderer = PlanLineRenderer::default();
     walk_plan_rows(
-        |visit| {
-            for (index, row) in rows.iter().enumerate() {
-                if !visit(index, row) {
-                    break;
-                }
-            }
-        },
+        source,
         selected_idx,
         usize::MAX,
         width,
@@ -569,6 +569,34 @@ pub(crate) fn compute_unified_plan_lines(
         &mut renderer,
     );
     (renderer.lines, renderer.offsets)
+}
+
+/// Renders an already-collected slice of Plans rows.
+///
+/// The regression tests drive the renderer from an owned projection so they can
+/// assert on the exact rows a frame drew; a production frame renders straight
+/// from the lazy walk through `render_plan_lines_from` (c-2).
+#[cfg(test)]
+pub(crate) fn compute_unified_plan_lines(
+    rows: &[VisiblePlanRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    render_plan_lines_from(
+        |visit| {
+            for (index, row) in rows.iter().enumerate() {
+                if !visit(index, row) {
+                    break;
+                }
+            }
+        },
+        selected_idx,
+        width,
+        theme_mode,
+        cache,
+    )
 }
 
 /// Measures the row offsets and the total height of the Plans tree without

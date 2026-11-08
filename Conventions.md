@@ -142,7 +142,15 @@ The TAUQE workspace is decomposed into five specialized crates with strict, unid
    - Regression tests must accompany every bug fix to prevent regressions.
 2. **Zero Warnings Standard:**
    - All code across workspace crates must compile cleanly without compiler errors or Clippy warnings (`cargo clippy` runs strictly with `-D warnings`).
-
+3. **Async Test Execution & Hang-Free Invariants:**
+   - **Mandatory RAII Drop Guards for Test Barriers & Spin Loops:** Any test fixture, mock provider, or synchronization barrier that holds execution or parks a thread or task (atomic flags, condition loops, notification channels) must be guarded by an RAII drop guard. The guard must automatically signal release or cancellation upon stack unwinding (assertion failure, test timeout, panic), preventing worker thread starvation or deadlocked runtimes on failure paths. Imperative releases placed after `assert!` statements are strictly forbidden.
+   - **No Synchronous Blocking in Async Test Runtimes:** Never invoke `std::thread::sleep` or blocking synchronization primitives inside Tokio runtime threads, including unit tests. Use `tokio::time::sleep` or cooperative channel synchronization to allow clean task cancellation and avoid starving Tokio worker threads.
+   - **The Single Exemption — A Fixture Whose Subject Is Non-Yieldingness:**
+     - A fixture that reproduces a task refusing to yield must spin synchronously, because any suspension point would let an abort land and destroy the very behavior under test.
+     - Such a fixture carries two mandatory bounds: the spin ends at a fixed budget of its own, so a flag that is never released cannot pin a worker thread until process exit, and the flag that ends it early is released by a drop guard.
+     - The exemption is stated next to the code it excuses, never assumed. A runtime whose worker thread is pinned inside a non-yielding stretch blocks its own shutdown, so an unbounded stretch turns one failed assertion into a suite-wide hang.
+   - **Explicit Timeout Scope Passing across Task Boundaries:** Tests verifying timeout, cancellation, or watchdog mechanics must pass deadlines and grace periods explicitly or propagate task-local contexts into spawned background tasks (`tokio::spawn(task_local.scope(...))`). Never rely on implicit task-local overrides across `tokio::spawn`, which drops parent task-locals and silently falls back to production deadlines (e.g. 30s).
+   - **Compressed Time Scales (Fast Failure):** Watchdog, cancellation, and timeout tests must operate on compressed millisecond scales (e.g. 50–150 ms) with bounded polling loops and strict overall timeouts (`tokio::time::timeout`). A unit test must never wait on production-scale timeouts.
 ---
 
 ## 6. Commit Message Format (Conventional Commits)

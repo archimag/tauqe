@@ -71,12 +71,7 @@ fn model_selector_parts(state: &AppState) -> (String, Option<tauqe_protocol::Rea
             .roles
             .as_ref()
             .and_then(|roles| roles.entries.as_ref())
-            .and_then(|entries| {
-                entries
-                    .primary
-                    .iter()
-                    .find(|entry| &entry.model == model_ref)
-            })
+            .and_then(|entries| entries.repl.iter().find(|entry| &entry.model == model_ref))
             .cloned(),
         // A tier selection carries the full { model, effort } coordinate of
         // the picked role-list entry, so the label is rendered straight from
@@ -880,7 +875,7 @@ mod tests {
             scribe: ModelRef::openrouter("scribe-model"),
             coder: ModelRef::openrouter("coder-model"),
             architect: ModelRef::openrouter("architect-model"),
-            primary: ModelRef::openrouter("primary-model"),
+            repl: ModelRef::openrouter("repl-model"),
             reviewer: ModelRef::openrouter("reviewer-model"),
             efforts: None,
             entries: None,
@@ -902,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_selector_label_idle_uses_the_primary_entry_label() {
+    fn test_model_selector_label_idle_uses_the_repl_entry_label() {
         let mut state = test_app_state();
         let entry =
             tauqe_protocol::ModelEntry::new(ModelRef::openrouter("google/gemini-2.0-flash"), None);
@@ -912,11 +907,11 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("google/gemini-2.0-flash"),
+                repl: ModelRef::openrouter("google/gemini-2.0-flash"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
-                    primary: vec![entry],
+                    repl: vec![entry],
                     ..Default::default()
                 }),
             }),
@@ -949,7 +944,7 @@ mod tests {
             scribe: ModelRef::openrouter("scribe-model"),
             coder: ModelRef::openrouter("coder-model"),
             architect: ModelRef::openrouter("architect-model"),
-            primary: ModelRef::openrouter("primary-model"),
+            repl: ModelRef::openrouter("repl-model"),
             reviewer: ModelRef::openrouter("reviewer-model"),
             efforts: None,
             entries: Some(tauqe_protocol::ModelRolesEntries {
@@ -988,12 +983,12 @@ mod tests {
             role: Some(ModelRole::Scribe),
             effort: None,
         });
-        assert_eq!(model_selector_label(&state, 40), "primary-model");
+        assert_eq!(model_selector_label(&state, 40), "repl-model");
 
         // Once the turn settles the header returns to the developer's selection.
         state.model.status = crate::views::repl::TurnStatus::Done;
         state.running_model = None;
-        assert_eq!(model_selector_label(&state, 40), "primary-model");
+        assert_eq!(model_selector_label(&state, 40), "repl-model");
     }
 
     #[test]
@@ -1051,7 +1046,7 @@ mod tests {
             scribe: ModelRef::openrouter("scribe-model"),
             coder: ModelRef::openrouter("coder-model"),
             architect: ModelRef::openrouter("architect-model"),
-            primary: ModelRef::openrouter("google/gemini-2.0-flash"),
+            repl: ModelRef::openrouter("google/gemini-2.0-flash"),
             reviewer: ModelRef::openrouter("reviewer-model"),
             efforts: None,
             entries: Some(tauqe_protocol::ModelRolesEntries {
@@ -1093,7 +1088,7 @@ mod tests {
             scribe: ModelRef::openrouter("scribe-model"),
             coder: ModelRef::openrouter("coder-model"),
             architect: ModelRef::openrouter("architect-model"),
-            primary: ModelRef::openrouter("google/gemini-2.0-flash"),
+            repl: ModelRef::openrouter("google/gemini-2.0-flash"),
             reviewer: ModelRef::openrouter("reviewer-model"),
             efforts: None,
             entries: None,

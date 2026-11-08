@@ -332,7 +332,7 @@ mod verification_outcome_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
         )
         .unwrap();
 
@@ -361,7 +361,7 @@ mod verification_outcome_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'cat']\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'cat']\n",
         )
         .unwrap();
 

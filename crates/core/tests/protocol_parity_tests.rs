@@ -126,14 +126,14 @@ fn schema_types(node: &serde_json::Value) -> Vec<String> {
     }
 }
 
-/// Nesting depth the schema generator expands before it stops recursing.
+/// Nesting depth the schema generator expands before it stops descending.
 ///
 /// The walk spends one level per object property it descends into, so seeding
 /// it with zero would emit every `$ref`-backed collection empty and a generated
 /// plan would carry no concept node and no step at all. Seeding with this bound
-/// produces authored nodes at every level while the recursion still terminates.
-const GENERATED_TREE_DEPTH: usize = 2;
-
+/// produces authored nodes at every level of the walk, and the walk still
+/// terminates.
+const GENERATED_TREE_DEPTH: usize = 3;
 /// Generates a minimal value that validates against `schema`.
 ///
 /// Generation walks the very schema the model is constrained by, so a valid
@@ -180,9 +180,9 @@ fn generate_from_schema(
             .get("items")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        // A recursive definition is generated one level shallower; at the
+        // A $ref-backed collection is generated one level shallower; at the
         // bound the collection is emitted empty.
-        if depth == 0 && items.to_string().contains("$ref") {
+        if depth == 0 {
             return serde_json::Value::Array(Vec::new());
         }
         let element = generate_from_schema(&items, definitions, depth.saturating_sub(1));
@@ -347,11 +347,14 @@ fn plan_definitions_declare_exactly_the_fields_of_the_rust_nodes() {
         details: Some("details".to_string()),
         children: vec![tauqe_protocol::ConceptItem::default()],
     };
-    assert_eq!(
-        schema_fields(&definitions["ConceptItem"]),
-        dto_fields(&concept),
-        "ConceptItem definition and Rust node diverged"
-    );
+    for level in 1..=tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH {
+        let name = format!("ConceptItemL{level}");
+        assert_eq!(
+            schema_fields(&definitions[name.as_str()]),
+            dto_fields(&concept),
+            "{name} definition and Rust node diverged"
+        );
+    }
 
     let item = tauqe_protocol::PlanItem {
         id: "1".to_string(),
@@ -367,30 +370,35 @@ fn plan_definitions_declare_exactly_the_fields_of_the_rust_nodes() {
         depends_on: vec!["0".to_string()],
         children: vec![tauqe_protocol::PlanItem::default()],
     };
-    assert_eq!(
-        schema_fields(&definitions["PlanItem"]),
-        dto_fields(&item),
-        "PlanItem definition and Rust node diverged"
-    );
-
+    for level in 1..=tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH {
+        let name = format!("PlanItemL{level}");
+        assert_eq!(
+            schema_fields(&definitions[name.as_str()]),
+            dto_fields(&item),
+            "{name} definition and Rust node diverged"
+        );
+    }
     // A strict definition requires exactly the fields it declares, so a
     // declared field can never be optional against the Rust model.
-    for name in ["ConceptItem", "PlanItem"] {
-        let mut required: Vec<String> = definitions[name]["required"]
-            .as_array()
-            .map(|required| {
-                required
-                    .iter()
-                    .filter_map(|field| field.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        required.sort();
-        assert_eq!(
-            required,
-            schema_fields(&definitions[name]),
-            "{name} must require exactly the fields it declares"
-        );
+    for level in 1..=tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH {
+        for kind in ["ConceptItem", "PlanItem"] {
+            let name = format!("{kind}L{level}");
+            let mut required: Vec<String> = definitions[name.as_str()]["required"]
+                .as_array()
+                .map(|required| {
+                    required
+                        .iter()
+                        .filter_map(|field| field.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            required.sort();
+            assert_eq!(
+                required,
+                schema_fields(&definitions[name.as_str()]),
+                "{name} must require exactly the fields it declares"
+            );
+        }
     }
 }
 
@@ -738,7 +746,21 @@ fn structured_schema_is_the_projection_of_the_narrowed_surface() {
             // cannot author plans carries no definition to lift.
             let authors_plans = surface.contains(LlmCapability::PlanCreation)
                 || surface.contains(LlmCapability::PlanUpdate);
-            assert_eq!(schema.get("$defs").is_some(), authors_plans);
+            if authors_plans {
+                // The composition lifts the authoritative unrolled tree, so
+                // the `#/$defs/<Name>L1` references inside `plan_update` resolve
+                // against the definitions `crates/protocol` itself builds.
+                assert_eq!(
+                    schema.get("$defs"),
+                    Some(tauqe_protocol::discussion::schema::plan_schema_definitions()),
+                    "the {intent:?} schema must lift the authoritative plan definitions"
+                );
+            } else {
+                assert!(
+                    schema.get("$defs").is_none(),
+                    "the {intent:?} surface authors no plan, so it must lift no definition"
+                );
+            }
         }
     }
 }

@@ -1,0 +1,30 @@
+[[review.presets]]
+name = "crates"
+title = "Workspace Crates Audit"
+post_analysis = "manual"
+
+[[review.presets.groups]]
+name = "protocol"
+paths = ["crates/protocol/src"]
+prompt = "Audit wire contracts, pure DTOs, and serialization invariants without I/O or async dependencies."
+
+[[review.presets.groups]]
+name = "tools"
+paths = ["crates/tools/src"]
+prompt = "Audit deterministic substrate invariants: virtual staging, atomic writes, Git transactions, process isolation, and repomap extraction."
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+prompt = "Audit harness engine invariants: bounded-turn FSM, capability registry, prompt layout, context, and provider streaming."
+
+[[review.presets.groups]]
+name = "server"
+paths = ["crates/server/src"]
+prompt = "Audit RPC daemon: concurrency control (OperationGuard), request dispatching, and streaming transport."
+
+[[review.presets.groups]]
+name = "tui"
+paths = ["crates/tui/src"]
+prompt = "Audit terminal UI: views, event translation, layout geometry, and client transport without direct disk/git operations."
+

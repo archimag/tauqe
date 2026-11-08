@@ -21,7 +21,7 @@ use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::policy::ApplyPolicy;
 
-use super::WorkflowExecutionResult;
+use super::{FsmTurnOutcome, WorkflowExecutionResult};
 use crate::workflow::fsm::guard::rollback_or_log;
 use crate::workflow::fsm::{
     announce_plan_diagnostics, begin_session_turn, record_session_response, run_fsm_turn_body,
@@ -262,15 +262,34 @@ impl ExecutionMode for SingleExecution {
         // protocol-level diagnostic the developer must see, so the turn stream
         // announces it exactly once.
         announce_plan_diagnostics(&turn, &stream_tx).await;
+        // The turn outcome is destructured exhaustively, without a rest pattern,
+        // so the packed result cannot drop a field the FSM decides: an omission
+        // fails to compile here instead of disappearing from every caller.
+        let FsmTurnOutcome {
+            assistant_text,
+            result,
+            is_cancelled,
+            blocked,
+            protocol_failure,
+            has_terminal_success,
+            plan_saved,
+            plan_errors,
+            plan_warnings,
+            skip_reason,
+            abort,
+        } = turn;
         Ok(WorkflowExecutionResult {
-            result: turn.result,
-            assistant_text: turn.assistant_text,
-            blocked: turn.blocked,
-            skip_reason: turn.skip_reason,
-            abort: turn.abort,
-            plan_saved: turn.plan_saved,
-            plan_errors: turn.plan_errors,
-            plan_warnings: turn.plan_warnings,
+            result,
+            assistant_text,
+            is_cancelled,
+            has_terminal_success,
+            blocked,
+            protocol_failure,
+            skip_reason,
+            abort,
+            plan_saved,
+            plan_errors,
+            plan_warnings,
         })
     }
 }
@@ -466,6 +485,11 @@ mod tests {
             "an unverified answer is the outcome of the turn: {:?}",
             execution.result
         );
+        assert!(
+            !execution.has_terminal_success,
+            "an unverified answer is not a validated conclusion"
+        );
+        assert!(!execution.is_cancelled, "the turn ran to completion");
         assert!(execution.abort.is_none(), "no abort report is produced");
         assert_eq!(
             provider.requests().len(),
@@ -480,6 +504,60 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
             "pub fn compute() -> i32 { 0 }\n"
+        );
+    }
+
+    /// A cancelled turn is a valid outcome rather than a failure, so it still
+    /// returns `Ok`. The packed result carries the flag that tells an
+    /// interrupted turn apart from an answer that carried no text, so a
+    /// supervisor reports it as cancelled instead of failed.
+    #[tokio::test]
+    async fn single_execution_reports_a_cancelled_turn_as_cancelled() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let provider = MockLlmProvider::scripted([MockResponse::text("unused")]);
+        let model = ModelRef::openrouter("mock/model");
+        let (tx, _rx) = mpsc::channel(256);
+        // The signal is already raised, so the provider observes the
+        // cancellation before it produces a single token.
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        let mut policy = DirectApplyPolicy::new();
+
+        let exec = SingleExecution::new(WorkflowOptions::default());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Set compute to return 42",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                &protocol,
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("a cancelled turn is not a failure");
+
+        assert!(execution.is_cancelled, "the turn reports its interruption");
+        assert!(
+            !execution.has_terminal_success,
+            "an interrupted turn concluded nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
+            "pub fn compute() -> i32 { 0 }\n"
+        );
+        assert!(
+            history.get_entries().expect("the history reads").is_empty(),
+            "a cancelled turn leaves no recorded entry behind"
         );
     }
 
@@ -707,6 +785,10 @@ mod tests {
             .expect("validated answer runs to completion");
 
         assert!(matches!(execution.result, ModelResult::Answer { .. }));
+        assert!(
+            execution.has_terminal_success,
+            "an explicit terminal success validates the answer"
+        );
         assert_eq!(
             provider.requests().len(),
             1,

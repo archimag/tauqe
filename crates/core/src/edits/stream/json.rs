@@ -142,22 +142,77 @@ impl JsonStreamFilter {
     ///
     /// An element range is delimited by its own braces, so it is final the
     /// moment it is reported: the rest of the payload never has to be re-read to
-    /// validate it, and an element that already closed is never lexed again.
-    fn scan_new_changes(&mut self) -> Vec<StructuredChangeProposal> {
+    /// validate it, and an element that already closed is never lexed again. A
+    /// closed element that names no change entry is reported as malformed rather
+    /// than dropped, because the early preview may already have announced the
+    /// file its header names, and only a terminal event can correct that.
+    fn scan_new_changes(&mut self) -> Vec<CompletedChange> {
         let ranges = self.lex.scan(&self.buffer);
-        let mut changes = Vec::with_capacity(ranges.len());
+        let mut completed = Vec::with_capacity(ranges.len());
         for range in ranges {
             let Some(element) = self.buffer.get(range) else {
                 continue;
             };
             match serde_json::from_str::<StructuredChangeProposal>(element) {
-                Ok(change) => changes.push(change),
+                Ok(change) => completed.push(CompletedChange::Parsed(change)),
                 Err(error) => {
-                    tracing::warn!(%error, "discarding a malformed changes entry");
+                    let (op, path) = peek_element_header(element);
+                    let change = MalformedChange {
+                        op,
+                        path,
+                        diagnostic: format!("Malformed changes entry: {error}"),
+                    };
+                    completed.push(CompletedChange::Malformed(change));
                 }
             }
         }
-        changes
+        completed
+    }
+
+    /// Reports every element the lexer has completed since the last call.
+    ///
+    /// Both call sites of `scan_new_changes` dispatch through here, so a closed
+    /// element always reaches exactly one terminal report whatever payload it
+    /// carried.
+    fn drain_completed_changes(&mut self, events: &mut Vec<StreamEvent>) {
+        for completed in self.scan_new_changes() {
+            match completed {
+                CompletedChange::Parsed(change) => self.process_completed_change(&change, events),
+                CompletedChange::Malformed(change) => self.reject_malformed_change(change, events),
+            }
+        }
+    }
+
+    /// Completes the announced file with the defect of an element that names no change.
+    ///
+    /// The element closed, so nothing about it is truncated: the early preview
+    /// opened the file whose header it could already read, while the payload the
+    /// element delivered names no change entry at all. Completing that file from
+    /// the truncation branch would claim the response ended inside an edit that
+    /// arrived complete, so the file is completed with the defect its payload
+    /// actually has, which is the entry the staging engine would refuse.
+    fn reject_malformed_change(&mut self, change: MalformedChange, events: &mut Vec<StreamEvent>) {
+        let MalformedChange {
+            op,
+            path,
+            diagnostic,
+        } = change;
+        // The element closed, so the file its header announced is not truncated.
+        self.open_file_unterminated = false;
+        let (Some(op), Some(path)) = (op, path) else {
+            // An element that names no file was never announced, so no terminal
+            // event of the preview has to be corrected.
+            tracing::warn!(%diagnostic, "discarding a malformed changes entry");
+            return;
+        };
+        if !self.has_emitted_edit_started {
+            events.push(StreamEvent::EditStarted);
+            self.has_emitted_edit_started = true;
+        }
+        let resolved = resolve_path(&path, &self.editable_paths, op == EditFileOp::Create);
+        self.open_file(&resolved, op, events);
+        let hunks_count = self.next_hunk_index(&resolved);
+        self.fail_open_file(resolved, diagnostic, hunks_count, events);
     }
 
     /// Reports the file named by the element that is still streaming in.
@@ -435,7 +490,28 @@ impl JsonStreamFilter {
         }
     }
 }
+/// One element the forward lexer has completed.
+///
+/// The element already closed, so its payload is final: it either deserializes
+/// into a change entry or names a payload no change entry accepts. The second
+/// case is a defect of the payload, never a truncation of the response, so it
+/// must not reach the terminal event of the early preview as one.
+enum CompletedChange {
+    /// The element deserialized into a change entry.
+    Parsed(StructuredChangeProposal),
+    /// The element closed but its payload names no change entry.
+    Malformed(MalformedChange),
+}
 
+/// A completed `changes` element whose payload names no change entry.
+struct MalformedChange {
+    /// Operation the element declares before its payload, when it declares one.
+    op: Option<EditFileOp>,
+    /// Path the element declares before its payload, when it declares one.
+    path: Option<String>,
+    /// Diagnostic of the rejected payload.
+    diagnostic: String,
+}
 impl EditStreamFilter for JsonStreamFilter {
     fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
@@ -485,12 +561,10 @@ impl EditStreamFilter for JsonStreamFilter {
             }
         }
 
-        // 2. Lex the changes array forward and process the elements that closed.
+        // 2. Lex the changes array forward and report the elements that closed.
         //    The lexer resumes where the previous chunk stopped, so a long payload
         //    is never re-read from its start.
-        for change in self.scan_new_changes() {
-            self.process_completed_change(&change, &mut events);
-        }
+        self.drain_completed_changes(&mut events);
         if self.lex.is_done() {
             self.flush_open_file(&mut events);
         }
@@ -525,9 +599,7 @@ impl EditStreamFilter for JsonStreamFilter {
             }
         }
         // Synthesize any edit events left by a truncated or single-shot payload.
-        for change in self.scan_new_changes() {
-            self.process_completed_change(&change, &mut events);
-        }
+        self.drain_completed_changes(&mut events);
         self.flush_open_file(&mut events);
         events
     }
@@ -798,7 +870,7 @@ fn resolve_array_opener(buffer: &str, from: usize) -> OpenerOutcome {
     OpenerOutcome::Pending
 }
 
-/// Reads the `op` and `path` fields named by a streaming element header.
+/// Reads the `op` and `path` fields an element declares before its payload.
 ///
 /// The walk is depth- and string-aware, so a `path` mentioned inside the payload
 /// of another field is never mistaken for the header field itself. Only a string
@@ -806,6 +878,10 @@ fn resolve_array_opener(buffer: &str, from: usize) -> OpenerOutcome {
 /// still streaming in would open the file under a prefix of its final path, and
 /// the reported event chain would then depend on how the provider split its
 /// deltas.
+///
+/// A completed element is read through the same walk, so the file an element
+/// announces while it streams and the file its defect is reported against are
+/// always the ones its own two fields name.
 fn peek_element_header(element: &str) -> (Option<EditFileOp>, Option<String>) {
     let bytes = element.as_bytes();
     let mut index = 0;
@@ -1573,5 +1649,66 @@ mod tests {
             )),
             "the hunk must carry the resolved coordinates: {events:?}"
         );
+    }
+    #[test]
+    fn test_malformed_changes_element_reports_its_defect_instead_of_a_truncation() {
+        let path = "a.rs";
+        // The element closes with a balanced payload no change entry accepts.
+        // The early preview announces the file from its header, so the terminal
+        // event must name the defect of the payload instead of claiming the
+        // response ended inside the edit.
+        let input = concat!(
+            "{\"message\":\"Editing\",\"changes\":[",
+            "{\"op\":\"create\",\"path\":\"a.rs\",\"to\":\"\",",
+            "\"start\":\"\",\"end\":\"\",\"content\":5}]}"
+        );
+        let root = scratch_dir("json-malformed-element");
+        let boundaries: Vec<usize> = input
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(input.len()))
+            .collect();
+        for split in boundaries {
+            let mut filter = JsonStreamFilter::new(vec![path.to_string()], root.clone());
+            let mut events = filter.push_chunk(&input[..split]);
+            events.extend(filter.push_chunk(&input[split..]));
+            events.extend(Box::new(filter).finish());
+
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                    .count(),
+                1,
+                "split {split}"
+            );
+            let terminals: Vec<(EditFileStatus, Option<String>, usize)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::EditFileDone {
+                        status,
+                        error,
+                        hunks_count,
+                        ..
+                    } => Some((*status, error.clone(), *hunks_count)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminals.len(), 1, "split {split}: {terminals:?}");
+            let (status, error, hunks_count) = &terminals[0];
+            assert_eq!(*status, EditFileStatus::Error, "split {split}");
+            assert_eq!(*hunks_count, 0, "split {split}");
+            let error = error
+                .as_deref()
+                .expect("the rejection must carry its diagnostic");
+            assert!(
+                !error.contains("truncated"),
+                "split {split}: the closed element is no truncation: {error}"
+            );
+            assert!(
+                error.to_lowercase().contains("malformed"),
+                "split {split}: the diagnostic must name the payload defect: {error}"
+            );
+        }
     }
 }

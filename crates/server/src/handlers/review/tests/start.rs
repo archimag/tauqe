@@ -26,7 +26,7 @@ async fn test_handle_review_start_defaults_to_reviewer_role() {
         "test/reviewer-model",
     )
     .into()]);
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -25,8 +25,8 @@ use tauqe_core::plan::prompt::{
 use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT, SESSION_PREFIX_REVIEW};
 use tauqe_core::workflow::fsm::structured::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::workflow::implementation::{
-    ExecutionScope, ImplementationHost, RefinementRequest, RefinementResult, StepFailure,
-    StepTurnRequest, StepTurnResult,
+    ExecutionScope, ImplementationFrame, ImplementationHost, RefinementRequest, RefinementResult,
+    StepFailure, StepTurnRequest, StepTurnResult,
 };
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::model::{TurnWorkContext, TurnWorkQueue};
@@ -43,6 +43,7 @@ use crate::handlers::common::{
     turn_left_unreverted_changes, OuterDocsRefusal,
 };
 use crate::handlers::model::{build_apply_policy, execute_model_turn, StepTurnOptions};
+use crate::handlers::offload;
 use crate::handlers::review::publish_review;
 use crate::state::{AppState, OperationGuard};
 
@@ -149,6 +150,14 @@ impl ServerImplementationHost {
     /// The pipeline already resolved the ladder and applied the lazy level-up
     /// invariant, so the request names the exact rung to execute; the host never
     /// re-derives the escalation policy locally.
+    ///
+    /// The rung travels as the pair of its model and the reasoning depth the
+    /// request states, and it is resolved against the configured Architect
+    /// entries: the attempt budget and the escalation marker declared for that
+    /// pair reach the synthesis contour, so the wave runs within the rounds it is
+    /// granted and a rung the developer reserved for manual runs stays saturated.
+    /// A pair the configuration does not declare keeps the requested depth and
+    /// resolves no runtime parameters, exactly as a plain tier carries them.
     fn architect_tier(
         &self,
         selection: Option<&ModelSelection>,
@@ -158,7 +167,29 @@ impl ServerImplementationHost {
             Some(selection) => self.config.resolve_model(selection),
             None => self.config.models.architect_tier(0).model,
         };
-        ArchitectTier::new(model, effort)
+        let rung = ModelSelection::Tier { model, effort };
+        self.config.models.resolve_selection_architect_tier(&rung)
+    }
+
+    /// Resolves the frame a scope executes without occupying an async worker.
+    ///
+    /// Resolving a frame reads the plan or the review session from disk and
+    /// takes the process-wide storage mutex the storage engines hold, which is
+    /// the blocking work every other storage touch point of the daemon offloads.
+    /// A resolution the blocking pool could not complete is reported as an
+    /// infrastructure failure instead of stalling an executor thread.
+    async fn resolve_frame(
+        scope: &ExecutionScope,
+        repo_root: &Path,
+    ) -> Result<ImplementationFrame, StepFailure> {
+        let scope = scope.clone();
+        let root = repo_root.to_path_buf();
+        match offload(move || scope.resolve(&root)).await {
+            Ok(resolved) => resolved,
+            Err(reason) => Err(StepFailure::infrastructure(format!(
+                "The implementation frame could not be resolved: {reason}"
+            ))),
+        }
     }
 
     /// Resolves the external documents the active step of the run declares.
@@ -170,12 +201,12 @@ impl ServerImplementationHost {
     /// host never carries a second copy of the step graph. A scope that cannot be
     /// read declares nothing: the pipeline reports that failure through the
     /// diagnostic it owns.
-    fn declared_outer_docs(
+    async fn declared_outer_docs(
         scope: &ExecutionScope,
         queue: &TurnWorkQueue,
         repo_root: &Path,
     ) -> Vec<String> {
-        let Ok(frame) = scope.resolve(repo_root) else {
+        let Ok(frame) = Self::resolve_frame(scope, repo_root).await else {
             return Vec::new();
         };
         let Some(step_id) = queue.active().map(|item| item.id.as_str()) else {
@@ -200,7 +231,7 @@ impl ServerImplementationHost {
         queue: &TurnWorkQueue,
         cancel_rx: &watch::Receiver<bool>,
     ) -> Result<Vec<String>, OuterDocsRefusal> {
-        let declared = Self::declared_outer_docs(scope, queue, &self.repo_root);
+        let declared = Self::declared_outer_docs(scope, queue, &self.repo_root).await;
         if declared.is_empty() {
             return Ok(Vec::new());
         }
@@ -348,7 +379,7 @@ impl ImplementationHost for ServerImplementationHost {
 
     async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult {
         let tier = self.architect_tier(request.selection.as_ref(), request.reasoning_effort);
-        let frame = match request.scope.resolve(&self.repo_root) {
+        let frame = match Self::resolve_frame(&request.scope, &self.repo_root).await {
             Ok(frame) => frame,
             Err(failure) => {
                 return RefinementResult::Blocked {
@@ -494,9 +525,11 @@ impl ImplementationHost for ServerImplementationHost {
 mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
+    use crate::transport::OutChannel;
+    use tauqe_core::config::ModelsConfig;
     use tauqe_core::plan::storage::PlanStorage;
     use tauqe_protocol::model::TurnWorkItem;
-    use tauqe_protocol::{Plan, PlanItem};
+    use tauqe_protocol::{ModelEntry, ModelRef, Plan, PlanItem};
 
     /// Ordered queue every work-context assertion advances through.
     fn queue() -> TurnWorkQueue {
@@ -601,8 +634,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_active_step_declares_the_external_documents_it_preloads() {
+    #[tokio::test]
+    async fn the_active_step_declares_the_external_documents_it_preloads() {
         let root = scratch_root("host-outer-docs");
         let plan = Plan::from_parts(
             "outer-docs-plan".to_string(),
@@ -647,7 +680,8 @@ mod tests {
                 &scope,
                 &queue("1", "Read the published contract"),
                 &root
-            ),
+            )
+            .await,
             vec!["vendor/api.md".to_string()]
         );
         // The declaration belongs to the running leaf, so a step that declares
@@ -657,13 +691,14 @@ mod tests {
             &queue("2", "Wire the client"),
             &root
         )
+        .await
         .is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn a_scope_that_cannot_be_resolved_declares_no_external_documents() {
+    #[tokio::test]
+    async fn a_scope_that_cannot_be_resolved_declares_no_external_documents() {
         let queue = TurnWorkQueue {
             items: vec![TurnWorkItem {
                 id: "1".to_string(),
@@ -677,7 +712,76 @@ mod tests {
         };
         let root = scratch_root("host-absent-scope");
 
-        assert!(ServerImplementationHost::declared_outer_docs(&scope, &queue, &root).is_empty());
+        let declared = ServerImplementationHost::declared_outer_docs(&scope, &queue, &root);
+        assert!(declared.await.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// Builds a host bound to its own scratch repository root and configuration.
+    fn test_host(config: AppConfig, label: &str) -> (ServerImplementationHost, PathBuf) {
+        let root = scratch_root(label);
+        let (out, _events) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config.clone(), root.clone(), history_sender, out);
+        let operation = state
+            .try_begin_operation()
+            .expect("the operation slot is free");
+        (
+            ServerImplementationHost::new(state, Arc::new(operation), config, root.clone()),
+            root,
+        )
+    }
+
+    /// A wave requests the whole rung by its `(model, effort)` pair, so the
+    /// runtime parameters declared for that exact Architect entry reach the
+    /// synthesis contour instead of being reset by a reconstructed tier.
+    #[tokio::test]
+    async fn the_wave_tier_keeps_the_configured_parameters_of_its_rung() {
+        let shared = ModelRef::openrouter("architect/shared");
+        let mut manual = ModelEntry::new(shared.clone(), Some(ReasoningEffort::High));
+        manual.attempts = Some(4);
+        manual.level_up = Some(false);
+        let config = AppConfig {
+            models: ModelsConfig {
+                repl: vec![ModelEntry::from(ModelRef::openrouter("base/primary"))],
+                architect: Some(vec![
+                    ModelEntry::new(shared.clone(), Some(ReasoningEffort::Low)),
+                    manual,
+                ]),
+                ..ModelsConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let (host, root) = test_host(config, "host-architect-tier");
+
+        let selection = ModelSelection::Tier {
+            model: shared.clone(),
+            effort: Some(ReasoningEffort::High),
+        };
+        let tier = host.architect_tier(Some(&selection), Some(ReasoningEffort::High));
+        assert_eq!(tier.model, shared);
+        assert_eq!(tier.effort, Some(ReasoningEffort::High));
+        assert_eq!(tier.attempts, Some(4));
+        assert_eq!(tier.attempts(), 4);
+        assert_eq!(tier.level_up, Some(false));
+
+        // A pair the configuration does not declare keeps the requested depth
+        // and resolves no runtime parameters, exactly as a plain tier carried
+        // them before the rung identity was introduced.
+        let outside = ModelSelection::Tier {
+            model: ModelRef::openrouter("architect/outside"),
+            effort: Some(ReasoningEffort::Max),
+        };
+        let tier = host.architect_tier(Some(&outside), Some(ReasoningEffort::Max));
+        assert_eq!(tier.model, ModelRef::openrouter("architect/outside"));
+        assert_eq!(tier.effort, Some(ReasoningEffort::Max));
+        assert_eq!(tier.attempts, None);
+        assert_eq!(tier.level_up, None);
+
+        // An absent selection still resolves the base rung of the ladder.
+        let tier = host.architect_tier(None, Some(ReasoningEffort::Low));
+        assert_eq!(tier.model, ModelRef::openrouter("architect/shared"));
+        assert_eq!(tier.effort, Some(ReasoningEffort::Low));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

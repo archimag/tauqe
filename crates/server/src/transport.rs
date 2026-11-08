@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tauqe_core::providers::StreamEvent;
 use tauqe_protocol::{Event, Response};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
@@ -150,6 +151,40 @@ impl OutboundState {
     }
 }
 
+/// Classifies a stream event for outbound headroom pacing.
+///
+/// The pacing contract has exactly one owner: terminal notices are exempt
+/// because a stall must never delay the completion, cancellation, or failure a
+/// contour reports — the client that stopped reading would otherwise park the
+/// very event that ends the operation. Every other variant is telemetry a
+/// stalled client may hold back, so it waits for the writer to catch up.
+///
+/// The match is exhaustive on purpose and carries no wildcard arm, so a new
+/// [`StreamEvent`] variant fails compilation until it is classified here
+/// instead of inheriting an unreviewed default in whichever contour relays it
+/// next.
+fn is_pacing_exempt(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_) => true,
+        StreamEvent::ReasoningDelta(_)
+        | StreamEvent::TextDelta(_)
+        | StreamEvent::ContextChanged(_)
+        | StreamEvent::EditStarted
+        | StreamEvent::EditFileStarted { .. }
+        | StreamEvent::EditHunk { .. }
+        | StreamEvent::EditFileDone { .. }
+        | StreamEvent::EditFileRetrying { .. }
+        | StreamEvent::TurnPhase { .. }
+        | StreamEvent::RepoMapTokens(_)
+        | StreamEvent::TierEscalated { .. }
+        | StreamEvent::ToolchainStarted { .. }
+        | StreamEvent::ToolchainFinished { .. }
+        | StreamEvent::RetryingConnection { .. }
+        | StreamEvent::ResetStream
+        | StreamEvent::Usage(_) => false,
+    }
+}
+
 /// Safe thread-safe event and response sink that routes output lines
 /// sequentially to stdout.
 #[derive(Clone)]
@@ -223,6 +258,20 @@ impl OutChannel {
             }
             self.state.lost.notified().await;
         }
+    }
+
+    /// Applies the transport's pacing policy to one streamed event.
+    ///
+    /// A relay contour calls this instead of restating an exemption set of its
+    /// own, so the classification declared in [`is_pacing_exempt`] is applied
+    /// identically across every contour: a terminal notice publishes
+    /// immediately, and every other variant waits for the writer to catch up
+    /// through [`OutChannel::wait_for_headroom`].
+    pub async fn pace_event(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
+        if is_pacing_exempt(event) {
+            return;
+        }
+        self.wait_for_headroom(cancel).await;
     }
 
     /// Awaits until the outbound queue drained below the low-water mark.
@@ -787,5 +836,95 @@ mod tests {
 
         writing.abort();
         let _ = writing.await;
+    }
+
+    /// The transport owns the pacing classification, so a terminal notice
+    /// passes a stalled queue immediately: a stall must never delay the
+    /// completion, cancellation, or failure it reports.
+    #[tokio::test]
+    async fn terminal_notices_pass_a_stalled_queue_without_waiting() {
+        let (out, _rx) = OutChannel::new();
+        for _ in 0..=BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+
+        for notice in [
+            StreamEvent::Done,
+            StreamEvent::Cancelled,
+            StreamEvent::Error("provider rejected the request".to_string()),
+        ] {
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                out.pace_event(&notice, &mut cancel),
+            )
+            .await
+            .expect("a terminal notice must never wait for a stalled client");
+        }
+    }
+
+    /// A token-granularity event stays gated: the classification exempts the
+    /// terminal notices and nothing else, so the event parks at the high-water
+    /// mark and resumes once the writer drained the queue.
+    #[tokio::test]
+    async fn a_gated_event_parks_until_the_writer_drains_the_queue() {
+        let (out, rx) = OutChannel::new();
+        for _ in 0..=BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let gated_event = StreamEvent::TextDelta("delta".to_string());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                out.pace_event(&gated_event, &mut cancel)
+            )
+            .await
+            .is_err(),
+            "a gated event must park while the backlog sits above the high-water mark"
+        );
+
+        let writing = tokio::spawn(out.writer(rx).run_with(tokio::io::sink()));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            out.pace_event(&gated_event, &mut cancel),
+        )
+        .await
+        .expect("the writer must drain the queue below the low-water mark");
+
+        writing.abort();
+        let _ = writing.await;
+    }
+
+    /// A raised cancellation releases a gated event even while the queue stays
+    /// stalled, so an interrupted contour never waits for a reader that never
+    /// returns.
+    #[tokio::test]
+    async fn a_cancelled_operation_releases_a_gated_event() {
+        let (out, _rx) = OutChannel::new();
+        for _ in 0..=BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        let gated_event = StreamEvent::TextDelta("delta".to_string());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                out.pace_event(&gated_event, &mut cancel)
+            )
+            .await
+            .is_err(),
+            "the stalled client must hold the gated event"
+        );
+
+        let _ = cancel_tx.send(true);
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            out.pace_event(&gated_event, &mut cancel),
+        )
+        .await
+        .expect("a cancelled operation must not wait for the stalled client");
     }
 }

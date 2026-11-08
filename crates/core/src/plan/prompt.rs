@@ -27,7 +27,7 @@ pub use discussion::{
 pub use refine::{
     build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, parse_plan_refinement_output,
     plan_refine_response_schema, plan_refine_response_schema_definition, PlanHorizonDiagnostics,
-    PlanRefinementOutput, MAX_PLAN_REFINEMENT_DEPTH,
+    PlanRefinementAbort, PlanRefinementOutput, MAX_PLAN_REFINEMENT_DEPTH,
 };
 pub use step::{
     format_plan_step_execution_prompt, format_plan_step_retry_prompt, PLAN_STEP_EXECUTION_PREFIX,
@@ -343,5 +343,85 @@ mod tests {
         }
         let no_done_prompt = build_plan_horizon_user_prompt(&no_done, None, None);
         assert!(no_done_prompt.contains("*(No completed steps yet)*"));
+    }
+
+    /// Pins the external-specification contract of a plan to the public
+    /// facade: the Architect declares the project `[[outer_docs]]` entries a
+    /// leaf must be implemented against, and the executor receives them as
+    /// preloaded read-only reference material together with the prefix-bounded
+    /// request directive of its contour.
+    #[test]
+    fn test_plan_prompts_publish_the_external_specification_contract() {
+        let mut plan = sample_plan();
+        let step = plan
+            .implementation
+            .items
+            .iter_mut()
+            .find(|item| item.id.as_str() == "2")
+            .expect("the endpoint step");
+        step.outer_docs = vec!["vendor/api.md".to_string()];
+
+        let tagged =
+            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Xml, Some("MK"))
+                .expect("the execution prompt");
+        assert!(tagged.contains("Preloaded External Specifications (read-only reference)"));
+        assert!(tagged.contains("vendor/api.md"));
+        assert!(tagged.contains("<outer_doc_request_MK id=\"root/relative.md\" />"));
+        assert!(tagged.contains("never name a path that climbs above the declared root"));
+
+        // A structured turn emits no command tag, so the same contract arrives
+        // as the schema field it decodes into.
+        let structured =
+            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Structured, None)
+                .expect("the execution prompt");
+        assert!(structured.contains("vendor/api.md"));
+        assert!(structured.contains("`outer_doc_requests`"));
+        assert!(!structured.contains("<outer_doc_request"));
+
+        // The Architect side publishes the same contract: the system prompt
+        // mandates the declaration and the strict schema describes the prefix.
+        let horizon_system = build_plan_horizon_system_prompt();
+        assert!(horizon_system.contains("External Specification Contract (Outer Docs)"));
+        assert!(horizon_system.contains("outer_docs: [\"id\"]"));
+        assert!(horizon_system.contains("never climb above it"));
+
+        let horizon_user = build_plan_horizon_user_prompt(&plan, None, None);
+        assert!(horizon_user.contains("external specifications the project publishes"));
+        assert!(horizon_user.contains("`outer_docs`"));
+
+        let schema = plan_refine_response_schema();
+        let outer_docs = &schema["properties"]["items"]["items"]["properties"]["outer_docs"];
+        let description = outer_docs["description"]
+            .as_str()
+            .expect("the outer_docs property declares its contract");
+        assert!(description.contains("id/relative.md"));
+        assert!(description.contains("parent container items must have an empty outer_docs list"));
+    }
+
+    /// Pins the abort escape hatch to the stable `plan::prompt::*` path.
+    ///
+    /// A reported host failure is part of the refinement contract, so a caller
+    /// reaches its payload through the same facade as every other item of the
+    /// prompt surface.
+    #[test]
+    fn test_the_abort_escape_hatch_reaches_callers_through_the_facade() {
+        let output = PlanRefinementOutput {
+            status: "blocked".to_string(),
+            explanation: "The toolchain cannot run".to_string(),
+            reason: None,
+            abort: Some(PlanRefinementAbort {
+                is_aborted: true,
+                reason: "clippy is not installed".to_string(),
+                recommendation: "rustup component add clippy".to_string(),
+            }),
+            context_requests: Vec::new(),
+            repo_searches: Vec::new(),
+            repo_maps: Vec::new(),
+            items: Vec::new(),
+        };
+
+        let abort = output.abort.expect("an active abort");
+        assert!(abort.is_aborted);
+        assert_eq!(abort.recommendation, "rustup component add clippy");
     }
 }

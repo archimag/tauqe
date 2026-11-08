@@ -22,8 +22,8 @@ use super::model_list::{handle_dialog_key, hoisted_editor_yank, ModelListKeyOutc
 /// Routes key events for the review-execution form dialog.
 ///
 /// The dialog is dismissed by dropping the pending confirmation; confirming
-/// dispatches `review/execute` with the selected Coder model, the optional
-/// directives, and the targeted subplan step.
+/// dispatches `review/execute` with the typed execution target beside the
+/// selected Coder model and the optional directives.
 pub(super) async fn handle_execute_review_dialog(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
@@ -110,9 +110,10 @@ mod tests {
         }
     }
 
-    /// Finding-level point target: it names the finding itself, so it never
-    /// carries an implementation step — a step id travels only with a group
-    /// target (c-4, c-5).
+    /// Finding-level point target: it names the finding itself, so no
+    /// implementation step travels on the wire — a step-armed confirmation
+    /// dispatches the group target, which executes the whole horizon
+    /// (c-1, c-4, c-5).
     fn state_with_target() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Review;
@@ -121,9 +122,6 @@ mod tests {
             "Session rev-1".to_string(),
             "Finding 1".to_string(),
             Some(1),
-            // A finding-level target names the finding itself; an implementation
-            // step travels only together with a group target (c-4, c-5).
-            None,
             vec![finding(1)],
             vec![coder("coder-a"), coder("coder-b")],
         ));
@@ -340,62 +338,6 @@ mod tests {
         assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Review);
         assert!(conn.written().is_empty());
-    }
-
-    /// A step of a group plan travels as `group_id` + `step_id` with the
-    /// developer's Coder rung and directives, and never as a finding queue
-    /// (c-1, c-4, c-5).
-    #[tokio::test]
-    async fn ctrl_enter_submits_the_targeted_group_step() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Review;
-        st.modals.confirm_execute_review = Some(
-            ConfirmExecuteReviewState::new(
-                Some("rev-1".to_string()),
-                "Session rev-1".to_string(),
-                "Unified auth guard".to_string(),
-                None,
-                Some("1.1".to_string()),
-                Vec::new(),
-                vec![coder("coder-a"), coder("coder-b")],
-            )
-            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
-        );
-        {
-            let target = st
-                .modals
-                .confirm_execute_review
-                .as_mut()
-                .expect("dialog must be open");
-            target.selector.select_index(1);
-            target
-                .instructions_editor
-                .insert_str("keep the guard unified");
-        }
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        press(
-            &state,
-            &mut conn,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
-        )
-        .await;
-
-        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
-        assert!(payload.contains("review/execute"), "{payload}");
-        assert!(payload.contains("\"group_id\":\"arch-auth\""), "{payload}");
-        assert!(payload.contains("\"step_id\":\"1.1\""), "{payload}");
-        assert!(payload.contains("coder-b"), "{payload}");
-        assert!(payload.contains("keep the guard unified"), "{payload}");
-        assert!(
-            !payload.contains("item_ids"),
-            "a group step never queues findings: {payload}"
-        );
-
-        let guard = state.lock().await;
-        assert!(guard.modals.confirm_execute_review.is_none());
-        assert_eq!(guard.view_mode, ViewMode::Repl);
     }
     /// The letter accelerators are bare presses: `Ctrl+Y` is the editor's yank
     /// chord, so it must neither launch a token-spending turn nor dismiss the

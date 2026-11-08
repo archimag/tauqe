@@ -196,6 +196,23 @@ inherits the budget of the rung the ladder saturates on. A failed turn
 therefore ends in an error or a blocked outcome instead of quietly promoting
 the model the developer reserved.
 
+#### A promotion is published
+
+A promotion is a semantic event of the run, not an internal detail of the
+escalation loop. When a rung is exhausted and the ladder advances, the step
+publishes the promoted rung — its model, its reasoning depth, and its ladder
+position — and the batch supervisor translates that report into
+`model/escalated`. The interface therefore renders the intra-role promotion
+while the step still runs, exactly as the Architect contour reports its own.
+
+The promoted rung travels as the whole `(model, effort)` pair, never as a bare
+model name. A ladder that deepens the reasoning depth of one model — `low` then
+`high` of the same model — therefore keeps two distinct rungs all the way to the
+provider call: the promoted selection addresses the entry the ladder entered,
+and no consumer collapses it onto the first entry of that model. Session
+affinity follows the model alone, so deepening the depth of one model keeps the
+provider cache warm instead of rotating the session.
+
 ### 3.3 The architect ladder
 
 Each horizon synthesis records the architect configuration that produced it (model
@@ -327,7 +344,7 @@ the exact role-list entry the developer chose.
   decodes unchanged.
 - **The catalog row shows the full provider catalog.** The last row of the `repl`
   picker opens the complete list of models declared under `[providers]`, never a
-  second view of the primary list. Configured primary models therefore never lock
+  second view of the `repl` list. Configured `repl` models therefore never lock
   the developer out of a model the provider exposes, and the two lists stay
   distinguishable: one is a role list, the other is the provider catalog.
   second view of the `repl` list. Configured `repl` models therefore never lock

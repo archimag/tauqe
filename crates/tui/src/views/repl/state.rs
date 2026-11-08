@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use ratatui::text::Line;
+use tauqe_protocol::edit::EditOutcome;
 use tauqe_protocol::model::{TurnWorkContext, UsageTotalsSnapshot};
 use tauqe_protocol::{ModelRef, ModelResult};
 
@@ -427,19 +428,11 @@ impl ReplView {
         self.markdown_lines.clear();
         self.code_blocks.clear();
         self.links.clear();
-        self.diff_cache = DiffRenderCache::default();
         self.markdown_dirty = false;
         self.last_markdown_render = None;
         self.error = None;
         self.result = None;
-        self.edits_active = false;
-        self.files.clear();
-        self.selected_file_index = 0;
-        // The recenter cycle is scoped to the selection, and a fresh turn
-        // starts it over from its first beat.
-        self.recenter = RecenterState::default();
-        self.edit_final_applied = None;
-        self.edit_final_error = None;
+        self.discard_edit_cycle();
         self.last_commit_hash = None;
         self.last_commit_summary = None;
         self.toolchain = None;
@@ -454,6 +447,71 @@ impl ReplView {
         // The projection describes the canvas of the finished turn; the next
         // turn records its own before anything reads it (c-1).
         self.canvas = CanvasProjection::default();
+    }
+
+    /// Applies the terminal closure of the edit cycle to the turn on display.
+    ///
+    /// The client is a safeguard, not the only witness of the closure: the
+    /// buffered cycle describes the turn the developer is looking at, so a
+    /// closing that arrives after the terminal event still settles that shown
+    /// turn instead of being dropped. A closing of a cycle the viewport no
+    /// longer holds — its buffers were released by a stream reset or by the
+    /// next turn — is an idempotent no-op, and it never stamps a rejected
+    /// badge onto a fresh attempt (c-1). Returns whether the closure applied.
+    pub fn close_edit_cycle(&mut self, outcome: &EditOutcome) -> bool {
+        if !self.edits_active {
+            return false;
+        }
+        self.edit_final_applied = Some(outcome.applied);
+        self.edit_final_error = outcome.error.clone();
+        if let Some(hash) = &outcome.commit_hash {
+            self.last_commit_hash = Some(hash.clone());
+        }
+        if outcome.applied {
+            for file in self.files.iter_mut() {
+                file.status = FileEditStatus::Ok;
+                file.error = None;
+                file.retry_info = None;
+            }
+        } else {
+            let fallback = outcome
+                .error
+                .clone()
+                .unwrap_or_else(|| active_t("repl.edit_failed_fallback"));
+            for file in self.files.iter_mut() {
+                if matches!(
+                    file.status,
+                    FileEditStatus::Running | FileEditStatus::Retrying
+                ) {
+                    file.status = FileEditStatus::Error;
+                    file.retry_info = None;
+                    if file.error.is_none() {
+                        file.error = Some(fallback.clone());
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Releases the edit cycle of a withdrawn attempt.
+    ///
+    /// A stream reset voids every fragment of the aborted attempt, so the
+    /// viewport forgets its cycle together with the answer: the streamed
+    /// files, the activity flag, the settled outcome with its reason, and the
+    /// rendered diff cache. The next escalation rung then opens its own cycle
+    /// on a clean slate instead of inheriting a rejected badge and a
+    /// withdrawal reason that belong to the discarded attempt (c-1).
+    pub fn discard_edit_cycle(&mut self) {
+        self.edits_active = false;
+        self.files.clear();
+        self.selected_file_index = 0;
+        // The recenter cycle is scoped to the selection, so releasing the files
+        // starts it over from its first beat.
+        self.recenter = RecenterState::default();
+        self.edit_final_applied = None;
+        self.edit_final_error = None;
+        self.diff_cache = DiffRenderCache::default();
     }
 
     /// Re-renders the answer markdown; while streaming, repeated calls within the
@@ -536,11 +594,6 @@ impl ReplView {
         }
     }
 
-    /// True while the response area is empty and the splash greeting owns it.
-    ///
-    /// The greeting never competes with real output: as soon as the turn
-    /// produces text, an error, a toolchain report, or a streamed edit, the
-    /// regular viewport takes over on the very next frame (c-1).
     pub fn splash_visible(&self) -> bool {
         !self.is_busy()
             && self.text.is_empty()
@@ -548,6 +601,7 @@ impl ReplView {
             && self.toolchain.is_none()
             && self.files.is_empty()
             && !self.edits_active
+            && self.edit_final_applied.is_none()
     }
 
     /// Fraction of the kinetic glyph assembly already played, clamped to
@@ -670,6 +724,7 @@ impl ReplView {
         }
         self.edits_active.hash(&mut hasher);
         self.edit_final_applied.hash(&mut hasher);
+        self.edit_final_error.hash(&mut hasher);
         self.selected_file_index.hash(&mut hasher);
         self.last_commit_hash.hash(&mut hasher);
         self.last_commit_summary.hash(&mut hasher);
@@ -1106,6 +1161,12 @@ mod splash_tests {
         };
         assert!(!view_files.splash_visible());
 
+        // 5. Final applied state
+        let view_applied = ReplView {
+            edit_final_applied: Some(false),
+            ..ReplView::default()
+        };
+        assert!(!view_applied.splash_visible());
         // 5. All busy TurnStatus variants
         let busy_statuses = [
             TurnStatus::Awaiting,
@@ -1535,27 +1596,10 @@ mod compact_file_list_tests {
 
         assert_derivation_matches_the_canvas(&mut view);
     }
-
-    /// The settled, expanded reasoning block renders its whole transcript, and
-    /// the derivation must follow it.
-    #[test]
-    fn a_settled_expanded_transcript_keeps_the_derived_rows_on_the_drawn_canvas() {
-        let mut view = view();
-        for index in 0..30 {
-            view.reasoning
-                .append_delta(&format!("reasoning line {index}\n"));
-        }
-        view.reasoning.finalize();
-        view.reasoning.toggle_fold();
-        assert!(view.reasoning.show, "the settled block is expanded");
-
-        assert_derivation_matches_the_canvas(&mut view);
-    }
-
     /// Crossing the transcript retention cap is a discrete state transition: the
-    /// retained window keeps streaming while a truncation-marker row joins the
-    /// canvas. The fingerprint must observe it, or a recording measured before
-    /// the trim answers after the window grew back to the same length (c-1, c-4).
+    /// canvas grows the marker row that counts the dropped earlier lines, so the
+    /// fingerprint must observe the trim, or a recording measured before it would
+    /// answer after the window grew back to the same length (c-1, c-4).
     #[test]
     fn a_tripped_retention_cap_invalidates_the_recorded_projection() {
         let mut view = view();

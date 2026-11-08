@@ -13,6 +13,7 @@ use tauqe_protocol::{methods, LocaleGenerateParams};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogFocus, LocaleDialogState};
+use crate::command::is_bare_press;
 use crate::i18n::{active_t, canonical_catalog, delete_custom_locale};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
@@ -56,8 +57,14 @@ pub(super) async fn handle_locale_dialog(
 
     if dialog.focus.is_actions() {
         match key.code {
-            // Dismissal: the dialog stays dropped (safe cancellation).
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(Some(InputResult::Continue)),
+            // Dismissal: the dialog stays dropped (safe cancellation). `Esc` is
+            // unconditional, while the dismissal letter is a bare press, so a
+            // command chord or the AltGr compose chord never discards a typed
+            // target language (Conventions §5.2).
+            KeyCode::Esc => return Ok(Some(InputResult::Continue)),
+            KeyCode::Char('q') if is_bare_press(key.modifiers) => {
+                return Ok(Some(InputResult::Continue));
+            }
             KeyCode::Tab => {
                 dialog.focus = LocaleDialogFocus::Editor;
                 st.modals.locale_dialog = Some(dialog);
@@ -389,5 +396,55 @@ mod tests {
         let st = state.lock().await;
         let dialog = st.modals.locale_dialog.as_ref().expect("dialog stays open");
         assert_eq!(dialog.language_editor.get_text(), "Р");
+    }
+    /// The dismissal letter answers to a bare press only: a command chord or
+    /// the AltGr compose chord keeps the dialog, and the target language typed
+    /// into it, open (Conventions §5.2).
+    #[tokio::test]
+    async fn command_modified_q_keeps_the_locale_dialog_open() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let mut st = crate::app::test_state();
+            let mut dialog = LocaleDialogState {
+                focus: LocaleDialogFocus::Actions,
+                ..LocaleDialogState::default()
+            };
+            dialog.language_editor.insert_str("Elvish");
+            st.modals.locale_dialog = Some(dialog);
+            let state = Arc::new(Mutex::new(st));
+
+            dispatch(&state, KeyEvent::new(KeyCode::Char('q'), modifiers))
+                .await
+                .unwrap();
+
+            let st = state.lock().await;
+            let dialog = st
+                .modals
+                .locale_dialog
+                .as_ref()
+                .expect("a command chord never dismisses the dialog");
+            assert_eq!(dialog.language_editor.get_text(), "Elvish");
+            assert!(st.active_notification().is_none());
+        }
+    }
+
+    /// The guard never over-blocks: the bare dismissal letter still closes the
+    /// dialog without a request (Conventions §5.2).
+    #[tokio::test]
+    async fn bare_q_still_dismisses_the_locale_dialog() {
+        let mut st = crate::app::test_state();
+        let dialog = LocaleDialogState {
+            focus: LocaleDialogFocus::Actions,
+            ..LocaleDialogState::default()
+        };
+        st.modals.locale_dialog = Some(dialog);
+        let state = Arc::new(Mutex::new(st));
+
+        dispatch(&state, key(KeyCode::Char('q'))).await.unwrap();
+
+        assert!(state.lock().await.modals.locale_dialog.is_none());
     }
 }

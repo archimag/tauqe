@@ -13,10 +13,11 @@ use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
+use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::research::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
-use tauqe_protocol::{events, ContextAccess, Event};
-use tokio::sync::watch;
+use tauqe_protocol::{events, ContextAccess, Event, ModelEscalatedEvent};
+use tokio::sync::{mpsc, watch};
 
 /// Emits a server event with an optional serialized parameter payload.
 pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -57,6 +58,52 @@ pub(crate) fn withdraw_streamed_attempt(
         })
         .ok(),
     );
+}
+
+/// Relays the coder promotions a batch raises to the client.
+///
+/// The batch channel carries the telemetry the implementation machinery raises
+/// while it executes a horizon, and the coordinate a client renders is the
+/// promotion of a coder rung. The relay drains that channel for the whole run
+/// and translates every promotion into the `model/escalated` event the
+/// interface already reads, so an intra-role promotion becomes as visible as
+/// the Architect contour reports its own. Every other coordinate is absorbed
+/// here: step telemetry reaches the client through the turn's own sink, and
+/// the channel exists so the executor never parks on a full queue.
+///
+/// The returned task settles once every sender is gone, so a supervisor drops
+/// its own sender and joins it to publish the last promotion before the
+/// terminal batch report leaves.
+pub(crate) fn spawn_escalation_relay(
+    out: OutChannel,
+    operation_id: String,
+    mut events_rx: mpsc::Receiver<StreamEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if let StreamEvent::TierEscalated {
+                tier,
+                model,
+                role,
+                effort,
+            } = event
+            {
+                emit(
+                    &out,
+                    events::MODEL_ESCALATED,
+                    serde_json::to_value(ModelEscalatedEvent {
+                        operation_id: operation_id.clone(),
+                        model,
+                        role: Some(role),
+                        alias: None,
+                        effort,
+                        tier,
+                    })
+                    .ok(),
+                );
+            }
+        }
+    })
 }
 
 /// Whether a completed turn actually applied code edits to disk.
@@ -101,9 +148,13 @@ pub fn turn_left_unreverted_changes(turn: &crate::handlers::model::ModelTurnResu
 /// anchor instead of rendering it. A focus anchored on any other entity is
 /// left untouched. The single shared implementation keeps plan and review
 /// deletions from drifting apart.
+///
+/// The comparison and the release are one critical section inside
+/// [`AppState`], because `discussion/setFocus` shares no mutual exclusion with
+/// the deleting handler: a focus installed concurrently must survive a
+/// release that never addressed it.
 pub(crate) async fn release_focus_anchored_on(state: &Arc<AppState>, anchor: &DiscussionTarget) {
-    if state.discussion_focus().await.target() == Some(anchor) {
-        state.clear_discussion_focus().await;
+    if state.release_discussion_focus_anchored_on(anchor).await {
         tracing::info!(
             anchor = ?anchor,
             "Cleared the discussion focus anchored on the deleted entity"
@@ -630,5 +681,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// The relay is the single translation seam between the batch channel and
+    /// the wire: a coder promotion becomes `model/escalated` under the
+    /// operation of the batch, every other coordinate is absorbed, and the task
+    /// settles once the channel closes.
+    #[tokio::test]
+    async fn test_escalation_relay_publishes_a_promotion_and_ends_on_close() {
+        let (out, mut rx) = OutChannel::new();
+        let (stream_tx, stream_rx) = mpsc::channel(8);
+        let relay = spawn_escalation_relay(out, "op-batch".to_string(), stream_rx);
+
+        stream_tx
+            .send(StreamEvent::TextDelta("absorbed".to_string()))
+            .await
+            .expect("the relay is listening");
+        stream_tx
+            .send(StreamEvent::TierEscalated {
+                tier: 2,
+                model: tauqe_protocol::ModelRef::openrouter("shared/model"),
+                role: tauqe_protocol::ModelRole::Coder,
+                effort: Some(tauqe_protocol::ReasoningEffort::High),
+            })
+            .await
+            .expect("the relay is listening");
+        drop(stream_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("the relay settles once the channel closes")
+            .expect("the relay task joins");
+
+        let mut published = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            published.push(line);
+        }
+        assert_eq!(
+            published.len(),
+            1,
+            "only the promotion reaches the client: {published:?}"
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(&published[0]).expect("the event is valid JSON");
+        assert_eq!(event["method"], events::MODEL_ESCALATED);
+        assert_eq!(event["params"]["operation_id"], "op-batch");
+        assert_eq!(event["params"]["tier"], 2);
+        assert_eq!(event["params"]["role"], "coder");
+        assert_eq!(event["params"]["effort"], "high");
+        assert_eq!(event["params"]["model"]["name"], "shared/model");
     }
 }

@@ -156,13 +156,17 @@ impl StagingInputs {
 /// while a large change set stages.
 ///
 /// An offload can fail instead of returning its result, and the two failures
-/// are not interchangeable. A blocking task the runtime cancelled never ran the
-/// state machine, so the attempt degrades to the synchronous path and the change
-/// set still stages — it simply does so on the calling thread. A blocking task
-/// that panicked already ran the state machine and crashed: the work is
-/// deterministic, so retrying it on the caller would crash a second time and
-/// spend the whole staging pass again. The panic therefore resumes here with the
-/// payload it was raised with.
+/// are not interchangeable. A closure the runtime dropped before it started
+/// never ran the state machine, so the attempt degrades to the synchronous path
+/// and the change set still stages — it simply does so on the calling thread. A
+/// closure that ran and panicked already ran the state machine and crashed: the
+/// work is deterministic, so retrying it on the caller would crash a second time
+/// and spend the whole staging pass again. The panic therefore resumes here with
+/// the payload it was raised with. The offload reports which of the two happened
+/// instead of inferring it from a join error, because a blocking closure cannot
+/// be cancelled: one that already runs keeps running even after the runtime
+/// stops waiting for it, and a fallback would stage the change set twice,
+/// concurrently.
 async fn stage_off_the_executor(
     inputs: Arc<StagingInputs>,
     config_validator: Option<StagedConfigValidator>,
@@ -172,9 +176,12 @@ async fn stage_off_the_executor(
     match staged {
         Ok(result) => result,
         Err(error) => {
-            // A cancelled offload leaves the state machine unrun, so the
-            // synchronous fallback still stages the change set. A panicked one
-            // already ran it, so its payload resumes instead of being retried.
+            // A closure the runtime dropped before it ran leaves the state
+            // machine unrun, so the synchronous fallback still stages the change
+            // set. A closure that ran and panicked already staged it, so its
+            // payload resumes instead of the work being retried: the offload
+            // proves which case it is, and a staging pass still in flight is
+            // never duplicated by a fallback.
             resolve_offload_failure(error, "stage_and_validate_edits", || {
                 inputs.stage(config_validator)
             })

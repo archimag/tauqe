@@ -168,7 +168,7 @@ fn select_request(selection: ModelSelection) -> Request {
 #[tokio::test]
 async fn model_select_rotates_the_session_confirmed_by_the_effective_model() {
     let mut cfg = AppConfig::default();
-    cfg.models.primary = vec![
+    cfg.models.repl = vec![
         ModelRef::openrouter("alpha/model").into(),
         ModelRef::openrouter("beta/model").into(),
     ];
@@ -567,7 +567,7 @@ async fn preflight_rejects_malformed_tauqe_toml() {
 #[tokio::test]
 async fn preflight_rejects_semantically_invalid_tauqe_toml() {
     match preflight_with(Some(concat!(
-        "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        "[models]\nrepl = [\"openrouter:a/b\"]\n",
         "\n[project.verify]\ncommand = \"@missing\"\n",
     )))
     .await
@@ -584,7 +584,7 @@ async fn preflight_rejects_semantically_invalid_tauqe_toml() {
 /// never declared.
 #[tokio::test]
 async fn preflight_accepts_a_declaration_without_verification() {
-    let verdict = preflight_with(Some("[models]\nprimary = [\"openrouter:a/b\"]\n")).await;
+    let verdict = preflight_with(Some("[models]\nrepl = [\"openrouter:a/b\"]\n")).await;
     assert!(
         matches!(verdict, PreflightVerdict::Passed),
         "a declaration without verification must pass: {verdict:?}"
@@ -595,7 +595,7 @@ async fn preflight_accepts_a_declaration_without_verification() {
 #[tokio::test]
 async fn preflight_accepts_a_valid_tauqe_toml() {
     let verdict = preflight_with(Some(
-        "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
+        "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
     ))
     .await;
     assert!(
@@ -905,7 +905,7 @@ fn clear_history_request() -> Request {
 #[tokio::test]
 async fn model_select_is_refused_while_an_operation_is_registered() {
     let mut cfg = AppConfig::default();
-    cfg.models.primary = vec![
+    cfg.models.repl = vec![
         ModelRef::openrouter("alpha/model").into(),
         ModelRef::openrouter("beta/model").into(),
     ];
@@ -1147,6 +1147,16 @@ async fn a_recorded_review_decision_is_published_as_review_updated() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Budget after which a deliberate non-yielding stretch ends on its own.
+///
+/// The stretch exists to prove what an abort cannot reach, so it spins
+/// synchronously instead of parking on an abort landing point. The budget is the
+/// second line of defence behind the test's release guard: an unbounded stretch
+/// pins the worker thread of its runtime, whose shutdown waits for that thread,
+/// so one failed assertion would hang the whole suite instead of failing one
+/// case.
+const SYNCHRONOUS_STRETCH_BUDGET: Duration = Duration::from_secs(5);
+
 /// Provider that relays a cancellation and then parks the workflow task inside a
 /// synchronous stretch, so the task never reaches the suspension point an abort
 /// lands at.
@@ -1199,22 +1209,38 @@ impl LlmProvider for AbortIgnoringProvider {
         // is exactly what the deferred reaping has to survive.
         let _ = tx.send(StreamEvent::Cancelled).await;
         let _ = self.entered.send(());
-        while !self.released.load(Ordering::SeqCst) {
+        // The non-yielding stretch is the subject of this fixture, so it spins
+        // synchronously: a suspension point here would let the abort land and
+        // erase the hazard under test. Its budget ends the spin even when the
+        // test's release guard never fires.
+        let deadline = std::time::Instant::now() + SYNCHRONOUS_STRETCH_BUDGET;
+        while !self.released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
         self.exited.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
+/// Flips the release flag on drop so an aborted or panicked test never leaves
+/// the synchronous stretch spinning on a worker thread.
+struct StretchRelease(Arc<AtomicBool>);
 
-/// A workflow task that survives the abort must never be detached: the turn hands
-/// the still-owned handle to the shared watchdog, which keeps the operation slot
-/// registered until the task has truly exited, so the zombie releases the session
-/// lock before any new operation can register.
+impl Drop for StretchRelease {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A workflow task that survives the abort must never be detached: the turn
+/// either unwinds it or hands the still-owned handle to the shared watchdog,
+/// while the operation slot stays registered until the task has truly exited, so
+/// the zombie releases the session lock before any new operation can register.
 ///
 /// The regression runs on a multi-thread runtime because the stand-in parks the
 /// workflow task inside a synchronous stretch: that stretch never yields, which
-/// is exactly why the abort cannot land there.
+/// is exactly why the abort cannot land there. Ending the stretch is what lets
+/// the turn settle, so the wedged assertions are made first and the awaiting
+/// second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
     use tauqe_core::workflow::DirectApplyPolicy;
@@ -1231,12 +1257,13 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
     let (provider, mut entered) = AbortIgnoringProvider::new();
     let released = Arc::clone(&provider.released);
     let exited = Arc::clone(&provider.exited);
+    let _release_guard = StretchRelease(Arc::clone(&released));
     let injected: Arc<dyn LlmProvider> = Arc::new(provider);
     *state.provider_override.lock().await = Some(injected);
 
-    // The production grace exists to give a real workflow time to unwind. Short
-    // graces confined to this turn's task make the second expiry reachable
-    // without changing what any concurrently running test observes.
+    // The production grace exists to give a real workflow time to unwind. A short
+    // grace confined to this turn's task reaches the expiry without changing what
+    // any concurrently running test observes.
     let grace = Duration::from_millis(150);
     let turn_state = Arc::clone(&state);
     let turn = tokio::spawn(async move {
@@ -1266,22 +1293,16 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
         .await
         .expect("the turn must reach the provider")
         .expect("the provider signals that the workflow task is parked");
-    state.hard_cancel_active_operation();
+    state.cancel_active_operation();
 
-    // Both graces expire while the workflow task sits between abort landing
-    // points, so the turn has handed the handle to the watchdog by now.
+    // The cancelled workflow sits between abort landing points, so it keeps
+    // running and keeps holding the session lock it acquired: no new operation
+    // may register while it is still in there.
     tokio::time::sleep(grace * 5).await;
     assert!(
         !exited.load(Ordering::SeqCst),
         "the workflow task must still be inside the synchronous stretch"
     );
-
-    let result = tokio::time::timeout(Duration::from_secs(10), turn)
-        .await
-        .expect("the turn must return once the reaping is deferred")
-        .expect("the turn task joins")
-        .expect("the turn returns a cancelled result");
-    assert!(result.is_cancelled, "the turn must report the cancellation");
     assert!(
         state.is_operation_active(),
         "the slot must stay registered while the aborted task still runs"
@@ -1290,14 +1311,20 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
         state.try_begin_operation().is_err(),
         "a new operation must stay refused until the aborted task has exited"
     );
-    assert!(
-        !exited.load(Ordering::SeqCst),
-        "the deferred task must still hold the session lock"
-    );
 
-    // Letting the stretch end gives the pending abort a landing point; the
-    // watchdog then reaps the task and drops the registration with it.
+    // Ending the stretch gives the pending abort a landing point, so the turn
+    // settles within its budget instead of outliving the grace period whatever
+    // value the cancel path observed.
     released.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .expect("the turn must return once the workflow task can unwind")
+        .expect("the turn task joins")
+        .expect("the turn returns a cancelled result");
+    assert!(result.is_cancelled, "the turn must report the cancellation");
+
+    // The registration outlives the task only until the task really exits, and it
+    // is dropped either by the task's own guard or by the deferred watchdog.
     let mut freed = false;
     for _ in 0..500 {
         if !state.is_operation_active() {
@@ -1306,10 +1333,7 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        freed,
-        "the watchdog must release the slot once the task exits"
-    );
+    assert!(freed, "the slot must be released once the task exits");
     assert!(
         exited.load(Ordering::SeqCst),
         "the workflow task must have reached its own end"
@@ -1624,6 +1648,10 @@ fn a_watchdog_reap_that_expires_releases_the_slot_of_a_pinned_task() {
         .expect("the confirmation runtime starts");
 
     let stretch_ends = Arc::new(AtomicBool::new(false));
+    // The stretch belongs to a runtime of its own, whose shutdown waits for its
+    // pinned worker: releasing it on drop keeps a failed assertion from hanging
+    // the suite.
+    let _stretch_guard = StretchRelease(Arc::clone(&stretch_ends));
     let exited = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1635,13 +1663,17 @@ fn a_watchdog_reap_that_expires_releases_the_slot_of_a_pinned_task() {
             let exited = Arc::clone(&exited);
             wedged_runtime.spawn(async move {
                 let _marker = WatchdogExitMarker(Arc::clone(&exited));
+                // The signal proves the task reached the stretch, so the abort
+                // delivered below lands on a task that is demonstrably running
+                // instead of racing its very first poll.
                 let _ = entered_tx.send(());
                 // A non-yielding stretch: the task reaches no suspension point,
-                // so the abort cannot land while it spins.
-                while !stretch_ends.load(Ordering::SeqCst) {
+                // so the abort cannot land while it spins. Its budget ends the
+                // spin even when the release guard never fires.
+                let deadline = std::time::Instant::now() + SYNCHRONOUS_STRETCH_BUDGET;
+                while !stretch_ends.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
                 }
-                std::future::pending::<()>().await
             })
         };
         entered_rx
@@ -1696,6 +1728,361 @@ fn a_watchdog_reap_that_expires_releases_the_slot_of_a_pinned_task() {
             "the orphaned task must die once its non-yielding stretch ends"
         );
     });
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Drains the transport queue into the ordered list of published events.
+fn published_events(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<(String, serde_json::Value)> {
+    let mut events = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line).expect("the transport writes JSON lines");
+        let method = event
+            .get("method")
+            .and_then(|method| method.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let params = event.get("params").cloned().unwrap_or_default();
+        events.push((method, params));
+    }
+    events
+}
+
+/// A turn that applies its change set closes the edit cycle exactly once, and
+/// the closing precedes the terminal `model/result` event.
+#[tokio::test]
+async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_core::workflow::DirectApplyPolicy;
+
+    const CHANGE_SET: &str = concat!(
+        "Rewriting the value.\n",
+        "<edits summary=\"Bump the value\">\n",
+        "  <edit path=\"target.rs\">\n",
+        "    <search>\n",
+        "pub fn value() -> i32 { 0 }\n",
+        "    </search>\n",
+        "    <replace>\n",
+        "pub fn value() -> i32 { 42 }\n",
+        "    </replace>\n",
+        "  </edit>\n",
+        "</edits>\n",
+    );
+
+    let root = scratch_root("turn-cycle-success");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
+        .expect("write the edit target");
+    tauqe_core::git::cmd::stage_files(&root, &["target.rs".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let mut cfg = AppConfig::default();
+    cfg.repl.protocol = EditProtocolKind::Xml;
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(cfg, root.clone(), history_sender, out);
+    state
+        .context
+        .write()
+        .await
+        .add_file("target.rs", tauqe_protocol::ContextAccess::Editable)
+        .expect("the edit target is editable");
+    let script = [
+        MockResponse::text(CHANGE_SET),
+        MockResponse::text("<success commit_message=\"Bump the value\" />"),
+    ];
+    let injected: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted(script));
+    *state.provider_override.lock().await = Some(injected);
+
+    let result = execute_model_turn(
+        &state,
+        "Bump the value to 42".to_string(),
+        Box::new(DirectApplyPolicy::new()),
+        StepTurnOptions {
+            intent: TurnIntent::InteractiveRepl,
+            custom_selection: None,
+            plan_context: None,
+            work_context: None,
+            reasoning_effort: None,
+            marker: None,
+            session_id: None,
+            shared_operation: None,
+            phase_out: None,
+        },
+    )
+    .await
+    .expect("the bounded turn runs");
+    assert!(
+        result.is_success(),
+        "the turn must apply: {:?}",
+        result.result
+    );
+
+    let events = published_events(&mut rx);
+    let position = |wanted: &str| {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, (method, _))| method == wanted)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    let started = position(tauqe_protocol::events::EDIT_STARTED);
+    let finished = position(tauqe_protocol::events::EDIT_FINISHED);
+    let results = position(tauqe_protocol::events::MODEL_RESULT);
+    assert_eq!(started.len(), 1, "the cycle opens exactly once");
+    assert_eq!(finished.len(), 1, "the cycle closes exactly once");
+    assert_eq!(results.len(), 1);
+    assert!(started[0] < finished[0]);
+    assert!(
+        finished[0] < results[0],
+        "the closing must precede the terminal result"
+    );
+    assert_eq!(events[finished[0]].1["applied"], true);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Provider that opens an edit cycle, withdraws the attempt, opens the next
+/// one, and then answers in text without applying anything.
+struct WithdrawingProvider {
+    /// Set once the first call has played the withdrawn attempt.
+    played: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for WithdrawingProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        if !self.played.swap(true, Ordering::SeqCst) {
+            let _ = tx.send(StreamEvent::EditStarted).await;
+            let _ = tx.send(StreamEvent::ResetStream).await;
+            let _ = tx.send(StreamEvent::EditStarted).await;
+        }
+        let _ = tx
+            .send(StreamEvent::TextDelta("No change is needed.".to_string()))
+            .await;
+        Ok(())
+    }
+}
+
+/// A withdrawn attempt closes its cycle before the next rung opens one, and a
+/// turn that ends with a text answer leaves no cycle open: every opening is
+/// answered by exactly one closing, and the last closing precedes the result.
+#[tokio::test]
+async fn a_withdrawn_attempt_closes_its_cycle_before_the_next_one_opens() {
+    use tauqe_core::workflow::DirectApplyPolicy;
+
+    let root = scratch_root("turn-cycle-withdrawn");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let mut cfg = AppConfig::default();
+    cfg.repl.protocol = EditProtocolKind::Xml;
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(cfg, root.clone(), history_sender, out);
+    let injected: Arc<dyn LlmProvider> = Arc::new(WithdrawingProvider {
+        played: AtomicBool::new(false),
+    });
+    *state.provider_override.lock().await = Some(injected);
+
+    let _ = execute_model_turn(
+        &state,
+        "Explain the repository".to_string(),
+        Box::new(DirectApplyPolicy::new()),
+        StepTurnOptions {
+            intent: TurnIntent::InteractiveRepl,
+            custom_selection: None,
+            plan_context: None,
+            work_context: None,
+            reasoning_effort: None,
+            marker: None,
+            session_id: None,
+            shared_operation: None,
+            phase_out: None,
+        },
+    )
+    .await
+    .expect("the bounded turn runs");
+
+    let events = published_events(&mut rx);
+    let cycle: Vec<&(String, serde_json::Value)> = events
+        .iter()
+        .filter(|(method, _)| {
+            method == tauqe_protocol::events::EDIT_STARTED
+                || method == tauqe_protocol::events::EDIT_FINISHED
+        })
+        .collect();
+    for (index, (method, params)) in cycle.iter().enumerate() {
+        if index % 2 == 0 {
+            assert_eq!(method, tauqe_protocol::events::EDIT_STARTED);
+        } else {
+            assert_eq!(method, tauqe_protocol::events::EDIT_FINISHED);
+            assert!(
+                !params["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty(),
+                "an unapplied closing must carry a reason: {params}"
+            );
+        }
+    }
+    assert_eq!(cycle.len() % 2, 0, "no cycle may stay open");
+
+    let last_closing = events
+        .iter()
+        .rposition(|(method, _)| method == tauqe_protocol::events::EDIT_FINISHED);
+    let result = events
+        .iter()
+        .position(|(method, _)| method == tauqe_protocol::events::MODEL_RESULT);
+    if let (Some(closing), Some(result)) = (last_closing, result) {
+        assert!(closing < result, "the closing must precede the result");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Provider that opens an edit cycle and then parks until the harness cancels
+/// the turn, so the cancellation lands while the cycle is open.
+struct OpenCycleProvider {
+    /// Signals that the cycle is open and the provider is parked.
+    entered: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for OpenCycleProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        if tx.send(StreamEvent::EditStarted).await.is_err() {
+            return Ok(());
+        }
+        let _ = self.entered.send(());
+        while !*cancel_rx.borrow() {
+            if cancel_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        let _ = tx.send(StreamEvent::Cancelled).await;
+        Ok(())
+    }
+}
+
+/// A turn cancelled while its edit cycle is open closes the cycle exactly once,
+/// with an unapplied outcome that states its reason, before the cancellation
+/// notice reaches the client.
+#[tokio::test]
+async fn a_cancelled_turn_closes_its_open_cycle_exactly_once() {
+    use tauqe_core::workflow::DirectApplyPolicy;
+
+    let root = scratch_root("turn-cycle-cancelled");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let injected: Arc<dyn LlmProvider> = Arc::new(OpenCycleProvider {
+        entered: entered_tx,
+    });
+    *state.provider_override.lock().await = Some(injected);
+
+    let turn_state = Arc::clone(&state);
+    let turn = tokio::spawn(async move {
+        execute_model_turn(
+            &turn_state,
+            "Explain the repository".to_string(),
+            Box::new(DirectApplyPolicy::new()),
+            StepTurnOptions {
+                intent: TurnIntent::InteractiveRepl,
+                custom_selection: None,
+                plan_context: None,
+                work_context: None,
+                reasoning_effort: None,
+                marker: None,
+                session_id: None,
+                shared_operation: None,
+                phase_out: None,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("the turn must reach the provider")
+        .expect("the provider signals that the cycle is open");
+    state.hard_cancel_active_operation();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .expect("the cancelled turn must return")
+        .expect("the turn task joins")
+        .expect("the turn reports the cancellation");
+    assert!(result.is_cancelled);
+
+    let events = published_events(&mut rx);
+    let position = |wanted: &str| {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, (method, _))| method == wanted)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    let started = position(tauqe_protocol::events::EDIT_STARTED);
+    let finished = position(tauqe_protocol::events::EDIT_FINISHED);
+    let cancelled = position(tauqe_protocol::events::MODEL_CANCELLED);
+    assert_eq!(started.len(), 1, "the cycle opens exactly once");
+    assert_eq!(finished.len(), 1, "the cycle closes exactly once");
+    assert_eq!(cancelled.len(), 1);
+    assert!(
+        finished[0] < cancelled[0],
+        "the closing must precede the cancellation notice"
+    );
+    let closing = &events[finished[0]].1;
+    assert_eq!(closing["applied"], false);
+    assert!(
+        !closing["error"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "an unapplied closing must carry a reason: {closing}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

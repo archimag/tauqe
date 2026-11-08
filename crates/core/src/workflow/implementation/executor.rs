@@ -28,7 +28,7 @@ use crate::workflow::implementation::{
 use async_trait::async_trait;
 use tauqe_protocol::model::TurnWorkQueue;
 use tauqe_protocol::{
-    EditProtocolKind, IssueStatus, ModelRole, ModelSelection, PlanItem, PlanItemStatus,
+    EditProtocolKind, IssueStatus, ModelEntry, ModelRole, ModelSelection, PlanItem, PlanItemStatus,
     PlanScopeEvaluation, ReasoningEffort, TurnWorkItem,
 };
 use tokio::sync::{mpsc, watch};
@@ -93,16 +93,21 @@ impl BatchStepExecutor for PlanImplementationStepExecutor<'_> {
     async fn execute_step(
         &mut self,
         step: &BatchStep,
-        _stream_tx: mpsc::Sender<StreamEvent>,
+        stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
-        Ok(self.run(step, cancel_rx).await)
+        Ok(self.run(step, stream_tx, cancel_rx).await)
     }
 }
 
 impl PlanImplementationStepExecutor<'_> {
     /// Runs one leaf of the horizon to its terminal outcome.
-    async fn run(&self, step: &BatchStep, cancel_rx: watch::Receiver<bool>) -> BatchStepOutcome {
+    async fn run(
+        &self,
+        step: &BatchStep,
+        stream_tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> BatchStepOutcome {
         // The horizon is re-resolved from the storage that owns it, so the
         // executor never decides a lifecycle transition from a stale copy of
         // the step graph.
@@ -373,9 +378,30 @@ impl PlanImplementationStepExecutor<'_> {
                                 );
                                 ladder_idx = next_idx;
                                 max_tier_attempts = tier.attempts();
-                                selection = ModelSelection::Specific(tier.model);
+                                // The promoted rung travels as the whole
+                                // `(model, effort)` pair, so no consumer can
+                                // collapse the step onto the first entry of the
+                                // same model: a rung that only deepens the
+                                // reasoning depth keeps its own depth.
+                                selection = ModelSelection::Tier {
+                                    model: tier.model.clone(),
+                                    effort: tier.effort,
+                                };
                                 reasoning_effort = tier.effort;
                                 tier_attempts = 0;
+                                // The promotion is a semantic event of the run,
+                                // so it reaches the client through the batch
+                                // channel instead of staying a log line. A
+                                // channel nobody holds any more is not a
+                                // failure of the step.
+                                let _ = stream_tx
+                                    .send(StreamEvent::TierEscalated {
+                                        tier: next_idx,
+                                        model: tier.model,
+                                        role: ModelRole::Coder,
+                                        effort: tier.effort,
+                                    })
+                                    .await;
                             }
                         }
                     } else {
@@ -671,7 +697,7 @@ fn set_leaf_state(
 /// a step runs on.
 ///
 /// The verdict reads the typed exclusion of the coder role, never the model
-/// name: a run started manually on a model the ladder excludes is already
+/// name: a run started manually on a rung the ladder excludes is already
 /// saturated, and so is a run sitting on the strongest eligible rung.
 fn saturation_message(
     models: &ModelsConfig,
@@ -680,15 +706,21 @@ fn saturation_message(
     reason: &str,
 ) -> String {
     let model = models.resolve_model(selection);
-    let saturation = if models.excluded_from_escalation(ModelRole::Coder, &model) {
+    // The marker belongs to one rung, so the selected reasoning depth is resolved
+    // before the exclusion is read: a sibling rung of the same model at another
+    // depth keeps participating in the ladder.
+    let effort = models.resolve_selection_effort(ModelRole::Coder, selection);
+    let excluded = models.excluded_from_escalation(ModelRole::Coder, &model, effort);
+    let rung = ModelEntry::new(model, effort).display_label();
+    let saturation = if excluded {
         format!(
             "`{}` is excluded from the automatic ladder (`level_up = false`)",
-            model
+            rung
         )
     } else {
         format!(
             "`{}` is already the strongest rung of the automatic ladder",
-            model
+            rung
         )
     };
     format!(
@@ -705,6 +737,7 @@ mod tests {
 
     use crate::config::ModelsConfig;
     use crate::plan::storage::PlanStorage;
+    use crate::providers::StreamEvent;
     use crate::review::storage::ReviewStorage;
     use crate::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepStatus};
     use crate::workflow::implementation::{
@@ -715,8 +748,9 @@ mod tests {
     use async_trait::async_trait;
     use tauqe_protocol::review::{IssueStatus, IssueType, ReviewIssue};
     use tauqe_protocol::{
-        ArchitectTier, EditProtocolKind, ModelEntry, ModelRef, ModelSelection, Plan,
-        PlanImplementation, PlanItem, PlanItemStatus, ReviewGroup, ReviewItem, ReviewSession,
+        ArchitectTier, EditProtocolKind, ModelEntry, ModelRef, ModelRole, ModelSelection, Plan,
+        PlanImplementation, PlanItem, PlanItemStatus, ReasoningEffort, ReviewGroup, ReviewItem,
+        ReviewSession,
     };
     use tempfile::tempdir;
     use tokio::sync::{mpsc, watch};
@@ -824,7 +858,7 @@ mod tests {
     fn run_config(step_id: &str) -> ImplementationRunConfig {
         ImplementationRunConfig {
             models: ModelsConfig {
-                primary: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+                repl: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
                 coder: Some(vec![ModelEntry::from(ModelRef::openrouter("base/model"))]),
                 auto_level_up: true,
                 ..ModelsConfig::default()
@@ -840,7 +874,7 @@ mod tests {
     /// Coder ladder whose rungs each grant a single content attempt.
     fn two_rung_models() -> ModelsConfig {
         ModelsConfig {
-            primary: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+            repl: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
             coder: Some(vec![
                 ModelEntry {
                     model: ModelRef::openrouter("base/model"),
@@ -859,11 +893,36 @@ mod tests {
             ..ModelsConfig::default()
         }
     }
+
+    /// Coder ladder whose two rungs are one model at two reasoning depths, so a
+    /// promotion deepens the depth instead of switching the model.
+    fn single_model_ladder() -> ModelsConfig {
+        let shared = ModelRef::openrouter("shared/model");
+        ModelsConfig {
+            repl: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+            coder: Some(vec![
+                ModelEntry {
+                    model: shared.clone(),
+                    effort: Some(ReasoningEffort::Low),
+                    attempts: Some(1),
+                    level_up: None,
+                },
+                ModelEntry {
+                    model: shared,
+                    effort: Some(ReasoningEffort::High),
+                    attempts: Some(1),
+                    level_up: None,
+                },
+            ]),
+            auto_level_up: true,
+            ..ModelsConfig::default()
+        }
+    }
     /// Coder role pairing a participating rung with an opted-out model, so a run
     /// started on the opted-out model proves which entry owns the budget.
     fn excluded_model_models(attempts: Option<u32>) -> ModelsConfig {
         ModelsConfig {
-            primary: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+            repl: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
             coder: Some(vec![
                 ModelEntry {
                     model: ModelRef::openrouter("base/model"),
@@ -882,12 +941,25 @@ mod tests {
             ..ModelsConfig::default()
         }
     }
-    fn channels() -> (
-        mpsc::Sender<crate::providers::StreamEvent>,
+    /// Channels of a run, with the batch channel a step publishes its telemetry
+    /// into exposed to the test.
+    fn channels_with_events() -> (
+        mpsc::Sender<StreamEvent>,
+        mpsc::Receiver<StreamEvent>,
         watch::Receiver<bool>,
     ) {
-        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        let (stream_tx, stream_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        (stream_tx, stream_rx, cancel_rx)
+    }
+
+    /// Channels of a run whose streamed telemetry no test observes.
+    ///
+    /// The receiver is dropped, so a promotion the step publishes reaches a
+    /// closed channel and stays a no-op instead of parking the run.
+    fn channels() -> (mpsc::Sender<StreamEvent>, watch::Receiver<bool>) {
+        let (stream_tx, stream_rx, cancel_rx) = channels_with_events();
+        drop(stream_rx);
         (stream_tx, cancel_rx)
     }
 
@@ -1010,9 +1082,14 @@ mod tests {
         assert!(outcome.is_success());
         let requests = host.requests();
         assert_eq!(requests.len(), 2);
+        // The promoted rung travels as the whole `(model, effort)` pair, so the
+        // selection names the exact ladder entry the run entered.
         assert_eq!(
             requests[1].selection,
-            ModelSelection::Specific(ModelRef::openrouter("stronger/model"))
+            ModelSelection::Tier {
+                model: ModelRef::openrouter("stronger/model"),
+                effort: None,
+            }
         );
         assert!(requests[1].prompt.contains("Correction Required"));
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
@@ -1021,6 +1098,96 @@ mod tests {
         assert_eq!(
             stored.implementation.find_item("1").unwrap().status,
             PlanItemStatus::Done
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promotion_of_one_model_keeps_the_full_rung_and_its_session() {
+        let dir = tempdir().unwrap();
+        PlanStorage::save_plan(dir.path(), &horizon_plan()).unwrap();
+        let host = ScriptedHost::new(vec![
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+            StepTurnResult::Success {
+                summary: "the depth was enough".to_string(),
+                commit: None,
+            },
+        ]);
+        let scope = ExecutionScope::Plan {
+            plan_id: "step-horizon".to_string(),
+            step_id: None,
+        };
+        let mut config = run_config("1");
+        config.models = single_model_ladder();
+        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("1", "seam"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert!(outcome.is_success());
+        let requests = host.requests();
+        assert_eq!(requests.len(), 2);
+        // The promoted rung addresses the exact ladder entry the run entered:
+        // naming only the model would collapse the step onto the base entry of
+        // that model and lose the depth the promotion handed out.
+        assert_eq!(
+            requests[1].selection,
+            ModelSelection::Tier {
+                model: ModelRef::openrouter("shared/model"),
+                effort: Some(ReasoningEffort::High),
+            }
+        );
+        assert_eq!(requests[1].reasoning_effort, Some(ReasoningEffort::High));
+        // Affinity follows the model alone, so deepening the depth of one model
+        // keeps the provider session warm.
+        assert_eq!(requests[1].session_id, requests[0].session_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_coder_promotion_is_published_on_the_batch_channel() {
+        let dir = tempdir().unwrap();
+        PlanStorage::save_plan(dir.path(), &horizon_plan()).unwrap();
+        let host = ScriptedHost::new(vec![
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+            StepTurnResult::Success {
+                summary: "the depth was enough".to_string(),
+                commit: None,
+            },
+        ]);
+        let scope = ExecutionScope::Plan {
+            plan_id: "step-horizon".to_string(),
+            step_id: None,
+        };
+        let mut config = run_config("1");
+        config.models = single_model_ladder();
+        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let (stream_tx, mut stream_rx, cancel_rx) = channels_with_events();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("1", "seam"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert!(outcome.is_success());
+        match stream_rx.try_recv() {
+            Ok(StreamEvent::TierEscalated {
+                tier,
+                model,
+                role,
+                effort,
+            }) => {
+                assert_eq!(tier, 1);
+                assert_eq!(model, ModelRef::openrouter("shared/model"));
+                assert_eq!(role, ModelRole::Coder);
+                assert_eq!(effort, Some(ReasoningEffort::High));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            stream_rx.try_recv().is_err(),
+            "a promotion is published once per rung, not once per attempt"
         );
     }
 
@@ -1361,5 +1528,56 @@ mod tests {
             stored.implementation.find_item("1").unwrap().status,
             PlanItemStatus::Todo
         );
+    }
+
+    #[test]
+    fn saturation_message_distinguishes_the_excluded_rung_from_its_sibling() {
+        use tauqe_protocol::ReasoningEffort;
+
+        let shared = ModelRef::openrouter("shared/model");
+        let mut excluded = ModelEntry::new(shared.clone(), Some(ReasoningEffort::Max));
+        excluded.level_up = Some(false);
+        let models = ModelsConfig {
+            repl: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+            coder: Some(vec![
+                ModelEntry::new(shared.clone(), Some(ReasoningEffort::Low)),
+                excluded,
+                ModelEntry::from(ModelRef::openrouter("stronger/model")),
+            ]),
+            auto_level_up: true,
+            ..ModelsConfig::default()
+        };
+        let plan = horizon_plan();
+        let leaf = plan
+            .implementation
+            .items
+            .first()
+            .expect("the horizon declares one leaf");
+        let reason = "the patch did not apply";
+
+        // The opted-out rung reports the marker of its own entry ...
+        let selection = ModelSelection::Tier {
+            model: shared.clone(),
+            effort: Some(ReasoningEffort::Max),
+        };
+        let message = super::saturation_message(&models, &selection, leaf, reason);
+        assert!(
+            message.contains("excluded from the automatic ladder"),
+            "got: {message}"
+        );
+        assert!(message.contains("shared/model [max]"), "got: {message}");
+
+        // ... while the participating sibling of the same model is reported as the
+        // strongest rung, because no marker names it.
+        let selection = ModelSelection::Tier {
+            model: shared,
+            effort: Some(ReasoningEffort::Low),
+        };
+        let message = super::saturation_message(&models, &selection, leaf, reason);
+        assert!(
+            message.contains("strongest rung of the automatic ladder"),
+            "got: {message}"
+        );
+        assert!(message.contains("shared/model [low]"), "got: {message}");
     }
 }

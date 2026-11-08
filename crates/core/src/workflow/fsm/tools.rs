@@ -313,6 +313,7 @@ fn cancelled_turn(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
         },
         is_cancelled: true,
         blocked: None,
+        protocol_failure: None,
         abort: None,
         has_terminal_success: false,
         plan_saved: false,

@@ -208,35 +208,126 @@ pub struct ReviewCancelParams {
     pub mode: Option<CancelMode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Parameters for `review/execute`.
+///
+/// The execution target travels flattened at the top level of the payload, so
+/// a request always states exactly one target and can never mix two. `model`
+/// and `instructions` are the only fields beside it, and both stay off the
+/// wire when absent, so a request that overrides nothing keeps the compact
+/// form its target declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewExecuteParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step_id: Option<String>,
-    /// Identifier of the review group whose unified implementation is executed.
-    ///
-    /// A group run addresses the group itself, never one of its findings:
-    /// `step_id` then names a step of the group implementation. The field is a target
-    /// of its own, so a request names either a group or findings, and the
-    /// server rejects a request that mixes `group_id` with `item_id` or
-    /// `item_ids`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
-    /// Client-ordered finding ids limiting a session queue to the findings
-    /// one rendered section shows.
-    ///
-    /// `None` runs every actionable finding of the session; the ids are
-    /// resolved verbatim in the given order, and unknown or non-actionable
-    /// ids are dropped instead of guessed at.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_ids: Option<Vec<u32>>,
+    /// Entity the request executes, flattened beside the execution overrides.
+    #[serde(flatten)]
+    pub target: ReviewExecuteTarget,
+    /// Coder rung the target runs on, when the client overrides the role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
+    /// Developer directives forwarded to the execution turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+}
+
+/// Target of one `review/execute` request.
+///
+/// The tag names the executed entity, so the combinations the previous flat
+/// payload admitted are unrepresentable here: a group run never names a
+/// finding, [`Self::Finding`] and [`Self::Findings`] are distinct targets, and
+/// no variant carries a `step_id`. This is the same discipline `ModelAskParams`
+/// applies to its two turn kinds, and it keeps the mutual exclusion in the type
+/// instead of in handler code.
+///
+/// A payload that still names a second target — a legacy flat payload without
+/// its `kind` tag, a group beside finding fields, a single finding beside an
+/// explicit selection, or the retired sub-step — fails to decode, so the
+/// boundary refuses it before any handler runs. The unified implementation
+/// pipeline executes the whole remaining horizon of the entity it is given,
+/// which is why no variant carries a `step_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewExecuteTarget {
+    /// Every actionable finding of every stored review session.
+    AllSessions,
+    /// The implicit queue of one whole review session.
+    Session(ReviewSessionTarget),
+    /// One finding of one review session.
+    Finding(ReviewFindingTarget),
+    /// A client-ordered selection of findings of one review session.
+    Findings(ReviewFindingsTarget),
+    /// The unified implementation horizon of one architectural review group.
+    Group(ReviewGroupTarget),
+}
+
+impl ReviewExecuteTarget {
+    /// Session the target addresses, or `None` for the cross-session run.
+    ///
+    /// Only [`Self::AllSessions`] names no session, so a consumer that needs
+    /// the session identifier reads it here instead of matching every variant
+    /// on its own.
+    pub fn review_id(&self) -> Option<&str> {
+        match self {
+            Self::AllSessions => None,
+            Self::Session(target) => Some(&target.review_id),
+            Self::Finding(target) => Some(&target.review_id),
+            Self::Findings(target) => Some(&target.review_id),
+            Self::Group(target) => Some(&target.review_id),
+        }
+    }
+}
+
+/// Whole-session target: the implicit queue of one stored session.
+///
+/// The payload refuses a field it does not declare, so a request that still
+/// names a finding, a selection, a group, or a retired sub-step fails to
+/// decode instead of being silently reduced to the session queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSessionTarget {
+    /// Identifier of the stored session whose queue is executed.
+    pub review_id: String,
+}
+
+/// Single-finding target.
+///
+/// The payload refuses a field it does not declare, so a finding never travels
+/// beside an explicit selection, a group identifier, or a retired sub-step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingTarget {
+    /// Identifier of the stored session that declares the finding.
+    pub review_id: String,
+    /// Audit ordinal of the finding inside that session.
+    pub item_id: u32,
+}
+
+/// Client-ordered selection of findings of one session.
+///
+/// The ids resolve verbatim in the given order, and unknown or non-actionable
+/// ids are dropped instead of being guessed at. The payload refuses a field it
+/// does not declare, so a selection never travels beside a single finding, a
+/// group identifier, or a retired sub-step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingsTarget {
+    /// Identifier of the stored session whose findings are executed.
+    pub review_id: String,
+    /// Finding ids in client order.
+    pub item_ids: Vec<u32>,
+}
+
+/// Unified-horizon target of one architectural review group.
+///
+/// A group owns a single root-cause plan, so the target names the group itself
+/// and never one of the findings it collects. The payload refuses a field it
+/// does not declare, so a group never travels beside a finding, a selection, or
+/// a retired sub-step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGroupTarget {
+    /// Identifier of the stored session that declares the group.
+    pub review_id: String,
+    /// Identifier of the group inside that session.
+    pub group_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

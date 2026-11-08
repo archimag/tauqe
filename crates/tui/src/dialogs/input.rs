@@ -2,12 +2,16 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
-use tauqe_protocol::{methods, DiscussionFocus, ModelResult, ReviewStartParams};
+use tauqe_protocol::{
+    methods, DiscussionFocus, ModelResult, ReviewExecuteParams, ReviewExecuteTarget,
+    ReviewFindingTarget, ReviewFindingsTarget, ReviewGroupTarget, ReviewSessionTarget,
+    ReviewStartParams,
+};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{
-    ActiveModal, AppState, BatchCancelButton, HelpTab, PendingReviewLaunch, ReviewDialogState,
-    ViewMode,
+    ActiveModal, AppState, BatchCancelButton, ConfirmExecuteReviewState, HelpTab,
+    PendingReviewLaunch, ReviewDialogState, ViewMode,
 };
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::command::is_bare_press;
@@ -334,37 +338,8 @@ pub(crate) async fn confirm_execute_review(
     } else {
         None
     };
-    // A group plan addresses the group itself: its steps are synthesized
-    // just-in-time and executed as one coherent change set, so no per-finding
-    // queue travels with the request. A step of that plan travels only together
-    // with its group, and a finding-level request never names a group (c-1,
-    // c-2, c-4).
-    let group_id = target.group_id.clone();
-    let step_id = target.step_id.clone().filter(|_| group_id.is_some());
-    let item_id = target.item_id.filter(|_| group_id.is_none());
-    // A section queue names the findings the confirmation showed, so the server
-    // runs exactly the audited selection instead of re-deriving a wider queue
-    // behind a dialog that promised less. A whole-session launch is the
-    // opposite contract: it names the session and leaves the members to the
-    // server, so the implicit queue built there subsumes the architectural
-    // groups — executed through their root-cause plans — exactly as the
-    // cross-session batch does, and no finding list may narrow it (concept
-    // #c-1, #c-2).
-    let item_ids = if !target.whole_session
-        && group_id.is_none()
-        && target.review_id.is_some()
-        && item_id.is_none()
-    {
-        Some(target.items.iter().map(|issue| issue.id).collect())
-    } else {
-        None
-    };
-    let params = tauqe_protocol::ReviewExecuteParams {
-        review_id: target.review_id,
-        item_id,
-        step_id,
-        group_id,
-        item_ids,
+    let params = ReviewExecuteParams {
+        target: review_execute_target(&target),
         model,
         instructions,
     };
@@ -379,6 +354,37 @@ pub(crate) async fn confirm_execute_review(
     )
     .await;
     Ok(())
+}
+
+/// Maps the confirmed execution dialog onto the typed wire target.
+///
+/// One dialog state serves every launch shape, so the mapping states which
+/// target each shape becomes: a group confirmation addresses the group itself,
+/// because the unified pipeline executes its whole remaining horizon; a
+/// whole-session launch names the session, a single finding
+/// names that finding, an explicit section queue names its findings in the order
+/// the dialog showed them, and a request without a session is the cross-session
+/// run (c-1, c-2, c-4).
+fn review_execute_target(target: &ConfirmExecuteReviewState) -> ReviewExecuteTarget {
+    let Some(review_id) = target.review_id.clone() else {
+        return ReviewExecuteTarget::AllSessions;
+    };
+    if let Some(group_id) = target.group_id.clone() {
+        return ReviewExecuteTarget::Group(ReviewGroupTarget {
+            review_id,
+            group_id,
+        });
+    }
+    if let Some(item_id) = target.item_id {
+        return ReviewExecuteTarget::Finding(ReviewFindingTarget { review_id, item_id });
+    }
+    if target.whole_session {
+        return ReviewExecuteTarget::Session(ReviewSessionTarget { review_id });
+    }
+    ReviewExecuteTarget::Findings(ReviewFindingsTarget {
+        review_id,
+        item_ids: target.items.iter().map(|issue| issue.id).collect(),
+    })
 }
 
 /// Launches a plan-step batch execution from a developer confirmation.
@@ -1884,7 +1890,6 @@ mod tests {
             "Session rev-1".to_string(),
             "All remaining TODO findings".to_string(),
             None,
-            None,
             vec![review_issue(1), review_issue(2)],
             Vec::new(),
         )
@@ -1948,7 +1953,6 @@ mod tests {
             "Session rev-1".to_string(),
             "All remaining TODO findings".to_string(),
             None,
-            None,
             vec![review_issue(1), review_issue(2)],
             Vec::new(),
         )
@@ -1991,7 +1995,6 @@ mod tests {
             Some("rev-arch".to_string()),
             "Session rev-arch".to_string(),
             "All remaining TODO findings".to_string(),
-            None,
             None,
             items,
             Vec::new(),
@@ -2395,7 +2398,6 @@ mod tests {
                 Some("rev-1".to_string()),
                 "Session rev-1".to_string(),
                 "Unified auth guard".to_string(),
-                None,
                 None,
                 vec![review_issue(1), review_issue(2)],
                 Vec::new(),

@@ -572,7 +572,7 @@ pub struct ModelRolesEntries {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub architect: Vec<ModelEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub primary: Vec<ModelEntry>,
+    pub repl: Vec<ModelEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewer: Vec<ModelEntry>,
     /// Provider catalog backing client-side display names.
@@ -594,7 +594,7 @@ pub struct ModelRolesSummary {
     pub scribe: ModelRef,
     pub coder: ModelRef,
     pub architect: ModelRef,
-    pub primary: ModelRef,
+    pub repl: ModelRef,
     pub reviewer: ModelRef,
     /// Per-role reasoning-effort overrides, carried so clients can render each
     /// role's reasoning depth without re-reading configuration.

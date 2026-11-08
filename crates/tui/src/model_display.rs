@@ -170,8 +170,13 @@ fn collect_roles(summary: Option<&ModelRolesSummary>) -> HashMap<ModelRole, Mode
         (ModelRole::Scribe, &summary.scribe),
         (ModelRole::Coder, &summary.coder),
         (ModelRole::Architect, &summary.architect),
-        (ModelRole::REPL, &summary.primary),
+        (ModelRole::REPL, &summary.repl),
         (ModelRole::Reviewer, &summary.reviewer),
+        // The acceptance role is derived, not stored: the summary carries no
+        // dedicated acceptance entry, so the role follows the engine chain
+        // (gatekeeper, then Scribe, then the base `repl` entry) through the
+        // already-resolved Scribe model (c-1).
+        (ModelRole::Gatekeeper, &summary.scribe),
     ]
     .into_iter()
     .map(|(role, model)| {
@@ -190,8 +195,11 @@ fn role_effort(summary: &ModelRolesSummary, role: ModelRole) -> Option<Reasoning
         ModelRole::Scribe => efforts.scribe,
         ModelRole::Coder => efforts.coder,
         ModelRole::Architect => efforts.architect,
-        ModelRole::REPL => efforts.primary,
+        ModelRole::REPL => efforts.repl,
         ModelRole::Reviewer => efforts.reviewer,
+        // Only the model travels along the acceptance chain, so the role never
+        // borrows the reasoning depth of the summarizer it inherited from.
+        ModelRole::Gatekeeper => None,
     }
 }
 
@@ -265,7 +273,7 @@ mod tests {
             scribe: flash(),
             coder: deepseek(),
             architect: flash(),
-            primary: flash(),
+            repl: flash(),
             reviewer: deepseek(),
             efforts: Some(ModelRolesEffort {
                 coder: Some(ReasoningEffort::High),
@@ -327,16 +335,16 @@ mod tests {
         assert_eq!(coder.effort, Some(ReasoningEffort::High));
         assert_eq!(entry_label(&coder), "DeepSeek Flash [high]");
 
-        let primary = role_entry(ModelRole::REPL).expect("primary entry");
-        assert_eq!(primary.model, flash());
-        assert_eq!(primary.effort, None);
-        assert_eq!(entry_label(&primary), "Gemini Flash");
+        let repl = role_entry(ModelRole::REPL).expect("repl entry");
+        assert_eq!(repl.model, flash());
+        assert_eq!(repl.effort, None);
+        assert_eq!(entry_label(&repl), "Gemini Flash");
 
         // The role is a selection mechanism, never part of the printed name.
-        for label in [entry_label(&coder), entry_label(&primary)] {
+        for label in [entry_label(&coder), entry_label(&repl)] {
             assert!(!label.contains("Coder"), "got: {label}");
             assert!(!label.contains("[Cod]"), "got: {label}");
-            assert!(!label.contains("Primary"), "got: {label}");
+            assert!(!label.contains("REPL"), "got: {label}");
         }
     }
 
@@ -415,7 +423,7 @@ mod tests {
             scribe: ModelRef::openrouter("a/b"),
             coder: ModelRef::openrouter("a/b"),
             architect: ModelRef::openrouter("a/b"),
-            primary: ModelRef::openrouter("a/b"),
+            repl: ModelRef::openrouter("a/b"),
             reviewer: ModelRef::openrouter("a/b"),
             efforts: None,
             entries: Some(ModelRolesEntries {

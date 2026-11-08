@@ -683,10 +683,14 @@ impl<'a> PlanImplementationPipeline<'a> {
             scope: self.scope.clone(),
             failed_step: failed_step.clone(),
             failure: failure.map(|failure| failure.reason().to_string()),
-            // The wave runs on exactly the rung the ladder handed out: the resolved
-            // pair travels as the explicit selection of the request, so the host
-            // executes it without re-deriving the policy.
-            selection: Some(ModelSelection::Specific(tier.model)),
+            // The wave runs on exactly the rung the ladder handed out, so the
+            // whole rung travels as the explicit selection of the request: its
+            // pair addresses the configured entry, and the host resolves the
+            // runtime parameters of that entry instead of re-deriving the policy.
+            selection: Some(ModelSelection::Tier {
+                model: tier.model,
+                effort: tier.effort,
+            }),
             reasoning_effort: tier.effort,
             instructions: self.options.instructions.clone(),
             marker: self.options.marker.clone(),
@@ -1063,7 +1067,7 @@ mod tests {
     fn config_with_ladder(architect: Vec<ModelEntry>, max_replans: usize) -> AppConfig {
         let mut config = AppConfig {
             models: ModelsConfig {
-                primary: vec![ModelEntry::from(ModelRef::openrouter("base/primary"))],
+                repl: vec![ModelEntry::from(ModelRef::openrouter("base/primary"))],
                 architect: Some(architect),
                 ..ModelsConfig::default()
             },
@@ -1220,9 +1224,10 @@ mod tests {
         assert_eq!(waves[0].failed_step, None);
         assert_eq!(
             waves[0].selection,
-            Some(ModelSelection::Specific(ModelRef::openrouter(
-                "architect/one"
-            )))
+            Some(ModelSelection::Tier {
+                model: ModelRef::openrouter("architect/one"),
+                effort: None,
+            })
         );
 
         let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
@@ -1302,9 +1307,10 @@ mod tests {
         );
         assert_eq!(
             waves[0].selection,
-            Some(ModelSelection::Specific(ModelRef::openrouter(
-                "architect/one"
-            )))
+            Some(ModelSelection::Tier {
+                model: ModelRef::openrouter("architect/one"),
+                effort: Some(ReasoningEffort::Low),
+            })
         );
         assert_eq!(waves[0].reasoning_effort, Some(ReasoningEffort::Low));
     }
@@ -1376,9 +1382,10 @@ mod tests {
         assert_eq!(waves[0].failed_step.as_deref(), Some("1"));
         assert_eq!(
             waves[0].selection,
-            Some(ModelSelection::Specific(ModelRef::openrouter(
-                "architect/two"
-            )))
+            Some(ModelSelection::Tier {
+                model: ModelRef::openrouter("architect/two"),
+                effort: Some(ReasoningEffort::High),
+            })
         );
         assert_eq!(waves[0].reasoning_effort, Some(ReasoningEffort::High));
 
@@ -1390,6 +1397,77 @@ mod tests {
             stored.implementation.last_replanned_step.as_deref(),
             Some("1")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_failure_escalates_a_single_model_ladder_by_effort() {
+        let dir = tempdir().unwrap();
+        let shared = ModelRef::openrouter("architect/shared");
+        let low = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::Low));
+        let high = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::High));
+        PlanStorage::save_plan(
+            dir.path(),
+            &plan_with(
+                concept(),
+                vec![leaf("1", PlanItemStatus::Todo)],
+                Some(low),
+                // The horizon was already reprojected around step `1`, so the next
+                // failure of that very step is a repeated failure.
+                Some("1".to_string()),
+            ),
+        )
+        .unwrap();
+
+        let host = ScriptedHost::new(
+            vec![
+                StepTurnResult::Blocked("the approved structure cannot express it".to_string()),
+                StepTurnResult::Success {
+                    summary: "reprojected".to_string(),
+                    commit: None,
+                },
+            ],
+            vec![RefinementResult::Synthesized {
+                items: vec![leaf("2", PlanItemStatus::Todo)],
+                tier: high.clone(),
+            }],
+        );
+        let channels = Channels::new();
+
+        let report = run_scope(
+            dir.path(),
+            plan_scope(),
+            &host,
+            config_with_ladder(
+                vec![
+                    ModelEntry::new(shared.clone(), Some(ReasoningEffort::Low)),
+                    ModelEntry::new(shared.clone(), Some(ReasoningEffort::High)),
+                ],
+                2,
+            ),
+            &channels,
+        )
+        .await;
+
+        assert_eq!(report.stop, PlanImplementationStop::Completed);
+        assert_eq!(report.replans, 1);
+
+        let waves = host.refinements();
+        assert_eq!(waves[0].failed_step.as_deref(), Some("1"));
+        // Both rungs name the same model, so the whole rung travels as the
+        // selection: the requested depth is what tells them apart.
+        assert_eq!(
+            waves[0].selection,
+            Some(ModelSelection::Tier {
+                model: shared.clone(),
+                effort: Some(ReasoningEffort::High),
+            })
+        );
+        assert_eq!(waves[0].reasoning_effort, Some(ReasoningEffort::High));
+
+        let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.implementation.architect, Some(high));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,7 +16,7 @@ fn execute_request(review_id: &str) -> Request {
     Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
-        params: Some(serde_json::json!({ "review_id": review_id })),
+        params: Some(serde_json::json!({ "kind": "session", "review_id": review_id })),
     }
 }
 

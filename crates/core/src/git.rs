@@ -8,7 +8,10 @@
 //! wall-clock budget every Git command runs under. Both are declared in
 //! `tauqe.toml`, which the substrate must not read, so this module resolves them
 //! into a [`GitHooks`] decision and a [`GitDeadline`], and hands those decisions
-//! to every committing entry point.
+//! to every committing entry point. Both decisions come from the same
+//! declaration, so one resolution answers them together: a step that consults the
+//! index gate, resolves its budget, and commits under its hook policy reads the
+//! layered document once instead of once per decision.
 //!
 //! The checkpoint capture and the step commit also observe the turn's cancellation
 //! signal, so a repository hook or a signing agent that holds the commit is
@@ -33,30 +36,39 @@ use std::time::{Duration, Instant};
 use tauqe_tools::git::checkpoint::{index_availability, IndexAvailability};
 use tokio::sync::watch;
 
-/// Resolves the hook policy a commit inside `dir` follows.
+/// The harness-specific inputs every committing Git step of `dir` runs under.
 ///
-/// The declaration is read from the project configuration of the directory the
-/// commit targets, so a turn never inherits the settings of whatever process it
-/// happens to run in. An absent or unreadable configuration keeps the harness
-/// default, which bypasses the hooks.
-fn hooks_for(dir: &Path) -> GitHooks {
-    if crate::config::load_git_config(dir).bypass_hooks {
-        GitHooks::Bypass
-    } else {
-        GitHooks::Run
-    }
+/// The hook policy and the wall-clock budget are two properties of the same
+/// `[git]` declaration, so one resolution answers both. Resolving them
+/// separately made a checkpoint capture read the layered document three times:
+/// once for the index gate, once for its own budget, and once for the hook
+/// policy.
+struct GitPolicy {
+    /// Whether the commit bypasses the repository hooks.
+    hooks: GitHooks,
+    /// The wall-clock budget and cancellation signal every Git child runs under.
+    deadline: GitDeadline,
 }
 
-/// Resolves the wall-clock budget of every Git command a turn runs against
-/// `dir`, together with the cancellation signal of that turn.
-///
-/// The declaration is read from the project configuration of the directory the
-/// command targets, exactly as the hook policy is, so a turn never inherits the
-/// budget of whatever process it happens to run in. An absent or unreadable
-/// configuration keeps the harness default.
-fn git_deadline(dir: &Path, cancel: Option<watch::Receiver<bool>>) -> GitDeadline {
-    let timeout_secs = crate::config::load_git_config(dir).timeout_secs;
-    GitDeadline::with_timeout(timeout_secs).with_cancel(cancel)
+impl GitPolicy {
+    /// Resolves the policy of the directory a Git step targets.
+    ///
+    /// The declaration is read from the project configuration of that directory,
+    /// so a turn never inherits the settings of whatever process it happens to run
+    /// in. An absent or unreadable configuration keeps the harness defaults.
+    fn resolve(dir: &Path, cancel: Option<watch::Receiver<bool>>) -> Self {
+        let config = crate::config::load_git_config(dir);
+        let timeout_secs = config.timeout_secs;
+        let hooks = if config.bypass_hooks {
+            GitHooks::Bypass
+        } else {
+            GitHooks::Run
+        };
+        Self {
+            hooks,
+            deadline: GitDeadline::with_timeout(timeout_secs).with_cancel(cancel),
+        }
+    }
 }
 
 /// Refuses a transaction step that begins after the turn was cancelled.
@@ -124,11 +136,30 @@ pub enum IndexGateError {
 /// The lock location and the staleness rule stay in the substrate, which is the
 /// only layer allowed to address `.git`; this gate owns the retry policy and the
 /// typed refusal.
+///
+/// A caller outside a transaction step enters through this entry point, which
+/// resolves the policy of the repository on its own. A committing entry point
+/// resolves that policy once and hands the same budget to the gate and to the
+/// command that follows it.
 pub fn ensure_index_available(
     dir: &Path,
     cancel: Option<&watch::Receiver<bool>>,
 ) -> Result<(), IndexGateError> {
-    let deadline = git_deadline(dir, cancel.cloned());
+    let policy = GitPolicy::resolve(dir, cancel.cloned());
+    await_index_available(dir, &policy.deadline, cancel)
+}
+
+/// Awaits the index under a budget the caller has already resolved.
+///
+/// The transactional entry points resolve the policy of their repository once and
+/// hand the same budget to the gate and to the command that follows it, so one
+/// transaction step reads the layered project configuration once instead of once
+/// per decision.
+fn await_index_available(
+    dir: &Path,
+    deadline: &GitDeadline,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<(), IndexGateError> {
     let started = Instant::now();
     let mut pause = INDEX_GATE_INITIAL_PAUSE;
 
@@ -138,7 +169,7 @@ pub fn ensure_index_available(
         if cancel.is_some_and(|cancel| *cancel.borrow()) {
             return Err(IndexGateError::Cancelled);
         }
-        match index_availability(dir, &deadline) {
+        match index_availability(dir, deadline) {
             IndexAvailability::Free | IndexAvailability::Reclaimed => return Ok(()),
             IndexAvailability::Held(age) => {
                 tracing::debug!(
@@ -163,9 +194,10 @@ pub mod checkpoint {
     //! Checkpoints, step commits, squash, and crash recovery.
     //!
     //! The committing entry points resolve the hook policy and the wall-clock
-    //! budget of the target repository, and delegate the transaction itself to
-    //! the substrate. The capture and the step commit additionally observe the
-    //! turn's cancellation signal, which they hand to every Git child they run.
+    //! budget of the target repository in one resolution, and delegate the
+    //! transaction itself to the substrate. The capture and the step commit
+    //! additionally observe the turn's cancellation signal, which they hand to
+    //! every Git child they run.
     use std::path::Path;
 
     use tokio::sync::watch;
@@ -191,12 +223,12 @@ pub mod checkpoint {
         super::refuse_cancelled(cancel, "checkpoint capture")?;
         // The capture commits, and Git refuses a commit while another process
         // holds the index, so the gate runs before the first repository probe.
-        super::ensure_index_available(dir, cancel)?;
-        let deadline = super::git_deadline(dir, cancel.cloned());
+        let policy = super::GitPolicy::resolve(dir, cancel.cloned());
+        super::await_index_available(dir, &policy.deadline, cancel)?;
         tauqe_tools::git::checkpoint::create_checkpoint_with_deadline(
             dir,
-            super::hooks_for(dir),
-            &deadline,
+            policy.hooks,
+            &policy.deadline,
         )
     }
 
@@ -215,14 +247,14 @@ pub mod checkpoint {
         super::refuse_cancelled(cancel, "step commit")?;
         // The commit writes the index, so a lock another process holds would
         // fail it halfway through; the gate settles that before it starts.
-        super::ensure_index_available(dir, cancel)?;
-        let deadline = super::git_deadline(dir, cancel.cloned());
+        let policy = super::GitPolicy::resolve(dir, cancel.cloned());
+        super::await_index_available(dir, &policy.deadline, cancel)?;
         tauqe_tools::git::checkpoint::create_step_commit_with_deadline(
             dir,
             changed_files,
             step_name,
-            super::hooks_for(dir),
-            &deadline,
+            policy.hooks,
+            &policy.deadline,
         )
     }
 
@@ -233,14 +265,14 @@ pub mod checkpoint {
         changed_files: &[String],
         commit_message: &str,
     ) -> anyhow::Result<String> {
-        let deadline = super::git_deadline(dir, None);
+        let policy = super::GitPolicy::resolve(dir, None);
         tauqe_tools::git::checkpoint::finalize_ai_commit_with_deadline(
             dir,
             checkpoint,
             changed_files,
             commit_message,
-            super::hooks_for(dir),
-            &deadline,
+            policy.hooks,
+            &policy.deadline,
         )
     }
 
@@ -250,20 +282,24 @@ pub mod checkpoint {
         changed_files: &[String],
         commit_message: &str,
     ) -> anyhow::Result<String> {
-        let deadline = super::git_deadline(dir, None);
+        let policy = super::GitPolicy::resolve(dir, None);
         tauqe_tools::git::checkpoint::create_ai_commit_with_deadline(
             dir,
             changed_files,
             commit_message,
-            super::hooks_for(dir),
-            &deadline,
+            policy.hooks,
+            &policy.deadline,
         )
     }
 
     /// Restores the working tree to its pre-turn state.
     pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> anyhow::Result<()> {
-        let deadline = super::git_deadline(dir, None);
-        tauqe_tools::git::checkpoint::restore_checkpoint_with_deadline(dir, checkpoint, &deadline)
+        let policy = super::GitPolicy::resolve(dir, None);
+        tauqe_tools::git::checkpoint::restore_checkpoint_with_deadline(
+            dir,
+            checkpoint,
+            &policy.deadline,
+        )
     }
 }
 
@@ -282,13 +318,13 @@ pub mod cmd {
         message: &str,
         allow_empty: bool,
     ) -> anyhow::Result<()> {
-        let deadline = super::git_deadline(dir, None);
+        let policy = super::GitPolicy::resolve(dir, None);
         tauqe_tools::git::cmd::commit_with_developer_author_with_deadline(
             dir,
             message,
             allow_empty,
-            super::hooks_for(dir),
-            &deadline,
+            policy.hooks,
+            &policy.deadline,
         )
     }
 }
@@ -309,12 +345,8 @@ pub mod diff {
         base_ref: &str,
         message: &str,
     ) -> anyhow::Result<String> {
-        tauqe_tools::git::diff::squash_to_single_commit(
-            dir,
-            base_ref,
-            message,
-            super::hooks_for(dir),
-        )
+        let policy = super::GitPolicy::resolve(dir, None);
+        tauqe_tools::git::diff::squash_to_single_commit(dir, base_ref, message, policy.hooks)
     }
 }
 
@@ -337,9 +369,10 @@ pub mod state {
         initial_commit: bool,
     ) -> anyhow::Result<RepositoryState> {
         // Without a directory the command runs in the process working directory,
-        // which is therefore where the hook policy is declared.
+        // which is therefore where the harness policy is declared.
         let policy_root = dir.unwrap_or_else(|| Path::new("."));
-        tauqe_tools::git::state::init_repository(dir, initial_commit, super::hooks_for(policy_root))
+        let policy = super::GitPolicy::resolve(policy_root, None);
+        tauqe_tools::git::state::init_repository(dir, initial_commit, policy.hooks)
     }
 }
 
@@ -360,9 +393,17 @@ pub use state::{
 #[cfg(test)]
 mod tests {
     use super::{
-        create_checkpoint, create_step_commit, ensure_index_available, hooks_for, run_git,
-        GitHooks, IndexGateError,
+        create_checkpoint, create_step_commit, ensure_index_available, run_git, GitHooks,
+        IndexGateError,
     };
+
+    /// Resolves the hook policy the commit of `dir` follows.
+    ///
+    /// The committing entry points resolve the whole policy once per step; the
+    /// tests read the one decision they assert from that same resolution.
+    fn hooks_for(dir: &std::path::Path) -> GitHooks {
+        super::GitPolicy::resolve(dir, None).hooks
+    }
 
     /// The hook policy is the one harness-specific input of the Git substrate, so
     /// its resolution is pinned here: the substrate crate receives the decision

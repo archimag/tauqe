@@ -49,6 +49,18 @@ static DISCUSSION_RESPONSE_SCHEMA_DEFINITION: OnceLock<serde_json::Value> = Once
 /// Process-wide cache of the project custom tool invocation contract.
 static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
+/// Fixed nesting depth the unrolled plan schema admits.
+///
+/// Strict Structured Output mode rejects a definition that references itself,
+/// so the plan tree is unrolled into one definition per level instead of a
+/// cyclic `$ref`. The value sits at the deep end of the 2-3 level calibration
+/// for interactive planning: deep enough for a concept subtree and a task
+/// group with nested steps, small enough that the unrolled schema stays well
+/// inside the provider size quotas. The deepest level seals `children` to an
+/// empty array, so a deeper node is rejected by the schema instead of being
+/// silently truncated.
+pub const PLAN_TREE_DEPTH: usize = 3;
+
 /// Generates the structured plan payload property of the plan contract.
 ///
 /// The plan shape is declared here once, beside the Rust plan model it mirrors,
@@ -70,6 +82,11 @@ static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 pub fn plan_update_schema() -> &'static serde_json::Value {
     PLAN_UPDATE_SCHEMA
         .get_or_init(|| {
+            // The collection descriptions state the fixed unroll depth, so the
+            // model knows the tree stops at the deepest level instead of
+            // guessing why a `children` array stays empty.
+            let concept_description = format!("Hierarchical architectural concept items (requirements, invariants, decisions), unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children. Mandatory when action is 'save' to establish the conceptual foundation.");
+            let items_description = format!("Hierarchical implementation plan items or steps, unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children; an 'update' action may add leaf steps only");
             serde_json::json!({
                 "anyOf": [
                     {
@@ -104,16 +121,16 @@ pub fn plan_update_schema() -> &'static serde_json::Value {
                             },
                             "concept": {
                                 "type": "array",
-                                "description": "Hierarchical architectural concept items (requirements, invariants, decisions). Mandatory when action is 'save' to establish the conceptual foundation.",
+                                "description": concept_description,
                                 "items": {
-                                    "$ref": "#/$defs/ConceptItem"
+                                    "$ref": "#/$defs/ConceptItemL1"
                                 }
                             },
                             "items": {
                                 "type": "array",
-                                "description": "Hierarchical implementation plan items or steps; an 'update' action may add leaf steps only",
+                                "description": items_description,
                                 "items": {
-                                    "$ref": "#/$defs/PlanItem"
+                                    "$ref": "#/$defs/PlanItemL1"
                                 }
                             }
                         },
@@ -129,18 +146,172 @@ pub fn plan_update_schema() -> &'static serde_json::Value {
         })
 }
 
+/// Builds the `children` property one unrolled definition level declares.
+///
+/// A level above the deepest one chains to the next level of its own kind, so
+/// the unrolled definitions form an acyclic chain and no `$ref` points back at
+/// a level above it — the property strict Structured Output mode requires in
+/// place of a cyclic self-reference. The deepest level seals the array
+/// instead: `maxItems: 0` forbids every element, and the strict empty-object
+/// `items` schema keeps the seal exact on endpoints that treat the schema as a
+/// strong hint rather than a guarantee.
+fn children_property(kind: &str, level: usize, description: &str) -> serde_json::Value {
+    if level < PLAN_TREE_DEPTH {
+        serde_json::json!({
+            "type": "array",
+            "description": description,
+            "items": {
+                "$ref": format!("#/$defs/{kind}L{}", level + 1)
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "array",
+            "maxItems": 0,
+            "description": "Deepest unrolled level of the plan tree: this array must remain empty, because the schema admits no node below it",
+            "items": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }
+        })
+    }
+}
+
+/// Builds one unrolled level of the concept-node definition.
+///
+/// Every level declares exactly the fields of `ConceptItem` and requires all
+/// of them, so a node at any depth validates against the same field contract
+/// as the Rust struct it mirrors.
+fn concept_item_definition(level: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "An architectural concept item or requirement",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Concept item identifier (e.g. 'c-1', '1.1')"
+            },
+            "title": {
+                "type": "string",
+                "description": "Short title or thesis of the concept item"
+            },
+            "details": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ],
+                "description": "Detailed explanation, rationale, or invariant"
+            },
+            "children": children_property(
+                "ConceptItem",
+                level,
+                "Sub-items or nested concept requirements"
+            )
+        },
+        "required": ["id", "title", "details", "children"],
+        "additionalProperties": false
+    })
+}
+
+/// Builds one unrolled level of the plan-step definition.
+///
+/// Every level declares exactly the fields of `PlanItem` and requires all of
+/// them, and the status description is verbatim at every depth, so a step at
+/// any level reads the same lifecycle narrowing as the Rust struct it mirrors.
+fn plan_item_definition(level: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "An item or step within a plan",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Step identifier (e.g. '1', '1.1')"
+            },
+            "title": {
+                "type": "string",
+                "description": "Short title of the step in the same language as the plan description and user request"
+            },
+            "details": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ],
+                "description": "Detailed description, requirements, or execution criteria in the same language as the plan description"
+            },
+            "status": {
+                "type": "string",
+                "enum": plan_item_status_enum(),
+                "description": "Status of the plan step. A step that a plan mutation creates or amends may carry only 'todo' or 'discussion': 'in_progress', 'blocked', and 'cancelled' belong to the execution pipeline and to the developer's manual control, while 'done' is reachable only through a verified step turn. An assignment of any other status to a created step is repaired to 'todo' and reported instead of being persisted."
+            },
+            "commit": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ],
+                "description": "Identifier of the Git commit that completed this step. The harness records it when the step reaches 'done', and a mutation that reproduces a finished step reproduces its commit verbatim."
+            },
+            "files": {
+                "type": "array",
+                "description": "Target repository-relative file paths for this implementation step",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "readonly_files": {
+                "type": "array",
+                "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "outer_docs": {
+                "type": "array",
+                "description": "Identifiers of the project-declared `[[outer_docs]]` entries preloaded as read-only reference context when this step executes",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "concept_refs": {
+                "type": "array",
+                "description": "IDs of referenced concept items",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "depends_on": {
+                "type": "array",
+                "description": "IDs of prerequisite steps that must reach DONE status before this step executes",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "children": children_property("PlanItem", level, "Sub-items or nested steps")
+        },
+        "required": ["id", "title", "details", "status", "commit", "files", "readonly_files", "outer_docs", "concept_refs", "depends_on", "children"],
+        "additionalProperties": false
+    })
+}
+
 /// Generates the shared definitions [`plan_update_schema`] references.
 ///
-/// A plan is a tree: concept nodes and implementation steps nest their own kind,
-/// so neither shape can be inlined into the payload without the payload
-/// containing itself. The definitions travel beside the payload, and a consumer
-/// lifts them to the root of its composed schema, which is where the
-/// `#/$defs/<Name>` references resolve.
+/// A plan is a tree: concept nodes and implementation steps nest their own
+/// kind, but strict Structured Output mode rejects a definition that
+/// references itself. The tree is therefore unrolled into one definition per
+/// depth — `ConceptItemL1`, `ConceptItemL2`, … and `PlanItemL1`,
+/// `PlanItemL2`, …, as many levels as [`PLAN_TREE_DEPTH`] declares — and the
+/// `children` array of each level chains to the next, deeper definition of
+/// the same kind. The reference graph is an acyclic chain that terminates at
+/// the deepest level, where `children` is sealed to an empty array and admits
+/// no node below it. The definitions travel beside the payload, and a
+/// consumer lifts them to the root of its composed schema, which is where
+/// the `#/$defs/<Name>` references resolve.
 ///
-/// `children` is declared on both definitions and points back to the definition
-/// that owns it, so a nested tree of any depth validates against the very same
-/// contract as its root. Every field of `ConceptItem` and `PlanItem` appears
-/// exactly once, and the `status` enum is generated from [`PlanItemStatus`], so
+/// Every level of one kind declares exactly the fields of the Rust struct it
+/// mirrors (`ConceptItem` or `PlanItem`) and requires all of them, so a node
+/// at any depth validates against the same field contract as its root. The
+/// `status` enum is generated from [`PlanItemStatus`] at every step level, so
 /// a variant the model gains or loses cannot drift away from the schema the
 /// model reads: the builder matches the enum exhaustively, and a test pins
 /// every generated spelling to the serde representation that travels on the
@@ -148,120 +319,24 @@ pub fn plan_update_schema() -> &'static serde_json::Value {
 ///
 /// The definitions are assembled once and served by a shared reference, so a
 /// consumer that embeds them clones the reference once instead of paying a
-/// per-call deep copy of both trees.
+/// per-call deep copy of the tree.
 pub fn plan_schema_definitions() -> &'static serde_json::Value {
-    PLAN_SCHEMA_DEFINITIONS
-        .get_or_init(|| {
-            serde_json::json!({
-                "ConceptItem": {
-                    "type": "object",
-                    "description": "An architectural concept item or requirement",
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": "Concept item identifier (e.g. 'c-1', '1.1')"
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Short title or thesis of the concept item"
-                        },
-                        "details": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Detailed explanation, rationale, or invariant"
-                        },
-                        "children": {
-                            "type": "array",
-                            "description": "Sub-items or nested concept requirements",
-                            "items": {
-                                "$ref": "#/$defs/ConceptItem"
-                            }
-                        }
-                    },
-                    "required": ["id", "title", "details", "children"],
-                    "additionalProperties": false
-                },
-                "PlanItem": {
-                    "type": "object",
-                    "description": "An item or step within a plan",
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": "Step identifier (e.g. '1', '1.1')"
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Short title of the step in the same language as the plan description and user request"
-                        },
-                        "details": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Detailed description, requirements, or execution criteria in the same language as the plan description"
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": plan_item_status_enum(),
-                            "description": "Status of the plan step. A step that a plan mutation creates or amends may carry only 'todo' or 'discussion': 'in_progress', 'blocked', and 'cancelled' belong to the execution pipeline and to the developer's manual control, while 'done' is reachable only through a verified step turn. An assignment of any other status to a created step is repaired to 'todo' and reported instead of being persisted."
-                        },
-                        "commit": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Identifier of the Git commit that completed this step. The harness records it when the step reaches 'done', and a mutation that reproduces a finished step reproduces its commit verbatim."
-                        },
-                        "files": {
-                            "type": "array",
-                            "description": "Target repository-relative file paths for this implementation step",
-                            "items": {
-                                "type": "string"
-                            }
-                        },
-                        "readonly_files": {
-                            "type": "array",
-                            "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
-                            "items": {
-                                "type": "string"
-                            }
-                        },
-                        "outer_docs": {
-                            "type": "array",
-                            "description": "Identifiers of the project-declared `[[outer_docs]]` entries preloaded as read-only reference context when this step executes",
-                            "items": {
-                                "type": "string"
-                            }
-                        },
-                        "concept_refs": {
-                            "type": "array",
-                            "description": "IDs of referenced concept items",
-                            "items": {
-                                "type": "string"
-                            }
-                        },
-                        "depends_on": {
-                            "type": "array",
-                            "description": "IDs of prerequisite steps that must reach DONE status before this step executes",
-                            "items": {
-                                "type": "string"
-                            }
-                        },
-                        "children": {
-                            "type": "array",
-                            "description": "Sub-items or nested steps",
-                            "items": {
-                                "$ref": "#/$defs/PlanItem"
-                            }
-                        }
-                    },
-                    "required": ["id", "title", "details", "status", "commit", "files", "readonly_files", "outer_docs", "concept_refs", "depends_on", "children"],
-                    "additionalProperties": false
-                }
-            })
-        })
+    PLAN_SCHEMA_DEFINITIONS.get_or_init(|| {
+        let mut definitions = serde_json::Map::new();
+        // The levels are grouped by kind — every concept level, then every
+        // step level — in depth order, so identical state renders identical
+        // bytes and the map reads as two unrolled chains.
+        for level in 1..=PLAN_TREE_DEPTH {
+            definitions.insert(
+                format!("ConceptItemL{level}"),
+                concept_item_definition(level),
+            );
+        }
+        for level in 1..=PLAN_TREE_DEPTH {
+            definitions.insert(format!("PlanItemL{level}"), plan_item_definition(level));
+        }
+        serde_json::Value::Object(definitions)
+    })
 }
 
 /// Generates the structured review decision property of the review contract.
@@ -553,7 +628,7 @@ mod tests {
 
     use super::{
         discussion_response_schema, discussion_response_schema_definition, plan_item_status_wire,
-        plan_schema_definitions, plan_update_schema,
+        plan_schema_definitions, plan_update_schema, PLAN_TREE_DEPTH,
     };
     use crate::context::ContextAccess;
     use crate::discussion::{DiscussionPlanAction, DiscussionResponse};
@@ -705,7 +780,7 @@ mod tests {
         field: "plan_update_error",
         reason: "decode-boundary diagnostic: the structured stream records why a present plan_update could not be honored, so the model never authors the field",
     },
-];
+    ];
 
     /// Net count of square brackets a line opens.
     fn bracket_balance(line: &str) -> i32 {
@@ -800,24 +875,53 @@ mod tests {
         }
     }
 
-    /// Schema object that mirrors one struct declaration.
-    fn schema_object_for<'a>(
+    /// Returns every unrolled level definition of one plan tree kind.
+    fn plan_definition_levels<'a>(
+        definitions: &'a serde_json::Map<String, serde_json::Value>,
+        kind: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        (1..=PLAN_TREE_DEPTH)
+            .map(|level| plan_definition_level(definitions, kind, level))
+            .collect()
+    }
+
+    /// Returns one unrolled level definition of a plan tree kind.
+    fn plan_definition_level<'a>(
+        definitions: &'a serde_json::Map<String, serde_json::Value>,
+        kind: &str,
+        level: usize,
+    ) -> &'a serde_json::Value {
+        let name = format!("{kind}L{level}");
+        definitions
+            .get(name.as_str())
+            .unwrap_or_else(|| panic!("the plan tree declares {name}"))
+    }
+
+    /// Schema objects that mirror one struct declaration.
+    ///
+    /// The plan tree is unrolled into one definition per depth level, so a
+    /// mirrored struct can name several schema objects: every level of the
+    /// kind is compared against the same Rust declaration.
+    fn schema_objects_for<'a>(
         schema: &'a serde_json::Value,
         struct_name: &str,
-    ) -> &'a serde_json::Value {
+    ) -> Vec<&'a serde_json::Value> {
         match struct_name {
-            "DiscussionResponse" => schema,
-            "DiscussionPlanUpdate" => &schema["properties"]["plan_update"]["anyOf"][0],
-            "ReviewUpdateProposal" => &schema["properties"]["review_update"]["anyOf"][0],
-            "DiscussionContextRequest" => &schema["properties"]["context_requests"]["items"],
-            "RepoSearchRequest" => &schema["properties"]["repo_searches"]["items"],
-            "DirListRequest" => &schema["properties"]["dir_lists"]["items"],
-            "ConceptItem" => &schema["$defs"]["ConceptItem"],
-            "PlanItem" => &schema["$defs"]["PlanItem"],
+            "DiscussionResponse" => vec![schema],
+            "DiscussionPlanUpdate" => vec![&schema["properties"]["plan_update"]["anyOf"][0]],
+            "ReviewUpdateProposal" => vec![&schema["properties"]["review_update"]["anyOf"][0]],
+            "DiscussionContextRequest" => vec![&schema["properties"]["context_requests"]["items"]],
+            "RepoSearchRequest" => vec![&schema["properties"]["repo_searches"]["items"]],
+            "DirListRequest" => vec![&schema["properties"]["dir_lists"]["items"]],
+            "ConceptItem" | "PlanItem" => {
+                let definitions = schema["$defs"]
+                    .as_object()
+                    .expect("the plan payload ships its shared definitions");
+                plan_definition_levels(definitions, struct_name)
+            }
             other => panic!("no schema object mirrors {other}"),
         }
     }
-
     /// Declared fields of a struct minus the recorded exemptions.
     fn expected_schema_fields(source: &str, struct_name: &str) -> BTreeSet<String> {
         let declared = declared_struct_fields(source, struct_name);
@@ -880,46 +984,85 @@ mod tests {
         );
         assert_eq!(
             object["properties"]["concept"]["items"]["$ref"],
-            "#/$defs/ConceptItem"
+            "#/$defs/ConceptItemL1"
         );
         assert_eq!(
             object["properties"]["items"]["items"]["$ref"],
-            "#/$defs/PlanItem"
+            "#/$defs/PlanItemL1"
         );
+
+        // The collection descriptions state the fixed unroll depth, so the
+        // model learns the tree boundary from the payload contract itself.
+        for field in ["concept", "items"] {
+            let description = object["properties"][field]["description"]
+                .as_str()
+                .expect("the collection property states the unroll depth");
+            assert!(
+                description.contains(&format!("at most {PLAN_TREE_DEPTH} nesting levels")),
+                "{description}"
+            );
+        }
     }
 
     /// The definitions mirror `ConceptItem` and `PlanItem`, including `children`.
+    /// The unrolled definitions mirror `ConceptItem` and `PlanItem` at every
+    /// level.
     ///
-    /// Each definition requires exactly the fields it declares and nests its own
-    /// kind through `children`, so a tree of any depth validates against the
-    /// contract of its root. The `status` enum is generated from the Rust model,
-    /// and its spellings are the spellings serde actually emits.
+    /// The definitions are grouped by kind — every concept level, then every
+    /// step level — and each level requires exactly the fields its Rust struct
+    /// declares. A level above the deepest chains `children` to the next level
+    /// of its own kind, and the deepest level seals the array, so the
+    /// reference chain is acyclic and the tree stops exactly where the schema
+    /// says it stops. The `status` enum is generated from the Rust model, and
+    /// its spellings are the spellings serde actually emits.
     #[test]
     fn test_plan_definitions_mirror_the_plan_model() {
-        let definitions = plan_schema_definitions();
-        let names: Vec<String> = definitions
-            .as_object()
-            .map(|definitions| definitions.keys().cloned().collect())
-            .unwrap_or_default();
-        assert_eq!(
-            names,
-            vec!["ConceptItem".to_string(), "PlanItem".to_string()]
-        );
+        // The calibration fixes the unrolled depth, so changing it is an
+        // architectural decision that must revisit the whole suite.
+        assert_eq!(PLAN_TREE_DEPTH, 3);
 
-        for name in ["ConceptItem", "PlanItem"] {
-            let node = &definitions[name];
-            assert_eq!(node["type"], "object", "{name}");
-            assert_eq!(node["additionalProperties"], serde_json::json!(false));
-            assert_eq!(
-                declared_fields(node),
-                required_fields(node),
-                "{name} requires exactly the fields it declares"
-            );
-            assert_eq!(node["properties"]["children"]["type"], "array", "{name}");
-            assert_eq!(
-                node["properties"]["children"]["items"]["$ref"],
-                serde_json::json!(format!("#/$defs/{name}"))
-            );
+        let definitions = plan_schema_definitions();
+        let map = definitions
+            .as_object()
+            .expect("the unrolled definitions are an object");
+        let mut expected: Vec<String> = Vec::new();
+        for level in 1..=PLAN_TREE_DEPTH {
+            expected.push(format!("ConceptItemL{level}"));
+        }
+        for level in 1..=PLAN_TREE_DEPTH {
+            expected.push(format!("PlanItemL{level}"));
+        }
+        let names: Vec<String> = map.keys().cloned().collect();
+        assert_eq!(names, expected);
+
+        for kind in ["ConceptItem", "PlanItem"] {
+            for level in 1..=PLAN_TREE_DEPTH {
+                let node = plan_definition_level(map, kind, level);
+                assert_eq!(node["type"], "object", "{kind}L{level}");
+                assert_eq!(node["additionalProperties"], serde_json::json!(false));
+                assert_eq!(
+                    declared_fields(node),
+                    required_fields(node),
+                    "{kind}L{level} requires exactly the fields it declares"
+                );
+                let children = &node["properties"]["children"];
+                assert_eq!(children["type"], "array", "{kind}L{level}");
+                if level < PLAN_TREE_DEPTH {
+                    assert_eq!(
+                        children["items"]["$ref"],
+                        format!("#/$defs/{kind}L{}", level + 1),
+                        "{kind}L{level} chains to the next level of its own kind"
+                    );
+                } else {
+                    // The deepest level seals the tree: no element is admitted,
+                    // and the strict empty-object `items` keeps the seal exact.
+                    assert_eq!(children["maxItems"], serde_json::json!(0));
+                    assert_eq!(
+                        children["items"]["additionalProperties"],
+                        serde_json::json!(false)
+                    );
+                }
+            }
         }
 
         let statuses = [
@@ -930,14 +1073,17 @@ mod tests {
             PlanItemStatus::Blocked,
             PlanItemStatus::Cancelled,
         ];
-        let published: Vec<&str> = definitions["PlanItem"]["properties"]["status"]["enum"]
-            .as_array()
-            .expect("the status enum is an array")
-            .iter()
-            .filter_map(|status| status.as_str())
-            .collect();
-        let expected: Vec<&str> = statuses.into_iter().map(plan_item_status_wire).collect();
-        assert_eq!(published, expected);
+        for level in 1..=PLAN_TREE_DEPTH {
+            let node = plan_definition_level(map, "PlanItem", level);
+            let published: Vec<&str> = node["properties"]["status"]["enum"]
+                .as_array()
+                .expect("the status enum is an array")
+                .iter()
+                .filter_map(|status| status.as_str())
+                .collect();
+            let expected: Vec<&str> = statuses.into_iter().map(plan_item_status_wire).collect();
+            assert_eq!(published, expected, "PlanItemL{level}");
+        }
         for status in statuses {
             assert_eq!(
                 serde_json::to_value(status).unwrap(),
@@ -946,24 +1092,119 @@ mod tests {
         }
     }
 
+    /// Collects every `$ref` target reachable inside a schema node.
+    fn collect_reference_targets(node: &serde_json::Value, targets: &mut BTreeSet<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "$ref" {
+                        if let Some(target) = value.as_str() {
+                            targets.insert(target.to_string());
+                        }
+                    }
+                    collect_reference_targets(value, targets);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_reference_targets(item, targets);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks the `$ref` graph from one definition, failing on a cycle.
+    ///
+    /// `path` carries the definitions of the current walk, so a diamond-shaped
+    /// graph is harmless while a definition that reaches itself through its
+    /// own chain fails the walk.
+    fn walk_references(
+        definitions: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        path: &mut Vec<String>,
+    ) {
+        assert!(
+            !path.iter().any(|visited| visited.as_str() == name),
+            "cyclic $ref chain through {name}"
+        );
+        path.push(name.to_string());
+        let node = definitions
+            .get(name)
+            .unwrap_or_else(|| panic!("the reference {name} names no declared definition"));
+        let mut targets = BTreeSet::new();
+        collect_reference_targets(node, &mut targets);
+        for target in &targets {
+            let next = target
+                .strip_prefix("#/$defs/")
+                .expect("a definition reference stays inside $defs");
+            walk_references(definitions, next, path);
+        }
+        path.pop();
+    }
+
+    /// The unrolled chain resolves inside `$defs` and never cycles.
+    ///
+    /// A cyclic `$ref` is exactly what strict Structured Output mode rejects,
+    /// so the suite pins the two properties that replace it: every reference
+    /// the definitions emit resolves inside the definition map, and following
+    /// the references from any definition terminates instead of revisiting a
+    /// node on its own path.
+    #[test]
+    fn test_definition_references_resolve_and_never_cycle() {
+        let definitions = plan_schema_definitions();
+        let map = definitions
+            .as_object()
+            .expect("the unrolled definitions are an object");
+
+        let mut targets = BTreeSet::new();
+        collect_reference_targets(definitions, &mut targets);
+        assert!(!targets.is_empty());
+        for target in &targets {
+            let name = target
+                .strip_prefix("#/$defs/")
+                .unwrap_or_else(|| panic!("a definition reference stays inside $defs: {target}"));
+            assert!(
+                map.contains_key(name),
+                "the reference {target} names no declared definition"
+            );
+        }
+
+        // A depth-first walk from every definition terminates: the unrolled
+        // chain is acyclic, which is what strict mode requires in place of a
+        // self-referencing definition.
+        let mut path: Vec<String> = Vec::new();
+        for name in map.keys() {
+            walk_references(map, name, &mut path);
+        }
+        assert!(path.is_empty());
+    }
+
+    /// The status property states the lifecycle barrier the storage enforces.
     /// The status property states the lifecycle barrier the storage enforces.
     ///
     /// The enum admits every state a step can reach, while a mutation may
     /// introduce a step only as `todo` or `discussion`. The description carries
     /// that narrowing to the model, so a payload never asserts a status the
-    /// status barrier would repair.
+    /// status barrier would repair. The unrolled tree states it at every
+    /// level, so a step at any depth reads the same lifecycle.
     #[test]
     fn test_plan_item_status_description_states_the_creation_barrier() {
         let definitions = plan_schema_definitions();
-        let description = definitions["PlanItem"]["properties"]["status"]["description"]
-            .as_str()
-            .expect("the status property describes the lifecycle of a step");
-        assert!(
-            description.contains("'todo' or 'discussion'"),
-            "{description}"
-        );
-        assert!(description.contains("'done'"), "{description}");
-        assert!(description.contains("repaired"), "{description}");
+        let map = definitions
+            .as_object()
+            .expect("the unrolled definitions are an object");
+        for object in plan_definition_levels(map, "PlanItem") {
+            let description = object["properties"]["status"]["description"]
+                .as_str()
+                .expect("the status property describes the lifecycle of a step");
+            assert!(
+                description.contains("'todo' or 'discussion'"),
+                "{description}"
+            );
+            assert!(description.contains("'done'"), "{description}");
+            assert!(description.contains("repaired"), "{description}");
+        }
     }
 
     #[test]
@@ -988,17 +1229,17 @@ mod tests {
         let schema = discussion_response_schema();
 
         // 1. Every mirrored struct is compared against its own declaration, so
+        // 1. Every mirrored struct is compared against its own declaration, so
         //    a field the schema withholds is either recorded as a deliberate
-        //    exemption or reported as drift.
+        //    exemption or reported as drift. The unrolled plan tree mirrors one
+        //    struct at several depths, and every level is held to the same
+        //    contract.
         for struct_name in SCHEMA_MIRRORED_STRUCTS {
             let expected = expected_schema_fields(source_for_struct(struct_name), struct_name);
-            assert_strict_object(
-                struct_name,
-                schema_object_for(schema, struct_name),
-                &expected,
-            );
+            for object in schema_objects_for(schema, struct_name) {
+                assert_strict_object(struct_name, object, &expected);
+            }
         }
-
         // 2. The fields without an object shape carry their own contracts:
         //    repo_dirs is a nullable boolean and repo_maps is a path array.
         let dir_variants = schema["properties"]["repo_dirs"]["anyOf"]
@@ -1010,31 +1251,33 @@ mod tests {
         assert_eq!(schema["properties"]["repo_maps"]["items"]["type"], "string");
 
         // 3. Every PlanItemStatus variant must be expressible in the status enum.
-        let status_enum: BTreeSet<String> = schema["$defs"]["PlanItem"]["properties"]["status"]
-            ["enum"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for status in [
-            PlanItemStatus::Discussion,
-            PlanItemStatus::Todo,
-            PlanItemStatus::InProgress,
-            PlanItemStatus::Done,
-            PlanItemStatus::Blocked,
-            PlanItemStatus::Cancelled,
-        ] {
-            let wire = serde_json::to_value(status).unwrap();
-            let wire = wire.as_str().unwrap();
-            assert!(
-                status_enum.contains(wire),
-                "status enum is missing variant {wire}"
-            );
+        // 3. Every PlanItemStatus variant must be expressible in the status
+        //    enum of every unrolled step level.
+        for object in schema_objects_for(schema, "PlanItem") {
+            let status_enum: BTreeSet<String> = object["properties"]["status"]["enum"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for status in [
+                PlanItemStatus::Discussion,
+                PlanItemStatus::Todo,
+                PlanItemStatus::InProgress,
+                PlanItemStatus::Done,
+                PlanItemStatus::Blocked,
+                PlanItemStatus::Cancelled,
+            ] {
+                let wire = serde_json::to_value(status).unwrap();
+                let wire = wire.as_str().unwrap();
+                assert!(
+                    status_enum.contains(wire),
+                    "status enum is missing variant {wire}"
+                );
+            }
         }
-
         // 4. Every DiscussionPlanAction variant must be expressible in the
         //    plan_update.action enum.
         let action_enum: BTreeSet<String> = schema["properties"]["plan_update"]["anyOf"][0]
@@ -1140,13 +1383,15 @@ mod tests {
                 exemption.struct_name,
                 exemption.field
             );
-            let properties = declared_fields(schema_object_for(schema, exemption.struct_name));
-            assert!(
-                !properties.contains(exemption.field),
-                "{}.{} is published by the schema again, so its exemption must be retired",
-                exemption.struct_name,
-                exemption.field
-            );
+            for object in schema_objects_for(schema, exemption.struct_name) {
+                let properties = declared_fields(object);
+                assert!(
+                    !properties.contains(exemption.field),
+                    "{}.{} is published by the schema again, so its exemption must be retired",
+                    exemption.struct_name,
+                    exemption.field
+                );
+            }
         }
     }
 

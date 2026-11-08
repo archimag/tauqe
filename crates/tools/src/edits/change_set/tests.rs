@@ -988,3 +988,142 @@ fn a_refused_file_member_keeps_the_effect_of_an_earlier_member() {
     );
     assert!(result.staged_state.deleted_paths.is_empty());
 }
+
+/// A destination the disk commit could never create is refused while the change
+/// set is still purely in memory: a `create` beneath a component that already
+/// exists as a regular file fails with `ENOTDIR` and rolls the whole change set
+/// back instead of reporting the offending member.
+#[test]
+fn a_create_beneath_a_file_blocked_parent_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "src/new", "not a directory\n");
+
+    let created = EditOperation::Create {
+        path: "src/new/a.rs".to_string(),
+        content: "pub fn a() {}\n".to_string(),
+    };
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        std::slice::from_ref(&created),
+        None,
+    );
+
+    assert!(!result.is_success());
+    let failure = result.failed_files.first().expect("the create is refused");
+    assert_eq!(failure.path, "src/new/a.rs");
+    match &failure.error {
+        EditError::ParentNotDirectory { path, blocked_by } => {
+            assert_eq!(path, "src/new/a.rs");
+            assert_eq!(blocked_by, "src/new");
+        }
+        other => panic!("expected a blocked parent rejection, got {other:?}"),
+    }
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+    assert!(result.successful_paths.is_empty());
+}
+
+/// An `overwrite` reads the same admission as a `create`, so a destination
+/// beneath a blocked parent is refused with the same typed rejection.
+#[test]
+fn an_overwrite_beneath_a_file_blocked_parent_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "src/new", "not a directory\n");
+
+    let overwritten = EditOperation::Overwrite {
+        path: "src/new/a.rs".to_string(),
+        content: "pub fn a() {}\n".to_string(),
+    };
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        std::slice::from_ref(&overwritten),
+        None,
+    );
+
+    assert!(!result.is_success());
+    let failure = result
+        .failed_files
+        .first()
+        .expect("the overwrite is refused");
+    assert_eq!(failure.path, "src/new/a.rs");
+    match &failure.error {
+        EditError::ParentNotDirectory { blocked_by, .. } => assert_eq!(blocked_by, "src/new"),
+        other => panic!("expected a blocked parent rejection, got {other:?}"),
+    }
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.successful_paths.is_empty());
+}
+
+/// A rename proves the parent chain of its destination before it transfers any
+/// content, so the source keeps its place instead of being recorded as moved.
+#[test]
+fn a_rename_beneath_a_file_blocked_parent_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "a.txt", "from a\n");
+    write(root, "src/new", "not a directory\n");
+
+    let edits = [EditOperation::Move {
+        from: "a.txt".to_string(),
+        to: "src/new/a.txt".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["a.txt"]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    let failure = result.failed_files.first().expect("the rename is refused");
+    assert_eq!(failure.path, "src/new/a.txt");
+    match &failure.error {
+        EditError::ParentNotDirectory { blocked_by, .. } => assert_eq!(blocked_by, "src/new"),
+        other => panic!("expected a blocked parent rejection, got {other:?}"),
+    }
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(!result.staged_state.deleted_paths.contains("a.txt"));
+    assert!(result.successful_paths.is_empty());
+}
+
+/// A directory move proves the parent chain of every destination it expands
+/// into before the first file stages, so a blocked destination refuses the whole
+/// member instead of leaving a half-moved subtree behind.
+#[test]
+fn a_directory_move_beneath_a_file_blocked_parent_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "src/old/moved.rs", "fn moved() {}\n");
+    write(root, "src/new", "not a directory\n");
+    track_all(root);
+
+    let edits = [EditOperation::MoveDir {
+        from: "src/old".to_string(),
+        to: "src/new".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    let failure = result.failed_files.first().expect("the move is refused");
+    assert_eq!(failure.path, "src/new/moved.rs");
+    match &failure.error {
+        EditError::ParentNotDirectory { blocked_by, .. } => assert_eq!(blocked_by, "src/new"),
+        other => panic!("expected a blocked parent rejection, got {other:?}"),
+    }
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+    assert!(result.successful_paths.is_empty());
+}

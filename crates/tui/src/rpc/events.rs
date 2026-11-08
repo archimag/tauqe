@@ -86,7 +86,6 @@ fn retry_detail(data: &EditFileRetryingEvent) -> String {
         .replacen("{}", &data.reason, 1)
 }
 
-/// Builds the in-app warning that reports the plan mutations the harness refused
 /// Builds the error record that reports the plan mutations the harness refused
 /// during the turn.
 ///
@@ -131,6 +130,37 @@ fn compose_plan_notice(detail_key: &str, details: &str) -> String {
     let template = active_t(detail_key);
     notice.push_str(&template.replacen("{}", details, 1));
     notice
+}
+
+/// Resolves the localized label of one bounded-turn phase.
+///
+/// The footer pipeline and the last-resort diagnostic name a phase through the
+/// same catalog entries, so a diagnostic spells the phase exactly like the
+/// footer displays it (c-1).
+fn phase_label(phase: tauqe_protocol::TurnPhase) -> String {
+    active_t(match phase {
+        tauqe_protocol::TurnPhase::Research => "phase.research",
+        tauqe_protocol::TurnPhase::Proposal => "phase.proposal",
+        tauqe_protocol::TurnPhase::Staging => "phase.staging",
+        tauqe_protocol::TurnPhase::Verification => "phase.verification",
+        tauqe_protocol::TurnPhase::Healing => "phase.healing",
+    })
+}
+
+/// Builds the last-resort diagnostic of a turn that settled while its edit
+/// cycle stayed open.
+///
+/// The phase is read from the typed telemetry before the terminal cleanup
+/// clears it, so the diagnostic names where the cycle was left open instead of
+/// reporting a bare desynchronization. A turn that carried no phase falls back
+/// to the phase-less wording through its own catalog entry. Both wordings are
+/// interface text, so they resolve through the catalog like every other
+/// visible phrase (c-1).
+fn edit_desync_reason(phase: Option<tauqe_protocol::TurnPhase>) -> String {
+    match phase {
+        Some(phase) => active_t("notify.edit_desync_phase").replacen("{}", &phase_label(phase), 1),
+        None => active_t("notify.edit_desync"),
+    }
 }
 
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
@@ -529,7 +559,16 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.text.clear();
                     st.model.markdown_lines.clear();
                     st.model.code_blocks.clear();
+                    // The hyperlinks were painted from the answer being
+                    // dropped, and the edit cycle of the withdrawn attempt is
+                    // void as well: its streamed files, its activity flag, its
+                    // settled outcome with the reason, and its rendered diffs
+                    // are released before the next rung opens its own cycle on
+                    // a clean slate instead of inheriting a rejected badge
+                    // (c-1).
+                    st.model.links.clear();
                     st.model.reasoning.clear();
+                    st.model.discard_edit_cycle();
                 }
             }
         }
@@ -638,36 +677,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::EDIT_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFinishedEvent>(params) {
-                    st.model.edit_final_applied = Some(data.outcome.applied);
-                    st.model.edit_final_error = data.outcome.error;
-                    if let Some(hash) = data.outcome.commit_hash {
-                        st.model.last_commit_hash = Some(hash);
-                    }
-                    if data.outcome.applied {
-                        for f in st.model.files.iter_mut() {
-                            f.status = FileEditStatus::Ok;
-                            f.error = None;
-                            f.retry_info = None;
-                        }
-                    } else {
-                        let fallback_err = st
-                            .model
-                            .edit_final_error
-                            .clone()
-                            .or_else(|| Some(active_t("repl.edit_failed_fallback")));
-                        for f in st.model.files.iter_mut() {
-                            if matches!(
-                                f.status,
-                                FileEditStatus::Running | FileEditStatus::Retrying
-                            ) {
-                                f.status = FileEditStatus::Error;
-                                f.retry_info = None;
-                                if f.error.is_none() {
-                                    f.error = fallback_err.clone();
-                                }
-                            }
-                        }
-                    }
+                    // The client is a safeguard, not the only witness of the
+                    // closure: it settles the cycle the viewport still holds,
+                    // and a closing of a cycle whose buffers were released is
+                    // an idempotent no-op instead of a desync or a rejected
+                    // badge over a fresh attempt (c-1).
+                    st.model.close_edit_cycle(&data.outcome);
                 }
             }
         }
@@ -781,6 +796,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             // absent or malformed. Gating this block on payload parsing would
             // leave the spinner running, `is_busy()` blocking the prompt, and
             // the cancel dialog targeting a turn that has already ended (c-2).
+            // The last-resort diagnostic of an open edit cycle names the phase
+            // the turn was in, so the phase is read from the typed telemetry
+            // before the terminal cleanup clears it (c-1).
+            let desync_phase = st.model.turn_phase;
             st.model.status = TurnStatus::Done;
             st.model.toolchain = None;
             st.model.retrying = None;
@@ -794,7 +813,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     f.retry_info = None;
                 }
             } else {
-                fail_safe_reject_edits(&mut st.model, &active_t("notify.edit_desync"));
+                fail_safe_reject_edits(&mut st.model, &edit_desync_reason(desync_phase));
             }
             st.model.update_markdown();
             let h = st.last_model_height;
@@ -1224,6 +1243,9 @@ fn settle_batch_turn(st: &mut AppState, summary: &BatchFinishSummary) {
     // interface projects it instead of reconstructing a reason from the member
     // journals (c-1).
     let reason = batch_stop_reason(summary);
+    // The queue reports the same last-resort diagnostic, so the phase is read
+    // from the typed telemetry before the terminal cleanup clears it (c-1).
+    let desync_phase = st.model.turn_phase;
 
     let model = &mut st.model;
     model.reasoning.finalize();
@@ -1254,7 +1276,7 @@ fn settle_batch_turn(st: &mut AppState, summary: &BatchFinishSummary) {
             file.retry_info = None;
         }
     } else {
-        fail_safe_reject_edits(model, &active_t("notify.edit_desync"));
+        fail_safe_reject_edits(model, &edit_desync_reason(desync_phase));
     }
     model.update_markdown();
     model.clamp_scroll(height);
@@ -1409,6 +1431,7 @@ fn format_elapsed(seconds: u64) -> String {
         format!("{}m {}s", seconds / 60, seconds % 60)
     }
 }
+
 /// The supervisor queue a finished batch belongs to.
 ///
 /// The notification builder resolves the queue's localized label and status
@@ -1422,6 +1445,7 @@ enum BatchKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::edit::EditOutcome;
     use tauqe_protocol::{
         HistoryEntryStatus, ModelCatalogEntry, ModelFinishedEvent, ModelRef, ModelRole,
         ModelRolesEntries, ModelRolesSummary, ReasoningEffort, UiHistoryItem, UiHistoryKind,
@@ -1753,7 +1777,7 @@ mod tests {
             scribe: ModelRef::openrouter("scribe"),
             coder: ModelRef::openrouter("stronger-coder"),
             architect: ModelRef::openrouter("architect"),
-            primary: ModelRef::openrouter("primary"),
+            repl: ModelRef::openrouter("repl"),
             reviewer: ModelRef::openrouter("reviewer"),
             efforts: None,
             entries: Some(ModelRolesEntries {
@@ -3498,7 +3522,6 @@ mod tests {
             "the attempt detail must be composed from the catalog template"
         );
         assert!(file.error.is_none());
-        assert!(file.error.is_none());
     }
 
     /// The daemon resolves the coordinates of a hunk while it stages the change
@@ -3701,6 +3724,303 @@ mod tests {
         assert!(
             guard.history_view.has_more,
             "the dropped records stay reachable through paging"
+        );
+    }
+
+    fn edit_finished_event(outcome: EditOutcome) -> Event {
+        Event {
+            method: events::EDIT_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(EditFinishedEvent {
+                    operation_id: "op-stream".to_string(),
+                    outcome,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn stream_reset_event() -> Event {
+        Event {
+            method: events::MODEL_STREAM_RESET.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ModelStreamResetEvent {
+                    operation_id: "op-stream".to_string(),
+                    reason: "connection interrupted mid-stream".to_string(),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn model_finished_event() -> Event {
+        Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: None,
+        }
+    }
+
+    /// The client is a safeguard of the edit cycle: a closing that arrives
+    /// after the turn settled still applies to the shown turn, because the
+    /// viewport still holds the cycle the terminal fallback claimed (c-1).
+    #[tokio::test]
+    async fn test_edit_finished_after_the_terminal_event_settles_the_shown_turn() {
+        let mut st = crate::app::test_state();
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file(STREAMED_PATH)
+        });
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Verification);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(model_finished_event(), &state, &mut is_reasoning).await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(
+                guard.model.edit_final_applied,
+                Some(false),
+                "the terminal fallback claims the cycle the server left open"
+            );
+            assert_eq!(guard.model.files[0].status, FileEditStatus::Error);
+        }
+
+        handle_event(
+            edit_finished_event(EditOutcome {
+                applied: true,
+                changed_files: vec![STREAMED_PATH.to_string()],
+                commit_hash: Some("a1b2c3d".to_string()),
+                ..EditOutcome::default()
+            }),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.status,
+            TurnStatus::Done,
+            "the late closing settles the shown turn and never reopens it"
+        );
+        assert_eq!(guard.model.edit_final_applied, Some(true));
+        assert!(guard.model.edit_final_error.is_none());
+        assert_eq!(guard.model.files[0].status, FileEditStatus::Ok);
+        assert_eq!(guard.model.last_commit_hash.as_deref(), Some("a1b2c3d"));
+    }
+
+    /// A closing of a cycle the viewport no longer holds is an idempotent
+    /// no-op: the stream reset released the buffers, so the closing never
+    /// raises a desync nor stamps a rejected badge over a fresh attempt (c-1).
+    #[tokio::test]
+    async fn test_edit_finished_of_a_released_cycle_is_an_idempotent_noop() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(stream_reset_event(), &state, &mut is_reasoning).await;
+        handle_event(
+            edit_finished_event(EditOutcome {
+                applied: false,
+                error: Some("the streamed attempt was withdrawn".to_string()),
+                ..EditOutcome::default()
+            }),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert!(!guard.model.edits_active);
+        assert!(guard.model.files.is_empty());
+        assert!(
+            guard.model.edit_final_applied.is_none(),
+            "a released cycle keeps no settled outcome"
+        );
+        assert!(
+            guard.model.edit_final_error.is_none(),
+            "the withdrawal reason never reaches the fresh attempt"
+        );
+        assert!(
+            guard.active_notification().is_none(),
+            "a released cycle is not a desync"
+        );
+    }
+
+    /// The escalation sequence releases the withdrawn cycle completely:
+    /// closure, stream reset, and the next opening leave the viewport without
+    /// a stale badge and without a withdrawal reason, so the next rung renders
+    /// its own Modifying state from a clean slate (c-1).
+    #[tokio::test]
+    async fn test_stream_reset_releases_the_withdrawn_cycle_for_the_next_rung() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            edit_finished_event(EditOutcome {
+                applied: false,
+                error: Some("the streamed attempt was withdrawn".to_string()),
+                ..EditOutcome::default()
+            }),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(
+                guard.model.edit_final_applied,
+                Some(false),
+                "the withdrawal closes the cycle it opened"
+            );
+            assert!(guard.model.edit_final_error.is_some());
+        }
+
+        handle_event(stream_reset_event(), &state, &mut is_reasoning).await;
+        {
+            let guard = state.lock().await;
+            assert!(!guard.model.edits_active);
+            assert!(guard.model.files.is_empty());
+            assert!(
+                guard.model.edit_final_applied.is_none(),
+                "the rejected badge of the withdrawn attempt must not survive"
+            );
+            assert!(
+                guard.model.edit_final_error.is_none(),
+                "the withdrawal reason must not survive"
+            );
+        }
+
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let guard = state.lock().await;
+        assert!(guard.model.edits_active);
+        assert_eq!(
+            guard.model.files[0].status,
+            FileEditStatus::Running,
+            "the next rung opens its own cycle from a clean slate"
+        );
+        assert!(guard.model.edit_final_applied.is_none());
+    }
+
+    /// The last-resort desync diagnostic names the phase the cycle stayed open
+    /// in, read from the typed telemetry before the terminal cleanup clears it
+    /// (c-1).
+    #[tokio::test]
+    async fn test_edit_desync_diagnostic_names_the_phase() {
+        let mut st = crate::app::test_state();
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file(STREAMED_PATH)
+        });
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Staging);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(model_finished_event(), &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let diagnostic = guard
+            .model
+            .edit_final_error
+            .as_deref()
+            .expect("the last-resort diagnostic is recorded");
+        assert!(
+            diagnostic.contains(&active_t("phase.staging")),
+            "the diagnostic must name the phase the cycle stayed open in: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("{}"),
+            "the phase placeholder must be resolved: {diagnostic}"
+        );
+    }
+
+    /// A turn that carried no phase falls back to the phase-less wording
+    /// through its own catalog entry (c-1).
+    #[tokio::test]
+    async fn test_edit_desync_diagnostic_without_a_phase_uses_the_phase_less_wording() {
+        let mut st = crate::app::test_state();
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file(STREAMED_PATH)
+        });
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(model_finished_event(), &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.edit_final_error.as_deref(),
+            Some(active_t("notify.edit_desync").as_str())
+        );
+    }
+
+    /// The queue settles its shared turn through the same discipline: the
+    /// desync fallback names the phase read before the batch cleanup clears
+    /// the telemetry (c-1).
+    #[tokio::test]
+    async fn test_batch_desync_diagnostic_names_the_phase() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file(STREAMED_PATH)
+        });
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Healing);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            Event {
+                method: events::PLAN_BATCH_FINISHED.to_string(),
+                params: Some(
+                    serde_json::to_value(PlanBatchFinishedEvent {
+                        operation_id: "op-plan-batch".to_string(),
+                        summary: batch_summary(BatchFinishStatus::Completed, 1, 1, 12),
+                    })
+                    .unwrap(),
+                ),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        let diagnostic = guard
+            .model
+            .edit_final_error
+            .as_deref()
+            .expect("the queue records its own last-resort diagnostic");
+        assert!(
+            diagnostic.contains(&active_t("phase.healing")),
+            "the queue diagnostic must name the phase: {diagnostic}"
         );
     }
 }

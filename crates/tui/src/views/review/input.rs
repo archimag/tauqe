@@ -574,7 +574,6 @@ fn execute_review_finding_action(st: &mut AppState, session_id: &str, item_id: u
                 session_title,
                 item.title.clone(),
                 Some(item.id),
-                None,
                 vec![ReviewIssue::from(item)],
                 coder_entries,
             ));
@@ -637,7 +636,6 @@ fn execute_review_session_action(st: &mut AppState, session_id: &str) {
             Some(session.id.clone()),
             session_title,
             scope_title,
-            None,
             None,
             todo_items,
             coder_entries,
@@ -709,7 +707,6 @@ fn execute_review_group_action(
                 session_title,
                 scope_title,
                 None,
-                None,
                 items,
                 coder_entries,
             )
@@ -719,7 +716,6 @@ fn execute_review_group_action(
             Some(session.id.clone()),
             session_title,
             group_title.to_string(),
-            None,
             None,
             items,
             coder_entries,
@@ -794,76 +790,9 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         active_t("review.all_sessions_title"),
         queue_scope_title(group_plans),
         None,
-        None,
         todo_items,
         coder_entries,
     ));
-}
-
-/// Arms the point-execution confirmation for one step of a group plan.
-///
-/// A subplan step belongs to the unified plan of its group, so the confirmation
-/// carries the group target and the concrete step while still addressing one
-/// targeted unit of work: the Coder selector and the directives editor stay
-/// available (c-5, Conventions §6).
-fn execute_review_group_step_action(
-    st: &mut AppState,
-    session_id: &str,
-    group_id: &str,
-    step_id: &str,
-    step_title: &str,
-) {
-    if st.model.is_busy() {
-        st.notify_warning(active_t("notify.model_busy_esc"));
-        return;
-    }
-
-    let session = match find_session(st, session_id) {
-        Some(session) => session,
-        None => {
-            st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
-            return;
-        }
-    };
-
-    let session_title = if session.title.trim().is_empty() {
-        session.id.clone()
-    } else {
-        session.title.clone()
-    };
-    let group_title = session
-        .effective_groups()
-        .into_iter()
-        .find(|group| group.id == group_id)
-        .map(|group| group_display_title(&group))
-        .unwrap_or_else(|| group_id.to_string());
-
-    let items: Vec<ReviewIssue> = st
-        .review
-        .group_findings(&session, group_id)
-        .into_iter()
-        .filter(|item| is_actionable(item.status))
-        .map(ReviewIssue::from)
-        .collect();
-
-    let scope_title = active_t("review.group_step_scope")
-        .replacen("{}", step_title, 1)
-        .replacen("{}", &group_title, 1);
-
-    let coder_entries = st.coder_entries();
-    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-    st.modals.confirm_execute_review = Some(
-        crate::app::ConfirmExecuteReviewState::new(
-            Some(session.id.clone()),
-            session_title,
-            scope_title,
-            None,
-            Some(step_id.to_string()),
-            items,
-            coder_entries,
-        )
-        .with_group(group_id.to_string(), group_title),
-    );
 }
 
 fn format_item_for_clipboard(issue: &ReviewIssue) -> String {
@@ -1071,18 +1000,21 @@ pub async fn handle_review_key(
                     VisibleReviewRow::SubplanItem {
                         session_id,
                         group_id,
-                        step_id,
-                        title,
                         ..
                     } => {
-                        // Confirming on a step row executes exactly that step of
-                        // the group plan with the configured Coder (c-5).
-                        execute_review_group_step_action(
+                        // A step row belongs to the unified plan of its group, and
+                        // the pipeline executes that plan's remaining horizon as one
+                        // coherent change set, so the row arms the same binary
+                        // root-cause confirmation as the group header (c-1, c-5).
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
                             &mut st,
                             &session_id,
                             &group_id,
-                            &step_id,
+                            kind,
                             &title,
+                            &subplan,
                         );
                     }
                     // Confirming on a group header resolves through the group
@@ -1151,16 +1083,17 @@ pub async fn handle_review_key(
                     VisibleReviewRow::SubplanItem {
                         session_id,
                         group_id,
-                        step_id,
-                        title,
                         ..
                     } => {
-                        execute_review_group_step_action(
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
                             &mut st,
                             &session_id,
                             &group_id,
-                            &step_id,
+                            kind,
                             &title,
+                            &subplan,
                         );
                     }
                     // A group executes exactly its own scope, never the whole
@@ -1652,13 +1585,13 @@ mod tests {
         st.model_choice.roles = Some(ModelRolesSummary {
             architect: ModelRef::openrouter("test-arch"),
             coder: ModelRef::openrouter("test-coder"),
-            primary: ModelRef::openrouter("test-pri"),
+            repl: ModelRef::openrouter("test-repl"),
             reviewer: rev_model.clone(),
             scribe: ModelRef::openrouter("test-scribe"),
             efforts: Some(ModelRolesEffort {
                 architect: None,
                 coder: None,
-                primary: None,
+                repl: None,
                 reviewer: Some(ReasoningEffort::High),
                 scribe: None,
             }),
@@ -2383,7 +2316,6 @@ mod tests {
         assert_eq!(target.group_id.as_deref(), Some("arch"));
         assert_eq!(target.group_title, "Shared cause");
         assert!(target.item_id.is_none());
-        assert!(target.step_id.is_none());
         assert!(
             !target.is_single_target(),
             "a whole group plan confirms as a binary card"
@@ -2427,7 +2359,6 @@ mod tests {
             .as_ref()
             .expect("the group plan confirmation must be armed");
         assert_eq!(target.group_id.as_deref(), Some("arch"));
-        assert!(target.step_id.is_none());
         assert_eq!(
             target.scope_title,
             "Root-cause plan of group 'Shared cause' (not synthesized yet: projected just-in-time)"
@@ -2475,11 +2406,12 @@ mod tests {
         );
     }
 
-    /// `x` on a step of a group plan arms the point form for exactly that step,
-    /// so the developer keeps the Coder choice and the directives editor
-    /// (c-5).
+    /// `x` on a step of a group plan arms the same binary root-cause
+    /// confirmation as the group header: the unified pipeline executes the
+    /// plan's remaining horizon as one coherent change set, so no step is ever
+    /// dispatched alone (c-1, c-5).
     #[tokio::test]
-    async fn test_x_on_a_group_plan_step_arms_the_single_step_form() {
+    async fn test_x_on_a_group_plan_step_arms_the_root_cause_plan() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
@@ -2496,13 +2428,17 @@ mod tests {
             .modals
             .confirm_execute_review
             .as_ref()
-            .expect("the step confirmation must be armed");
+            .expect("the step row arms the root-cause plan");
+        assert_eq!(target.review_id.as_deref(), Some("rev-arch"));
         assert_eq!(target.group_id.as_deref(), Some("arch"));
-        assert_eq!(target.step_id.as_deref(), Some("1"));
-        assert!(target.is_single_target());
+        assert_eq!(target.group_title, "Shared cause");
+        assert!(
+            !target.is_single_target(),
+            "a root-cause plan confirms as a binary card"
+        );
         assert_eq!(
             target.scope_title,
-            "Plan step 'Container step' of review group 'Shared cause'"
+            "Root-cause plan of group 'Shared cause' (2 plan step(s))"
         );
         assert_eq!(target.items.len(), 1);
         assert_eq!(
@@ -2535,7 +2471,6 @@ mod tests {
         assert_eq!(target.review_id.as_deref(), Some("rev-arch"));
         assert_eq!(target.group_id.as_deref(), Some("arch"));
         assert_eq!(target.group_title, "Shared cause");
-        assert!(target.step_id.is_none());
         assert_eq!(
             target.scope_title,
             "Root-cause plan of group 'Shared cause' (2 plan step(s))"

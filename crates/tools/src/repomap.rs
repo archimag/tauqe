@@ -279,6 +279,12 @@ pub fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
 
 /// Formats repository symbols and all other Git files into an outline within `token_budget`.
 ///
+/// Every detail level is priced from the byte lengths its blocks and the
+/// remaining plain entries occupy once joined, because the token estimate is a
+/// pure function of that length: a level that does not fit never materializes
+/// the document it would immediately discard, and the winning level is joined
+/// once, into a buffer sized by the count the fit decision already computed.
+///
 /// Accepts both owned payloads and shared `Arc` payloads, so map generation
 /// formats cached symbols without cloning them.
 pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
@@ -293,137 +299,178 @@ pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
         DetailLevel::TopLevelOnly,
     ];
 
+    // The cheapest level also seeds the greedy fallback below, so the last
+    // candidate leaves the loop instead of being rendered a second time.
+    let mut cheapest: Option<Vec<RenderedBlock>> = None;
+
     for &level in &levels {
-        let rendered = format_all_files(symbols, level);
-        let combined = combine_outline_and_other_files(&rendered, all_git_files);
-        if !combined.is_empty() && crate::tokens::estimate_tokens(&combined) <= token_budget {
-            return combined;
+        let blocks = format_all_files(symbols, level);
+        let block_texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        let entries = plain_entries(&blocks, all_git_files);
+        let byte_len = combined_bytes(
+            joined_bytes(&block_texts, BLOCK_SEPARATOR),
+            joined_bytes(&entries, ENTRY_SEPARATOR),
+        );
+        if byte_len > 0 && fits_budget(byte_len, token_budget) {
+            return join_document(&block_texts, &entries, byte_len);
         }
+        cheapest = Some(blocks);
     }
 
-    // If even TopLevelOnly + other files exceeds budget, greedily include symbol blocks then other files
-    let mut accumulated: Vec<String> = Vec::new();
-    let mut rendered_paths: HashSet<String> = HashSet::new();
-    let mut current_tokens = 0;
-    let separator_tokens = crate::tokens::estimate_tokens("\n\n");
-
-    for file in symbols {
-        let file = file.as_ref();
-        let block = format_file_symbols(file, DetailLevel::TopLevelOnly);
-        if block.is_empty() {
-            continue;
-        }
-        let block_tokens = crate::tokens::estimate_tokens(&block);
-        let needed_tokens = if accumulated.is_empty() {
-            block_tokens
-        } else {
-            block_tokens + separator_tokens
-        };
-
-        if current_tokens + needed_tokens > token_budget {
-            break;
-        }
-
-        current_tokens += needed_tokens;
-        rendered_paths.insert(file.path.clone());
-        accumulated.push(block);
-    }
-
-    let outline = accumulated.join("\n\n");
-
-    let other_files: Vec<&str> = all_git_files
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|f| !rendered_paths.contains(*f))
-        .collect();
-
-    // The candidate is priced from its byte length instead of being rebuilt and
-    // re-estimated on every iteration: the token heuristic is a pure function of
-    // the byte count, so a running length answers the same question at one
-    // addition per appended file. This fallback runs exactly when a tight budget
-    // meets a large repository, where the file list is longest.
-    let outline_prefix_bytes = if outline.is_empty() {
-        0
-    } else {
-        // The outline and the file block are joined by a blank line.
-        outline.len() + 2
-    };
-    let mut other_accumulated: Vec<&str> = Vec::new();
-    let mut other_bytes = 0usize;
-    for file in other_files {
-        // Listed files are joined by single newlines, so only a file that already
-        // has a predecessor adds a separator byte.
-        let separator_bytes = usize::from(!other_accumulated.is_empty());
-        let entry_bytes = separator_bytes + file.len();
-        let byte_len = (outline_prefix_bytes + other_bytes + entry_bytes) as u64;
-        let candidate_tokens = crate::tokens::estimate_tokens_from_bytes(byte_len);
-        if candidate_tokens > token_budget as u64 {
-            break;
-        }
-        other_bytes += entry_bytes;
-        other_accumulated.push(file);
-    }
-
-    if other_accumulated.is_empty() {
-        outline
-    } else {
-        let other_block = other_accumulated.join("\n");
-        if outline.is_empty() {
-            other_block
-        } else {
-            format!("{}\n\n{}", outline, other_block)
-        }
-    }
+    // The level list is never empty, so a candidate always exists; the
+    // degenerate answer stays an empty outline instead of a panic.
+    cheapest
+        .map(|blocks| greedy_outline(&blocks, all_git_files, token_budget))
+        .unwrap_or_default()
 }
 
-/// A rendered symbol outline together with the exact paths it names.
+/// The blank line separating two rendered symbol blocks.
+const BLOCK_SEPARATOR: &str = "\n\n";
+
+/// The newline separating two plain repository entries.
+const ENTRY_SEPARATOR: &str = "\n";
+
+/// One rendered symbol block paired with the repository path it describes.
 ///
 /// A rendered header carries a ` (N lines)` suffix and a repository path may
 /// itself contain ` (`, so an outline line cannot be parsed back into a path:
 /// splitting on the first separator truncates such a path and leaves the file
-/// to be listed a second time among the plain entries. The set is collected
-/// while the blocks are produced, where every path is still the structured
-/// `RepoFileSymbols::path` field.
-struct RenderedOutline {
-    outline: String,
-    paths: HashSet<String>,
+/// to be listed a second time among the plain entries. The path therefore
+/// travels beside its block, taken from the structured `RepoFileSymbols::path`
+/// field while the block is produced.
+struct RenderedBlock {
+    path: String,
+    text: String,
 }
 
-/// Renders every symbol block at `level` and records the paths it names.
-fn format_all_files<S: AsRef<RepoFileSymbols>>(files: &[S], level: DetailLevel) -> RenderedOutline {
-    let mut blocks: Vec<String> = Vec::new();
-    let mut paths: HashSet<String> = HashSet::new();
+/// Renders every symbol block at `level`, in repository order.
+fn format_all_files<S: AsRef<RepoFileSymbols>>(
+    files: &[S],
+    level: DetailLevel,
+) -> Vec<RenderedBlock> {
+    let mut blocks: Vec<RenderedBlock> = Vec::new();
     for file in files {
         let file = file.as_ref();
-        let block = format_file_symbols(file, level);
-        if !block.is_empty() {
-            paths.insert(file.path.clone());
-            blocks.push(block);
+        let text = format_file_symbols(file, level);
+        if !text.is_empty() {
+            blocks.push(RenderedBlock {
+                path: file.path.clone(),
+                text,
+            });
         }
     }
-    RenderedOutline {
-        outline: blocks.join("\n\n"),
-        paths,
+    blocks
+}
+
+/// The repository entries the outline does not name, in repository order.
+fn plain_entries<'a>(blocks: &[RenderedBlock], all_git_files: &'a [String]) -> Vec<&'a str> {
+    let rendered: HashSet<&str> = blocks.iter().map(|block| block.path.as_str()).collect();
+    all_git_files
+        .iter()
+        .map(|path| path.as_str())
+        .filter(|path| !rendered.contains(*path))
+        .collect()
+}
+
+/// Byte length a list of items occupies once joined by `separator`.
+fn joined_bytes<T: AsRef<str>>(items: &[T], separator: &str) -> usize {
+    let content: usize = items.iter().map(|item| item.as_ref().len()).sum();
+    let separators = separator.len() * items.len().saturating_sub(1);
+    content + separators
+}
+
+/// Bytes `separator` contributes before an item appended to a non-empty list.
+fn separator_bytes<T>(items: &[T], separator: &str) -> usize {
+    if items.is_empty() {
+        0
+    } else {
+        separator.len()
     }
 }
 
-fn combine_outline_and_other_files(rendered: &RenderedOutline, all_git_files: &[String]) -> String {
-    let other_files: Vec<&str> = all_git_files
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|f| !rendered.paths.contains(*f))
-        .collect();
-
-    if other_files.is_empty() {
-        return rendered.outline.clone();
-    }
-
-    let other_block = other_files.join("\n");
-    if rendered.outline.is_empty() {
-        other_block
+/// Byte length of the document assembled from a joined outline and the plain
+/// entries that follow it.
+fn combined_bytes(outline_bytes: usize, entries_bytes: usize) -> usize {
+    let separator = if outline_bytes > 0 && entries_bytes > 0 {
+        BLOCK_SEPARATOR.len()
     } else {
-        format!("{}\n\n{}", rendered.outline, other_block)
+        0
+    };
+    outline_bytes + separator + entries_bytes
+}
+
+/// Reports whether a document of `byte_len` bytes fits the token budget.
+///
+/// The token estimate is a pure function of the byte length, so a candidate is
+/// priced from its bytes alone and only a candidate that passes this check is
+/// materialized.
+fn fits_budget(byte_len: usize, token_budget: usize) -> bool {
+    crate::tokens::estimate_tokens_from_bytes(byte_len as u64) <= token_budget as u64
+}
+
+/// Materializes the priced document exactly once, into a buffer sized by the
+/// byte count the fit decision already computed.
+fn join_document(blocks: &[&str], entries: &[&str], byte_len: usize) -> String {
+    let mut document = String::with_capacity(byte_len);
+    let mut pending = "";
+    for block in blocks {
+        document.push_str(pending);
+        document.push_str(block);
+        pending = BLOCK_SEPARATOR;
     }
+    for entry in entries {
+        document.push_str(pending);
+        document.push_str(entry);
+        pending = ENTRY_SEPARATOR;
+    }
+    document
+}
+
+/// Extends the cheapest rendered outline with the plain entries it leaves out
+/// until the budget is exhausted.
+///
+/// The blocks arrive already rendered at the cheapest level, and every addition
+/// is priced by the byte length the joined document would gain, so the fallback
+/// neither renders the repository a second time nor rounds a per-block token
+/// estimate against a budget that is checked over the whole document.
+fn greedy_outline(
+    blocks: &[RenderedBlock],
+    all_git_files: &[String],
+    token_budget: usize,
+) -> String {
+    let mut included: Vec<&RenderedBlock> = Vec::new();
+    let mut outline_bytes = 0usize;
+    for block in blocks {
+        let candidate_bytes =
+            outline_bytes + separator_bytes(&included, BLOCK_SEPARATOR) + block.text.len();
+        if !fits_budget(candidate_bytes, token_budget) {
+            break;
+        }
+        outline_bytes = candidate_bytes;
+        included.push(block);
+    }
+
+    let rendered: HashSet<&str> = included.iter().map(|block| block.path.as_str()).collect();
+    let mut entries: Vec<&str> = Vec::new();
+    let mut entries_bytes = 0usize;
+    for path in all_git_files {
+        if rendered.contains(path.as_str()) {
+            continue;
+        }
+        // Listed files are joined by single newlines, so only a file that
+        // already has a predecessor adds a separator byte.
+        let candidate_bytes =
+            entries_bytes + separator_bytes(&entries, ENTRY_SEPARATOR) + path.len();
+        if !fits_budget(combined_bytes(outline_bytes, candidate_bytes), token_budget) {
+            break;
+        }
+        entries_bytes = candidate_bytes;
+        entries.push(path.as_str());
+    }
+
+    let block_texts: Vec<&str> = included.iter().map(|block| block.text.as_str()).collect();
+    let byte_len = combined_bytes(outline_bytes, entries_bytes);
+    join_document(&block_texts, &entries, byte_len)
 }
 
 fn format_file_symbols(file: &RepoFileSymbols, level: DetailLevel) -> String {

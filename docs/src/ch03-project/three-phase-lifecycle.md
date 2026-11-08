@@ -92,6 +92,17 @@ input. Verifying before the generator runs checks a tree that is not final.
     success outcome — an English Conventional Commits header — so the harness
     never authors a message of its own and the commit describes the payload it
     really contains.
+15. **The edit cycle is one paired transaction.** Every `edit/started` is answered by
+    exactly one `edit/finished` carrying an `EditOutcome`. On every ordinary path the
+    closing precedes the terminal event of the turn, and an abnormal unwind answers the
+    opening through the drop guard of the handle as the last hand.
+16. **A closing explains itself.** An unapplied outcome always carries a non-empty
+    reason in `EditOutcome.error` — the error it already named, or the description of
+    its typed termination — while an applied outcome never carries one.
+17. **The interface is a safeguard, not the only witness.** A late closing still settles
+    the turn on display while the event queue drains, and a closing of a cycle the
+    interface already released is an idempotent no-op rather than a surviving rejected
+    badge.
 
 ---
 
@@ -134,6 +145,15 @@ input. Verifying before the generator runs checks a tree that is not final.
   destination directory and relocates the whole subtree between them. The entry
   carries no line range and no payload: the files it moves are the tracked files
   the engine finds under the source, never a list the model enumerates.
+- **Edit cycle** — one `edit/started` and the one `edit/finished` that answers it. The
+  cycle is the lifecycle of a pair of RPC events, so it belongs to the server.
+- **Closing** — the single `edit/finished` that carries the `EditOutcome` of the cycle:
+  whether a change set was applied, the paths it touched, the commit it produced, the
+  verification verdict, and the reason it ended when nothing was applied.
+- **Termination reason** — the typed classification of why a cycle ended
+  (`EditTermination`): completed, cancelled, withdrawn, provider failure, protocol
+  failure, blocked, or aborted. The code that ends the cycle states it, and no surface
+  infers it from the wording of a diagnostic.
 ### 2.3 Exactly one formatting surface
 
 Formatting has a single contour: the declared `[project.format]` filter rewrites
@@ -332,7 +352,8 @@ unverified instead of running a command nobody declared.
   that names no directory or holds no tracked file, and a destination inside the
   source are reported during in-memory staging. The diagnostic names the
   offending path, so the model chooses a free destination within the same turn
-  and nothing moves until the whole subtree is accepted.- **Format failure** — the authored content is kept and the turn continues.
+  and nothing moves until the whole subtree is accepted.
+- **Format failure** — the authored content is kept and the turn continues.
 - **No declared formatter** — the file is written exactly as authored; this is the
   normal outcome for documentation and configuration.
 - **Post-hook failure** — the change set is aborted and the turn fails with the
@@ -381,6 +402,57 @@ and prunes the source directories the change set emptied, so a rename reaches Gi
 as one change instead of a leftover empty directory tree. Because the member is
 atomic, a cancelled or failed turn rolls the whole subtree back: the sources
 return and the destinations disappear together.
+
+### 3.9 The paired edit cycle
+
+`edit/started` and `edit/finished` are one transaction of the RPC protocol. Every
+opening is answered by exactly one closing that carries an `EditOutcome`: whether a
+change set was applied, the paths it touched, the commit it produced, the verification
+verdict, and the reason it ended when nothing was applied. The cycle belongs to the
+server, because it is the lifecycle of a pair of events; the engine never names it and
+never publishes either half.
+
+Three scopes may reach the closing, and each of them opens the cycle before it closes
+it. The closing scope is therefore not decided in advance, it is arbitrated at the end:
+
+1. **The streaming relay** closes the cycle from the stream itself — the application
+   outcome of the change set, a withdrawn attempt, a cancellation, or a provider
+   failure — and does so before any terminal event of the turn is published. This is
+   the ordinary path: the developer sees the settled change set, the file badges, the
+   commit trail, and the closing in one frame.
+2. **The turn owner** closes the cycle unapplied when the turn ends without a change
+   set — an answer, a blocked report, an abort, a protocol refusal — so an opening
+   whose edits were never applied still settles with a reason.
+3. **The drop guard of the handle** closes the cycle as aborted when the turn task
+   panics or is force-aborted. It is the last hand: an unwind that never reaches a
+   terminal event answers its opening instead of leaving the pair half open.
+
+Arbitration is one atomic `compare_exchange` on the open flag. The first scope to reach
+the end wins and publishes the single `edit/finished`; every later closing publishes
+nothing, so a relay, an owner, and a drop guard that all observe the same ending still
+produce one closing.
+
+Every ending is classified before it is published. A cancellation, a blocker, an abort,
+and a protocol refusal each name themselves, and a semantic ending outranks a protocol
+violation: a turn that was cancelled, blocked, or aborted reports that ending even when
+its last proposal also violated the edit protocol. The payload of the closing obeys one
+absolute rule: an unapplied outcome always carries a non-empty reason in
+`EditOutcome.error` — the error it already named, or the description of its typed
+termination — while an applied outcome never carries one. A success that carries an
+error and a refusal that carries none are both defects of the contract, never a matter
+of styling.
+
+The interface is a safeguard, not the only witness. A closing recorded after the
+terminal event still settles the turn on display while the event queue drains, because
+the buffered cycle describes that very turn. A closing of a cycle the interface no
+longer holds — its buffers were released by a stream reset or by the next turn — is an
+idempotent no-op, so a rejected badge is never resurrected onto a fresh attempt. A cycle
+that stays open past its terminal event is reported as a diagnostic that names the phase
+in which it remained open.
+
+The cycle states when the outcome of a change set becomes news to the client. What that
+change set is, how it is addressed, staged, formatted, hooked, and verified stays with
+the phases above, which own those rules alone.
 ---
 
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
@@ -408,7 +480,8 @@ return and the destinations disappear together.
 - **It is not a recursive file enumeration.** A directory move names two
   directories, and the engine expands the subtree from the tracked files it owns.
   The model never lists the files it moves, so the operation stays one atomic
-  member instead of a list of independent renames.- **It is not a post-verification disk pass.** Formatting runs once, before the
+  member instead of a list of independent renames.
+- **It is not a post-verification disk pass.** Formatting runs once, before the
   change set reaches disk; nothing reformats a verified tree afterwards, so no
   compensation layer has to restore it.
 - **It is not an escape hatch around ignore rules.** A path the repository ignore
@@ -422,6 +495,17 @@ return and the destinations disappear together.
   post-hook, during a repair round, or during verification — is committed even when
   the model never wrote it, because the change set is read off the tree, not off the
   proposal.
+- **It is not one event.** An `edit/started` without its `edit/finished` is an incomplete
+  transaction. The pair is the unit the client renders, and the pairing is arbitrated,
+  so no path may publish a second closing to compensate for a lost one.
+- **It is not the engine's concern.** The pair is the lifecycle of two RPC events, so it
+  lives in the server. The engine reports the typed outcome of a change set and never
+  opens, closes, or names a cycle.
+- **It is not a closing without a reason.** A refused cycle always explains itself in its
+  outcome; a closing that names no reason hides the phase that left it unapplied.
+- **It is not a resurrection.** A closing that arrives for a cycle the interface already
+  released settles nothing. Accepting it would stamp a rejected badge from a discarded
+  attempt onto a fresh one.
 
 ---
 

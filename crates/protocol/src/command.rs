@@ -872,8 +872,6 @@ mod tests {
         assert!(json.contains("\"status\":\"rejected\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), command);
 
-        // The dialogue anchor authorizes a decision, not a capability module,
-        // so the command carries neither a capability nor a phase of its own.
         // A decision is a capability of the review discussion regime, so the
         // command carries that capability and its execution phase.
         assert_eq!(command.capability(), Some(LlmCapability::ReviewUpdate));

@@ -733,7 +733,7 @@ mod tests {
                 "tauqe.toml",
                 concat!(
                     "[models]\n",
-                    "primary = [\"openrouter:mock/model\"]\n",
+                    "repl = [\"openrouter:mock/model\"]\n",
                     "\n",
                     "[project.verify]\n",
                     "command = \"false\"\n",
@@ -805,7 +805,7 @@ mod tests {
         let config = format!(
             concat!(
                 "[models]\n",
-                "primary = [\"openrouter:mock/model\"]\n",
+                "repl = [\"openrouter:mock/model\"]\n",
                 "\n",
                 "[project.verify]\n",
                 "command = \"sh\"\n",
@@ -944,7 +944,7 @@ mod tests {
                 "tauqe.toml",
                 concat!(
                     "[models]\n",
-                    "primary = [\"openrouter:mock/model\"]\n",
+                    "repl = [\"openrouter:mock/model\"]\n",
                     "\n",
                     "[project.verify]\n",
                     "command = \"sh\"\n",

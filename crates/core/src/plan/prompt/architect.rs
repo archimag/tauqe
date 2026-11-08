@@ -95,7 +95,7 @@ pub fn resolve_architect_tier(
     // reprojection stays on it and no level up is reported.
     if let Some(tier) = recorded.filter(|tier| {
         cfg.models
-            .excluded_from_escalation(ModelRole::Architect, &tier.model)
+            .excluded_from_escalation(ModelRole::Architect, &tier.model, tier.effort)
     }) {
         return (tier.clone(), None);
     }
@@ -118,7 +118,7 @@ mod tests {
     fn config_with_ladder(architect: Vec<ModelEntry>) -> AppConfig {
         AppConfig {
             models: ModelsConfig {
-                primary: vec![ModelRef::openrouter("base/primary").into()],
+                repl: vec![ModelRef::openrouter("base/primary").into()],
                 architect: Some(architect),
                 ..Default::default()
             },
@@ -275,6 +275,44 @@ mod tests {
         assert_eq!(tier.attempts, Some(3));
         assert_eq!(tier.attempts(), 3);
         assert_eq!(tier.level_up, Some(false));
+        assert!(level_up.is_none());
+    }
+
+    #[test]
+    fn a_mixed_ladder_escalates_a_participating_rung_and_pins_an_excluded_sibling() {
+        let shared = ModelRef::openrouter("planner/shared");
+        let mut excluded = ModelEntry::new(shared.clone(), Some(ReasoningEffort::Max));
+        excluded.level_up = Some(false);
+        let cfg = config_with_ladder(vec![
+            ModelEntry::new(shared.clone(), Some(ReasoningEffort::Low)),
+            excluded,
+            ModelEntry::new(shared.clone(), Some(ReasoningEffort::High)),
+        ]);
+        let low = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::Low));
+        let high = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::High));
+        let max = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::Max));
+
+        // The first failure of a never-reprojected step is answered by the
+        // Architect that planned the horizon.
+        let (tier, level_up) = resolve_architect_tier(&cfg, Some(&low), None, Some("s-1"), None);
+        assert_eq!(tier, low);
+        assert!(level_up.is_none());
+
+        // A repeated failure escalates the participating rung one tier up. The
+        // excluded sibling rung of the same model never pins it, because the
+        // marker names a rung instead of the model (c-1).
+        let (tier, level_up) =
+            resolve_architect_tier(&cfg, Some(&low), None, Some("s-1"), Some("s-1"));
+        assert_eq!(tier, high);
+        let level_up = level_up.expect("the participating rung escalates");
+        assert_eq!(level_up.from, Some(low));
+        assert_eq!(level_up.to, high);
+
+        // The recorded excluded sibling is a manual run the developer pinned, so
+        // a repeated failure keeps it instead of restarting the ladder.
+        let (tier, level_up) =
+            resolve_architect_tier(&cfg, Some(&max), None, Some("s-1"), Some("s-1"));
+        assert_eq!(tier, max);
         assert!(level_up.is_none());
     }
 }

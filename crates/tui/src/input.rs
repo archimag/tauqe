@@ -22,8 +22,7 @@ use tauqe_protocol::{methods, GitSquashPreviewParams, HistoryGetParams};
 use tokio::sync::Mutex;
 
 use crate::app::{
-    ActiveModal, AppState, BatchCancelButton, ConfirmDialogButton, HelpTab, SquashDialogState,
-    ViewMode,
+    AppState, BatchCancelButton, ConfirmDialogButton, HelpTab, SquashDialogState, ViewMode,
 };
 use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
 use crate::command::translate_code;
@@ -204,91 +203,15 @@ pub async fn switch_view(
     Ok(())
 }
 
-/// Routes pasted text to the surface that currently owns the keyboard.
+/// Routes pasted text into the editor the capture boundary declares.
 ///
-/// A modal receives the text in the field it exposes, and the REPL prompt
-/// takes it when no modal is open. Every other surface ignores a paste, so a
-/// bracketed paste can never mutate a view the developer is not editing.
+/// The destination is resolved by [`AppState::route_paste`], which owns the one
+/// declaration of which surface captures text, so a bracketed paste and the
+/// middle-click pointer paste reach exactly the editor the keyboard would type
+/// into, and a surface that captures no text drops the payload instead of guessing
+/// a field (Conventions §5.1, c-text-capture-boundary).
 pub fn handle_paste(st: &mut AppState, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    match st.active_modal() {
-        Some(ActiveModal::Squash) => {
-            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
-                if dialog.custom_input_active {
-                    dialog.custom_editor.insert_paste_single_line(text);
-                } else {
-                    dialog.message_editor.insert_paste(text);
-                }
-            }
-        }
-        Some(ActiveModal::Prompt) => {
-            if let Some(modal) = st.modals.prompt_modal.as_mut() {
-                modal.prompt_editor.insert_paste(text);
-            }
-        }
-        Some(ActiveModal::Review) => {
-            if let Some(dialog) = st.modals.review_dialog.as_mut() {
-                if dialog.focus.is_path_editor() {
-                    if let Some(editor) = dialog.active_path_editor_mut() {
-                        editor.insert_paste_single_line(text);
-                    }
-                    dialog.refresh_path_completion();
-                } else {
-                    dialog.prompt_editor.insert_paste(text);
-                }
-            }
-        }
-        Some(ActiveModal::Locale) => {
-            if let Some(dialog) = st.modals.locale_dialog.as_mut() {
-                dialog.language_editor.insert_paste_single_line(text);
-            }
-        }
-        // Every remaining surface owns no field the paste path feeds: its body
-        // is a list, a confirmation, or a read-only area, so the payload is
-        // dropped instead of being routed to a guessed field. The variants are
-        // enumerated one by one, so a surface added later must state whether a
-        // paste reaches it instead of inheriting a silent wildcard
-        // (Conventions §5.1, c-text-capture-boundary). The plan-refinement and
-        // review-execution forms do expose an instructions editor; this path
-        // feeds only the four dialogs above, and that split stays as it is.
-        Some(ActiveModal::ServerDisconnected)
-        | Some(ActiveModal::ReviewTruncation)
-        | Some(ActiveModal::ConfirmCancel)
-        | Some(ActiveModal::ConfirmQuit)
-        | Some(ActiveModal::BatchCancel)
-        | Some(ActiveModal::ClearAuto)
-        | Some(ActiveModal::ClearUser)
-        | Some(ActiveModal::RemoveContextFile)
-        | Some(ActiveModal::OuterDocsCacheRemove)
-        | Some(ActiveModal::OuterDocsCache)
-        | Some(ActiveModal::ConfirmDetachFocus)
-        | Some(ActiveModal::ClearHorizonFinal)
-        | Some(ActiveModal::ClearHorizon)
-        | Some(ActiveModal::DeletePlanFinal)
-        | Some(ActiveModal::DeletePlan)
-        | Some(ActiveModal::DeleteReview)
-        | Some(ActiveModal::ReviewAnalyze)
-        | Some(ActiveModal::ExecuteReview)
-        | Some(ActiveModal::ExecutePipeline)
-        | Some(ActiveModal::ExecuteScope)
-        | Some(ActiveModal::CreatePlan)
-        | Some(ActiveModal::RefineDialog)
-        | Some(ActiveModal::RefineBlocked)
-        | Some(ActiveModal::ClearHistory)
-        | Some(ActiveModal::Status)
-        | Some(ActiveModal::Selection)
-        | Some(ActiveModal::DiffInspector)
-        | Some(ActiveModal::ThemeSelector)
-        | Some(ActiveModal::UsageSummary)
-        | Some(ActiveModal::Help) => {}
-        None => {
-            if st.view_mode == ViewMode::Repl {
-                st.input_editor.insert_paste(text);
-            }
-        }
-    }
+    st.route_paste(text);
 }
 
 /// Handles one terminal event and reports whether the interface keeps running.
@@ -536,7 +459,7 @@ fn text_input_active(st: &AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::app::ActiveModal;
     #[test]
     fn ctrl_g_is_the_keyboard_quit_and_altgr_is_not() {
         assert!(is_keyboard_quit(&KeyEvent::new(
@@ -935,13 +858,16 @@ mod tests {
         assert!(st.modals.usage_summary.is_some());
     }
 
-    /// The explicit list of command surfaces never swallows a dialog that does
-    /// expose a field, so a paste still reaches the squash commit message
-    /// (Conventions §5.1).
+    /// A dialog receives a paste in the field the capture boundary resolves, so the
+    /// squash commit message takes the payload exactly while its editor holds the
+    /// keyboard (Conventions §5.1, c-text-capture-boundary).
     #[test]
-    fn paste_still_reaches_a_dialog_that_exposes_a_field() {
+    fn paste_reaches_the_focused_editor_of_a_dialog() {
         let mut st = crate::app::test_state();
-        st.modals.squash_dialog = Some(SquashDialogState::default());
+        st.modals.squash_dialog = Some(SquashDialogState {
+            focus: crate::app::SquashDialogFocus::MessageEditor,
+            ..Default::default()
+        });
 
         handle_paste(&mut st, "fix(tui): keep the wheel modal-scoped");
         let dialog = st
@@ -1040,5 +966,125 @@ mod tests {
         let guard = state.lock().await;
         assert!(!guard.modals.show_help);
         assert!(!guard.modals.confirm_quit);
+    }
+    /// One review finding with the given identity.
+    fn review_issue(id: u32, title: &str) -> tauqe_protocol::ReviewIssue {
+        tauqe_protocol::ReviewIssue {
+            id,
+            title: title.to_string(),
+            uuid: None,
+            commit: None,
+            group: None,
+            model: None,
+            issue_type: tauqe_protocol::IssueType::Bug,
+            status: tauqe_protocol::IssueStatus::Todo,
+            description: String::new(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            note: None,
+        }
+    }
+
+    /// Both plan forms declare their instructions editor as a capturing field, so a
+    /// pasted payload reaches them instead of being dropped (Conventions §5.1,
+    /// c-text-capture-boundary).
+    #[test]
+    fn paste_reaches_the_plan_form_editors() {
+        use crate::views::plans::{PlanCreateDialogState, PlanRefineDialogState};
+
+        let mut st = crate::app::test_state();
+        st.modals.refine_dialog = Some(PlanRefineDialogState::new(
+            "plan-1".to_string(),
+            "Plan 1".to_string(),
+            Vec::new(),
+        ));
+        handle_paste(&mut st, "split the second step");
+        assert_eq!(
+            st.modals
+                .refine_dialog
+                .as_ref()
+                .expect("the dialog stays open")
+                .instructions_editor
+                .get_text(),
+            "split the second step"
+        );
+
+        let mut st = crate::app::test_state();
+        st.modals.create_dialog = Some(PlanCreateDialogState::new(Vec::new()));
+        handle_paste(&mut st, "add a retry budget");
+        assert_eq!(
+            st.modals
+                .create_dialog
+                .as_ref()
+                .expect("the dialog stays open")
+                .directives_editor
+                .get_text(),
+            "add a retry budget"
+        );
+    }
+
+    /// Only the single-target review execution exposes a directives editor, so only
+    /// that shape takes the payload; the batch card confirms without one and drops
+    /// it (Conventions §5.1, c-text-capture-boundary).
+    #[test]
+    fn paste_reaches_only_the_single_target_review_execution() {
+        let mut st = crate::app::test_state();
+        st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Finding 1".to_string(),
+            Some(1),
+            vec![review_issue(1, "Finding 1")],
+            Vec::new(),
+        ));
+        handle_paste(&mut st, "guard the header");
+        assert_eq!(
+            st.modals
+                .confirm_execute_review
+                .as_ref()
+                .expect("the card stays open")
+                .instructions_editor
+                .get_text(),
+            "guard the header"
+        );
+
+        let mut st = crate::app::test_state();
+        st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining findings".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ));
+        handle_paste(&mut st, "ignored by the batch shape");
+        assert_eq!(
+            st.modals
+                .confirm_execute_review
+                .as_ref()
+                .expect("the card stays open")
+                .instructions_editor
+                .get_text(),
+            ""
+        );
+    }
+
+    /// The inline Context path input and the onboarding field are declared
+    /// capturing single-line fields, so a paste reaches them and collapses the line
+    /// breaks the payload may carry (Conventions §5.1, c-text-capture-boundary).
+    #[test]
+    fn paste_reaches_the_context_path_input_and_the_onboarding_field() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.context_view.adding_file = true;
+        handle_paste(&mut st, "crates/tui\nsrc");
+        assert_eq!(st.context_view.add_input.get_text(), "crates/tui src");
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Onboarding;
+        st.onboarding.input_active = true;
+        handle_paste(&mut st, "sk-or-secret");
+        assert_eq!(st.onboarding.input_buffer.get_text(), "sk-or-secret");
     }
 }

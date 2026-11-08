@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use super::cmd::{git_command, spawn_pipe_drain};
+use super::cmd::{git_command, spawn_pipe_drain, PipeDrain};
 
 /// Wall-clock budget of a Git invocation that names none of its own.
 pub const DEFAULT_GIT_TIMEOUT_SECS: u64 = 300;
@@ -44,7 +44,29 @@ const POLL_CEILING: Duration = Duration::from_millis(50);
 /// behind and every later invocation of the same repository fails on it. The
 /// grace period is the window in which the child runs that handler before the
 /// group is torn down.
-pub const TERMINATION_GRACE: Duration = Duration::from_millis(300);
+///
+/// The window is sized for a loaded host, not for an idle one. Signal
+/// delivery, the scheduling of the process that installed the handler, and
+/// the cleanup that handler runs are all wall-clock costs the child pays
+/// before its locks are gone, and a window that only covers an idle machine
+/// leaves the lock behind exactly when the host is busy. A turn that is
+/// already aborting pays the window once, while a surviving lock fails every
+/// later invocation of the same repository.
+pub const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+/// Window in which an exited Git child's output pipes may still reach EOF.
+///
+/// The direct child can exit while a descendant it spawned keeps the inherited
+/// pipes open, so the drain is bounded on its own instead of inheriting whatever
+/// remains of the invocation budget. The window starts when the drain starts,
+/// which is why a child that used almost all of its budget still delivers its
+/// complete output, and it is short enough that a lingering descendant can never
+/// hold the turn.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Diagnostic appended to the standard error of an invocation whose output pipes
+/// a descendant kept open.
+const ABANDONED_DRAIN_NOTE: &[u8] = b"a descendant process held the output pipes open";
 
 /// The polite termination signal: it lets the child clean up after itself.
 #[cfg(unix)]
@@ -130,8 +152,9 @@ pub(super) struct GitOutput {
     pub(super) code: Option<i32>,
     /// The bytes the child wrote to its standard output.
     pub(super) stdout: Vec<u8>,
-    /// The bytes the child wrote to its standard error, or the reason it
-    /// produced no answer at all.
+    /// The bytes the child wrote to its standard error, the reason it produced
+    /// no answer at all, and — when a descendant kept the pipes open past the
+    /// drain window — the diagnostic of the abandoned drain.
     pub(super) stderr: Vec<u8>,
 }
 
@@ -157,6 +180,11 @@ impl GitOutput {
 /// it, which is how `check-ignore` reads its candidate list. Without a payload
 /// the child receives no input at all, so a command can never consume the
 /// daemon's own request stream.
+///
+/// How the child ended comes from the wait alone. A descendant that inherits the
+/// output pipes and outlives the child delays the drain, never the verdict: the
+/// exit code and the bytes the child already produced survive, and the abandoned
+/// drain is appended to the standard error as a diagnostic.
 pub(super) fn run_bounded(
     dir: Option<&Path>,
     args: &[&str],
@@ -205,35 +233,32 @@ pub(super) fn run_bounded(
         Wait::Unobservable(err) => (GitEnd::Exited, None, Some(err.to_string())),
     };
 
-    let drained = collect_output(stdout_drain, stderr_drain, deadline, started, &display);
-    let Some((stdout, drained_stderr)) = drained else {
-        // A descendant inherited the pipes and never exited. The invocation
-        // window closed, so the readers are abandoned instead of waiting for a
-        // process that may never finish.
-        let end = if deadline.is_cancelled() {
-            GitEnd::Cancelled
-        } else {
-            GitEnd::TimedOut
-        };
-        return GitOutput {
-            end,
-            code: None,
-            stdout: Vec::new(),
-            stderr: b"a descendant process held the output pipes open".to_vec(),
-        };
-    };
+    // The drain annotates the invocation; it never reclassifies it. How the
+    // child ended was established by the wait, and a descendant that keeps the
+    // inherited pipes open can neither turn a clean exit into a kill nor
+    // discard the output the child already produced.
+    let drained = collect_output(stdout_drain, stderr_drain, deadline, &display);
 
     if let Some(writer) = stdin_writer {
         let _ = writer.join();
     }
 
+    let mut stderr = match probe_reason {
+        Some(reason) => reason.into_bytes(),
+        None => drained.stderr,
+    };
+    if drained.abandoned {
+        if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(ABANDONED_DRAIN_NOTE);
+    }
+
     GitOutput {
         end,
         code,
-        stdout,
-        stderr: probe_reason
-            .map(String::into_bytes)
-            .unwrap_or(drained_stderr),
+        stdout: drained.stdout,
+        stderr,
     }
 }
 
@@ -297,48 +322,52 @@ fn wait_under_budget(
     }
 }
 
-/// Waits for both output pipes to reach EOF under the invocation window.
+/// What an exited Git child's output pipes delivered.
+struct DrainedOutput {
+    /// The bytes the child wrote to its standard output.
+    stdout: Vec<u8>,
+    /// The bytes the child wrote to its standard error.
+    stderr: Vec<u8>,
+    /// Whether a descendant kept a pipe open past the drain window.
+    abandoned: bool,
+}
+
+/// Waits for both output pipes and collects what they delivered.
 ///
 /// The direct child can exit while a descendant it spawned keeps the inherited
-/// pipes open. The wait is bounded by the same budget and cancellation signal
-/// that bound the child, so a cancelled or overdue turn is released instead of
-/// waiting for a process that may never exit.
+/// pipes open. The wait is bounded by the caller's cancellation signal and by
+/// [`DRAIN_GRACE`] measured from this call, so a cancelled turn is released at
+/// once and an exited child's output is never held hostage by a descendant. The
+/// bytes the readers already delivered come back in every case, so an abandoned
+/// drain annotates the invocation instead of replacing its verdict or its
+/// output.
 fn collect_output(
-    stdout_drain: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr_drain: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_drain: PipeDrain,
+    stderr_drain: PipeDrain,
     deadline: &GitDeadline,
-    started: Instant,
     rendered: &str,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> DrainedOutput {
+    let started = Instant::now();
     let mut interval = POLL_FLOOR;
-    loop {
+    let abandoned = loop {
         if stdout_drain.is_finished() && stderr_drain.is_finished() {
-            return Some((collect_drain(stdout_drain), collect_drain(stderr_drain)));
+            break false;
         }
-        if deadline.is_cancelled() || deadline.is_spent(started) {
+        if deadline.is_cancelled() || started.elapsed() >= DRAIN_GRACE {
             tracing::warn!(
                 command = %rendered,
-                "abandoned a git child pipe a descendant kept open"
+                "abandoned a git child pipe a lingering descendant kept open"
             );
-            return None;
+            break true;
         }
         std::thread::sleep(interval);
         interval = (interval * 2).min(POLL_CEILING);
-    }
-}
+    };
 
-/// Collects the bytes one drain thread read.
-fn collect_drain(handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Vec<u8> {
-    match handle.join() {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(err)) => {
-            tracing::warn!(reason = %err, "failed to drain a git child pipe");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!("a git child pipe drain thread panicked");
-            Vec::new()
-        }
+    DrainedOutput {
+        stdout: stdout_drain.collect(),
+        stderr: stderr_drain.collect(),
+        abandoned,
     }
 }
 
@@ -444,12 +473,41 @@ fn signal_process_group(pid: u32, signal: i32) -> bool {
     unsafe { kill(-target, signal) == 0 }
 }
 
-/// Places the child in its own process group, so expiry or cancellation tears
-/// down everything the child spawned.
+/// Places the child in its own process group and lets it receive the polite
+/// termination request.
+///
+/// A group only winds down gracefully when its members can act on `SIGTERM`.
+/// Signal dispositions and the signal mask are inherited across `fork` and
+/// `exec`, so a parent that ignores or blocks that signal — a supervisor, a
+/// Git hook, or a test harness — silently silences every child it starts,
+/// including the processes a repository hook runs. The teardown would then
+/// fall through to the forceful kill without the cleanup window the grace
+/// period exists for, and the lock files Git removes from its own termination
+/// handler would survive. The child therefore starts with the default
+/// `SIGTERM` disposition and an unblocked `SIGTERM`; a script stays free to
+/// override either with its own `trap`.
+///
+/// The hook runs in the forked child before `exec`, so it confines itself to
+/// async-signal-safe calls that touch nothing but the child's own state.
 #[cfg(unix)]
 fn isolate_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
+
     command.process_group(0);
+    // SAFETY: `pre_exec` requires a closure that is safe to run between `fork`
+    // and `exec`. `signal` and `sigprocmask` are async-signal-safe, they
+    // allocate nothing, and they modify only the child's own signal state,
+    // which is exactly what the graceful teardown depends on.
+    unsafe {
+        command.pre_exec(|| {
+            let _ = libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            let mut unblocked = std::mem::zeroed::<libc::sigset_t>();
+            let _ = libc::sigemptyset(&mut unblocked);
+            let _ = libc::sigaddset(&mut unblocked, libc::SIGTERM);
+            let _ = libc::sigprocmask(libc::SIG_UNBLOCK, &unblocked, std::ptr::null_mut());
+            Ok(())
+        });
+    }
 }
 
 /// Leaves the child where the platform cannot isolate it.
@@ -538,12 +596,19 @@ mod tests {
     ///
     /// The shell installs the termination handler Git installs, so a polite
     /// signal lets it remove the file while a forceful one leaves it behind.
+    ///
+    /// The fixture idles in a loop of short foreground sleeps instead of
+    /// waiting for a background job, so the shell regains control at least
+    /// every 50 ms and runs its handler well inside the grace window. A shell
+    /// that defers a trap until the job it waits for completes would otherwise
+    /// spend the whole window inside `wait` and be killed before its handler
+    /// could remove the lock.
     #[cfg(unix)]
     fn spawn_lock_holder(dir: &Path) -> (Child, std::path::PathBuf) {
         let lock = dir.join("index.lock");
         let child = spawn_group_fixture(
             dir,
-            "trap 'rm -f index.lock; exit 0' TERM; : > index.lock; sleep 5 & wait",
+            "trap 'rm -f index.lock; exit 0' TERM; : > index.lock; while :; do sleep 0.05; done",
         );
         assert!(wait_for_file(&lock), "the fixture never published its lock");
         (child, lock)

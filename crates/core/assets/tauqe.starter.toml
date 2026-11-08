@@ -40,10 +40,11 @@
 # =============================================================================
 #
 # A functional role is backed by an ordered list of model entries rather than by
-# a single model name, and each role keeps one mandate: `primary` owns the
+# a single model name, and each role keeps one mandate: `repl` owns the
 # interactive engineering dialogue, `coder` owns concrete code changes,
 # `architect` owns decomposition and plans, `reviewer` audits without editing a
-# byte, and `scribe` compacts history and writes commit messages.
+# byte, `scribe` compacts history and writes commit messages, and `gatekeeper`
+# accepts the result of a plan step before that step is committed.
 #
 # An entry names a model by its provider specification (`openrouter:vendor/model`)
 # or by an alias registered in the provider catalog, and adds only the runtime
@@ -53,16 +54,22 @@
 # is declared once in the catalog, so the same model is never labelled twice.
 
 [models]
-# `primary` is mandatory and must list at least one entry. Its first entry is the
+# `repl` is mandatory and must list at least one entry. Its first entry is the
 # idle active model and the deterministic default for every specialized role
 # that omits its own list, so a role never silently loses access to the
 # configured models. Replace the entry below with a model your account can
 # reach.
-primary = ["openrouter:~google/gemini-flash-latest"]
+repl = ["openrouter:~google/gemini-flash-latest"]
 
 # The single utility model for history compaction, commit message synthesis, and
-# diff summarization. It defaults to the first `primary` entry.
+# diff summarization. It defaults to the first `repl` entry.
 # scribe = "openrouter:~anthropic/claude-haiku-latest"
+#
+# The acceptance model that reviews the result of a plan step before the step is
+# committed. It defaults to the Scribe model and, when the summarizer is not
+# declared either, to the first `repl` entry, so acceptance never silently
+# disables itself.
+# gatekeeper = "openrouter:~anthropic/claude-sonnet-latest"
 
 # The coder list is the escalation ladder. When verification healing stalls or
 # the retry budget is exhausted, the turn advances one rung at a time and

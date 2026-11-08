@@ -2,6 +2,9 @@ pub mod architect;
 pub mod common;
 pub mod config;
 pub mod context;
+// The edit-cycle primitive is introduced ahead of its consumers.
+#[allow(dead_code)]
+pub(crate) mod edit_cycle;
 pub mod git;
 pub mod history;
 pub mod host;
@@ -553,7 +556,7 @@ mod tests {
         // toolchain the project never declared.
         std::fs::write(
             dir.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
         )
         .unwrap();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -568,7 +571,7 @@ mod tests {
         std::fs::write(
             dir.join("tauqe.toml"),
             concat!(
-                "[models]\nprimary = [\"openrouter:a/b\"]\n",
+                "[models]\nrepl = [\"openrouter:a/b\"]\n",
                 "\n[project.verify]\ncommand = \"@missing\"\n",
             ),
         )
@@ -589,7 +592,7 @@ mod tests {
         let dir = scratch_root("preflight-valid");
         std::fs::write(
             dir.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
         )
         .unwrap();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -615,7 +618,7 @@ mod tests {
         let dir = scratch_root("preflight-cancel");
         std::fs::write(
             dir.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
         )
         .unwrap();
 

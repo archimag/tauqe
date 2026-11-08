@@ -125,7 +125,7 @@ pub struct ModelRolesEffort {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_effort_opt"
     )]
-    pub primary: Option<ReasoningEffort>,
+    pub repl: Option<ReasoningEffort>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

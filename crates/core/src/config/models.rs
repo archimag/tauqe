@@ -12,11 +12,18 @@ pub(crate) use raw::ModelsConfigRaw;
 use raw::RoleModelSpec;
 
 pub const BUILTIN_DEFAULT_SCRIBE_MODEL: &str = "~anthropic/claude-haiku-latest";
+
+/// Built-in default of the acceptance role.
+///
+/// A project that declares neither an acceptance model nor a summarizer accepts
+/// steps with the default summarizer model, so the two roles share one built-in
+/// default.
+pub const BUILTIN_DEFAULT_GATEKEEPER_MODEL: &str = BUILTIN_DEFAULT_SCRIBE_MODEL;
 pub const BUILTIN_DEFAULT_CODER_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_ARCHITECT_MODEL: &str = "~anthropic/claude-sonnet-latest";
-pub const BUILTIN_DEFAULT_PRIMARY_MODEL: &str = "~google/gemini-flash-latest";
+pub const BUILTIN_DEFAULT_REPL_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_REVIEWER_MODEL: &str = "~anthropic/claude-sonnet-latest";
-pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_PRIMARY_MODEL;
+pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_REPL_MODEL;
 
 /// Serializes an optional model reference in its canonical `provider:name` form.
 ///
@@ -36,21 +43,27 @@ where
 
 /// Role model lists and the coder escalation ladder (`[models]`).
 ///
-/// `primary` is mandatory and must list at least one [`ModelEntry`]; its first
+/// `repl` is mandatory and must list at least one [`ModelEntry`]; its first
 /// entry is the idle active model and the deterministic default for every role
 /// that omits its own list. `coder`, `architect`, and `reviewer` are optional
-/// ordered lists: when omitted they inherit the entire `primary` list, so a
+/// ordered lists: when omitted they inherit the entire `repl` list, so a
 /// specialized role never silently loses access to the configured models. The
 /// `coder` list doubles as the escalation ladder: the FSM advances one entry at
 /// a time and saturates on the last. `scribe` is a single utility model used for
 /// history compaction and commit message synthesis; it defaults to the first
-/// `primary` entry.
+/// `repl` entry.
 ///
 /// Every reference is already resolved against the provider catalog, so a role
 /// never stores an alias and every consumer reads a concrete model.
+///
+/// `gatekeeper` is an optional single model rather than a list: it accepts the
+/// result of a plan step before that step is committed, so it never escalates
+/// and never alternates between models. When it is absent, the step is accepted
+/// by the Scribe model, and when the summarizer is absent as well the base
+/// `repl` entry does.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ModelsConfig {
-    pub primary: Vec<ModelEntry>,
+    pub repl: Vec<ModelEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coder: Option<Vec<ModelEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +75,12 @@ pub struct ModelsConfig {
         serialize_with = "serialize_model_ref_opt"
     )]
     pub scribe: Option<ModelRef>,
+    /// Acceptance model of a plan step, absent by default.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub gatekeeper: Option<ModelRef>,
     pub auto_level_up: bool,
 }
 
@@ -136,7 +155,7 @@ impl ModelsConfig {
         }
 
         Ok(ModelsConfig {
-            primary: resolve_role("primary", raw.primary, catalog)?,
+            repl: resolve_role("repl", raw.repl, catalog)?,
             coder: raw
                 .coder
                 .map(|entries| resolve_role("coder", entries, catalog))
@@ -157,23 +176,31 @@ impl ModelsConfig {
                         .map_err(|err| format!("[models] scribe: {}", err))
                 })
                 .transpose()?,
+            gatekeeper: raw
+                .gatekeeper
+                .map(|reference| {
+                    reference
+                        .resolve(catalog)
+                        .map_err(|err| format!("[models] gatekeeper: {}", err))
+                })
+                .transpose()?,
             auto_level_up: raw.auto_level_up,
         })
     }
 
-    /// Validates that `primary` is present and non-empty and that no populated
+    /// Validates that `repl` is present and non-empty and that no populated
     /// role list is empty.
     ///
-    /// `primary` is mandatory because it is the deterministic default source for
+    /// `repl` is mandatory because it is the deterministic default source for
     /// every other role; an empty list would leave the harness unable to resolve
     /// a single model.
     ///
     /// A role entry that declares a zero generation budget is rejected as well:
     /// a model allowed zero attempts could never regenerate a rejected patch.
     pub fn validate(&self) -> Result<(), String> {
-        if self.primary.is_empty() {
+        if self.repl.is_empty() {
             return Err(
-                "Invalid models configuration: models.primary must list at least one model"
+                "Invalid models configuration: models.repl must list at least one model"
                     .to_string(),
             );
         }
@@ -194,7 +221,7 @@ impl ModelsConfig {
         // a rejected patch, so a zero budget is refused instead of turning a
         // per-entry limit into a silent disable of the capability.
         for (role, entries) in [
-            ("primary", Some(self.primary.as_slice())),
+            ("repl", Some(self.repl.as_slice())),
             ("coder", self.coder.as_deref()),
             ("architect", self.architect.as_deref()),
             ("reviewer", self.reviewer.as_deref()),
@@ -215,16 +242,18 @@ impl ModelsConfig {
 
     /// Borrowed model list backing a functional role.
     ///
-    /// A specialized role without its own list borrows the entire `primary`
-    /// list, so read-only callers never clone the configured entries. `scribe` is
-    /// the single exception: it is a derived one-element role rather than a stored
-    /// list, so it yields `None` and its entry is resolved on demand instead.
+    /// A specialized role without its own list borrows the entire `repl`
+    /// list, so read-only callers never clone the configured entries. `scribe`
+    /// and `gatekeeper` are the two exceptions: both are derived single-model
+    /// roles rather than stored lists, so they yield `None` and their entries
+    /// are resolved on demand instead.
     fn role_slice(&self, role: ModelRole) -> Option<&[ModelEntry]> {
         match role {
-            ModelRole::REPL => Some(&self.primary),
-            ModelRole::Coder => Some(self.coder.as_deref().unwrap_or(&self.primary)),
-            ModelRole::Architect => Some(self.architect.as_deref().unwrap_or(&self.primary)),
-            ModelRole::Reviewer => Some(self.reviewer.as_deref().unwrap_or(&self.primary)),
+            ModelRole::REPL => Some(&self.repl),
+            ModelRole::Coder => Some(self.coder.as_deref().unwrap_or(&self.repl)),
+            ModelRole::Architect => Some(self.architect.as_deref().unwrap_or(&self.repl)),
+            ModelRole::Reviewer => Some(self.reviewer.as_deref().unwrap_or(&self.repl)),
+            ModelRole::Gatekeeper => None,
             ModelRole::Scribe => None,
         }
     }
@@ -234,6 +263,29 @@ impl ModelsConfig {
         self.role_slice(role)?.first()
     }
 
+    /// Resolves the acceptance entry through the fallback chain of its role.
+    ///
+    /// The Gatekeeper reviews the diff of a plan step before that step is
+    /// committed, so every project has one even when it declares no acceptance
+    /// model. An explicit `gatekeeper` declaration wins, an absent one inherits
+    /// the Scribe model, a project that declares neither inherits the base
+    /// `repl` entry, and the built-in default of the role closes the chain. The
+    /// chain is resolved in exactly one place, so `resolve_role` and
+    /// `role_entries` never disagree about the model acceptance runs on.
+    ///
+    /// Only the model travels along the chain: a reasoning depth and a
+    /// generation budget belong to the slot a model was declared in, so an
+    /// inherited model never borrows the runtime parameters of another role.
+    fn gatekeeper_entry(&self, fallback: Option<ModelRef>) -> ModelEntry {
+        let model = self
+            .gatekeeper
+            .clone()
+            .or_else(|| self.scribe.clone())
+            .or_else(|| self.repl.first().map(|entry| entry.model.clone()))
+            .or(fallback)
+            .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_GATEKEEPER_MODEL));
+        ModelEntry::from(model)
+    }
     /// Entry of a role list matching a concrete model, without cloning the list.
     fn entry_for_model(&self, role: ModelRole, model: &ModelRef) -> Option<&ModelEntry> {
         self.role_slice(role)?
@@ -273,34 +325,48 @@ impl ModelsConfig {
         }
     }
 
-    /// Reports whether the role excludes `model` from automatic escalation.
+    /// Reports whether the role excludes the rung `(model, effort)` from escalation.
     ///
-    /// A model declared with `level_up = false` stays in the role catalog
+    /// A rung declared with `level_up = false` stays in the role catalog
     /// ([`ModelsConfig::role_entries`]) so the developer may run it directly, while
     /// [`ModelsConfig::coder_ladder`] and [`ModelsConfig::architect_ladder`] skip it.
-    /// A run started on such a model is already saturated: the automatic ladder
+    /// A run started on such a rung is already saturated: the automatic ladder
     /// never enters it and holds no stronger rung above it.
-    pub fn excluded_from_escalation(&self, role: ModelRole, model: &ModelRef) -> bool {
-        self.role_slice(role)
-            .unwrap_or(&[])
-            .iter()
-            .any(|entry| &entry.model == model && entry.level_up() == Some(false))
+    ///
+    /// The marker belongs to one rung, never to the model. The same model may
+    /// occupy several rungs at different reasoning depths, so excluding one of
+    /// them leaves every sibling rung participating in escalation, and a
+    /// participating sibling keeps its own ladder position and its own escalation.
+    pub fn excluded_from_escalation(
+        &self,
+        role: ModelRole,
+        model: &ModelRef,
+        effort: Option<ReasoningEffort>,
+    ) -> bool {
+        self.role_slice(role).unwrap_or(&[]).iter().any(|entry| {
+            &entry.model == model && entry.effort == effort && entry.level_up() == Some(false)
+        })
     }
 
     /// Ordered model list backing a functional role.
     ///
-    /// A specialized role without its own list inherits the entire `primary`
-    /// list. `scribe` is a single utility model that defaults to the first
-    /// `primary` entry; it is reported as a one-element list so callers can treat
+    /// A specialized role without its own list inherits the entire `repl`
+    /// list. `scribe` and `gatekeeper` are derived single-model roles: the
+    /// summarizer defaults to the first `repl` entry, and the acceptance model
+    /// follows its own chain (gatekeeper, then scribe, then the base `repl`
+    /// entry). Both are reported as one-element lists so callers can treat
     /// every role uniformly.
     pub fn role_entries(&self, role: ModelRole) -> Vec<ModelEntry> {
         if let Some(entries) = self.role_slice(role) {
             return entries.to_vec();
         }
+        if role == ModelRole::Gatekeeper {
+            return vec![self.gatekeeper_entry(None)];
+        }
 
         match &self.scribe {
             Some(model) => vec![ModelEntry::from(model.clone())],
-            None => self.primary.clone(),
+            None => self.repl.clone(),
         }
     }
 
@@ -311,6 +377,10 @@ impl ModelsConfig {
 
     /// Resolves a [`ModelRole`] to its base (first) model, consulting an optional
     /// external fallback and finally the built-in default for the role.
+    ///
+    /// The acceptance role is the exception: its own chain (`gatekeeper`, then
+    /// the Scribe model, then the base `repl` entry) runs first, and the
+    /// external fallback is consulted only once that chain is exhausted.
     pub fn resolve_role_with_fallback(
         &self,
         role: ModelRole,
@@ -320,11 +390,16 @@ impl ModelsConfig {
             return self
                 .scribe
                 .clone()
-                .or_else(|| self.primary.first().map(|entry| entry.model.clone()))
+                .or_else(|| self.repl.first().map(|entry| entry.model.clone()))
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_SCRIBE_MODEL));
         }
-
+        // The acceptance role follows its own chain, so it consults the
+        // external fallback only after gatekeeper, scribe, and `repl` are
+        // exhausted.
+        if role == ModelRole::Gatekeeper {
+            return self.gatekeeper_entry(fallback).model;
+        }
         self.base_entry(role)
             .map(|entry| entry.model.clone())
             .or(fallback)
@@ -444,7 +519,7 @@ impl ModelsConfig {
     /// Returns the ordered coder escalation ladder.
     ///
     /// The ladder is the coder list when present, otherwise the inherited
-    /// `primary` list. A rung whose entry declares `level_up = false` is
+    /// `repl` list. A rung whose entry declares `level_up = false` is
     /// skipped: the model stays selectable in the role catalog
     /// ([`ModelsConfig::role_entries`]) but automatic escalation never enters
     /// it. When even that leaves nothing, the ladder degrades to a single rung
@@ -485,7 +560,7 @@ impl ModelsConfig {
     ///
     /// `None` means the ladder is saturated: the next position resolves to the same
     /// `(model, effort)` pair, so advancing would only repeat the configuration that
-    /// already failed. A run started on a model the coder role excludes by
+    /// already failed. A run started on a rung the coder role excludes by
     /// `level_up = false` begins at the strongest eligible position
     /// ([`ModelsConfig::coder_tier_index`]), so it saturates here as well and no
     /// stronger tier is ever entered automatically.
@@ -508,7 +583,7 @@ impl ModelsConfig {
     /// first: an entry matching both wins, because the same model may occupy
     /// several rungs at different depths; a model-only match is the fallback.
     /// An absent selection, or a model the ladder does not carry at all, restarts
-    /// from the base rung instead of guessing a position. A manual run on a model
+    /// from the base rung instead of guessing a position. A manual run on a rung
     /// the coder role excludes from escalation by `level_up = false` is not a
     /// ladder position either, yet it is already at the top: it starts from the
     /// strongest eligible rung and leaves the ladder saturated
@@ -526,10 +601,12 @@ impl ModelsConfig {
             .or_else(|| ladder.iter().position(|entry| entry.model == model));
         match position {
             Some(index) => index,
-            // A model the coder role excludes from escalation is a manual run: it
+            // A rung the coder role excludes from escalation is a manual run: it
             // occupies no ladder position, so it starts on the strongest eligible
-            // rung and retrying can never enter a stronger tier.
-            None if self.excluded_from_escalation(ModelRole::Coder, &model) => {
+            // rung and retrying can never enter a stronger tier. The exclusion is
+            // read on the rung, so a participating sibling of the same model keeps
+            // its own position and its own escalation.
+            None if self.excluded_from_escalation(ModelRole::Coder, &model, effort) => {
                 ladder.len().saturating_sub(1)
             }
             None => 0,
@@ -544,7 +621,7 @@ impl ModelsConfig {
     /// Returns the ordered architect ladder.
     ///
     /// The ladder is the architect list when present, otherwise the inherited
-    /// `primary` list, so re-planning never loses access to the configured
+    /// `repl` list, so re-planning never loses access to the configured
     /// Architect models. A tier whose entry declares `level_up = false` is
     /// skipped: the model stays selectable in the role catalog but automatic
     /// escalation never enters it. When even that leaves nothing, the ladder
@@ -594,34 +671,58 @@ impl ModelsConfig {
 
     /// Returns the ladder position of a recorded Architect configuration.
     ///
-    /// `None` means the record does not belong to the current ladder: the
-    /// configuration changed between waves, so its position cannot be trusted.
+    /// A position is identified by the rung identity alone: the `(model, effort)`
+    /// pair. The runtime parameters a record carries — the generation budget and
+    /// the escalation marker — never participate in the comparison, so a tier
+    /// recorded by an earlier wave still matches the configured rung when its
+    /// budget or marker differs or is absent.
+    ///
+    /// A recorded depth the configuration no longer declares falls back to the
+    /// first rung of the same model. `None` means the record does not belong to
+    /// the current ladder at all: the configuration changed between waves, so its
+    /// position cannot be trusted.
     pub fn architect_tier_index(&self, recorded: Option<&ArchitectTier>) -> Option<usize> {
         let recorded = recorded?;
         let ladder = self.architect_ladder();
         ladder
             .iter()
-            .position(|tier| tier == recorded)
+            .position(|tier| tier.model == recorded.model && tier.effort == recorded.effort)
             .or_else(|| ladder.iter().position(|tier| tier.model == recorded.model))
     }
 
     /// Returns the rung that follows a recorded Architect configuration.
     ///
     /// A recorded rung that is absent from the current ladder restarts from the
-    /// base rung, so escalation never guesses a position. The last rung saturates,
-    /// so an exhausted ladder keeps the strongest Architect. A recorded rung the
-    /// ladder excludes by `level_up = false` is a manual run the developer pinned:
-    /// restarting would silently downgrade it, so the configuration stays as it is
-    /// and escalation is saturated.
+    /// base rung, so escalation never guesses a position. Escalation saturates on
+    /// rung identity, exactly as [`ModelsConfig::next_coder_tier`] reports it: a
+    /// next position resolving to the `(model, effort)` pair already recorded
+    /// advances nothing, so the recorded configuration is returned unchanged. The
+    /// depth of the recorded rung is therefore never downgraded, and a ladder
+    /// carrying several rungs of one model cannot cycle between them.
+    ///
+    /// A recorded rung the ladder excludes by `level_up = false` is a manual run
+    /// the developer pinned: restarting would silently downgrade it, so the
+    /// configuration stays as it is and escalation is saturated.
     pub fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
         let Some(recorded) = recorded else {
             return self.architect_tier(0);
         };
-        if self.excluded_from_escalation(ModelRole::Architect, &recorded.model) {
+        if self.excluded_from_escalation(ModelRole::Architect, &recorded.model, recorded.effort) {
             return recorded.clone();
         }
         match self.architect_tier_index(Some(recorded)) {
-            Some(idx) => self.architect_tier(idx + 1),
+            Some(idx) => {
+                let current = self.architect_tier(idx);
+                let next = self.architect_tier(idx + 1);
+                // Saturation is rung identity: a next position resolving to the
+                // pair already recorded advances nothing, so the recorded
+                // configuration stays and its depth is never downgraded.
+                if next.model == current.model && next.effort == current.effort {
+                    recorded.clone()
+                } else {
+                    next
+                }
+            }
             None => self.architect_tier(0),
         }
     }
@@ -637,7 +738,7 @@ impl ModelsConfig {
             scribe: self.resolve_role_with_fallback(ModelRole::Scribe, fallback.clone()),
             coder: self.resolve_role_with_fallback(ModelRole::Coder, fallback.clone()),
             architect: self.resolve_role_with_fallback(ModelRole::Architect, fallback.clone()),
-            primary: self.resolve_role_with_fallback(ModelRole::REPL, fallback.clone()),
+            repl: self.resolve_role_with_fallback(ModelRole::REPL, fallback.clone()),
             reviewer: self.resolve_role_with_fallback(ModelRole::Reviewer, fallback),
             efforts: None,
             entries: None,
@@ -648,9 +749,13 @@ impl ModelsConfig {
 fn default_model_for_role(role: ModelRole) -> &'static str {
     match role {
         ModelRole::Scribe => BUILTIN_DEFAULT_SCRIBE_MODEL,
+        // A project that declares neither an acceptance model nor a summarizer
+        // accepts steps with the default summarizer model, so the two roles
+        // share one built-in default.
+        ModelRole::Gatekeeper => BUILTIN_DEFAULT_GATEKEEPER_MODEL,
         ModelRole::Coder => BUILTIN_DEFAULT_CODER_MODEL,
         ModelRole::Architect => BUILTIN_DEFAULT_ARCHITECT_MODEL,
-        ModelRole::REPL => BUILTIN_DEFAULT_PRIMARY_MODEL,
+        ModelRole::REPL => BUILTIN_DEFAULT_REPL_MODEL,
         ModelRole::Reviewer => BUILTIN_DEFAULT_REVIEWER_MODEL,
     }
 }

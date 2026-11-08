@@ -44,7 +44,9 @@ pub(super) struct StagingOutcome {
 /// that match cleanly accumulate while failures are repaired through the
 /// patch-retry loop up to `max_retries`. A cancellation or a semantic block
 /// terminates the turn; otherwise the accumulated edits and residual failures
-/// are returned for the caller to finalize.
+/// are returned for the caller to finalize. A failure the model stops retrying
+/// keeps its own record: the loop stops asking for it, but the turn reports the
+/// file it left out instead of shrinking the change set without a trace.
 pub(super) async fn run_staging_phase(
     ctx: &mut TurnKernel<'_>,
     step: &ProposalStep,
@@ -55,7 +57,10 @@ pub(super) async fn run_staging_phase(
     let mut cumulative_edits: Vec<EditOperation> = Vec::new();
     let mut succeeded_files: HashSet<String> = HashSet::new();
     let mut last_failed_errors: HashMap<String, EditError> = HashMap::new();
-
+    // Failures the model stopped retrying. Their edits never reached the change
+    // set, so they are collected here and reported once the loop settles
+    // instead of disappearing with the entries that described them.
+    let mut abandoned_failures: HashMap<String, EditError> = HashMap::new();
     log_fsm_phase(
         ctx.workflow_name,
         ctx.model,
@@ -106,13 +111,20 @@ pub(super) async fn run_staging_phase(
                 "staging round completed"
             );
             staged_state = Some(stage_res.staged_state);
+            // Only a path that converged in this round answers its earlier
+            // rejection. Clearing by the cumulative set would also erase the
+            // failure of a path that succeeded in an earlier round and then
+            // failed again without being part of this attempt.
+            for path in &stage_res.successful_paths {
+                last_failed_errors.remove(path);
+                abandoned_failures.remove(path);
+            }
             succeeded_files.extend(stage_res.successful_paths);
             cumulative_edits.extend(stage_res.successful_edits);
-
-            for path in &succeeded_files {
-                last_failed_errors.remove(path);
-            }
             for failed in stage_res.failed_files {
+                // The path has just been attempted again, so it is no longer an
+                // omission whatever this attempt reported.
+                abandoned_failures.remove(&failed.path);
                 last_failed_errors.insert(failed.path, failed.error);
             }
         }
@@ -233,11 +245,20 @@ pub(super) async fn run_staging_phase(
         current_edits = step_out.edits().to_vec();
         current_protocol_errors = step_out.protocol_errors().to_vec();
         if !current_edits.is_empty() {
-            retain_retried_failed_files(
+            // The corrected set answers only for the paths it touches, so every
+            // other failure was not retried. The harness stops asking for those
+            // files — the model already declined them once — but their edits
+            // never reached the change set, so they are recorded here and
+            // reported once the loop settles instead of vanishing with the
+            // entries that described them.
+            let unretried = retain_retried_failed_files(
                 &mut last_failed_errors,
                 ctx.context_manager,
                 &current_edits,
             );
+            for (path, error) in unretried {
+                abandoned_failures.insert(path, error);
+            }
             if let Some(ref mut staged) = staged_state {
                 prepare_staged_for_retry(
                     staged,
@@ -248,6 +269,40 @@ pub(super) async fn run_staging_phase(
                 );
             }
         }
+    }
+
+    // A file the corrected edits never retried stays out of the change set, so
+    // the turn reports it once the retry budget is spent or the retried edits
+    // converge. A later round that attempts the file again clears the record.
+    if !abandoned_failures.is_empty() {
+        let mut abandoned: Vec<(String, String)> = abandoned_failures
+            .into_iter()
+            .map(|(path, error)| {
+                let reason = format_patch_retry_reason(&error, ctx.options.patch_strategy());
+                (path, reason)
+            })
+            .collect();
+        abandoned.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut lines: Vec<String> = Vec::with_capacity(abandoned.len());
+        for (path, reason) in &abandoned {
+            tracing::warn!(
+                workflow = ctx.workflow_name,
+                model = %ctx.model,
+                path = path.as_str(),
+                reason = reason.as_str(),
+                "failed edit was not retried and stays out of the change set"
+            );
+            lines.push(format!("- `{}`: {}", path, reason));
+        }
+        let notice = format!(
+            "\n\n---\n⚠️ **[Change Set Incomplete]** The corrected edits do not retry the following failed file(s), so they stay out of this change set:\n{}\n\n",
+            lines.join("\n")
+        );
+        let _ = ctx
+            .stream_tx
+            .send(StreamEvent::TextDelta(notice.clone()))
+            .await;
+        ctx.accumulated_text.push_str(&notice);
     }
 
     Ok(StagingPhase::Ready(StagingOutcome {
@@ -657,6 +712,10 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.contains("Protocol parsing errors")));
+        assert!(
+            outcome.protocol_failure.is_none(),
+            "a converged retry leaves no protocol-failure fact behind"
+        );
     }
 
     #[tokio::test]
@@ -956,6 +1015,15 @@ mod tests {
             }
             other => panic!("expected failed Edit result, got {other:?}"),
         }
+
+        let failure = outcome
+            .protocol_failure
+            .as_deref()
+            .expect("a protocol violation is a typed fact of the turn");
+        assert!(
+            !failure.trim().is_empty(),
+            "the fact carries the diagnostic of the violation"
+        );
     }
 
     #[tokio::test]
@@ -1399,7 +1467,7 @@ mod tests {
             (
                 "tauqe.toml",
                 r#"[models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "true"
@@ -1482,7 +1550,7 @@ args = ['-c', 'mkdir -p target && printf "artifact\n" > target/artifact.txt']
             (
                 "tauqe.toml",
                 r#"[models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "true"
@@ -1544,7 +1612,7 @@ args = ["-c", "tr a-z A-Z"]
             (
                 "tauqe.toml",
                 r#"[models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "true"
@@ -1843,7 +1911,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         let config = format!(
             concat!(
                 "[models]\n",
-                "primary = [\"openrouter:mock/model\"]\n",
+                "repl = [\"openrouter:mock/model\"]\n",
                 "\n",
                 "[project.verify]\n",
                 "command = \"sh\"\n",
@@ -2105,5 +2173,121 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
                 .contains("Every file you requested is already loaded in <context>"),
             "the satisfied-hint directive must stay withheld after the model wrote prose"
         );
+    }
+    /// A failed file the model stops retrying never leaves the turn without a
+    /// trace.
+    ///
+    /// The retry prompt asks for corrected blocks of every failed file, so a
+    /// corrected set that omits one leaves its edit unapplied. The loop stops
+    /// asking for that file — repeating a request the model already declined
+    /// buys nothing — but the omission is reported on the turn stream and in
+    /// the recorded answer instead of vanishing with the entry that described
+    /// it.
+    #[tokio::test]
+    async fn an_unretried_failed_file_is_reported_instead_of_vanishing() {
+        let (_dir, root) =
+            setup_repo(&[("a.rs", TARGET), ("b.rs", "pub fn other() -> i32 { 7 }\n")]);
+        let mut context = context_with_target(&root);
+        context.add_file("b.rs", ContextAccess::Editable).unwrap();
+        let mut history = HistoryManager::new(root.clone());
+
+        let first_round = concat!(
+            "<tauqe_edits summary=\"Edit\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\nnonexistent text\n</search>\n",
+            "<replace>\nirrelevant\n</replace>\n",
+            "</edit>\n",
+            "<edit path=\"b.rs\">\n",
+            "<search>\npub fn other() -> i32 { 7 }\n</search>\n",
+            "<replace>\npub fn other() -> i32 { 8 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>"
+        );
+        // The corrected set answers for `b.rs` alone: `a.rs` is left out of it
+        // entirely, so its rejected edit is never retried.
+        let corrected_round = concat!(
+            "<tauqe_edits summary=\"Edit\">\n",
+            "<edit path=\"b.rs\">\n",
+            "<search>\npub fn other() -> i32 { 7 }\n</search>\n",
+            "<replace>\npub fn other() -> i32 { 8 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>"
+        );
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(first_round),
+            MockResponse::text(corrected_round),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Edit both files",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the omitted file must not buy a round the model cannot answer"
+        );
+        assert!(
+            outcome.assistant_text.contains("Change Set Incomplete"),
+            "the answer must state that the change set lost a file: {}",
+            outcome.assistant_text
+        );
+        // The reason is rendered by the profile of the declared strategy, so the
+        // assertion derives it from that same source instead of pinning the
+        // wording of one dialect.
+        let expected_reason = crate::workflow::retry::format_patch_retry_reason(
+            &crate::edits::EditError::NoMatch {
+                path: "a.rs".to_string(),
+            },
+            options.patch_strategy(),
+        );
+        assert!(
+            outcome
+                .assistant_text
+                .contains(&format!("- `a.rs`: {expected_reason}")),
+            "the answer must name the omitted file and its reason: {}",
+            outcome.assistant_text
+        );
+        let mut streamed = String::new();
+        while let Ok(event) = stream_rx.try_recv() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("Change Set Incomplete"),
+            "the notice must reach the turn stream: {streamed}"
+        );
+        // The retried file converged, so the change set still applies; the
+        // notice is what keeps the omission from being silent.
+        match &outcome.result {
+            ModelResult::Edit { outcome: edit, .. } => {
+                assert!(edit.applied, "unexpected error: {:?}", edit.error);
+            }
+            other => panic!("expected an applied change set, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "pub fn other() -> i32 { 8 }\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
     }
 }

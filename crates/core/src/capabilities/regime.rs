@@ -244,7 +244,7 @@ pub fn intent_delta_rules(
         rules.push(ContractRule::new(
             "Code Verification",
             if structured {
-                "Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Leave the `verify` field unfilled and keep its `target` at 'none' (the harness runs toolchain verification and gating automatically)."
+                "The response surface of a step carries no verification channel: verification of code modifications is handled automatically and deterministically by the harness, which runs toolchain verification and gating at the end of the step."
             } else {
                 "Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit verification tags (the harness runs toolchain verification and gating automatically)."
             },
@@ -993,11 +993,15 @@ mod tests {
         assert!(immutability.contains("`is_blocked`"));
         assert!(immutability.contains("`details`"));
 
-        // Verification is delegated by leaving the verify field idle.
+        // The response surface of a step carries no verification channel, so the
+        // rule states the harness obligation instead of naming a field the
+        // strict step schema never declares.
         let verification = body(&step, "Code Verification");
-        assert!(verification.contains("`verify`"));
-        assert!(verification.contains("'none'"));
+        assert!(verification.contains("no verification channel"));
+        assert!(verification.contains("toolchain verification"));
+        assert!(!verification.contains("`verify`"));
         assert!(!verification.contains("verification tags"));
+        assert!(!verification.contains("<verify"));
     }
 
     #[test]

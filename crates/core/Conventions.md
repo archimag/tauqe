@@ -170,8 +170,10 @@ The interaction protocol between Tauqe and large language models is strictly div
      read (`tauqe.toml`, `package.json`), or a `git` subprocess — must never run
      directly on a Tokio worker thread.
    - Route such work through `crate::blocking::run_blocking` from synchronous
-     code, or `crate::blocking::run_blocking_async` (returning `Result<T, JoinError>`)
-     from async code when the closure is `Send + 'static`. Both helpers are
+     code, or `crate::blocking::run_blocking_async` from async code when the
+     closure is `Send + 'static`; it reports a failed offload as a typed error
+     that proves whether the closure ran, never as the join error of its task.
+     Both helpers are
      reentrant and degrade to a direct call outside a multi-threaded runtime, so
      synchronous callers and tests stay panic-free.
 2. **Rationale (Why):**

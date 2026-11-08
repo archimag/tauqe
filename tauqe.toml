@@ -25,158 +25,46 @@ models = [
   { model = "~anthropic/claude-haiku-latest", alias = "Claude Haiku" },
   { model = "~deepseek/deepseek-flash-latest", alias = "DeepSeek Flash" },
   { model = "~z-ai/glm-latest", alias = "GLM"  },
-  { model = "~z-ai/glm-flash-latest", alias = "GLM Flash" }
+  { model = "~z-ai/glm-flash-latest", alias = "GLM Flash" },
+  { model = "meta/muse-spark-1.3-contributor", alias = "Muse Spark"}
 ]
 
 [models]
-# Semantic model roles: specialized domain roles instead of generic difficulty tiers.
-# `primary` is mandatory and must list at least one model; its first entry is the
-# active model in the idle state and the deterministic default for the other roles.
-# If coder, architect or reviewer are omitted, they inherit the entire primary list.
-# `scribe` is a single utility model and defaults to the first primary model.
-# Every entry names a model either by its provider identifier ("~provider/model")
-# or by an alias registered in `[providers.openrouter].models`, and carries the
-# runtime parameters of that slot: an optional `effort` ("low", "medium", "high",
-# "xhigh", "max"), an optional `attempts` budget, and an optional `level_up`
-# marker. A display alias is not a role field — it describes the model itself and
-# lives in the catalog entry, so the same model is never labelled twice.
-#
-# `level_up = false` keeps a coder or architect rung out of automatic level-up
-# escalation while leaving the model selectable by hand; the default (`true`)
-# lets the harness escalate onto the rung when verification fails.
-primary = [
+scribe = "Claude Haiku"
+
+repl = [
+  "DeepSeek Flash",
   "Gemini Flash",
+  "DeepSeek Flash",
   "GLM"
 ]
-scribe = "Claude Haiku"    # history compaction, git squash commit messages, diff summarization
-# The coder list is the natural escalation ladder (level up): on verification
-# healing stalls or exhausted retries the turn advances to the next coder entry,
-# saturating on the last one. Escalation stays strictly within the Coder role and
-# never switches to Architect, preserving the What vs How role isolation.
+
 coder = [
-  { model = "DeepSeek Flash", effort = "max" },
-  { model = "GLM", effort = "max" },
+  { model = "DeepSeek Flash", effort = "max", attempts = 3 },
+  { model = "GLM", effort = "max", attempts = 2 },
   { model = "Gemini Flash", level_up = false },
-  # `level_up = false` keeps a rung manually selectable only: the automatic
-  # escalation ladder never enters it.
-  # { model = "Claude Opus", effort = "max", level_up = false }
+  { model = "Claude Sonnet", level_up = false }
 ]
+
 architect = [
   "GLM",
-  # `level_up = false` keeps a rung manually selectable only: re-planning
-  # escalation never enters it.
-  # { model = "Claude Opus", level_up = false }
+  { model = "Gemini Flash", level_up = false }
 ]
-# conceptual design, plan refinement, blocked-step replanning
+
 reviewer = [
   "GLM",
   "Claude Sonnet",
-]   # automated code review of active context files
+]
 
-# Automatically escalate the Coder along its ladder when verification healing stalls,
-# when a patch retry budget is exceeded, or when a plan step must be re-prompted after
-# protocol drift. Escalation advances one rung at a time within the Coder role and never
-# switches to Architect, preserving the strict What vs How role isolation. A terminal
-# <blocked> report short-circuits escalation entirely.
 auto_level_up = true
-
-# The `[repl]` section is the profile every bounded turn of this project runs
-# under, not only an interactive REPL turn: the workflow engine, the edit
-# protocol, the patch strategy, the prompt layout, and the retry and replanning
-# budgets apply to an isolated step and to a discussion exactly as they apply to
-# the REPL itself.
 [repl]
-# Retry budget for failed edit staging and for the verification healing loop. It bounds
-# the repairs of a single turn; how many content attempts a model tier receives is
-# declared per model entry with `attempts` in the `[models]` section.
 max_retries = 5
-# Maximum automated replanning cycles triggered by a blocked coder step before
-# requiring manual developer intervention (default: 2).
-# max_replans = 2
-# How a change set addresses the lines it replaces. `line_anchor` (default)
-# names an inclusive line range through the compact opaque anchors rendered
-# beside every context line, so the model copies a short token instead of
-# reproducing the text it replaces; `search_replace` echoes the replaced text
-# and matches it exactly. The strategy is orthogonal to `protocol`: the
-# protocol picks the encoding of an edit, the strategy picks the fields that
-# address a range.
-# patch_strategy = "line_anchor"
-# Prompt layout policy. `semantic` composes the prompt as blocks grouped by kind
-# (contract, repository map, context, plan, language, history, scratchpad), while
-# `chronological` interleaves context files with history entries in the order they
-# were added, so the prompt grows append-only from one turn to the next. When the
-# key is absent the layout follows the turn intent: interactive REPL turns use
-# `chronological`, isolated steps and discussions use `semantic`.
-# prompt_layout = "chronological"
-# workflow = "git"   # edit workflow: "git", "naive" (default: "git")
-# Active edit protocol. `structured` is the default and drives strict JSON-Schema
-# structured output, `xml` drives marker-protected XML tags, and `mixed` (legacy
-# alias `auto`) pairs both contours: XML for code edits, structured output for
-# discussions, commit messages, and history compaction. The format changes only the
-# transport, the token cost and the prefix caching — the capabilities of a turn
-# follow from its intent.
-# protocol = "structured"
 
 [project]
-# The `[project]` section is the single surface that declares what the harness may run
-# for this repository. Every entry is a plain command line executed as a process with
-# literal arguments — never through a shell — so a project command cannot widen into
-# arbitrary command execution. An entry may reuse a declared command by writing
-# `@<name>` as its executable. A reference names the command that runs, so it
-# carries no `args`, `description`, or `parameters` of its own; `timeout_secs` is
-# the exception, because it bounds one invocation instead of defining the command
-# line. The outermost declared budget wins along a reference chain, and a reference
-# that declares none inherits the budget of the command it names.
-#
-# A declared task runner (`runner = "just"`) delegates the project lifecycle to the
-# recipes carrying `[group('tauqe')]` in `Justfile`: `verify` fills the mandatory
-# verification gate, `format` fills the in-memory format filter, `post-hook` fills the
-# disk-side hook, and every other exported recipe becomes a typed custom tool. The
-# technology-specific command lines therefore live in `Justfile`, while this file keeps
-# only the harness policies. This repository declares the runner and the trust
-# boundaries below.
-#
-# A declaration in this section always takes precedence over the runner, so a stage may
-# be pinned here without touching the runner. Each entry is a plain command line with
-# literal arguments, and `verify` stays mandatory: a change set the harness cannot
-# verify is never accepted.
-#
-# [project.verify]
-# command = "cargo"
-# args = ["test", "--workspace"]
-# timeout_secs = 600
-#
-# # In-memory formatter: staged content arrives on standard input and the rewritten
-# # content leaves on standard output, so the change set is formatted while it still
-# # lives in staging and no unformatted byte ever reaches disk.
-# [project.format]
-# command = "rustfmt"
-# args = ["--emit", "stdout"]
-# timeout_secs = 120
-#
-# # Disk post-hook: runs strictly after the change set is written and before `verify`,
-# # so generated sources and refreshed manifests exist when verification runs. Artifacts
-# # it creates are captured through Git and join the same atomic commit.
-# [project.post_hook]
-# command = "cargo"
-# args = ["generate-lockfile"]
-#
-# # Named project command, published to the model as a typed custom tool.
-# [project.commands.check]
-# command = "cargo"
-# args = ["check", "--all-targets"]
-# timeout_secs = 600
 runner = "just"
 
-# Trust boundaries: paths the harness tracks through Git and keeps readable as
-# reference, yet never lets a turn create, rewrite, move, or delete. `Justfile`
-# owns the project verification lifecycle, so a change set able to rewrite it
-# could also make verification agree with itself. `docs/specs/**` holds the
-# specifications an implementation step is checked against, and `tauqe.d/**`
-# holds the modular configuration layers, so a turn able to rewrite one could
-# redefine the harness policy those layers declare.
 [project.boundaries]
-protected = ["Justfile", "docs/specs/**", "tauqe.d/**"]
+#protected = ["Justfile", "docs/specs/**", "tauqe.d/**"]
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
@@ -191,88 +79,8 @@ max_research_rounds = 12  # maximum rounds for autonomous context research
 token_budget = 1000000  # aggregate context token budget: repository files and external documents (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
-# max_search_requests_per_round = 5    # repository search queries honored per Research round (default: 5)
-# max_matched_files_per_search = 50    # matching files reported for one search query (default: 50)
-# max_dir_list_entries = 100           # entries rendered by one directory listing (default: 100)
-# max_repo_map_requests_per_round = 3  # targeted repository maps rendered per Research round (default: 3)
-# max_feedback_chars = 4000            # characters of one project command stream reported back to the model (default: 4000)
-# max_scratchpad_chars = 4000          # characters of a turn scratchpad block kept before truncation (default: 4000)
 pinned = [
     "Conventions.md",
     "Vision.md",
     "docs/src/SUMMARY.md"
 ]
-
-# Named review presets decompose one audit into isolated groups, each carrying
-# its own repository paths and an optional local prompt, and declare when the
-# post-analysis layer is produced: `automatic` classifies the findings once
-# every group has finished, `manual` waits for an explicit `review/analyze`
-# request, and `none` keeps them a flat list (default). A preset is declared as
-# `[[review.presets]]` with a mandatory `name`, an optional `title`, the
-# `post_analysis` mode, and one or more `[[review.presets.groups]]` entries
-# carrying a `name`, `paths`, and an optional `prompt`. An absent section
-# declares no preset, so single-audit sessions stay available. This repository
-# declares none.
-[[review.presets]]
-name = "crates"
-title = "Workspace Crates Audit"
-post_analysis = "manual"
-
-[[review.presets.groups]]
-name = "protocol"
-paths = ["crates/protocol/src"]
-prompt = "Audit wire contracts, pure DTOs, and serialization invariants without I/O or async dependencies."
-
-[[review.presets.groups]]
-name = "tools"
-paths = ["crates/tools/src"]
-prompt = "Audit deterministic substrate invariants: virtual staging, atomic writes, Git transactions, process isolation, and repomap extraction."
-
-[[review.presets.groups]]
-name = "core"
-paths = ["crates/core/src"]
-prompt = "Audit harness engine invariants: bounded-turn FSM, capability registry, prompt layout, context, and provider streaming."
-
-[[review.presets.groups]]
-name = "server"
-paths = ["crates/server/src"]
-prompt = "Audit RPC daemon: concurrency control (OperationGuard), request dispatching, and streaming transport."
-
-[[review.presets.groups]]
-name = "tui"
-paths = ["crates/tui/src"]
-prompt = "Audit terminal UI: views, event translation, layout geometry, and client transport without direct disk/git operations."
-
-# External documentation: authoritative material a project keeps outside the
-# repository and declares once. Every entry carries a mandatory `id` (its mount
-# point), a mandatory `title`, an optional `description`, and a mandatory
-# `source`: one string that names either an http(s) address or a local path. The
-# scheme decides the kind while the configuration is resolved — a value carrying
-# `http://` or `https://` becomes a remote address, and every other value becomes
-# a local file-system path — so a scheme the harness does not fetch is a
-# configuration error rather than a source that fails in the middle of a turn.
-#
-# The `id` names the root document. A request for `{id}` answers that root file
-# as its original text: the harness parses no index and synthesizes no catalog,
-# so the model follows the relative links the document itself carries and asks
-# for the parts it needs by `{id}/{relative}`. That relative request resolves
-# below the directory holding the root and can never leave it: a `..` segment, an
-# absolute path, a backslash, and a foreign scheme are refused. Documents are
-# materialized lazily into the Git-ignored cache `.tauqe/cache/outer_docs/`, a
-# duplicate `id` is a configuration error, and a snapshot the cache already holds
-# is served without asking the trust declaration again. Reaching a local source
-# or a non-public host for the first time requires the developer's own trust
-# declaration in `~/.config/tauqe/refs-trust.toml`, which a repository cannot
-# grant itself; authorizing the root covers the whole subtree the prefix jail
-# keeps inside it.
-#
-# [[outer_docs]]
-# id = "vendor/api.md"
-# title = "Upstream API notes"
-# description = "Endpoint contracts the implementation step is checked against."
-# source = "https://example.com/llm.txt"
-#
-# [[outer_docs]]
-# id = "mylib"
-# title = "MyLib Book"
-# source = "/srv/docs/mylib/README.md"

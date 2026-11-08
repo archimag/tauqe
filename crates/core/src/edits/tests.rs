@@ -858,7 +858,7 @@ async fn a_mixed_change_set_reports_only_the_tracked_paths() {
 }
 
 /// Valid project configuration used by the configuration-validation tests.
-const VALID_CONFIG: &str = "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n";
+const VALID_CONFIG: &str = "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n";
 
 #[test]
 fn staged_project_config_syntax_error_is_rejected() {
@@ -907,13 +907,13 @@ fn staged_project_config_without_verification_is_accepted() {
     // disk before the change set is applied.
     let dropped_verify = EditOperation::Overwrite {
         path: "tauqe.toml".into(),
-        content: "[models]\nprimary = [\"openrouter:a/b\"]\n".into(),
+        content: "[models]\nrepl = [\"openrouter:a/b\"]\n".into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
         staged_bytes(&result, "tauqe.toml"),
-        &b"[models]\nprimary = [\"openrouter:a/b\"]\n"[..]
+        &b"[models]\nrepl = [\"openrouter:a/b\"]\n"[..]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
@@ -926,7 +926,7 @@ fn staged_project_config_without_verification_is_accepted() {
     let broken_chain = EditOperation::Overwrite {
         path: "tauqe.toml".into(),
         content:
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
                 .into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
@@ -978,7 +978,7 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
     let broken_chain = EditOperation::Overwrite {
         path: ".tauqe.toml".into(),
         content:
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
                 .into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
@@ -997,7 +997,7 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
     // check itself never writes the configuration to disk.
     let extended = EditOperation::Overwrite {
         path: ".tauqe.toml".into(),
-        content: "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
+        content: "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
@@ -1019,7 +1019,7 @@ fn staged_project_config_preserving_invariants_is_accepted() {
 
     let extended = EditOperation::Overwrite {
         path: "tauqe.toml".into(),
-        content: "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
+        content: "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
     assert!(result.is_success());

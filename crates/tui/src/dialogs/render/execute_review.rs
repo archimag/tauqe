@@ -1,6 +1,6 @@
 //! Single-target review execution dialog: Coder picker and directives editor.
 //!
-//! Point execution of a finding or a subplan step exposes the Coder ladder and a
+//! Point execution of exactly one finding exposes the Coder ladder and a
 //! directives editor, so the developer picks the implementing model and adds
 //! instructions before a bounded turn spends tokens. The layout mirrors the
 //! Architect refinement dialogs — header, embedded model list, editor, action
@@ -22,7 +22,7 @@ use crate::ui::header::truncate_to_width;
 const EXECUTE_REVIEW_DIALOG_WIDTH: u16 = 68;
 /// Height of the single-target execution dialog, as a percentage of the terminal.
 const EXECUTE_REVIEW_DIALOG_HEIGHT: u16 = 56;
-/// Header rows: the review, the finding, an optional step, and target files.
+/// Header rows: the review, the finding, and its target files.
 const EXECUTE_REVIEW_HEADER_HEIGHT: u16 = 4;
 
 /// Full drawn confirm-button label, resolved from the runtime locale (c-1).
@@ -139,20 +139,6 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     }
     let mut header_lines = vec![Line::from(review_spans)];
 
-    // The architectural group owns the unified plan, so the form names it before
-    // the step: a group step is addressed through the group that carries the
-    // root cause, never through one of its findings (c-1, c-4, c-5).
-    if let Some(group_id) = target.group_id.as_deref() {
-        header_lines.push(Line::from(vec![
-            Span::styled(active_t("dialog.execute_review.group_label"), dim),
-            Span::styled(
-                truncate_to_width(&target.group_title, 48),
-                engine.fg(palette.text_primary).bold(),
-            ),
-            Span::styled(format!(" [{}]", group_id), dim),
-        ]));
-    }
-
     if let Some(item) = target.items.first() {
         header_lines.push(Line::from(vec![
             Span::styled(active_t("dialog.execute_review.finding_label"), dim),
@@ -172,15 +158,6 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
         }
     }
 
-    if let Some(step_id) = target.step_id.as_deref() {
-        header_lines.push(Line::from(vec![
-            Span::styled(active_t("dialog.execute_review.step_label"), dim),
-            Span::styled(
-                step_id.to_string(),
-                engine.fg(palette.status_warning).bold(),
-            ),
-        ]));
-    }
     // The header band is fixed at EXECUTE_REVIEW_HEADER_HEIGHT rows, so a card
     // that would carry more lines keeps the leading ones instead of painting
     // into the model list below it.
@@ -334,24 +311,20 @@ mod tests {
     use super::*;
     use crate::app::ConfirmExecuteReviewState;
 
-    /// A step of an architectural group names the group and the step in its
-    /// header band, so a point execution never loses the root cause it belongs
-    /// to (c-1, c-4, c-5).
+    /// The point form renders exactly one finding: a group target reaches the
+    /// binary root-cause card instead, so the form never promises a single step
+    /// the unified pipeline cannot isolate (c-1, c-4, c-5).
     #[test]
-    fn group_step_form_renders_the_group_and_the_step() {
+    fn point_form_renders_the_review_and_the_finding() {
         let mut st = crate::app::test_state();
-        st.modals.confirm_execute_review = Some(
-            ConfirmExecuteReviewState::new(
-                Some("rev-1".to_string()),
-                "Session rev-1".to_string(),
-                "Unified auth guard".to_string(),
-                None,
-                Some("1.1".to_string()),
-                Vec::new(),
-                Vec::new(),
-            )
-            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
-        );
+        st.modals.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Finding 1".to_string(),
+            Some(1),
+            Vec::new(),
+            Vec::new(),
+        ));
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
@@ -366,8 +339,11 @@ mod tests {
             }
             screen.push('\n');
         }
-        assert!(screen.contains("Unified auth guard"), "{screen}");
-        assert!(screen.contains("[arch-auth]"), "{screen}");
-        assert!(screen.contains("1.1"), "{screen}");
+        assert!(screen.contains("Session rev-1"), "{screen}");
+        assert!(screen.contains("[rev-1]"), "{screen}");
+        assert!(
+            !screen.contains(active_t("dialog.execute_review.group_label").trim()),
+            "the point form never names a group it cannot isolate: {screen}"
+        );
     }
 }

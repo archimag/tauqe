@@ -17,6 +17,7 @@ use self::types::{
     StreamingChunk,
 };
 
+pub mod catalog;
 mod sse;
 pub mod types;
 

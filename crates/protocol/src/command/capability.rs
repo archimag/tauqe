@@ -313,17 +313,22 @@ impl CapabilityProfile {
         )
     }
 
-    /// One isolated step: the dialogue head minus plan authoring and the
-    /// internal documentation of the harness, no delta.
+    /// One isolated step: the dialogue head minus plan authoring, the internal
+    /// documentation of the harness, and toolchain verification, no delta.
     ///
     /// External project documentation stays available, because a step reads the
     /// contracts it was pointed at; only knowledge about the harness itself is
     /// noise the step cannot act on.
+    ///
+    /// Toolchain verification is excluded here, in the profile itself, because
+    /// the harness owns a step's verification and runs it deterministically, so
+    /// the profile is the single place that decides the surface of a step.
     pub fn isolated_step() -> Self {
         Self::new(
             Self::dialogue_head()
                 .without(LlmCapability::PlanCreation)
-                .without(LlmCapability::DocRequest),
+                .without(LlmCapability::DocRequest)
+                .without(LlmCapability::ToolchainVerify),
             CapabilitySet::new(),
         )
     }
@@ -496,10 +501,10 @@ impl CapabilitySet {
     /// documentation stays reachable, because a step implements the contracts it
     /// was pointed at.
     ///
-    /// Toolchain verification stays declared in the profile and is stripped by
-    /// the turn-intent narrowing, so the decision that the harness owns
-    /// verification for a step lives in exactly one place instead of being
-    /// duplicated across this profile and the narrowing rule.
+    /// Toolchain verification is excluded in the profile itself, because the
+    /// harness owns a step's verification and runs it deterministically: the
+    /// profile is the single place that decides the surface of a step, and the
+    /// turn-intent narrowing stays a pure intersection for every intent.
     pub fn isolated_step() -> Self {
         CapabilityProfile::isolated_step().surface()
     }
@@ -803,18 +808,20 @@ mod tests {
         assert_eq!(repl.as_slice(), expected.as_slice());
 
         // A step keeps the operational surface of a dialogue except plan
-        // authoring and documentation; toolchain verification stays declared
-        // in the profile and is removed by the turn-intent narrowing.
+        // authoring, documentation, and toolchain verification; the last one is
+        // excluded by the profile itself, because the harness owns a step's
+        // verification.
         let step = CapabilitySet::isolated_step();
         assert_eq!(
             step.as_slice(),
             repl.without(LlmCapability::PlanCreation)
                 .without(LlmCapability::DocRequest)
+                .without(LlmCapability::ToolchainVerify)
                 .as_slice()
         );
         assert!(!step.contains(LlmCapability::PlanCreation));
         assert!(!step.contains(LlmCapability::DocRequest));
-        assert!(step.contains(LlmCapability::ToolchainVerify));
+        assert!(!step.contains(LlmCapability::ToolchainVerify));
         assert!(step.contains(LlmCapability::Blocked));
         assert!(step.contains(LlmCapability::Abort));
         // External project documentation stays researchable inside a step: a
@@ -878,7 +885,10 @@ mod tests {
             !step.core().contains(LlmCapability::DocRequest),
             "an isolated step never consults the harness documentation"
         );
-        assert!(step.core().contains(LlmCapability::ToolchainVerify));
+        assert!(
+            !step.core().contains(LlmCapability::ToolchainVerify),
+            "an isolated step never runs toolchain verification: the harness owns it"
+        );
     }
 
     #[test]

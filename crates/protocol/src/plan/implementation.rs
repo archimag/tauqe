@@ -358,7 +358,9 @@ impl PlanImplementation {
     /// Parent items act as conceptual milestones, phases, and task groups.
     /// They are never executed autonomously, so any `files`, `readonly_files`,
     /// `outer_docs`, or `depends_on` list attached to a non-leaf item is cleared.
-    /// items (`is_leaf()`) define target context files and DAG dependencies.
+    ///
+    /// Only executable leaf items (`is_leaf()`) define target context files and
+    /// DAG dependencies.
     pub fn normalize_leaf_files(&mut self) {
         fn walk(items: &mut [PlanItem]) {
             for item in items.iter_mut() {

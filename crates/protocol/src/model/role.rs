@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Five semantic model role specializations.
+/// Six semantic model role specializations.
 ///
 /// Deserialization routes through [`std::str::FromStr`] via
 /// `#[serde(try_from = "String")]`, so the wire form and the
@@ -12,6 +12,7 @@ pub enum ModelRole {
     Scribe,
     Coder,
     Architect,
+    Gatekeeper,
     #[serde(rename = "repl")]
     REPL,
     Reviewer,
@@ -23,6 +24,7 @@ impl std::fmt::Display for ModelRole {
             ModelRole::Scribe => f.write_str("scribe"),
             ModelRole::Coder => f.write_str("coder"),
             ModelRole::Architect => f.write_str("architect"),
+            ModelRole::Gatekeeper => f.write_str("gatekeeper"),
             ModelRole::REPL => f.write_str("repl"),
             ModelRole::Reviewer => f.write_str("reviewer"),
         }
@@ -37,10 +39,11 @@ impl std::str::FromStr for ModelRole {
             "scribe" => Ok(ModelRole::Scribe),
             "coder" => Ok(ModelRole::Coder),
             "architect" => Ok(ModelRole::Architect),
+            "gatekeeper" => Ok(ModelRole::Gatekeeper),
             "repl" => Ok(ModelRole::REPL),
             "reviewer" => Ok(ModelRole::Reviewer),
             other => Err(format!(
-                "Unknown model role '{}'. Expected scribe, coder, architect, repl, or reviewer",
+                "Unknown model role '{}'. Expected scribe, coder, architect, gatekeeper, repl, or reviewer",
                 other
             )),
         }

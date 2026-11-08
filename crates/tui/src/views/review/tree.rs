@@ -335,29 +335,29 @@ impl TreeRowSink for ReviewLineMeasure {
     }
 }
 
-/// Renders the flattened Review rows into lines and their row offsets.
+/// Renders the visible Review rows into lines and their row offsets.
 ///
-/// The Markdown detail blocks of findings and of their subplan steps come from
-/// `cache` instead of being parsed afresh: a frame that only moved the cursor or
-/// scrolled reuses the lines already rendered for the unchanged description,
-/// while a changed description, indent, width, or palette re-renders exactly
-/// that one body (c-1, c-3).
-pub(crate) fn compute_unified_review_lines(
-    rows: &[VisibleReviewRow],
+/// `source` drives the rows of the tree in render order and lends each of them
+/// for the duration of its own visit, so a frame renders straight from the
+/// view's lazy row walk instead of materializing an owned projection of the
+/// whole tree first (c-1, c-2). The Markdown detail blocks of findings and of
+/// their subplan steps come from `cache` instead of being parsed afresh: a
+/// frame that only moved the cursor or scrolled reuses the lines already
+/// rendered for the unchanged description, while a changed description, indent,
+/// width, or palette re-renders exactly that one body (c-1, c-3).
+pub(crate) fn render_review_lines_from<S>(
+    source: S,
     selected_idx: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> (Vec<Line<'static>>, Vec<usize>)
+where
+    S: FnMut(&mut dyn FnMut(usize, &VisibleReviewRow) -> bool),
+{
     let mut renderer = ReviewLineRenderer::default();
     walk_review_rows(
-        |visit| {
-            for (index, row) in rows.iter().enumerate() {
-                if !visit(index, row) {
-                    break;
-                }
-            }
-        },
+        source,
         selected_idx,
         usize::MAX,
         width,
@@ -366,6 +366,34 @@ pub(crate) fn compute_unified_review_lines(
         &mut renderer,
     );
     (renderer.lines, renderer.offsets)
+}
+
+/// Renders an already-collected slice of Review rows.
+///
+/// The regression tests drive the renderer from an owned projection so they can
+/// assert on the exact rows and bodies a frame drew; a production frame renders
+/// straight from the lazy walk through `render_review_lines_from` (c-1, c-2).
+#[cfg(test)]
+pub(crate) fn compute_unified_review_lines(
+    rows: &[VisibleReviewRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    render_review_lines_from(
+        |visit| {
+            for (index, row) in rows.iter().enumerate() {
+                if !visit(index, row) {
+                    break;
+                }
+            }
+        },
+        selected_idx,
+        width,
+        theme_mode,
+        cache,
+    )
 }
 
 /// Measures the row offsets and the total height of the Review tree without

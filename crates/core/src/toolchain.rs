@@ -299,7 +299,7 @@ mod tests {
         // The file declares only model roles, so the environment is sound:
         // verification is declarative, and a project that declares none runs no
         // verification step instead of failing validation.
-        let dir = repo(Some("[models]\nprimary = [\"openrouter:a/b\"]\n"));
+        let dir = repo(Some("[models]\nrepl = [\"openrouter:a/b\"]\n"));
 
         let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;
 
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_valid_project_configuration_keeps_the_project_pipeline() {
         let dir = repo(Some(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 0']\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 0']\n",
         ));
 
         let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;

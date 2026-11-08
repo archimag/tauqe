@@ -266,7 +266,7 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         // Open the shared usage ledger before the provider call: this audit
         // reports both the usage the provider returns and the duration the
         // harness measures, so every operation kind feeds one snapshot.
-        let usage_guard = state.begin_usage().await;
+        let usage_guard = state.begin_usage(&op_id).await;
 
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
         let err_tx = tx.clone();
@@ -293,23 +293,17 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         // The provider streams raw Structured Output JSON; this filter decodes
         // only the `summary` string so JSON syntax never reaches the client.
         let mut filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-        let mut usage: Option<ModelUsageInfo> = None;
         let mut failure: Option<String> = None;
         let mut stream_cancelled = false;
 
-        // The relay is the highest-rate producer of the whole audit: the summary
-        // arrives at token granularity, so a client that keeps its pipe open but
-        // stopped reading pauses the relay here instead of growing the outbound
-        // queue for the rest of the review. Only the arms that break this loop
-        // are exempted, because they publish the terminal notice of the audit: a
-        // stall must never delay the cancellation or the failure it reports.
+        // The relay applies the transport-owned pacing policy instead of
+        // restating an exemption set of its own: a terminal notice publishes
+        // immediately, and every other variant waits for the writer to catch up,
+        // so a client that keeps its pipe open but stopped reading pauses the
+        // relay here instead of growing the outbound queue for the rest of the
+        // review.
         while let Some(event) = rx.recv().await {
-            if !matches!(
-                event,
-                StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
-            ) {
-                state.out.wait_for_headroom(&mut cancel_rx).await;
-            }
+            state.out.pace_event(&event, &mut cancel_rx).await;
             match event {
                 StreamEvent::ReasoningDelta(delta) => emit(
                     &state.out,
@@ -335,7 +329,11 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
                         );
                     }
                 }
-                StreamEvent::Usage(u) => usage = Some(u),
+                // Fold every report the provider makes into the accounting window
+                // as it arrives: an audit that reported usage on an intermediate
+                // chunk, or whose retry resumed after an aborted attempt had
+                // already reported its tokens, must not lose the earlier reports.
+                StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
                 StreamEvent::Done => break,
                 // The provider may report cancellation as an explicit stream
                 // event even when the turn's cancel signal has not been observed
@@ -373,25 +371,27 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         // the shared ledger before any early return, so a failed or cancelled
         // audit is still charged and leaves no in-flight window behind for the
         // next operation.
-        let reported_usage = usage.unwrap_or_default();
-        usage_guard.observe(&reported_usage).await;
+        // Every report was already folded into the window as it arrived, so the
+        // flush below charges the whole audit instead of its last report alone.
         usage_guard.flush().await;
         let usage_snapshot = state.usage_snapshot().await;
 
         // The consumed tokens are published before any early return, exactly as
         // a review group publishes its own usage: an interrupted or failed audit
         // is charged to the session, so the client observes that charge instead
-        // of watching the session cost grow with no event behind it. The session
-        // total comes from the authoritative ledger rather than a second,
-        // independently accumulated counter.
+        // of watching the session cost grow with no event behind it. Both totals
+        // come from the authoritative ledger — the operation scope the flush just
+        // closed and the session scope it was folded into — rather than from a
+        // second, independently accumulated counter.
+        let operation_usage: ModelUsageInfo = usage_snapshot.prev.to_usage_info();
         let session_total_cost = usage_snapshot.session.cost;
-        let cost = reported_usage.cost.unwrap_or(0.0);
+        let cost = usage_snapshot.prev.cost;
         emit(
             &state.out,
             events::MODEL_USAGE,
             serde_json::to_value(ModelUsageEvent {
                 operation_id: op_id.clone(),
-                usage: reported_usage.clone(),
+                usage: operation_usage.clone(),
                 session_total_cost,
                 current_cost: Some(cost),
             })
@@ -560,14 +560,13 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
             );
         }
 
-        let usage = reported_usage;
         emit(
             &state.out,
             events::REVIEW_FINISHED,
             serde_json::to_value(ReviewFinishedEvent {
                 operation_id: op_id,
                 session,
-                usage: Some(usage),
+                usage: Some(operation_usage),
                 session_total_cost: Some(session_total_cost),
                 current_cost: Some(cost),
             })

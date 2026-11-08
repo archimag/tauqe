@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use crate::git::exec::{self, GitDeadline};
 use crate::git::GitHooks;
@@ -230,24 +231,79 @@ fn candidate_payload(paths: &[String]) -> Vec<u8> {
     payload
 }
 
+/// Bytes the drain thread reads from a child pipe before it publishes them.
+const PIPE_CHUNK_BYTES: usize = 16 * 1024;
+
+/// A child pipe drained on its own thread.
+///
+/// The bytes are published into a shared buffer as the reader consumes them, so
+/// a reader that is abandoned — because a descendant inherited the pipe and kept
+/// it open past the invocation window — still reports everything the child wrote
+/// before the window closed.
+pub(super) struct PipeDrain {
+    reader: std::thread::JoinHandle<std::io::Result<()>>,
+    delivered: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PipeDrain {
+    /// Reports whether the reader reached its end on its own.
+    pub(super) fn is_finished(&self) -> bool {
+        self.reader.is_finished()
+    }
+
+    /// Collects the bytes the reader delivered.
+    ///
+    /// A reader that reached its end is joined, so a failed or panicked drain
+    /// stays a diagnostic. A reader that a descendant still holds open is never
+    /// joined: the bytes it already published come back instead, and the reader
+    /// is abandoned with the buffer it keeps filling.
+    pub(super) fn collect(self) -> Vec<u8> {
+        if self.reader.is_finished() {
+            match self.reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(reason = %err, "failed to drain a git child pipe");
+                }
+                Err(_) => {
+                    tracing::warn!("a git child pipe drain thread panicked");
+                }
+            }
+        }
+        match self.delivered.lock() {
+            Ok(mut delivered) => std::mem::take(&mut *delivered),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+}
+
 /// Drains a child pipe to EOF on its own thread.
 ///
 /// Reading a pipe independently of the child's exit keeps a command that emits
 /// more than a pipe buffer holds from blocking on its own output, and it lets
 /// the bounded executor observe the child it started while the pipes drain.
-pub(super) fn spawn_pipe_drain<R>(
-    pipe: Option<R>,
-) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+pub(super) fn spawn_pipe_drain<R>(pipe: Option<R>) -> PipeDrain
 where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        if let Some(mut pipe) = pipe {
-            pipe.read_to_end(&mut buffer)?;
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&delivered);
+    let reader = std::thread::spawn(move || -> std::io::Result<()> {
+        let Some(mut pipe) = pipe else {
+            return Ok(());
+        };
+        let mut chunk = [0u8; PIPE_CHUNK_BYTES];
+        loop {
+            let read = pipe.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(());
+            }
+            match sink.lock() {
+                Ok(mut buffer) => buffer.extend_from_slice(&chunk[..read]),
+                Err(poisoned) => poisoned.into_inner().extend_from_slice(&chunk[..read]),
+            }
         }
-        Ok(buffer)
-    })
+    });
+    PipeDrain { reader, delivered }
 }
 
 /// Stages the specified list of files into the Git index.
@@ -667,6 +723,62 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the cancellation did not release the turn: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Hook that succeeds at once and leaves a descendant holding the inherited
+    /// output pipes behind.
+    ///
+    /// Git runs a hook with its standard output redirected to its own standard
+    /// error, so the marker the hook prints travels on the stderr pipe that the
+    /// descendant keeps open.
+    #[cfg(unix)]
+    const PIPE_HOLDING_HOOK: &str = "#!/bin/sh\necho hook-output\nsleep 5 &\nexit 0\n";
+
+    /// A command that exited on its own keeps its exit code and its output when
+    /// a descendant holds the inherited pipes open.
+    ///
+    /// The hook exits successfully and leaves a background descendant behind, so
+    /// the direct child exits with status 0 well inside its budget while the
+    /// pipes stay open. The wait owns the verdict: the invocation must stay
+    /// `Exited` with its code intact, and every byte the child wrote before the
+    /// drain window closed must survive the abandoned drain.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_exit_keeps_its_output_when_a_descendant_holds_the_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        install_hook(root, PIPE_HOLDING_HOOK);
+
+        let started = Instant::now();
+        let outcome = exec::run_bounded(
+            Some(root),
+            &["commit", "-m", "hooked"],
+            &GitDeadline::with_timeout(1),
+            None,
+        );
+
+        assert_eq!(
+            outcome.end,
+            exec::GitEnd::Exited,
+            "a command that exited on its own is never reported as killed"
+        );
+        assert_eq!(outcome.code, Some(0));
+        assert!(
+            String::from_utf8_lossy(&outcome.stdout).contains("hooked"),
+            "the output of the exited child must survive the drain: {}",
+            String::from_utf8_lossy(&outcome.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&outcome.stderr).contains("hook-output"),
+            "the bytes written before the drain window closed must survive: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the abandoned drain did not release the caller: {:?}",
             started.elapsed()
         );
     }

@@ -13,7 +13,7 @@ fn parse_models_with_catalog(raw: &str, catalog: &[ModelCatalogEntry]) -> Models
 fn test_role_entries_parse_attempts_and_reach_the_ladder() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:base/coder",
     { model = "openrouter:cheap/coder", effort = "low", attempts = 5 },
@@ -52,7 +52,7 @@ fn test_zero_attempts_is_rejected_by_validation() {
     // capability for that tier.
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:cheap/coder", attempts = 0 }]
 "#,
     );
@@ -64,7 +64,7 @@ coder = [{ model = "openrouter:cheap/coder", attempts = 0 }]
 
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [{ model = "openrouter:planner/one", attempts = 0 }]
 "#,
     );
@@ -81,10 +81,10 @@ fn test_role_entry_rejects_a_non_integer_attempts_value() {
     // configuration error instead of a silently ignored annotation.
     for raw in [
         r#"
-primary = [{ model = "openrouter:base/primary", attempts = -1 }]
+repl = [{ model = "openrouter:base/repl", attempts = -1 }]
 "#,
         r#"
-primary = [{ model = "openrouter:base/primary", attempts = "3" }]
+repl = [{ model = "openrouter:base/repl", attempts = "3" }]
 "#,
     ] {
         let err = toml::from_str::<ModelsConfigRaw>(raw)
@@ -98,7 +98,7 @@ primary = [{ model = "openrouter:base/primary", attempts = "3" }]
 fn test_attempts_survive_a_configuration_round_trip() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:cheap/coder", effort = "low", attempts = 5 }]
 architect = [{ model = "openrouter:planner/one", attempts = 1 }]
 "#,
@@ -113,6 +113,9 @@ architect = [{ model = "openrouter:planner/one", attempts = 1 }]
     assert_eq!(restored.coder_ladder(), config.coder_ladder());
     assert_eq!(restored.coder_tier(0).attempts(), 5);
     assert_eq!(restored.architect_tier(0).attempts(), 1);
+    // The resolved repl list survives the round trip, so serialization and
+    // deserialization stay symmetric after the role rename.
+    assert_eq!(restored.repl, config.repl);
 }
 
 #[test]
@@ -133,7 +136,7 @@ fn test_resolve_effort_defaults_to_none() {
 fn test_resolve_effort_reads_base_entry() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:deepseek/deepseek-chat", effort = "medium" },
     { model = "openrouter:google/gemini-flash-latest", effort = "high" },
@@ -162,7 +165,7 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
 fn test_coder_single_string_yields_one_rung() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = ["openrouter:anthropic/claude-3.7-sonnet"]
 "#,
     );
@@ -182,7 +185,7 @@ coder = ["openrouter:anthropic/claude-3.7-sonnet"]
 fn test_coder_single_table_carries_effort() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:deepseek/deepseek-chat", effort = "high" }]
 "#,
     );
@@ -204,7 +207,7 @@ coder = [{ model = "openrouter:deepseek/deepseek-chat", effort = "high" }]
 fn test_coder_array_builds_ordered_ladder() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:base/model",
     { model = "openrouter:strong/model", effort = "xhigh" },
@@ -225,7 +228,7 @@ coder = [
 #[test]
 fn test_coder_empty_ladder_rejected_by_validate() {
     let config = ModelsConfig {
-        primary: vec![ModelRef::openrouter("base/primary").into()],
+        repl: vec![ModelRef::openrouter("base/repl").into()],
         coder: Some(Vec::new()),
         ..Default::default()
     };
@@ -233,17 +236,17 @@ fn test_coder_empty_ladder_rejected_by_validate() {
 }
 
 #[test]
-fn test_coder_absent_inherits_primary_ladder() {
+fn test_coder_absent_inherits_repl_ladder() {
     let config = parse_models(
         r#"
-primary = ["openrouter:only/primary", "openrouter:second/primary"]
+repl = ["openrouter:only/repl", "openrouter:second/repl"]
 architect = ["openrouter:only/architect"]
 "#,
     );
     let ladder = config.coder_ladder();
     assert_eq!(ladder.len(), 2);
-    assert_eq!(ladder[0].model, ModelRef::openrouter("only/primary"));
-    assert_eq!(ladder[1].model, ModelRef::openrouter("second/primary"));
+    assert_eq!(ladder[0].model, ModelRef::openrouter("only/repl"));
+    assert_eq!(ladder[1].model, ModelRef::openrouter("second/repl"));
     assert_eq!(config.coder_tier(0), ladder[0]);
     assert_eq!(config.coder_tier(5), ladder[1]);
 }
@@ -252,7 +255,7 @@ architect = ["openrouter:only/architect"]
 fn test_architect_ladder_derives_from_role_list() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:planner/one", effort = "high" },
     { model = "openrouter:planner/two", effort = "xhigh" },
@@ -288,7 +291,7 @@ architect = [
 fn test_architect_ladder_restarts_when_recorded_rung_is_unknown() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = ["openrouter:planner/one"]
 "#,
     );
@@ -307,7 +310,7 @@ architect = ["openrouter:planner/one"]
 fn test_resolve_selection_effort_picks_matching_model_entry() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:deepseek/flash", effort = "max" },
     { model = "openrouter:google/gemini-flash", effort = "high" },
@@ -357,7 +360,7 @@ architect = [
 fn test_resolve_selection_effort_tier_reads_effort_from_the_dto() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:deepseek/flash", effort = "max" },
     { model = "openrouter:google/gemini-flash", effort = "high" },
@@ -397,7 +400,7 @@ architect = [
 fn test_architect_tier_index_falls_back_to_model_matching_on_effort_discrepancy() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:deepseek/flash", effort = "max" },
     { model = "openrouter:google/gemini-flash", effort = "high" },
@@ -425,7 +428,7 @@ architect = [
 fn test_model_entry_polymorphic_parsing_with_effort() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:plain/model",
     { model = "openrouter:detailed/model", effort = "high" },
@@ -447,7 +450,7 @@ fn test_role_entry_rejects_a_display_alias() {
     // of quietly reinstating a second source of truth for the same label.
     let err = toml::from_str::<ModelsConfigRaw>(
         r#"
-primary = [{ model = "openrouter:base/primary", alias = "Fast" }]
+repl = [{ model = "openrouter:base/repl", alias = "Fast" }]
 "#,
     )
     .expect_err("a role entry carrying an alias must be rejected")
@@ -461,7 +464,7 @@ fn test_role_entry_reports_precise_field_errors() {
     // instead of an opaque "data did not match any variant".
     let err = toml::from_str::<ModelsConfigRaw>(
         r#"
-primary = [{ model = "openrouter:base/primary", effort = "extreme" }]
+repl = [{ model = "openrouter:base/repl", effort = "extreme" }]
 "#,
     )
     .expect_err("an unknown reasoning effort must be rejected")
@@ -474,7 +477,7 @@ primary = [{ model = "openrouter:base/primary", effort = "extreme" }]
     // `duplicate key` report and it still names the offending key.
     let err = toml::from_str::<ModelsConfigRaw>(
         r#"
-primary = [{ model = "openrouter:a/b", model = "openrouter:c/d" }]
+repl = [{ model = "openrouter:a/b", model = "openrouter:c/d" }]
 "#,
     )
     .expect_err("a duplicated model key must be rejected")
@@ -485,7 +488,7 @@ primary = [{ model = "openrouter:a/b", model = "openrouter:c/d" }]
     // A table without a model reference is rejected.
     let err = toml::from_str::<ModelsConfigRaw>(
         r#"
-primary = [{ effort = "high" }]
+repl = [{ effort = "high" }]
 "#,
     )
     .expect_err("a table without a model must be rejected")
@@ -497,7 +500,7 @@ primary = [{ effort = "high" }]
 fn test_role_slice_mirrors_role_entries_for_stored_roles() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary", "openrouter:second/primary"]
+repl = ["openrouter:base/repl", "openrouter:second/repl"]
 coder = ["openrouter:only/coder"]
 architect = [{ model = "openrouter:only/architect", effort = "high" }]
 "#,
@@ -533,7 +536,7 @@ fn test_role_reference_resolves_catalog_alias() {
     ];
     let config = parse_models_with_catalog(
         r#"
-primary = ["Deep"]
+repl = ["Deep"]
 coder = [{ model = "Deep", effort = "max" }]
 scribe = "Deep"
 "#,
@@ -564,10 +567,10 @@ scribe = "Deep"
 #[test]
 fn test_unresolvable_role_reference_reports_the_role() {
     let raw: ModelsConfigRaw =
-        toml::from_str(r#"primary = ["anthropc:claude"]"#).expect("parse models config");
+        toml::from_str(r#"repl = ["anthropc:claude"]"#).expect("parse models config");
     let err = ModelsConfig::resolve(raw, &[])
         .expect_err("a mistyped provider prefix must fail resolution");
-    assert!(err.contains("primary"), "got: {err}");
+    assert!(err.contains("repl"), "got: {err}");
     assert!(err.contains("anthropc:claude"), "got: {err}");
 }
 
@@ -575,7 +578,7 @@ fn test_unresolvable_role_reference_reports_the_role() {
 fn test_resolve_selection_effort_distinguishes_tiers_of_the_same_model() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:google/gemini-flash", effort = "low" },
     { model = "openrouter:google/gemini-flash", effort = "high" },
@@ -630,7 +633,7 @@ architect = [
 fn test_picker_rows_of_one_model_reach_the_resolver_with_their_own_effort() {
     let config = parse_models(
         r#"
-primary = [
+repl = [
     { model = "openrouter:google/gemini-flash", effort = "low" },
     { model = "openrouter:google/gemini-flash", effort = "high" },
     { model = "openrouter:google/gemini-flash", effort = "max" },
@@ -704,7 +707,7 @@ primary = [
 fn test_role_rpc_tier_reaches_the_server_resolver() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 
 reviewer = [
     { model = "openrouter:shared/reviewer", effort = "low" },
@@ -779,7 +782,7 @@ coder = [
 fn test_coder_tier_index_defaults_to_the_base_rung() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:start/model", effort = "low" },
     { model = "openrouter:strong/model", effort = "max" },
@@ -811,7 +814,7 @@ coder = [
 fn test_coder_tier_index_matches_effort_then_model() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:shared/model", effort = "low" },
     { model = "openrouter:shared/model", effort = "high" },
@@ -865,7 +868,7 @@ fn test_level_up_defaults_to_participation() {
     // entry without an explicit marker, so it participates in escalation.
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:one/coder",
     { model = "openrouter:two/coder", effort = "high" },
@@ -905,7 +908,7 @@ architect = ["openrouter:one/architect"]
 fn test_level_up_false_keeps_the_model_in_the_role_catalog() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:fast/coder", effort = "low" },
     { model = "openrouter:premium/coder", effort = "max", level_up = false },
@@ -943,7 +946,7 @@ architect = [{ model = "openrouter:premium/architect", level_up = false }]
 fn test_coder_ladder_skips_excluded_rungs_in_declaration_order() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:start/model", effort = "low" },
     { model = "openrouter:premium/model", effort = "max", level_up = false },
@@ -976,7 +979,7 @@ fn test_ladder_walk_skips_an_opted_out_rung() {
     // walk step over the excluded model.
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:start/model", effort = "low" },
     { model = "openrouter:premium/model", effort = "max", level_up = false },
@@ -1013,7 +1016,7 @@ coder = [
 fn test_architect_ladder_skips_excluded_tiers() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:planner/first", effort = "high" },
     { model = "openrouter:planner/premium", effort = "max", level_up = false },
@@ -1054,7 +1057,7 @@ architect = [
 fn test_excluded_from_escalation_reports_the_declared_marker() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:base/coder",
     { model = "openrouter:premium/coder", level_up = false },
@@ -1063,31 +1066,127 @@ architect = [{ model = "openrouter:premium/architect", level_up = false }]
 "#,
     );
 
-    // The predicate reads the marker declared on the role entry, so a manual
-    // run is recognized without comparing model names by text.
-    assert!(!config.excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("base/coder")));
-    assert!(
-        config.excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("premium/coder"))
-    );
+    // The predicate reads the marker declared on one role entry and matches a
+    // rung by both of its coordinates, so a manual run is recognized without
+    // comparing model names by text.
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Coder,
+        &ModelRef::openrouter("base/coder"),
+        None
+    ));
+    assert!(config.excluded_from_escalation(
+        ModelRole::Coder,
+        &ModelRef::openrouter("premium/coder"),
+        None
+    ));
     // A model the role does not configure at all carries no marker.
-    assert!(
-        !config.excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("unknown/coder"))
-    );
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Coder,
+        &ModelRef::openrouter("unknown/coder"),
+        None
+    ));
+    // A depth the role does not configure names no rung, so it carries no marker
+    // either: the marker belongs to the configured rung alone.
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Coder,
+        &ModelRef::openrouter("premium/coder"),
+        Some(ReasoningEffort::Max)
+    ));
     assert!(config.excluded_from_escalation(
         ModelRole::Architect,
-        &ModelRef::openrouter("premium/architect")
+        &ModelRef::openrouter("premium/architect"),
+        None
     ));
     // Scribe is a derived single model and never declares an exclusion.
-    assert!(
-        !config.excluded_from_escalation(ModelRole::Scribe, &ModelRef::openrouter("premium/coder"))
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Scribe,
+        &ModelRef::openrouter("premium/coder"),
+        None
+    ));
+}
+
+/// The exclusion marker belongs to one rung, never to the model: the same model
+/// may occupy a participating rung and an opted-out sibling at another depth,
+/// and only the sibling leaves the automatic ladder (c-1).
+#[test]
+fn test_exclusion_belongs_to_one_rung_of_a_model() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+coder = [
+    { model = "openrouter:shared/coder", effort = "low" },
+    { model = "openrouter:shared/coder", effort = "max", level_up = false },
+    "openrouter:other/strong",
+]
+architect = [
+    { model = "openrouter:shared/architect", effort = "high" },
+    { model = "openrouter:shared/architect", effort = "xhigh", level_up = false },
+    { model = "openrouter:shared/architect", effort = "max" },
+]
+"#,
     );
+
+    let coder = ModelRef::openrouter("shared/coder");
+    // The marker names one rung: the participating sibling of the very same
+    // model is never reported as excluded.
+    assert!(!config.excluded_from_escalation(ModelRole::Coder, &coder, Some(ReasoningEffort::Low)));
+    assert!(config.excluded_from_escalation(ModelRole::Coder, &coder, Some(ReasoningEffort::Max)));
+    // A depth the role does not configure names no rung at all.
+    assert!(!config.excluded_from_escalation(ModelRole::Coder, &coder, None));
+
+    // The ladder drops the opted-out rung alone, so the participating sibling of
+    // the same model keeps its position and still escalates to the next rung.
+    let ladder = config.coder_ladder();
+    assert_eq!(ladder.len(), 2);
+    assert_eq!(ladder[0].effort, Some(ReasoningEffort::Low));
+    assert_eq!(ladder[1].model, ModelRef::openrouter("other/strong"));
+    let participating = ModelSelection::Tier {
+        model: coder.clone(),
+        effort: Some(ReasoningEffort::Low),
+    };
+    assert_eq!(config.coder_tier_index(Some(&participating)), 0);
+    let (next_index, next_rung) = config
+        .next_coder_tier(0)
+        .expect("the participating rung escalates to the next ladder position");
+    assert_eq!(next_index, 1);
+    assert_eq!(next_rung.model, ModelRef::openrouter("other/strong"));
+
+    // The same rules hold for the Architect ladder.
+    let architect = ModelRef::openrouter("shared/architect");
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Architect,
+        &architect,
+        Some(ReasoningEffort::High)
+    ));
+    assert!(config.excluded_from_escalation(
+        ModelRole::Architect,
+        &architect,
+        Some(ReasoningEffort::XHigh)
+    ));
+    assert!(!config.excluded_from_escalation(
+        ModelRole::Architect,
+        &architect,
+        Some(ReasoningEffort::Max)
+    ));
+
+    // A repeated failure escalates the participating rung of the shared model to
+    // its stronger sibling instead of pinning the whole model.
+    let high = ArchitectTier::new(architect.clone(), Some(ReasoningEffort::High));
+    assert_eq!(
+        config.next_architect_tier(Some(&high)),
+        ArchitectTier::new(architect.clone(), Some(ReasoningEffort::Max))
+    );
+    // The recorded excluded sibling is a manual run the developer pinned, so
+    // escalation keeps it instead of restarting or downgrading it.
+    let pinned = ArchitectTier::new(architect, Some(ReasoningEffort::XHigh));
+    assert_eq!(config.next_architect_tier(Some(&pinned)), pinned);
 }
 
 #[test]
 fn test_manual_architect_selection_saturates_the_ladder() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     "openrouter:planner/one",
     { model = "openrouter:planner/manual", level_up = false },
@@ -1111,7 +1210,7 @@ architect = [
 fn test_ladder_keeps_a_base_rung_when_every_rung_opts_out() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:only/coder", effort = "max", level_up = false }]
 architect = [{ model = "openrouter:only/architect", level_up = false }]
 "#,
@@ -1144,7 +1243,7 @@ architect = [{ model = "openrouter:only/architect", level_up = false }]
 fn test_resolve_role_still_reaches_an_opted_out_model() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:premium/coder", effort = "max", level_up = false },
     "openrouter:base/coder",
@@ -1182,7 +1281,7 @@ architect = [
 fn test_level_up_marker_survives_a_configuration_round_trip() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:base/coder",
     { model = "openrouter:premium/coder", effort = "max", level_up = false },
@@ -1201,6 +1300,9 @@ coder = [
     assert_eq!(restored.role_entries(ModelRole::Coder), catalog);
     assert_eq!(restored.coder_ladder(), config.coder_ladder());
     assert_eq!(restored.coder_ladder().len(), 1);
+    // The resolved repl list survives the round trip, so serialization and
+    // deserialization stay symmetric after the role rename.
+    assert_eq!(restored.repl, config.repl);
 }
 
 #[test]
@@ -1208,7 +1310,7 @@ fn test_level_up_marker_field_rules() {
     // An explicit `true` is the explicit form of the default and survives.
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:one/coder", level_up = true }]
 "#,
     );
@@ -1217,7 +1319,7 @@ coder = [{ model = "openrouter:one/coder", level_up = true }]
     // A repeated marker is rejected instead of letting the last value win.
     let err = toml::from_str::<ModelsConfigRaw>(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:one/coder", level_up = true, level_up = false }]
 "#,
     )
@@ -1231,7 +1333,7 @@ coder = [{ model = "openrouter:one/coder", level_up = true, level_up = false }]
     assert!(
         toml::from_str::<ModelsConfigRaw>(
             r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [{ model = "openrouter:one/coder", level_up = "false" }]
 "#,
         )
@@ -1248,7 +1350,7 @@ coder = [{ model = "openrouter:one/coder", level_up = "false" }]
 fn test_level_up_opt_out_end_to_end() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:cheap/coder",
     { model = "openrouter:expensive/coder", effort = "max", level_up = false },
@@ -1304,7 +1406,7 @@ coder = [
 fn test_resolve_selection_attempts_applies_the_adaptive_default() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     "openrouter:base/coder",
     { model = "openrouter:manual/coder", level_up = false },
@@ -1360,7 +1462,7 @@ architect = [
 fn test_resolve_selection_attempts_prefers_the_explicit_budget() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:base/coder", attempts = 5 },
     { model = "openrouter:manual/coder", level_up = false, attempts = 4 },
@@ -1397,7 +1499,7 @@ architect = [{ model = "openrouter:planner/manual", level_up = false, attempts =
 fn test_resolve_selection_attempts_reads_the_role_catalog_not_the_ladder() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 coder = [
     { model = "openrouter:base/coder", attempts = 5 },
     { model = "openrouter:manual/coder", level_up = false, attempts = 2 },
@@ -1426,7 +1528,7 @@ coder = [
 fn test_resolve_selection_attempts_distinguishes_tiers_of_the_same_model() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:planner/shared", effort = "low", attempts = 4 },
     { model = "openrouter:planner/shared", effort = "high" },
@@ -1478,7 +1580,7 @@ architect = [
 fn test_resolve_selection_attempts_falls_back_to_the_role_default() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 "#,
     );
     let unknown = ModelSelection::Specific(ModelRef::openrouter("unknown/model"));
@@ -1509,7 +1611,7 @@ primary = ["openrouter:base/primary"]
 fn test_resolve_selection_architect_tier_keeps_the_configured_parameters() {
     let config = parse_models(
         r#"
-primary = ["openrouter:base/primary"]
+repl = ["openrouter:base/repl"]
 architect = [
     { model = "openrouter:planner/shared", effort = "high", attempts = 3 },
     { model = "openrouter:planner/manual", effort = "max", level_up = false },
@@ -1551,4 +1653,271 @@ architect = [
     assert_eq!(tier.attempts, None);
     assert_eq!(tier.level_up, None);
     assert_eq!(tier.attempts(), 2);
+}
+
+#[test]
+fn test_architect_tier_index_positions_rungs_of_one_model_by_effort() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+architect = [
+    { model = "openrouter:google/gemini-flash", effort = "low" },
+    { model = "openrouter:google/gemini-flash", effort = "medium" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+]
+"#,
+    );
+    let model = ModelRef::openrouter("google/gemini-flash");
+
+    // The ladder keeps all three rungs of the one model, so a position is
+    // meaningful only together with the reasoning depth it names.
+    let ladder = config.architect_ladder();
+    assert_eq!(ladder.len(), 3);
+    let depths = [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+    for (index, effort) in depths.iter().copied().enumerate() {
+        let recorded = ArchitectTier::new(model.clone(), Some(effort));
+        assert_eq!(
+            config.architect_tier_index(Some(&recorded)),
+            Some(index),
+            "{effort}"
+        );
+    }
+
+    // Runtime parameters never identify a rung: a record carrying a budget and
+    // a marker the configuration does not declare still resolves by the
+    // `(model, effort)` pair instead of collapsing onto the first rung of the
+    // same model.
+    let mut recorded = ArchitectTier::new(model.clone(), Some(ReasoningEffort::High));
+    recorded.attempts = Some(1);
+    recorded.level_up = Some(false);
+    assert_eq!(config.architect_tier_index(Some(&recorded)), Some(2));
+
+    // A depth the configuration no longer declares keeps the established
+    // fallback and resolves to the first rung of the same model.
+    let retired = ArchitectTier::new(model, Some(ReasoningEffort::XHigh));
+    assert_eq!(config.architect_tier_index(Some(&retired)), Some(0));
+}
+
+#[test]
+fn test_next_architect_tier_walks_every_depth_and_saturates_on_rung_identity() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+architect = [
+    { model = "openrouter:google/gemini-flash", effort = "low" },
+    { model = "openrouter:google/gemini-flash", effort = "medium" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+]
+"#,
+    );
+    let model = ModelRef::openrouter("google/gemini-flash");
+    let low = ArchitectTier::new(model.clone(), Some(ReasoningEffort::Low));
+    let medium = ArchitectTier::new(model.clone(), Some(ReasoningEffort::Medium));
+    let high = ArchitectTier::new(model.clone(), Some(ReasoningEffort::High));
+
+    // Escalation advances one depth at a time across the rungs of the one
+    // model, so a ladder of three rungs does not cycle between the first two.
+    assert_eq!(config.next_architect_tier(Some(&low)), medium);
+    assert_eq!(config.next_architect_tier(Some(&medium)), high);
+
+    // The strongest rung is the end of the ladder: the next position resolves
+    // to the pair already recorded, so saturation returns it unchanged instead
+    // of restarting the walk.
+    let saturated = config.next_architect_tier(Some(&high));
+    assert_eq!(saturated, high);
+    assert_eq!(saturated.effort, Some(ReasoningEffort::High));
+
+    // Without a record the walk starts at the base rung.
+    assert_eq!(config.next_architect_tier(None), low);
+}
+
+#[test]
+fn test_repeated_failure_on_the_strongest_rung_keeps_the_recorded_tier() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+architect = [
+    { model = "openrouter:google/gemini-flash", effort = "low" },
+    { model = "openrouter:google/gemini-flash", effort = "medium" },
+    { model = "openrouter:google/gemini-flash", effort = "high", attempts = 2 },
+]
+"#,
+    );
+    let model = ModelRef::openrouter("google/gemini-flash");
+
+    // The strongest rung is recorded with a budget the configuration does not
+    // declare. The pair still positions it on the last rung, and saturation
+    // returns the record untouched, so a repeated failure neither restarts the
+    // ladder nor re-derives the tier from configuration.
+    let mut recorded = ArchitectTier::new(model.clone(), Some(ReasoningEffort::High));
+    recorded.attempts = Some(1);
+    assert_eq!(config.architect_tier_index(Some(&recorded)), Some(2));
+    let saturated = config.next_architect_tier(Some(&recorded));
+    assert_eq!(saturated, recorded);
+    assert_eq!(saturated.effort, Some(ReasoningEffort::High));
+    assert_eq!(saturated.attempts, Some(1));
+
+    // The same holds in the opposite direction: a record declaring no budget of
+    // its own is returned as recorded instead of the configured rung.
+    let bare = ArchitectTier::new(model, Some(ReasoningEffort::High));
+    assert_eq!(config.architect_tier_index(Some(&bare)), Some(2));
+    assert_eq!(config.next_architect_tier(Some(&bare)), bare);
+    assert_eq!(bare.attempts, None);
+}
+
+#[test]
+fn test_gatekeeper_role_name_round_trips() {
+    // The acceptance role is spelled `gatekeeper` on every surface: the
+    // configuration key, the CLI argument, and the wire form.
+    assert_eq!(
+        "gatekeeper".parse::<ModelRole>().expect("parse role name"),
+        ModelRole::Gatekeeper
+    );
+    assert_eq!(ModelRole::Gatekeeper.to_string(), "gatekeeper");
+    let wire = serde_json::to_string(&ModelRole::Gatekeeper).expect("serialize role");
+    assert_eq!(wire, "\"gatekeeper\"");
+    assert_eq!(
+        serde_json::from_str::<ModelRole>(&wire).expect("decode role"),
+        ModelRole::Gatekeeper
+    );
+}
+
+#[test]
+fn test_unknown_role_error_lists_every_role() {
+    // The diagnostic names every spelling the parser accepts, so a mistyped
+    // role is repaired from the message alone.
+    let err = "unknown"
+        .parse::<ModelRole>()
+        .expect_err("parse unknown role");
+    for role in [
+        "scribe",
+        "coder",
+        "architect",
+        "gatekeeper",
+        "repl",
+        "reviewer",
+    ] {
+        assert!(err.contains(role), "got: {err}");
+    }
+}
+
+#[test]
+fn test_gatekeeper_falls_back_to_scribe_then_repl() {
+    // A project that declares only the summarizer accepts steps with it.
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+scribe = "openrouter:summary/scribe"
+"#,
+    );
+    let scribe = ModelRef::openrouter("summary/scribe");
+    assert_eq!(config.resolve_role(ModelRole::Scribe), scribe);
+    assert_eq!(config.resolve_role(ModelRole::Gatekeeper), scribe);
+
+    // A project that declares neither falls back to the base `repl` entry.
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl", "openrouter:second/repl"]
+"#,
+    );
+    assert_eq!(
+        config.resolve_role(ModelRole::Gatekeeper),
+        ModelRef::openrouter("base/repl")
+    );
+    assert_eq!(
+        config.resolve_role(ModelRole::Scribe),
+        ModelRef::openrouter("base/repl")
+    );
+}
+
+#[test]
+fn test_gatekeeper_explicit_declaration_wins_over_scribe() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+scribe = "openrouter:summary/scribe"
+gatekeeper = "openrouter:judge/acceptance"
+"#,
+    );
+
+    assert_eq!(
+        config.resolve_role(ModelRole::Gatekeeper),
+        ModelRef::openrouter("judge/acceptance")
+    );
+    // The chain never reaches back: the summarizer keeps its own model.
+    assert_eq!(
+        config.resolve_role(ModelRole::Scribe),
+        ModelRef::openrouter("summary/scribe")
+    );
+
+    // The acceptance role is a derived single-model role, exactly like the
+    // summarizer: one entry, no stored slice, and no reasoning depth of its own.
+    assert!(config.role_slice(ModelRole::Gatekeeper).is_none());
+    assert_eq!(config.resolve_effort(ModelRole::Gatekeeper), None);
+    let entries = config.role_entries(ModelRole::Gatekeeper);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].model, ModelRef::openrouter("judge/acceptance"));
+    assert_eq!(entries[0].effort, None);
+}
+
+#[test]
+fn test_gatekeeper_inherits_a_model_without_its_runtime_parameters() {
+    // A reasoning depth belongs to the slot the model was declared in, so an
+    // inherited acceptance model takes the model alone.
+    let config = parse_models(
+        r#"
+repl = [{ model = "openrouter:base/repl", effort = "high" }]
+"#,
+    );
+    let entries = config.role_entries(ModelRole::Gatekeeper);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].model, ModelRef::openrouter("base/repl"));
+    assert_eq!(entries[0].effort, None);
+}
+
+#[test]
+fn test_gatekeeper_consults_the_external_fallback_last() {
+    // A configuration that declares no model at all still resolves the role,
+    // because the caller fallback ranks above the built-in default.
+    let config = ModelsConfig::default();
+    assert_eq!(
+        config.resolve_role_with_fallback(
+            ModelRole::Gatekeeper,
+            Some(ModelRef::openrouter("external/fallback"))
+        ),
+        ModelRef::openrouter("external/fallback")
+    );
+
+    // With neither a declaration nor a fallback the built-in default of the
+    // role applies, so acceptance never resolves to nothing.
+    assert_eq!(
+        config.resolve_role(ModelRole::Gatekeeper),
+        ModelRef::openrouter(BUILTIN_DEFAULT_GATEKEEPER_MODEL)
+    );
+}
+
+#[test]
+fn test_gatekeeper_survives_a_configuration_round_trip() {
+    let config = parse_models(
+        r#"
+repl = ["openrouter:base/repl"]
+gatekeeper = "openrouter:judge/acceptance"
+"#,
+    );
+
+    // Writing the section back preserves the declaration, so a round-trip
+    // through disk never re-enables the inherited chain.
+    let serialized = toml::to_string(&config).expect("serialize models config");
+    assert!(serialized.contains("gatekeeper"), "got: {serialized}");
+    let raw: ModelsConfigRaw = toml::from_str(&serialized).expect("re-parse models config");
+    let restored = ModelsConfig::resolve(raw, &[]).expect("resolve models config");
+    assert_eq!(restored.gatekeeper, config.gatekeeper);
+    assert_eq!(
+        restored.resolve_role(ModelRole::Gatekeeper),
+        config.resolve_role(ModelRole::Gatekeeper)
+    );
 }

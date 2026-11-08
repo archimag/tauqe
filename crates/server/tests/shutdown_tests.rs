@@ -17,8 +17,9 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -33,11 +34,19 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// assertion reports that instead of hanging the test run.
 const WAIT_HEADROOM: Duration = Duration::from_secs(5);
 
+/// Deadline for one JSON-RPC response while the daemon answers a request.
+///
+/// A daemon that wedges before it answers would leave a plain `read_line`
+/// blocked forever, and no assertion would ever run: without a panic there is
+/// no unwind, so the drop guard below would never fire either. Reading through
+/// a detached reader thread turns the wait into a bounded channel receive, so a
+/// silent daemon is reported as a failed handshake instead of a hung test run.
+const RESPONSE_BUDGET: Duration = Duration::from_secs(5);
 /// One running daemon driven over its JSON-RPC pipes.
 struct Daemon {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    lines: Receiver<String>,
     next_id: u64,
 }
 
@@ -57,10 +66,19 @@ impl Daemon {
             .expect("the daemon binary starts");
         let stdin = child.stdin.take().expect("the daemon stdin is captured");
         let stdout = child.stdout.take().expect("the daemon stdout is captured");
+        let (lines_tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if lines_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            lines,
             next_id: 0,
         }
     }
@@ -90,20 +108,23 @@ impl Daemon {
     }
 
     /// Reads output lines until the response of `id` arrives.
+    /// Reads output lines until the response of `id` arrives.
     ///
     /// The daemon interleaves events with responses on the same channel, so
-    /// lines are skipped until the one carrying this request's id appears.
+    /// lines are skipped until the one carrying this request's id appears. The
+    /// wait is bounded by `RESPONSE_BUDGET`, so a daemon that stops answering
+    /// fails the handshake instead of parking the test on a blocking read.
     fn read_response(&mut self, id: u64) -> Value {
         loop {
-            let mut line = String::new();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .expect("the daemon output is readable");
-            assert!(
-                read > 0,
-                "the daemon closed its stdout before answering request {id}"
-            );
+            let line = match self.lines.recv_timeout(RESPONSE_BUDGET) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the daemon did not answer request {id} within {RESPONSE_BUDGET:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the daemon closed its stdout before answering request {id}")
+                }
+            };
             let value: Value =
                 serde_json::from_str(line.trim()).expect("the daemon writes valid JSON");
             if value.get("id").and_then(Value::as_u64) == Some(id) {

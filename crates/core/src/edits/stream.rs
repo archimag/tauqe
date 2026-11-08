@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::edits::anchor::decode_anchor;
 use crate::edits::fuzzy::{scan_lines, LineSpan};
+use crate::edits::protocol::utils::resolve_preview_read_path;
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
@@ -43,6 +44,8 @@ pub(crate) fn resolve_path(candidate: &str, editable_paths: &[String], is_create
         })
 }
 
+/// Returns the content of a previewed file from staged memory or, failing that,
+/// from the working tree through the repository boundary.
 pub(crate) fn current_file_content(
     staged: &HashMap<String, String>,
     repo_root: &Path,
@@ -51,7 +54,19 @@ pub(crate) fn current_file_content(
     if let Some(content) = staged.get(path) {
         return Ok(content.clone());
     }
-    let full_path = repo_root.join(path);
+    read_repository_source(repo_root, path)
+}
+
+/// Reads a model-named file for the streaming preview.
+///
+/// The path passes the repository boundary before a byte is read: the decoration a
+/// model may wrap it in is stripped, `.` and `..` collapse without climbing above
+/// the repository root, an absolute path is refused, and a symbolic link that
+/// resolves outside the repository is refused. The authoritative decoder rejects a
+/// change that names such a path afterwards, so the preview must not disclose the
+/// file it would have read as the removed side of a hunk.
+fn read_repository_source(repo_root: &Path, path: &str) -> Result<String, String> {
+    let full_path = repo_root.join(resolve_preview_read_path(repo_root, path)?);
     crate::blocking::run_blocking(|| std::fs::read_to_string(&full_path))
         .map_err(|e| format!("Cannot read file '{}': {}", path, e))
 }
@@ -386,14 +401,25 @@ impl StagingSimulator {
     ///
     /// The original snapshot travels with the content, because the anchors of the
     /// destination still name the lines the file had before the change set.
+    ///
+    /// A source the repository boundary refuses is never read, so a move cannot
+    /// disclose a file outside the repository: the move is previewed without
+    /// content and the staging engine reports the rejection.
     pub(crate) fn apply_move(&mut self, from: &str, to: &str) {
         if let Some(content) = self.staged_contents.remove(from) {
             self.staged_contents.insert(to.to_string(), content);
         } else {
-            let full_from = self.repo_root.join(from);
-            let read = crate::blocking::run_blocking(|| std::fs::read_to_string(&full_from));
-            if let Ok(content) = read {
-                self.staged_contents.insert(to.to_string(), content);
+            match read_repository_source(&self.repo_root, from) {
+                Ok(content) => {
+                    self.staged_contents.insert(to.to_string(), content);
+                }
+                // A refused source is never read: the move is previewed without
+                // its content and the staging engine reports the rejection.
+                Err(reason) => tracing::debug!(
+                    path = %from,
+                    %reason,
+                    "streaming preview does not read the source of a move"
+                ),
             }
         }
         if let Some(original) = self.original_contents.remove(from) {
@@ -494,6 +520,7 @@ mod tests {
     use crate::edits::anchor::encode_anchor;
     use crate::test_paths::scratch_dir;
     use std::collections::HashMap;
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reads_files_and_moves_without_stalling_the_runtime() {
         let repo_root = scratch_dir("stream-blocking");
@@ -521,6 +548,7 @@ mod tests {
 
         std::fs::remove_dir_all(&repo_root).ok();
     }
+
     /// An anchored range whose anchors and content are owned by the test.
     struct Anchored {
         start: String,
@@ -672,6 +700,7 @@ mod tests {
 
         std::fs::remove_dir_all(&repo_root).ok();
     }
+
     #[test]
     fn a_replacement_reports_the_lines_it_addresses() {
         let repo_root = scratch_dir("stream-blocking");
@@ -722,5 +751,183 @@ mod tests {
         assert_eq!(coordinates.context_hint.as_deref(), Some("impl Test {"));
 
         std::fs::remove_dir_all(&repo_root).ok();
+    }
+
+    /// Names the file outside the repository that a preview must never read.
+    ///
+    /// Both scratch directories are siblings under the temporary directory, so one
+    /// parent step names the outside directory from inside the repository.
+    fn escaping_source(repo_root: &std::path::Path, outside: &std::path::Path) -> String {
+        let name = outside
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a scratch directory carries a UTF-8 name");
+        assert_eq!(
+            outside.parent(),
+            repo_root.parent(),
+            "the scratch directories are siblings"
+        );
+        format!("../{name}/secret.txt")
+    }
+
+    #[test]
+    fn an_escaping_path_is_never_read_for_the_preview() {
+        let repo_root = scratch_dir("stream-boundary");
+        let outside = scratch_dir("stream-boundary-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").expect("write the secret");
+        let escaping = escaping_source(&repo_root, &outside);
+        let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        // Reading, replacing, and anchoring reach the disk through one helper, so
+        // every preview of the escaping path is refused before a byte is read.
+        let read = simulator
+            .current_content(&escaping)
+            .expect_err("the preview must not read outside the repository");
+        let replaced = simulator
+            .apply_hunk(&escaping, "outside", "leaked")
+            .expect_err("a replacement must not read outside the repository");
+        let anchored = Anchored::new(&escaping, 0, 0, "leaked\n");
+        let batched = simulator
+            .apply_anchor_batch(&escaping, &[anchored.as_edit()])
+            .expect_err("an anchored range must not read outside the repository");
+        for error in [read, replaced, batched] {
+            assert!(
+                error.contains("escapes repository root"),
+                "the refusal names the boundary: {error}"
+            );
+            assert!(!error.contains("outside secret"), "{error}");
+        }
+
+        // A move preview reads its source through the same helper, so the secret
+        // never reaches the destination of the preview either.
+        simulator.apply_move(&escaping, "moved.txt");
+        assert!(
+            !simulator.staged_contents.contains_key("moved.txt"),
+            "the preview must not relocate a file it never read"
+        );
+
+        std::fs::remove_dir_all(&repo_root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_leaving_the_repository_is_never_read_for_the_preview() {
+        let repo_root = scratch_dir("stream-boundary-link");
+        let outside = scratch_dir("stream-boundary-link-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").expect("write the secret");
+        std::fs::write(repo_root.join("inside.txt"), "inside").expect("write the inside file");
+        std::os::unix::fs::symlink(&outside, repo_root.join("link"))
+            .expect("link the outside directory into the repository");
+        std::os::unix::fs::symlink(
+            repo_root.join("inside.txt"),
+            repo_root.join("inside_link.txt"),
+        )
+        .expect("link a repository file");
+
+        let simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        let error = simulator
+            .current_content("link/secret.txt")
+            .expect_err("a link leaving the repository must be refused");
+        assert!(error.contains("escapes repository root"), "{error}");
+        // A link that stays inside the repository is still a readable source.
+        assert_eq!(
+            simulator
+                .current_content("inside_link.txt")
+                .expect("a link inside the repository is admitted"),
+            "inside"
+        );
+
+        std::fs::remove_file(repo_root.join("link")).ok();
+        std::fs::remove_file(repo_root.join("inside_link.txt")).ok();
+        std::fs::remove_dir_all(&repo_root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn a_dot_segment_inside_the_repository_still_reads() {
+        let repo_root = scratch_dir("stream-relative");
+        std::fs::create_dir_all(repo_root.join("src")).expect("create a source directory");
+        std::fs::write(repo_root.join("source.txt"), "alpha\n").expect("write the source file");
+        let simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        // A `..` that never leaves the repository collapses into a path the
+        // preview reads like any other.
+        assert_eq!(
+            simulator
+                .current_content("src/../source.txt")
+                .expect("a relative path inside the repository is readable"),
+            "alpha\n"
+        );
+
+        std::fs::remove_dir_all(&repo_root).ok();
+    }
+
+    /// A change entry naming a path that the file system resolves outside the
+    /// repository must not disclose the file it names through the removed side
+    /// of a streamed hunk.
+    ///
+    /// The spelling is a symbolic link rather than a `..` traversal, because
+    /// the wire boundary collapses and rejects a traversal component before a
+    /// preview exists at all. A link that stays lexically inside the repository
+    /// while the file system resolves it outside is the escape only the
+    /// repository boundary check can refuse, so it is the one that proves the
+    /// preview performs that check.
+    #[test]
+    #[cfg(unix)]
+    fn an_escaping_change_entry_never_streams_the_file_content() {
+        use super::{EditStreamFilter, JsonStreamFilter};
+        use crate::providers::StreamEvent;
+
+        let repo_root = scratch_dir("stream-boundary-filter");
+        let outside = scratch_dir("stream-boundary-filter-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").expect("write the secret");
+        std::os::unix::fs::symlink(&outside, repo_root.join("link"))
+            .expect("link the outside directory into the repository");
+        let escaping = "link/secret.txt";
+        let change = serde_json::json!({
+            "op": "replace",
+            "path": escaping,
+            "to": "",
+            "start": encode_anchor(escaping, 0),
+            "end": encode_anchor(escaping, 0),
+            "content": "leaked\n",
+        });
+        let input = serde_json::json!({
+            "message": "Preview",
+            "changes": [change],
+        })
+        .to_string();
+
+        let mut filter = JsonStreamFilter::new(Vec::new(), repo_root.clone());
+        let mut events = filter.push_chunk(&input);
+        events.extend(Box::new(filter).finish());
+
+        // The entry addresses a line range, so previewing it would report the
+        // replaced text as the removed side of a hunk. The boundary refuses the
+        // read first, so no hunk and no content ever reaches the client.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::EditHunk { .. })),
+            "{events:?}"
+        );
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::EditFileDone { error, .. } => error.clone(),
+                _ => None,
+            })
+            .expect("the refused file reports its diagnostic");
+        assert!(error.contains("escapes repository root"), "{error}");
+        assert!(
+            !format!("{events:?}").contains("outside secret"),
+            "{events:?}"
+        );
+
+        std::fs::remove_file(repo_root.join("link")).ok();
+        std::fs::remove_dir_all(&repo_root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

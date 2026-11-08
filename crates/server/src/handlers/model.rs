@@ -21,7 +21,7 @@ use tauqe_protocol::{
 
 use crate::state::AppState;
 
-pub(crate) use turn::{build_apply_policy, emit_legacy_usage_event, CANCEL_UNWIND_GRACE};
+pub(crate) use turn::{build_apply_policy, emit_legacy_usage_event, unwind_grace};
 pub use turn::{execute_model_turn, start_model_turn, ModelTurnResult, StepTurnOptions};
 
 pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {

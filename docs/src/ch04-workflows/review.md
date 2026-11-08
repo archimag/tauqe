@@ -575,6 +575,19 @@ it cannot interpret.
 
 ### 3.7 Execution contracts
 
+`review/execute` names what it runs through one tagged target, and the tag states which
+queue the request addresses: `all_sessions`, `session`, `finding`, `findings`, or
+`group`. The target travels flattened beside the execution overrides, so a request
+always names exactly one entity and can never mix two, and no variant carries a
+`step_id`: the shared pipeline executes the whole remaining horizon of the entity it is
+given, so a request never picks one leaf out of a plan.
+
+The target is a typed contract, not a set of optional fields a handler reconciles. Every
+variant refuses a field it does not declare, so a group never travels beside a finding,
+a single finding never travels beside an explicit selection, and no variant admits a
+retired sub-step. A payload that names two targets fails to decode at the DTO boundary
+instead of being silently reduced to one of them.
+
 Everything a batch may run is a **member**: `{session}:{item}` addresses one finding,
 and `{session}:g:{group}` addresses one group plan. The member identifier is the
 addressing contract the supervisor decodes, so a group member never reaches the
@@ -582,8 +595,9 @@ finding path and a finding never reaches the group path.
 
 #### Independent findings and simple groups
 
-`x` or `Enter` on a finding row sends `review/execute` with a session and item
-identity. The request resolves to `ExecutionScope::ReviewFinding { review_id, item_id }`,
+`x` or `Enter` on a finding row sends `review/execute` with the `finding` target, which
+names one session and one item. The request resolves to
+`ExecutionScope::ReviewFinding { review_id, item_id }`,
 which builds a degenerate one-step horizon in memory: the finding is the single leaf, its
 `files` are the files that leaf targets, its `readonly_files` are the contracts it reads,
 and its description is the context of the step. The horizon is never persisted, so
@@ -637,8 +651,8 @@ contour. The server records the explanation in `note`, transitions the finding t
 #### Architectural groups
 
 `x` on the header of an architectural group addresses the group itself: the request
-carries `group_id` and never an `item_id`, because one root cause is fixed by one
-coherent change set. The request resolves to
+carries the `group` target, which names the group and never a finding, because one root
+cause is fixed by one coherent change set. The request resolves to
 `ExecutionScope::ReviewGroup { review_id, group_id }`, whose frame carries the group's own
 `implementation` and renders every finding of the group into the concept tree, so the
 description of each symptom reaches the context of every step it resolves. The shared
@@ -647,12 +661,11 @@ passing the same pre-flight and verification gates as a single finding, while th
 statuses stay frozen for the whole walk. The readiness gate runs before the
 walk: while one of the group's findings still poses an open question, an explicit launch
 is refused with the typed `GROUP_UNRESOLVED_QUESTIONS` diagnostic naming those findings,
-and a targeted sub-step never bypasses that refusal.
+and a step row arms the same refusal instead of bypassing it.
 
 The whole plan confirms as a binary card and runs on the configured roles: it spans
 several bounded turns, so a per-run Coder override would apply to none of them
-coherently. A targeted step keeps the Coder selector and the directives editor,
-because it is exactly one bounded turn.
+coherently.
 
 **Just-in-time synthesis.** A stored group may not carry a plan yet. Rather than
 refusing the run or asking the developer to decompose the finding by hand, the
@@ -680,18 +693,17 @@ that the work cannot be completed in the current environment, and the exact
 command only the developer can run travels with that verdict instead of a
 contradiction the model would have to invent.
 
-**A targeted step.** `x` on a step of the group plan sends `group_id` together with
-`step_id` and runs exactly that leaf step. The target is validated before the walk
-starts: a group without a plan refuses a step target with `INVALID_PARAMS`, because
-the horizon does not exist yet, and the shared plan scope evaluator refuses a step
-that is `DONE`, `CANCELLED`, `BLOCKED`, blocked by unfinished dependencies or
-blockers, or still in `DISCUSSION`. A review finding never accepts a step target: it
-executes as one isolated turn and owns no plan.
+**A step row arms the same plan.** `x` on a step of the group plan opens the binary
+confirmation of the root-cause plan the step belongs to, exactly as the group header
+does: the shared pipeline executes that plan's remaining horizon as one coherent change
+set, so a step never selects a leaf turn of its own, and no request carries a `step_id`.
 
 #### Session batch
 
 `x` on a session header queues every actionable finding of the session plus one group
-member per architectural group that owns at least one actionable finding. The group
+member per architectural group that owns at least one actionable finding. The request
+carries the `session` target, which names the session alone, so the server builds that
+queue from the stored session instead of from a list the client assembled. The group
 member takes the position of the group's first actionable finding, so the traversal
 order a client rendered is preserved, and the confirmation card states both halves of
 the queue: the per-finding work and the number of root-cause plans. Findings still in
@@ -707,9 +719,9 @@ architecture findings — instead of claiming the session has no work.
 #### Section batch
 
 `x` on a section — a root-cause group or the independent-issues group — queues the
-statuses that can still produce work. The audited selection travels on the wire as an
-explicit, client-ordered list of finding ids, so the run can never silently widen to
-the whole session behind a dialog that promised less. Ids that went stale between the
+statuses that can still produce work. The audited selection travels on the wire as the
+`findings` target, an explicit, client-ordered `item_ids` list, so the run can never
+silently widen to the whole session behind a dialog that promised less.
 confirmation and the launch — a finding already fixed, skipped, or sent back to
 discussion — are dropped instead of executed, and an empty selection is refused before
 any token is spent. Provenance groups keep the session-wide scope of their header;
@@ -723,7 +735,9 @@ the findings it renders are counted as deferred.
 `X` queues every actionable finding and every actionable root-cause plan across all
 sessions, in `{session}:{item}` and `{session}:g:{group}` order, advancing the active
 session pointer as it moves, with an aggregated confirmation that states the total
-scope first. A root-cause plan the readiness gate defers contributes no member and its
+scope first. The request carries the `all_sessions` target, which names no session at
+all and is resolved from the stored sessions instead. A root-cause plan the readiness
+gate defers contributes no member and its
 findings are counted as deferred, so a cross-session run crosses out of a group whose
 question is still open instead of executing it. It terminates with one aggregated
 batch-finished event.
@@ -962,7 +976,7 @@ nested inside the other: the steps render deeper than the branch, and the findin
 sibling band of rows. Folding the branch hides its steps and leaves the findings
 untouched, folding the group hides both, and a group whose plan is synthesized just in
 time simply gains a branch when the synthesis lands. Executing the group header runs the
-whole plan as one binary confirmed card, executing a step row runs exactly that leaf, and
+whole plan as one binary confirmed card, executing a step row arms that same card, and
 both keep the contracts of §3.7.
 
 A plan step is projected from the shared `PlanImplementation` exactly as a local plan is:
@@ -989,7 +1003,7 @@ missing icon.
 | `Ctrl+N` / `Ctrl+P` | accordion walk to the next / previous finding |
 | `Tab` / `Space` | fold or unfold the selected node |
 | `a` | fold or unfold the whole tree |
-| `Enter` / `x` | execute the selected finding, group, plan step, or session |
+| `Enter` / `x` | execute the selected finding, group, or session |
 | `X` | execute every finding and root-cause plan across all sessions |
 | `Shift+A` | classify the selected session with the Architect post-analysis |
 | `t` / `s` | open the status dialog |
@@ -1021,6 +1035,10 @@ verdict independent; sharing the REPL history destroys its value.
   review supervisor only selects members, addresses them, and reports the run, so the
   former review execution runtime and its per-item step runner are removed rather than
   kept dormant behind a flag.
+- **It is not a request that can name two targets.** The execution target is one tagged
+  variant — all sessions, one session, one finding, a finding queue, or one group — and
+  a payload that names a second target fails to decode at the DTO boundary instead of
+  being reconciled by a handler.
 - **It is not a per-step status feed.** A running remediation does not stamp findings as
   it advances: the horizon is the progress record, the findings keep the statuses the
   developer gave them, and the group closes once.

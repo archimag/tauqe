@@ -55,7 +55,12 @@ contacts a provider.
     letter fire only on a press without `Ctrl` and `Alt`: a yank chord never
     confirms a dialog, a quit chord never dismisses one, a view-switch digit never
     applies a status, and the AltGr compose chord is never a command. Text
-    insertion mirrors it: a composed character still reaches the buffer.
+   insertion mirrors it: a composed character still reaches the buffer.
+13. **One capture boundary, three consumers.** The set of text-capturing surfaces
+    is declared once, and character insertion, the quit guard, and the paste router
+    all derive their answer from it, so a focused editor can be typed into, is
+    protected against a silent exit, and receives a pasted payload without being
+    listed anywhere a second time.
 
 ---
 
@@ -372,6 +377,9 @@ description.
   resolved global command stays with the open modal. The dismissal letters
   remain bare presses: a command chord or the AltGr compose chord never
   dismisses Help, the status picker, or the theme selector.
+- Bracketed paste and the middle-click pointer paste reach the focused capturing
+  editor of the active surface — the one declaration the keyboard gate reads — and
+  a surface that captures no text drops the payload instead of guessing a field.
 - Confirmation dialogs accept `y` / `Y` to confirm immediately and `n` / `N`, `q`, or
   `Esc` to cancel. Those letters are bare presses: a press carrying `Ctrl`, `Alt`,
   or the AltGr compose chord confirms nothing and dismisses nothing, so no yank
@@ -425,12 +433,24 @@ signals are pending.
 ### 3.5 Confirmation before cost
 
 Anything destructive or long-running asks first, with the safe choice focused: quit
-with a non-empty draft, undo of an AI commit, squash, cancel generation, delete a plan
-or a review session, clear a context layer, clear history, and clear a plan horizon.
-Undo verifies that an undoable commit exists before prompting and reports a notice
-otherwise, so the dialog never opens onto an impossible action. Clearing a horizon that
-has already started escalates to a strict two-tier confirmation warning that the plan
-will diverge from committed repository history.
+with unsubmitted text in any capturing surface, undo of an AI commit, squash, cancel
+generation, delete a plan or a review session, clear a context layer, clear history,
+and clear a plan horizon. The quit guard is one scan over the declared capture
+boundary: it reports a running review, an in-flight bounded turn, a squash that is
+applying, and the text of every editor that holds input — whichever dialog owns it
+and whatever section holds the focus — so an editor the boundary declares is never
+missing from the guard merely because no hand-written list mentioned it, and a second
+quit request over the confirmation card stays guarded. The card names the input at
+stake from that same derivation — a review or a turn in flight, the REPL prompt, the
+squash message or custom base reference, the plan-refinement or plan-creation
+instructions, the single-target review-execution directives, the review-launch prompt
+or target paths, the discussion message, the locale or Context path input, or the
+setup field — so a confirmation never says that work may be lost without saying which
+work. Undo verifies that an undoable
+commit exists before prompting and reports a notice otherwise, so the dialog never
+opens onto an impossible action. Clearing a horizon that has already started
+escalates to a strict two-tier confirmation warning that the plan will diverge from
+committed repository history.
 
 ### 3.6 Progress and notifications
 

@@ -621,14 +621,16 @@ pub trait CapabilityModule: Send + Sync {
     }
     /// Shared JSON-schema definitions referenced by [`Self::json_schema_fragment`].
     ///
-    /// A capability whose structured payload nests recursively — a plan is a
+    /// A capability whose structured payload nests its own kind — a plan is a
     /// tree of concept nodes and implementation steps — cannot inline that
-    /// shape, because a nested object would have to contain itself. Such a
-    /// module declares the shared definitions here and references them from its
-    /// fragment with `#/$defs/<Name>`; the registry lifts them to the root of
-    /// the composed schema, which is the reference form strict structured
-    /// output accepts. A capability whose payload holds no recursion
-    /// contributes no definition.
+    /// shape, because a nested object would have to contain itself and strict
+    /// Structured Output mode rejects a definition that references itself.
+    /// Such a module declares the shared definitions here instead as one
+    /// acyclic definition per depth level, each chaining `children` to the
+    /// next level of its own kind, and references them from its fragment
+    /// with `#/$defs/<Name>`; the registry lifts them to the root of the
+    /// composed schema, where the references resolve. A capability whose
+    /// payload holds no nested tree contributes no definition.
     fn json_schema_defs(&self) -> Option<serde_json::Value> {
         None
     }
@@ -1091,10 +1093,10 @@ impl CapabilityRegistry {
     /// that describes it. `required` mirrors the emitted properties, because a
     /// strict schema must require exactly what it declares, and
     /// `additionalProperties` stays closed so an undeclared field is rejected
-    /// instead of silently dropped. A payload that nests recursively ships its
-    /// shared definitions through [`CapabilityModule::json_schema_defs`], and
-    /// the registry lifts them to the root of the composed schema, where the
-    /// `#/$defs/<Name>` references of that fragment resolve.
+    /// instead of silently dropped. A payload that nests its own kind ships
+    /// its shared definitions through [`CapabilityModule::json_schema_defs`],
+    /// and the registry lifts them to the root of the composed schema, which
+    /// is where their `#/$defs/<Name>` references resolve.
     ///
     /// The render context supplies the patch strategy that decides how a change
     /// set addresses the replaced lines, together with the project declaration
@@ -1343,6 +1345,9 @@ mod tests {
         let isolated = registry.operational_xml_tags(&CapabilitySet::isolated_step());
         assert!(isolated.iter().any(|tag| tag == "context_request"));
         assert!(!isolated.iter().any(|tag| tag == "plan"));
+        // The harness owns a step's verification, so the operational surface of
+        // a step advertises no verification tag for it to emit.
+        assert!(!isolated.iter().any(|tag| tag == "verify"));
     }
 
     #[test]
@@ -1757,8 +1762,17 @@ mod tests {
         let definitions = schema["$defs"]
             .as_object()
             .expect("the plan payload references shared definitions");
-        assert!(definitions.contains_key("ConceptItem"));
-        assert!(definitions.contains_key("PlanItem"));
+        // The unrolled tree is grouped by kind — every concept level, then
+        // every step level — in depth order, so identical state renders
+        // identical bytes.
+        let mut expected: Vec<String> = Vec::new();
+        for level in 1..=tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH {
+            expected.push(format!("ConceptItemL{level}"));
+        }
+        for level in 1..=tauqe_protocol::discussion::schema::PLAN_TREE_DEPTH {
+            expected.push(format!("PlanItemL{level}"));
+        }
+        assert_eq!(definitions.keys().cloned().collect::<Vec<_>>(), expected);
 
         // A surface that cannot author plans carries no nested payload, so its
         // composed schema keeps the flat shape.

@@ -15,8 +15,10 @@
 //! While the window is open, a per-second heartbeat republishes the snapshot
 //! with the live in-flight duration, so a client renders a running clock for
 //! the current operation instead of a dash. Every transition publishes a
-//! `model/usageTotals` event, so a client renders one consistent snapshot
-//! instead of stitching counters together.
+//! `model/usageTotals` event under the operation identifier its caller already
+//! announces through `model/started` and `model/finished`, so a client renders
+//! one consistent snapshot attributed to the operation it renders instead of
+//! correlating a second identifier of its own.
 //!
 //! Every window carries an identity that lives beside the snapshot under the
 //! same mutex, so the two can never disagree. The accounting layer itself
@@ -300,12 +302,16 @@ const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 /// in-flight duration, so a client renders a running clock for the current
 /// operation instead of a dash.
 ///
-/// The guard carries the identity of the window it owns, and every operation it
-/// performs is checked against that identity under the accounting lock. The
-/// identifier it publishes with is therefore always the one that owns the
-/// in-flight scope it reports.
+/// The guard carries two identities. The operation identifier is the one the
+/// caller already announces through its own lifecycle events, so every snapshot
+/// this window publishes names the operation a client is rendering. The window
+/// identifier stays internal: every operation the guard performs is checked
+/// against it under the accounting lock, so the guard can never publish or fold
+/// a scope a successor already replaced.
 pub struct UsageGuard {
     state: Arc<AppState>,
+    /// Identifier the window publishes under: the one the caller announces
+    /// through its own lifecycle events.
     operation_id: String,
     /// Identity of the accounting window this guard owns.
     window: WindowId,
@@ -371,15 +377,20 @@ fn spawn_live_duration_ticker(
 }
 
 impl AppState {
-    /// Opens a usage accounting window for one operation.
+    /// Opens a usage accounting window for the operation named by `operation_id`.
     ///
-    /// A window left behind by an operation that failed before flushing is
-    /// discarded here, so one abandoned turn never inflates the in-flight
-    /// totals of the next one. The fresh window receives an identity of its
-    /// own, minted under the same lock that installs it, so the abandoned
-    /// heartbeat can never mistake the successor's totals for its own.
-    pub async fn begin_usage(self: &Arc<Self>) -> UsageGuard {
-        self.begin_usage_with_tick(LIVE_DURATION_TICK).await
+    /// The identifier is the one the caller already announces through its own
+    /// lifecycle events, so the in-flight totals, the running-clock heartbeat,
+    /// and the final flush of this window name the operation a client is
+    /// rendering instead of a second identity it would have to correlate.
+    ///
+    /// Ownership stays a separate, internal identity minted under the lock that
+    /// installs the window, so a window left behind by an operation that failed
+    /// before flushing is discarded here and its abandoned heartbeat can never
+    /// mistake the successor's totals for its own.
+    pub async fn begin_usage(self: &Arc<Self>, operation_id: &str) -> UsageGuard {
+        self.begin_usage_with_tick(operation_id, LIVE_DURATION_TICK)
+            .await
     }
 
     /// Opens a usage accounting window whose heartbeat runs on `tick`.
@@ -388,17 +399,20 @@ impl AppState {
     /// passes a compressed one, so no assertion has to wait a whole production
     /// tick. The seam is private to this module and never changes the cadence
     /// the daemon publishes with.
-    async fn begin_usage_with_tick(self: &Arc<Self>, tick: Duration) -> UsageGuard {
-        let operation_id = format!("op-{}", next_operation_id());
+    async fn begin_usage_with_tick(
+        self: &Arc<Self>,
+        operation_id: &str,
+        tick: Duration,
+    ) -> UsageGuard {
         let window = {
             let mut ledger = self.usage.lock().await;
             ledger.begin()
         };
         let started = Instant::now();
-        let ticker = spawn_live_duration_ticker(self, window, &operation_id, started, tick);
+        let ticker = spawn_live_duration_ticker(self, window, operation_id, started, tick);
         let guard = UsageGuard {
             state: Arc::clone(self),
-            operation_id,
+            operation_id: operation_id.to_string(),
             window,
             started,
             ticker,
@@ -606,11 +620,11 @@ mod tests {
     async fn flushes_operations_into_the_session_totals() {
         let (state, mut rx, root) = test_state();
 
-        let first = state.begin_usage().await;
+        let first = state.begin_usage("op-first").await;
         first.observe(&usage(100, 40)).await;
         first.flush().await;
 
-        let second = state.begin_usage().await;
+        let second = state.begin_usage("op-second").await;
         second.observe(&usage(10, 5)).await;
         second.observe(&usage(2, 3)).await;
         second.flush().await;
@@ -652,7 +666,7 @@ mod tests {
     async fn keeps_the_in_flight_operation_visible_until_flush() {
         let (state, _rx, root) = test_state();
 
-        let guard = state.begin_usage().await;
+        let guard = state.begin_usage("op-visible").await;
         guard.observe(&usage(3, 2)).await;
 
         let in_flight = state.usage_snapshot().await;
@@ -683,7 +697,7 @@ mod tests {
         const TEST_TICK: Duration = Duration::from_millis(50);
         let (state, mut rx, root) = test_state();
 
-        let guard = state.begin_usage_with_tick(TEST_TICK).await;
+        let guard = state.begin_usage_with_tick("op-heartbeat", TEST_TICK).await;
         guard.observe(&usage(3, 2)).await;
 
         // Poll the transport until a heartbeat publishes the live duration.
@@ -752,7 +766,7 @@ mod tests {
     async fn flush_persists_the_project_lifetime() {
         let (state, _rx, root) = test_state();
 
-        let guard = state.begin_usage().await;
+        let guard = state.begin_usage("op-persist").await;
         guard.observe(&usage(100, 40)).await;
         guard.flush().await;
 
@@ -788,13 +802,13 @@ mod tests {
         const TEST_TICK: Duration = Duration::from_millis(20);
         let (state, mut rx, root) = test_state();
 
-        let abandoned = state.begin_usage_with_tick(TEST_TICK).await;
+        let abandoned = state.begin_usage_with_tick("op-abandoned", TEST_TICK).await;
         let abandoned_id = abandoned.operation_id.clone();
         abandoned.observe(&usage(100, 40)).await;
 
         // The successor installs its own window while the abandoned guard is
         // still alive: the abandoned totals are discarded with that window.
-        let successor = state.begin_usage_with_tick(TEST_TICK).await;
+        let successor = state.begin_usage_with_tick("op-successor", TEST_TICK).await;
         let successor_id = successor.operation_id.clone();
         successor.observe(&usage(3, 2)).await;
         while rx.try_recv().is_ok() {}
@@ -865,9 +879,11 @@ mod tests {
         const PARKED_TICK: Duration = Duration::from_secs(3600);
         let (state, mut rx, root) = test_state();
 
-        let abandoned = state.begin_usage_with_tick(PARKED_TICK).await;
+        let abandoned = state
+            .begin_usage_with_tick("op-superseded", PARKED_TICK)
+            .await;
         abandoned.observe(&usage(100, 40)).await;
-        let successor = state.begin_usage_with_tick(PARKED_TICK).await;
+        let successor = state.begin_usage_with_tick("op-current", PARKED_TICK).await;
         successor.observe(&usage(3, 2)).await;
         while rx.try_recv().is_ok() {}
 
@@ -904,7 +920,7 @@ mod tests {
     async fn reset_zeroes_the_project_lifetime_and_keeps_the_session() {
         let (state, _rx, root) = test_state();
 
-        let guard = state.begin_usage().await;
+        let guard = state.begin_usage("op-reset").await;
         guard.observe(&usage(10, 5)).await;
         guard.flush().await;
 
@@ -944,7 +960,7 @@ mod tests {
         let (state, _rx, first_root) = test_state();
         let second_root = scratch_root("usage-rebind");
 
-        let guard = state.begin_usage().await;
+        let guard = state.begin_usage("op-first").await;
         guard.observe(&usage(10, 5)).await;
         guard.flush().await;
         assert_eq!(state.usage_snapshot().await.lifetime.total_tokens, 15);
@@ -952,7 +968,7 @@ mod tests {
         // The second repository already carries its own, much smaller,
         // telemetry document.
         let second = state_at(&second_root);
-        let stored = second.begin_usage().await;
+        let stored = second.begin_usage("op-second").await;
         stored.observe(&usage(7, 3)).await;
         stored.flush().await;
         drop(second);

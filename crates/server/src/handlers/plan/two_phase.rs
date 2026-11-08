@@ -805,7 +805,7 @@ async fn collect_structured_round(
     session_id: Option<String>,
     op_id: &str,
 ) -> Result<String, CritiqueFailure> {
-    let usage = state.begin_usage().await;
+    let usage = state.begin_usage(op_id).await;
     let (tx, mut rx) = mpsc::channel(64);
     let cancel_rx = operation.cancel_receiver();
     let stream_cancel = cancel_rx.clone();

@@ -27,9 +27,11 @@ mod tests;
 pub use analysis::{PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput};
 pub use dto::{
     ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewCancelParams, ReviewDeleteParams,
-    ReviewDeleteResult, ReviewExecuteParams, ReviewGetParams, ReviewGetResult, ReviewListParams,
+    ReviewDeleteResult, ReviewExecuteParams, ReviewExecuteTarget, ReviewFindingTarget,
+    ReviewFindingsTarget, ReviewGetParams, ReviewGetResult, ReviewGroupTarget, ReviewListParams,
     ReviewListResult, ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult,
-    ReviewPreviewWindow, ReviewStartParams, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewPreviewWindow, ReviewSessionTarget, ReviewStartParams, ReviewUpdateItemParams,
+    ReviewUpdateItemResult,
 };
 pub use events::{
     ReviewAnalyzeFinishedEvent, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,

@@ -29,10 +29,13 @@ use self::projection::{
 };
 pub use self::render::render_review_view;
 pub(crate) use self::tree::{
-    compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
-    issue_type_badge, issue_type_style, location, measure_review_rows_from, model_badge,
-    plan_status_style,
+    format_created_at, issue_status_label, issue_status_style, issue_type_badge, issue_type_style,
+    location, measure_review_rows_from, model_badge, plan_status_style, render_review_lines_from,
 };
+// The slice-taking renderer exists only for the regression tests, which drive it
+// from an owned projection to assert on the rows and bodies a frame drew.
+#[cfg(test)]
+pub(crate) use self::tree::compute_unified_review_lines;
 
 /// Group whose isolated audit is currently streaming.
 ///
@@ -411,7 +414,10 @@ impl ReviewViewState {
     ///
     /// Mirrors `PlansViewState::is_all_expanded` so that the global fold key
     /// (`a`) behaves as a clean binary toggle: it collapses the tree only when
-    /// the whole tree is already fully expanded, otherwise it expands it.
+    /// the whole tree is already fully expanded, otherwise it expands it. Both
+    /// predicates inspect every level of their tree, because a partially folded
+    /// tree answers "not fully expanded" and the one shared chord must expand
+    /// it rather than collapse it in either view.
     pub fn is_all_expanded(&self) -> bool {
         if !self.collapsed_sessions.is_empty() {
             return false;

@@ -49,7 +49,7 @@ const HEAL_LIB: &str = "pub fn alpha() -> i32 { \"alpha\" }\npub fn beta() -> i3
 /// keeps the report free of build progress noise.
 const VERIFY_DECLARATION: &str = "\
 [models]
-primary = [\"openrouter:mock/model\"]
+repl = [\"openrouter:mock/model\"]
 
 [project.verify]
 command = \"cargo\"
@@ -2890,7 +2890,7 @@ async fn git_workflow_discards_formatter_failure_and_commits_verified_code() {
     let declaration = format!(
         r#"
 [models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "grep"
@@ -2944,7 +2944,7 @@ async fn git_workflow_commits_in_memory_formatter_output() {
     let declaration = format!(
         r#"
 [models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "grep"
@@ -3264,7 +3264,7 @@ async fn repo_dirs_lists_root_files_and_marks_pinned_conventions() {
     .expect("write target fixture");
     std::fs::write(
         repo_root.join("tauqe.toml"),
-        "[models]\nprimary = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"true\"\n\n[context]\npinned = [\"Conventions.md\"]\n",
+        "[models]\nrepl = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"true\"\n\n[context]\npinned = [\"Conventions.md\"]\n",
     )
     .expect("write project configuration");
     commit_fixture(
@@ -3916,7 +3916,7 @@ async fn project_verification_reports_structured_diagnostics_for_healing() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"sh\"\n",
@@ -3960,7 +3960,7 @@ async fn post_hook_artifacts_join_the_single_turn_commit() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
@@ -4064,7 +4064,7 @@ async fn post_hook_artifacts_survive_healing_into_one_commit() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
@@ -4196,7 +4196,7 @@ async fn verification_generated_lock_file_joins_the_single_turn_commit() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"sh\"\n",
@@ -4303,7 +4303,7 @@ async fn verification_generated_lock_file_joins_the_single_turn_commit() {
 #[cfg(unix)]
 const PROBE_DECLARATION: &str = "\
 [models]
-primary = [\"openrouter:mock/model\"]
+repl = [\"openrouter:mock/model\"]
 
 [project.verify]
 command = \"true\"
@@ -4955,7 +4955,7 @@ async fn auto_context_survives_a_failed_verification() {
         .expect("write helper fixture");
     std::fs::write(
         repo_root.join("tauqe.toml"),
-        "[models]\nprimary = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 1']\n",
+        "[models]\nrepl = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 1']\n",
     )
     .expect("write the project verification declaration");
     commit_fixture(&repo_root, &["target.rs", "helper.rs", "tauqe.toml"]);
@@ -5196,7 +5196,7 @@ async fn post_hook_corrupting_tauqe_toml_fails_verification_and_rolls_back() {
     // engine must refuse to verify the change set it produced.
     let declaration = r#"
 [models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "grep"
@@ -5299,7 +5299,7 @@ async fn post_hook_preserving_a_valid_tauqe_toml_commits_the_change_set() {
     // environment stays sound and the verification gate must not refuse it.
     let declaration = r##"
 [models]
-primary = ["openrouter:mock/model"]
+repl = ["openrouter:mock/model"]
 
 [project.verify]
 command = "grep"
@@ -6470,7 +6470,7 @@ async fn plan_discussion_edit_runs_the_transactional_path() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
@@ -6581,7 +6581,7 @@ async fn plan_discussion_edit_rolls_back_a_failed_verification() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"sh\"\n",
@@ -6742,7 +6742,7 @@ async fn review_dialogue_edit_runs_the_transactional_path() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
@@ -7454,7 +7454,7 @@ async fn dir_move_turn_rolls_back_a_failed_verification() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"sh\"\n",
@@ -7639,7 +7639,7 @@ async fn dir_move_turn_refuses_a_protected_subtree() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.boundaries]\n",
             "protected = [\"docs/specs/**\"]\n",
@@ -7737,10 +7737,7 @@ async fn git_workflow_reports_not_configured_when_the_declaration_omits_verifica
         "pub fn compute() -> i32 { 0 }\n",
     )
     .expect("write target fixture");
-    write_project_config(
-        &repo_root,
-        "[models]\nprimary = [\"openrouter:mock/model\"]\n",
-    );
+    write_project_config(&repo_root, "[models]\nrepl = [\"openrouter:mock/model\"]\n");
     commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -7839,7 +7836,7 @@ async fn git_workflow_reports_passed_verification_for_a_declared_command() {
         &repo_root,
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
@@ -8610,14 +8607,14 @@ async fn answer_turn_announces_its_normalized_plan_status() {
 async fn structured_turn_declares_the_custom_tool_field_only_for_a_declared_command() {
     const VERIFY_ONLY: &str = "\
 [models]
-primary = [\"openrouter:mock/model\"]
+repl = [\"openrouter:mock/model\"]
 
 [project.verify]
 command = \"true\"
 ";
     const WITH_COMMAND: &str = "\
 [models]
-primary = [\"openrouter:mock/model\"]
+repl = [\"openrouter:mock/model\"]
 
 [project.verify]
 command = \"true\"

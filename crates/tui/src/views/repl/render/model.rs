@@ -245,7 +245,7 @@ pub fn compute_model_lines_with_file_rows(
     // row with its operation, path, patch count, and verification status. The
     // patch bodies belong to the two-pane diff inspector, so a long diff never
     // breaks the conversational flow of the canvas (c-4).
-    if model.edits_active || !model.files.is_empty() {
+    if model.edits_active || !model.files.is_empty() || model.edit_final_applied.is_some() {
         model_lines.push(Line::raw(""));
 
         let total_files = model.files.len();
@@ -311,6 +311,19 @@ pub fn compute_model_lines_with_file_rows(
                 )),
                 Span::styled(summary.clone(), Style::default().bold()),
             ]));
+        }
+
+        if model.edit_final_applied == Some(false) {
+            if let Some(err) = &model.edit_final_error {
+                model_lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{} ", crate::i18n::active_t("repl.validation_error")),
+                        engine.fg(palette.status_error).bold(),
+                    ),
+                    Span::styled(err.clone(), engine.fg(palette.status_warning)),
+                ]));
+            }
         }
 
         for (idx, file) in model.files.iter().enumerate() {
@@ -514,6 +527,24 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_model_lines_yields_on_rejected_error() {
+        let mut model = ReplView {
+            edit_final_applied: Some(false),
+            edit_final_error: Some("Target file not in context".to_string()),
+            ..ReplView::default()
+        };
+        assert!(!model.splash_visible());
+        let lines = compute_model_lines(&mut model);
+        assert!(!lines.is_empty());
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("Target file not in context"));
+    }
+
+    #[test]
     fn usage_line_prefers_the_in_flight_operation() {
         let mut model = ReplView {
             text: "answer".to_string(),
@@ -631,5 +662,93 @@ mod link_row_tests {
 
         assert!(link_rows(&links, 0, &rows, &[0], &[0], 40).is_empty());
         assert!(link_rows(&links, 0, &rows, &[0], &[0], 0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod closure_reason_tests {
+    use super::super::super::state::TurnStatus;
+    use super::*;
+
+    /// Flattens one rendered row into its text.
+    fn row_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Index of the first row containing `needle`.
+    fn row_of(lines: &[Line<'static>], needle: &str) -> Option<usize> {
+        lines
+            .iter()
+            .position(|line| row_text(line).contains(needle))
+    }
+
+    fn closed_view(status: TurnStatus, reason: Option<&str>, applied: bool) -> ReplView {
+        ReplView {
+            status,
+            edit_final_applied: Some(applied),
+            edit_final_error: reason.map(str::to_string),
+            ..ReplView::default()
+        }
+    }
+
+    /// The reason of every kind of rejected closure is part of the response
+    /// body, under the state badge, whatever the turn status is when the
+    /// closure is drawn (c-6).
+    #[test]
+    fn every_closure_reason_is_visible_in_the_response_body() {
+        let reasons = [
+            "the model proposed no changes",
+            "the turn was cancelled before the edits were applied",
+            "the attempt was withdrawn and replaced by a retry",
+            "the provider failed before the edits were applied",
+            "the turn ended blocked by an unmet precondition",
+            "the model response violated the protocol",
+            "the turn was aborted by the host environment",
+        ];
+        let statuses = [
+            TurnStatus::Responding,
+            TurnStatus::Done,
+            TurnStatus::Cancelled,
+            TurnStatus::Error,
+        ];
+
+        for reason in reasons {
+            for status in statuses {
+                let mut model = closed_view(status, Some(reason), false);
+                let lines = compute_model_lines(&mut model);
+
+                let header = row_of(&lines, &crate::i18n::active_t("repl.proposed_edits"))
+                    .expect("the proposed edits block is drawn");
+                let badge = row_of(&lines, &crate::i18n::active_t("repl.edits_badge_rejected"))
+                    .expect("a rejected closure shows its state badge");
+                let reason_row = row_of(&lines, reason).unwrap_or_else(|| {
+                    panic!("the reason {reason:?} must be rendered for status {status:?}")
+                });
+
+                assert_eq!(badge, header, "the badge sits on the block header");
+                assert!(reason_row > header, "the reason renders below the badge");
+                assert!(
+                    row_text(&lines[reason_row])
+                        .contains(&crate::i18n::active_t("repl.validation_error")),
+                    "the reason row carries the catalog label"
+                );
+            }
+        }
+    }
+
+    /// A successful closure carries no error, so no reason row is drawn.
+    #[test]
+    fn a_successful_closure_renders_no_reason_row() {
+        let mut model = closed_view(TurnStatus::Done, None, true);
+        let lines = compute_model_lines(&mut model);
+
+        assert!(row_of(&lines, &crate::i18n::active_t("repl.proposed_edits")).is_some());
+        assert!(
+            row_of(&lines, &crate::i18n::active_t("repl.validation_error")).is_none(),
+            "an applied closure has nothing to explain"
+        );
     }
 }

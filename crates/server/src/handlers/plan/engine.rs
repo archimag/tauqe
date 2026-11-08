@@ -77,9 +77,11 @@ pub(super) async fn execute_plan_horizon_synthesis(
         // A manual run on a configuration the automatic ladder excludes cannot
         // escalate, which the published note states instead of leaving the
         // developer to assume a silent downgrade.
-        let escalation_excluded = cfg
-            .models
-            .excluded_from_escalation(ModelRole::Architect, &architect_tier.model);
+        let escalation_excluded = cfg.models.excluded_from_escalation(
+            ModelRole::Architect,
+            &architect_tier.model,
+            architect_tier.effort,
+        );
         // Every operational budget of the synthesis — research rounds, file and
         // repomap budgets, the eager-map switch, and the research limits — belongs
         // to the turn, so the contour reads them from one options value instead of

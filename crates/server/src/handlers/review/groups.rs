@@ -160,7 +160,7 @@ impl GroupAuditExecutor<'_> {
         // The guard opens the accounting window before the provider call so the
         // group reports both the usage the provider returns and the duration the
         // harness measures itself.
-        let usage_guard = self.state.begin_usage().await;
+        let usage_guard = self.state.begin_usage(&self.operation_id).await;
 
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
         let err_tx = tx.clone();
@@ -188,23 +188,17 @@ impl GroupAuditExecutor<'_> {
         // `summary` string so the accumulated body keeps its contract shape while
         // JSON syntax never has to be inspected by hand.
         let mut filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-        let mut usage: Option<ModelUsageInfo> = None;
         let mut failure: Option<String> = None;
         let mut stream_cancelled = false;
 
-        // A group relays reasoning at token granularity, so a client that keeps
-        // its pipe open but stopped reading pauses the audit here instead of
-        // growing the outbound queue for the rest of the batch. Only the arms that
-        // break this loop are exempted, because they publish the terminal notice
-        // of the group: a stall must never delay the cancellation or the failure
-        // it reports. The cancellation receiver is lent mutably for this gate.
+        // The group audit applies the transport-owned pacing policy instead of
+        // restating an exemption set of its own: a terminal notice publishes
+        // immediately, and every other variant waits for the writer to catch up,
+        // so a client that keeps its pipe open but stopped reading pauses the
+        // audit here instead of growing the outbound queue for the rest of the
+        // batch.
         while let Some(event) = rx.recv().await {
-            if !matches!(
-                event,
-                StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
-            ) {
-                self.state.out.wait_for_headroom(cancel_rx).await;
-            }
+            self.state.out.pace_event(&event, cancel_rx).await;
             match event {
                 StreamEvent::TextDelta(chunk) => {
                     // A group audit renders no live text, so the decoded delta is
@@ -224,7 +218,11 @@ impl GroupAuditExecutor<'_> {
                     })
                     .ok(),
                 ),
-                StreamEvent::Usage(reported) => usage = Some(reported),
+                // Fold every report the provider makes into the accounting window
+                // as it arrives: a group that reported usage on an intermediate
+                // chunk, or whose retry resumed after an aborted attempt had
+                // already reported its tokens, must not lose the earlier reports.
+                StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
                 StreamEvent::Done => break,
                 StreamEvent::Cancelled => {
                     stream_cancelled = true;
@@ -253,17 +251,21 @@ impl GroupAuditExecutor<'_> {
 
         // Account for the tokens, cost, and duration the group consumed before
         // any early return, so a failed or cancelled group is still charged.
-        let reported_usage = usage.unwrap_or_default();
-        usage_guard.observe(&reported_usage).await;
+        // Every report was already folded into the window as it arrived, so the
+        // flush below charges the whole group instead of its last report alone.
         usage_guard.flush().await;
-        let session_total_cost = self.state.usage_snapshot().await.session.cost;
-        let current_cost = reported_usage.cost.unwrap_or(0.0);
+        let usage_snapshot = self.state.usage_snapshot().await;
+        // Both totals are read from the authoritative ledger: the operation scope
+        // the flush just closed and the session scope it was folded into.
+        let operation_usage: ModelUsageInfo = usage_snapshot.prev.to_usage_info();
+        let session_total_cost = usage_snapshot.session.cost;
+        let current_cost = usage_snapshot.prev.cost;
         emit(
             &self.state.out,
             events::MODEL_USAGE,
             serde_json::to_value(ModelUsageEvent {
                 operation_id: self.operation_id.clone(),
-                usage: reported_usage,
+                usage: operation_usage,
                 session_total_cost,
                 current_cost: Some(current_cost),
             })

@@ -32,12 +32,35 @@ use tauqe_protocol::{ModelResult, PlanRejection, WorkflowKind};
 pub struct WorkflowExecutionResult {
     pub result: ModelResult,
     pub assistant_text: String,
+    /// Whether the developer cancelled the turn before it completed.
+    ///
+    /// Cancellation is a valid outcome rather than a failure, so the turn still
+    /// returns `Ok`: the flag is what tells an interrupted turn apart from an
+    /// answer that carried no text, and a supervisor maps it onto its cancelled
+    /// terminal status instead of reporting a failed step.
+    pub is_cancelled: bool,
+    /// Whether the model marked its answer as a validated conclusion.
+    ///
+    /// An answer without edits is a completed step only when the model declared
+    /// it with an explicit terminal success signal; otherwise it is an
+    /// unverified reply. The FSM classifies a step by exactly that distinction,
+    /// so the flag travels beside the result instead of being re-derived from
+    /// the assistant text by whoever reads it.
+    pub has_terminal_success: bool,
     /// Coder's block report when the turn ended with a semantic `<blocked>`
     /// signal. Preserved so the plan supervisor can move the step to `Blocked`.
     pub blocked: Option<String>,
+    /// Diagnostic of the edit-protocol violation that ended the turn without an
+    /// applied change set.
+    ///
+    /// The fact travels beside its diagnostic, exactly like `blocked` and
+    /// `abort`: it exists only when the model violated the edit protocol, so a
+    /// consumer classifies the ending by presence and never by the wording of
+    /// the error the turn reports.
+    pub protocol_failure: Option<String>,
     /// Coder's skip report when the turn ended with a semantic `<skip>`
     /// signal. Preserved so a review supervisor can mark the finding as
-    /// skipped instead of failing it.
+    /// skipped instead of treating the empty turn as an unverified reply.
     pub skip_reason: Option<String>,
     /// Coder's abort report when the turn ended with a semantic `<abort>`
     /// signal. Preserved so a supervisor can stop its queue without architect

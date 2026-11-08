@@ -75,7 +75,7 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     // provider returned and the duration the harness measured, so every
     // operation kind feeds one consistent snapshot.
     let op_id = format!("op-{}", crate::state::next_operation_id());
-    let usage_guard = state.begin_usage().await;
+    let usage_guard = state.begin_usage(&op_id).await;
 
     // Locale synthesis never produces code changes, so it is a Structured
     // Output operation (see `crates/core/Conventions.md`, section 1.2): the
@@ -247,6 +247,26 @@ mod tests {
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
     use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
+
+    /// Hard budget for a fixture whose subject is a task that reaches no
+    /// suspension point.
+    ///
+    /// The stretch ends at this budget on its own, so a flag that is never set
+    /// cannot pin a worker thread until process exit.
+    const SYNCHRONOUS_STRETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Releases a fixture's synchronization flag on stack unwinding.
+    ///
+    /// An imperative release placed after the assertions never runs when one of
+    /// them fails, which leaves the parked task spinning and hangs the runtime
+    /// at its own shutdown.
+    struct StretchRelease(Arc<AtomicBool>);
+
+    impl Drop for StretchRelease {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn item(key: &str, english: &str, max_width: Option<u16>) -> LocaleCatalogItem {
         LocaleCatalogItem {
@@ -803,7 +823,13 @@ mod tests {
                 .send(StreamEvent::TextDelta("{\"translations\": []}".to_string()))
                 .await;
             drop(tx);
-            while !self.released.load(Ordering::SeqCst) {
+            // The spin is bounded by its own budget, so a flag that is never
+            // released cannot pin a worker thread past it. The test still holds
+            // a drop guard that sets the flag on unwinding.
+            let stretch_deadline = std::time::Instant::now() + SYNCHRONOUS_STRETCH_BUDGET;
+            while !self.released.load(Ordering::SeqCst)
+                && std::time::Instant::now() < stretch_deadline
+            {
                 std::thread::yield_now();
             }
             self.exited.store(true, Ordering::SeqCst);
@@ -827,6 +853,9 @@ mod tests {
         let deadline = std::time::Duration::from_millis(50);
 
         let released = Arc::new(AtomicBool::new(false));
+        // Held for the whole test: a failed assertion unwinds through this guard
+        // instead of leaving the parked task spinning forever.
+        let _stretch_guard = StretchRelease(Arc::clone(&released));
         let provider = Arc::new(WedgedAfterTerminalProvider {
             released: Arc::clone(&released),
             exited: Arc::new(AtomicBool::new(false)),

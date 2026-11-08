@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use crate::app::AppState;
 use crate::i18n::active_t;
 
-use super::{architect_badge, compute_unified_plan_lines, status_style, VisiblePlanRow};
+use super::{architect_badge, render_plan_lines_from, status_style, VisiblePlanRow};
 
 pub fn render_plans_view(
     frame: &mut ratatui::Frame,
@@ -27,10 +27,14 @@ pub fn render_plans_view(
     let focus = state.discussion_focus.clone();
     state.plans_view.discussion_focus = focus;
 
-    let rows = state.plans_view.flatten_rows();
     state.plans_view.clamp_selection();
 
-    let (lines, _offsets) = if rows.is_empty() {
+    // The tree renders straight from the view's lazy cursor walk, so a frame
+    // never materializes an owned projection of every row before drawing it
+    // (c-2). The row counter drives the empty state and the status line.
+    let rows_len = state.plans_view.row_count();
+
+    let (lines, _offsets) = if rows_len == 0 {
         (
             vec![
                 Line::raw(""),
@@ -46,13 +50,24 @@ pub fn render_plans_view(
             Vec::new(),
         )
     } else {
-        compute_unified_plan_lines(
-            &rows,
+        // The walk borrows the plan tree while the Markdown cache the rows
+        // render their bodies through is owned by the same state, so the cache
+        // is taken out for the duration of the walk and put back afterwards
+        // (c-1, c-2).
+        let mut cache = std::mem::take(&mut state.plans_view.markdown_cache);
+        let rendered = render_plan_lines_from(
+            |visit| {
+                state
+                    .plans_view
+                    .walk_rows(&mut |index, row| visit(index, &row))
+            },
             state.plans_view.selected_index,
             width,
             state.plans_view.theme_mode,
-            &mut state.plans_view.markdown_cache,
-        )
+            &mut cache,
+        );
+        state.plans_view.markdown_cache = cache;
+        rendered
     };
 
     state.plans_view.rendered_lines = lines.len();
@@ -95,11 +110,10 @@ pub fn render_plans_view(
     if let Some(msg) = &state.plans_view.status_message {
         status_spans.push(Span::styled(msg.clone(), engine.fg(palette.text_secondary)));
     } else {
-        // The tree was already flattened for this frame, so the status line
-        // reads the selected row out of that list instead of flattening and
-        // cloning the whole tree a second time (c-2).
-        if let Some(row) = rows.get(state.plans_view.selected_index) {
-            status_spans.extend(describe_plan_row(row, &engine));
+        // The cursor walk stops on the selected row, so the status line reads
+        // one row instead of materializing the whole tree a second time (c-2).
+        if let Some(row) = state.plans_view.selected_row() {
+            status_spans.extend(describe_plan_row(&row, &engine));
         }
         let plans_count = state.plans_view.plans.len();
         let total_items: usize = state
@@ -124,13 +138,13 @@ pub fn render_plans_view(
             ),
             engine.fg(palette.text_muted),
         ));
-        if !rows.is_empty() {
+        if rows_len > 0 {
             status_spans.push(Span::styled(
                 format!(
                     " | {}",
                     active_t("ui.row_counter")
                         .replacen("{}", &(state.plans_view.selected_index + 1).to_string(), 1)
-                        .replacen("{}", &rows.len().to_string(), 1)
+                        .replacen("{}", &rows_len.to_string(), 1)
                 ),
                 engine.fg(palette.text_muted),
             ));

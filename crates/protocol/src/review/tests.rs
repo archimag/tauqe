@@ -5,60 +5,92 @@ use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 
 #[test]
 fn test_review_execute_params_serde() {
-    let single: ReviewExecuteParams =
-        serde_json::from_str(r#"{"review_id":"rev-1","item_id":2}"#).unwrap();
-    assert_eq!(single.review_id.as_deref(), Some("rev-1"));
-    assert_eq!(single.item_id, Some(2));
-    assert_eq!(single.step_id, None);
-    assert_eq!(single.model, None);
-    assert_eq!(single.instructions, None);
+    let all_sessions = ReviewExecuteParams {
+        target: ReviewExecuteTarget::AllSessions,
+        model: None,
+        instructions: None,
+    };
+    // A target that overrides nothing keeps the compact form of its variant.
+    assert_eq!(
+        serde_json::to_string(&all_sessions).unwrap(),
+        "{\"kind\":\"all_sessions\"}"
+    );
+    let decoded: ReviewExecuteParams = serde_json::from_str("{\"kind\":\"all_sessions\"}").unwrap();
+    assert_eq!(decoded, all_sessions);
 
-    let cross_session: ReviewExecuteParams = serde_json::from_str(r#"{}"#).unwrap();
-    assert_eq!(cross_session.review_id, None);
-    assert_eq!(cross_session.item_id, None);
-    assert_eq!(cross_session.step_id, None);
-    assert_eq!(cross_session.model, None);
-    assert_eq!(cross_session.instructions, None);
+    // A whole-session target names the session and nothing else.
+    let single_session_only = ReviewExecuteParams {
+        target: ReviewExecuteTarget::Session(ReviewSessionTarget {
+            review_id: "rev-2".to_string(),
+        }),
+        model: None,
+        instructions: None,
+    };
+    let json = serde_json::to_string(&single_session_only).unwrap();
+    assert_eq!(json, "{\"kind\":\"session\",\"review_id\":\"rev-2\"}");
+    let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, single_session_only);
 
-    let json = serde_json::to_string(&cross_session).unwrap();
-    assert_eq!(json, "{}");
-
-    let single_session_only: ReviewExecuteParams =
-        serde_json::from_str(r#"{"review_id":"rev-2"}"#).unwrap();
-    assert_eq!(single_session_only.review_id.as_deref(), Some("rev-2"));
-    assert_eq!(single_session_only.item_id, None);
-    assert_eq!(single_session_only.step_id, None);
-    assert_eq!(single_session_only.model, None);
-    assert_eq!(single_session_only.instructions, None);
-
+    // A finding target keeps the whole payload: the target, the Coder rung, and
+    // the developer directives travel together.
     let full = ReviewExecuteParams {
-        review_id: Some("rev-3".to_string()),
-        item_id: Some(5),
-        step_id: Some("5.1".to_string()),
-        group_id: None,
-        item_ids: None,
+        target: ReviewExecuteTarget::Finding(ReviewFindingTarget {
+            review_id: "rev-3".to_string(),
+            item_id: 5,
+        }),
         model: Some(ModelSelection::Role(crate::model::ModelRole::Coder)),
         instructions: Some("focus on unit tests".to_string()),
     };
     let full_json = serde_json::to_string(&full).unwrap();
-    assert!(full_json.contains("\"step_id\":\"5.1\""));
-    assert!(full_json.contains("\"model\":\"coder\""));
-    assert!(full_json.contains("\"instructions\":\"focus on unit tests\""));
+    assert!(full_json.contains("\"kind\":\"finding\""), "{full_json}");
+    assert!(full_json.contains("\"item_id\":5"), "{full_json}");
+    assert!(full_json.contains("\"model\":\"coder\""), "{full_json}");
+    assert!(full_json.contains("focus on unit tests"), "{full_json}");
     let de_full: ReviewExecuteParams = serde_json::from_str(&full_json).unwrap();
     assert_eq!(de_full, full);
 
-    // A section queue names its findings explicitly: the ids serialize
-    // verbatim in client order, and an absent list keeps the whole-session
-    // queue, so the wire form stays compact for every other caller.
+    // A section queue names its findings explicitly: the ids serialize verbatim
+    // in client order, and no single-finding field exists beside them, so the
+    // wire form states exactly one target.
     let section = ReviewExecuteParams {
-        review_id: Some("rev-4".to_string()),
-        item_ids: Some(vec![3, 1, 2]),
-        ..Default::default()
+        target: ReviewExecuteTarget::Findings(ReviewFindingsTarget {
+            review_id: "rev-4".to_string(),
+            item_ids: vec![3, 1, 2],
+        }),
+        model: None,
+        instructions: None,
     };
     let json = serde_json::to_string(&section).unwrap();
-    assert!(json.contains("\"item_ids\":[3,1,2]"), "got: {json}");
+    assert!(json.contains("\"item_ids\":[3,1,2]"), "{json}");
+    assert!(!json.contains("\"item_id\":"), "{json}");
     let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
     assert_eq!(de, section);
+}
+
+/// The flat payload the previous contract admitted could name two targets at
+/// once, so the illegal combinations were discoverable only by reading handler
+/// code. Every such spelling is refused at the decode boundary now, which keeps
+/// the mutual exclusion in the type.
+#[test]
+fn test_review_execute_params_refuse_conflicting_targets() {
+    for raw in [
+        // No `kind` tag: the legacy flat payload names no target at all.
+        r#"{"review_id":"rev-1","item_id":1}"#,
+        // A single finding beside an explicit selection.
+        r#"{"kind":"finding","review_id":"rev-1","item_id":1,"item_ids":[1,2]}"#,
+        // A group beside the fields of a finding target.
+        r#"{"kind":"finding","review_id":"rev-1","item_id":1,"group_id":"arch-1"}"#,
+        // A group beside an explicit selection.
+        r#"{"kind":"group","review_id":"rev-1","group_id":"arch-1","item_ids":[1]}"#,
+        // The retired sub-step target: the pipeline executes a whole horizon.
+        r#"{"kind":"step","review_id":"rev-1","step_id":"1.1"}"#,
+        r#"{"kind":"session","review_id":"rev-1","step_id":"1.1"}"#,
+        // A selection beside a whole-session target.
+        r#"{"kind":"session","review_id":"rev-1","item_ids":[1]}"#,
+    ] {
+        let decoded = serde_json::from_str::<ReviewExecuteParams>(raw);
+        assert!(decoded.is_err(), "a payload naming a second target: {raw}");
+    }
 }
 
 /// Every execution target carries the whole rung: the model together with the
@@ -73,29 +105,34 @@ fn test_review_execute_params_carry_an_explicit_rung() {
 
     let targets = [
         ReviewExecuteParams {
-            review_id: Some("rev-tier".to_string()),
-            item_id: Some(2),
+            target: ReviewExecuteTarget::Finding(ReviewFindingTarget {
+                review_id: "rev-tier".to_string(),
+                item_id: 2,
+            }),
             model: tier.clone(),
-            ..Default::default()
+            instructions: None,
         },
         ReviewExecuteParams {
-            review_id: Some("rev-tier".to_string()),
-            group_id: Some("arch-1".to_string()),
-            step_id: Some("1.1".to_string()),
+            target: ReviewExecuteTarget::Group(ReviewGroupTarget {
+                review_id: "rev-tier".to_string(),
+                group_id: "arch-1".to_string(),
+            }),
             model: tier.clone(),
-            ..Default::default()
+            instructions: None,
         },
         ReviewExecuteParams {
-            review_id: Some("rev-tier".to_string()),
-            item_ids: Some(vec![3, 1]),
+            target: ReviewExecuteTarget::Findings(ReviewFindingsTarget {
+                review_id: "rev-tier".to_string(),
+                item_ids: vec![3, 1],
+            }),
             model: tier.clone(),
-            ..Default::default()
+            instructions: None,
         },
     ];
 
     for params in targets {
         let json = serde_json::to_string(&params).unwrap();
-        assert!(json.contains("\"effort\":\"high\""), "got: {json}");
+        assert!(json.contains("\"effort\":\"high\""), "{json}");
         let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
         assert_eq!(de, params);
     }
@@ -1167,27 +1204,33 @@ fn test_review_group_refuses_legacy_subplan_keys() {
 
 #[test]
 fn test_review_execute_params_group_target() {
-    // A group run names the group itself: `step_id` then addresses a step of
-    // the group subplan, and the finding targets stay absent.
+    // A group run names the group itself, never one of its findings.
     let group_run = ReviewExecuteParams {
-        review_id: Some("rev-1".to_string()),
-        group_id: Some("arch-1".to_string()),
-        step_id: Some("1.1".to_string()),
-        ..Default::default()
+        target: ReviewExecuteTarget::Group(ReviewGroupTarget {
+            review_id: "rev-1".to_string(),
+            group_id: "arch-1".to_string(),
+        }),
+        model: None,
+        instructions: None,
     };
     let json = serde_json::to_string(&group_run).unwrap();
-    assert!(json.contains("\"group_id\":\"arch-1\""), "got: {json}");
+    assert!(json.contains("\"group_id\":\"arch-1\""), "{json}");
+    assert!(!json.contains("item_id"), "{json}");
     let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
     assert_eq!(de, group_run);
-    assert!(de.item_id.is_none());
-    assert!(de.item_ids.is_none());
 
-    // A finding run keeps the old wire shape: the group target stays absent.
-    let finding_run: ReviewExecuteParams =
-        serde_json::from_str(r#"{"review_id":"rev-1","item_id":2}"#).unwrap();
-    assert!(finding_run.group_id.is_none());
+    // A finding run names its own finding and never a group.
+    let finding_run = ReviewExecuteParams {
+        target: ReviewExecuteTarget::Finding(ReviewFindingTarget {
+            review_id: "rev-1".to_string(),
+            item_id: 2,
+        }),
+        model: None,
+        instructions: None,
+    };
     let json = serde_json::to_string(&finding_run).unwrap();
-    assert!(!json.contains("group_id"), "got: {json}");
+    assert!(!json.contains("group_id"), "{json}");
+    assert!(json.contains("\"kind\":\"finding\""), "{json}");
 }
 
 /// The note datum of a finding has exactly one wire spelling: the analytical

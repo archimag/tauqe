@@ -382,6 +382,20 @@ pub(super) fn outcome_carries_result(outcome: Option<&LlmOutcome>) -> bool {
     }
 }
 
+/// Typed fact of an edit-protocol violation reported by the final proposal round.
+///
+/// The fact exists exactly when the round decoded protocol errors, so a consumer
+/// classifies the ending by the presence of the value and never by the wording of
+/// the reason the turn reports. The payload only explains the violation to the
+/// developer; an empty slice reports no violation, so a change set that merely
+/// failed to address a line carries no fact.
+pub(super) fn protocol_failure(protocol_errors: &[String]) -> Option<String> {
+    if protocol_errors.is_empty() {
+        return None;
+    }
+    Some(protocol_errors.join("\n"))
+}
+
 /// Maps a normalized verification target onto the edit-protocol target.
 fn to_edit_verify_request(target: VerifyTarget, on_success: VerifyOnSuccess) -> EditVerifyRequest {
     let target = match target {
@@ -951,5 +965,21 @@ mod tests {
         let member = stored.find_item(1).expect("the finding is stored");
         assert_eq!(member.status, IssueStatus::Todo);
         assert!(member.resolution_notes.is_none());
+    }
+
+    /// The protocol-failure fact is typed: it exists exactly when the round
+    /// decoded protocol errors, so nothing derives the classification from the
+    /// wording of a reason.
+    #[test]
+    fn a_protocol_failure_fact_exists_only_when_the_round_reported_violations() {
+        assert_eq!(protocol_failure(&[]), None);
+
+        let errors = vec![
+            "unclosed <edit>".to_string(),
+            "unknown operation".to_string(),
+        ];
+        let fact = protocol_failure(&errors).expect("a violation is a typed fact");
+        assert!(fact.contains("unclosed <edit>"), "{fact}");
+        assert!(fact.contains("unknown operation"), "{fact}");
     }
 }

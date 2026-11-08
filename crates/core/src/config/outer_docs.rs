@@ -229,7 +229,7 @@ mod tests {
         let config: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [[outer_docs]]
 id = "vendor/api.md"
@@ -272,7 +272,7 @@ source = "/srv/docs/mylib/README.md"
         let config: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [[outer_docs]]
 id = "vendor/api.md"

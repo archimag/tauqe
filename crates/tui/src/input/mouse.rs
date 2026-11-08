@@ -514,9 +514,8 @@ mod tests {
         st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
-            "All remaining TODO findings".to_string(),
+            "Finding".to_string(),
             Some(1),
-            None,
             vec![tauqe_protocol::ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),

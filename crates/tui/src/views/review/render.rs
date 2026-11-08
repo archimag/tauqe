@@ -8,8 +8,8 @@ use crate::app::AppState;
 use crate::i18n::active_t;
 
 use super::{
-    compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
-    issue_type_badge, issue_type_style, location, model_badge, plan_status_style, VisibleReviewRow,
+    format_created_at, issue_status_label, issue_status_style, issue_type_badge, issue_type_style,
+    location, model_badge, plan_status_style, render_review_lines_from, VisibleReviewRow,
 };
 
 pub fn render_review_view(
@@ -31,10 +31,14 @@ pub fn render_review_view(
     let focus = state.discussion_focus.clone();
     state.review.discussion_focus = focus;
 
-    let rows = state.review.flatten_rows();
     state.review.clamp_selection();
 
-    let (lines, _offsets) = if rows.is_empty() {
+    // The tree renders straight from the view's lazy row walk, so a frame never
+    // materializes an owned projection of every row before drawing it (c-1,
+    // c-2). The row counter drives the empty state and the status line.
+    let rows_len = state.review.row_count();
+
+    let (lines, _offsets) = if rows_len == 0 {
         let empty_lines = if state.review.running {
             vec![
                 Line::raw(""),
@@ -62,13 +66,20 @@ pub fn render_review_view(
         };
         (empty_lines, Vec::new())
     } else {
-        compute_unified_review_lines(
-            &rows,
+        // The walk borrows the mirrored sessions while the Markdown cache the
+        // rows render their bodies through is owned by the same state, so the
+        // cache is taken out for the duration of the walk and put back
+        // afterwards (c-1, c-2).
+        let mut cache = std::mem::take(&mut state.review.markdown_cache);
+        let rendered = render_review_lines_from(
+            |visit| state.review.walk_rows(&mut |index, row| visit(index, &row)),
             state.review.selected_index,
             width,
             state.review.theme_mode,
-            &mut state.review.markdown_cache,
-        )
+            &mut cache,
+        );
+        state.review.markdown_cache = cache;
+        rendered
     };
 
     state.review.rendered_lines = lines.len();
@@ -163,11 +174,10 @@ pub fn render_review_view(
                 engine.fg(palette.status_warning).bold(),
             ));
         }
-        // The tree was already flattened for this frame, so the status line
-        // reads the selected row out of that list instead of flattening and
-        // cloning the whole tree a second time (c-2).
-        if let Some(row) = rows.get(state.review.selected_index) {
-            status_spans.extend(describe_review_row(row, &engine));
+        // The cursor walk stops on the selected row, so the status line reads
+        // one row instead of materializing the whole tree a second time (c-2).
+        if let Some(row) = state.review.selected_row() {
+            status_spans.extend(describe_review_row(&row, &engine));
         }
         status_spans.push(Span::styled(
             format!(
@@ -186,13 +196,13 @@ pub fn render_review_view(
                 engine.fg(palette.status_warning),
             ));
         }
-        if !rows.is_empty() {
+        if rows_len > 0 {
             status_spans.push(Span::styled(
                 format!(
                     " | {}",
                     active_t("ui.row_counter")
                         .replacen("{}", &(state.review.selected_index + 1).to_string(), 1)
-                        .replacen("{}", &rows.len().to_string(), 1)
+                        .replacen("{}", &rows_len.to_string(), 1)
                 ),
                 engine.fg(palette.text_secondary),
             ));
@@ -517,7 +527,7 @@ mod tests {
         review.set_session(session);
 
         let rows = review.flatten_rows();
-        let (lines, _offsets) = compute_unified_review_lines(
+        let (lines, _offsets) = crate::views::review::compute_unified_review_lines(
             &rows,
             review.selected_index,
             80,

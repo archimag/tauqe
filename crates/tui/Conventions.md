@@ -126,6 +126,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      In all views and dialogs where a text input editor is active (REPL prompt input, Squash message editor, file adding, modal text fields):
      - **Unconditional Character Insertion:** Every printable character typed without a command modifier MUST be unconditionally inserted into the text buffer. Intercepting bare alphanumeric keys (such as `u`, `s`, `c`, `y`, `[`, `]`, or `Space`) when the prompt buffer is empty is strictly forbidden.
      - All functional commands and actions within text input contexts MUST require an explicit command modifier.
+   - **One Declared Capture Boundary Governs Typing, the Quit Guard, and Paste:** The text-capturing surfaces are declared exactly once, as the typed capture-site resolver owned by the application state, and the keyboard dispatch gate, the quit-loss guard, and the paste router all derive their answer from that single declaration, so an editor that captures text is inserted into by typing, protected against a silent exit, and reached by a pasted payload without being listed anywhere a second time.
 
 2. **Symmetric Abstract Command Modifiers (`C-` and `M-`):**
    - Commands in text input contexts are formulated conceptually with two independent Emacs-style chords: the primary modifier `C-<key>` and the meta modifier `M-<key>`.

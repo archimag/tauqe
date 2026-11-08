@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::AppState;
+use crate::command::is_bare_press;
 use crate::input::InputResult;
 use crate::rpc::{
     allocate_request_id, send_request_with_rollback, OptimisticRollback, RpcConnection,
@@ -125,8 +126,11 @@ pub(super) async fn handle_selection_dialog_key(
     }
 
     match key.code {
-        // `Esc` and `q` dismiss the dialog; any other key keeps it open.
-        KeyCode::Esc | KeyCode::Char('q') => {}
+        // `Esc` always dismisses. The dismissal letter is a bare press, so a
+        // command chord or the AltGr compose chord keeps the picker open on the
+        // rung the developer highlighted (Conventions §5.2).
+        KeyCode::Esc => {}
+        KeyCode::Char('q') if is_bare_press(key.modifiers) => {}
         _ => st.modals.selection_dialog = Some(dialog),
     }
     Ok(Some(InputResult::Continue))
@@ -468,5 +472,37 @@ mod tests {
             conn.written().is_empty(),
             "browsing the picker never talks to the server"
         );
+    }
+    /// The dismissal letter answers to a bare press only: a command chord or
+    /// the AltGr compose chord leaves the picker open on the highlighted rung
+    /// (Conventions §5.2).
+    #[tokio::test]
+    async fn command_modified_q_keeps_the_selection_dialog_open() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let mut st = test_state();
+            st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+            st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            press(&state, &mut conn, KeyCode::Char('q'), modifiers).await;
+
+            let guard = state.lock().await;
+            let dialog = guard
+                .modals
+                .selection_dialog
+                .as_ref()
+                .expect("a command chord never dismisses the picker");
+            assert_eq!(dialog.selector.selected_index(), 0);
+            drop(guard);
+            assert!(
+                conn.written().is_empty(),
+                "a refused dismissal writes no request"
+            );
+        }
     }
 }

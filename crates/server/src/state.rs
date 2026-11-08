@@ -6,8 +6,8 @@ use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
-    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, EditProtocolKind, Event,
-    ModelRef, ModelSelection, UsageTotalsSnapshot,
+    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, DiscussionTarget,
+    EditProtocolKind, Event, ModelRef, ModelSelection, UsageTotalsSnapshot,
 };
 use tokio::sync::{watch, Mutex};
 
@@ -327,32 +327,32 @@ impl AppState {
             return;
         };
         let state = Arc::clone(self);
+        // Task-scoped values do not cross `tokio::spawn`, so both waits this
+        // watchdog spends are resolved here, in the caller's scope, and handed
+        // to it instead of being read inside it: the shared task-exit deadline
+        // and the unwind grace a test scopes to its own task tree.
+        let exit_deadline = task_exit_deadline();
+        let unwind_grace = crate::handlers::model::unwind_grace();
         tokio::spawn(async move {
-            tokio::time::sleep(crate::handlers::model::CANCEL_UNWIND_GRACE).await;
-            state.abort_stalled_operation(op_id).await;
+            tokio::time::sleep(unwind_grace).await;
+            state
+                .abort_stalled_operation_with_deadline(op_id, exit_deadline)
+                .await;
         });
     }
 
-    /// Force-aborts the operation identified by `op_id` after the hard-cancel
-    /// grace period has elapsed, once no git transaction is open.
+    /// Force-aborts `op_id` under a deadline the caller has already resolved.
     ///
-    /// Cooperative cancellation is the primary path; this is the last resort for
-    /// a workflow that ignored the cancel signal. The abort is deferred — never
-    /// dropped — while a git transaction is still open, so a half-finished
-    /// checkpoint or step commit is never abandoned mid-transaction. The handle
-    /// is read fresh from the slot, so the abort targets the currently running
-    /// inner task and a superseded watchdog can never abort a newer operation.
-    ///
-    /// The abort is never treated as synchronous death: a task terminates only
-    /// at its next suspension point. The registered slot is therefore watched
-    /// under the shared task-exit deadline until the operation releases it, and
-    /// an expired confirmation releases the registration itself, id-checked
-    /// exactly like an [`OperationGuard`] drop. A wedged task can thus neither
-    /// pin the slot until process exit nor wipe the registration of the operation
-    /// a client starts after it. The orphan keeps its abort delivered, dies at
-    /// its next suspension point, and releases its session lock only then; the
-    /// expiry diagnostic names it in the journal.
-    pub async fn abort_stalled_operation(&self, op_id: u64) {
+    /// A watchdog spawned by [`AppState::hard_cancel_active_operation`] cannot
+    /// read a task-scoped deadline: the value does not cross `tokio::spawn` and
+    /// would silently fall back to the production default. The spawner
+    /// therefore resolves it in the scope that actually carries the override
+    /// and hands it over here.
+    pub(crate) async fn abort_stalled_operation_with_deadline(
+        &self,
+        op_id: u64,
+        exit_deadline: std::time::Duration,
+    ) {
         let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
         while self.git_transaction_active.load(Ordering::SeqCst)
             && tokio::time::Instant::now() < deadline
@@ -376,7 +376,7 @@ impl AppState {
         );
         handle.abort();
 
-        if self.confirm_operation_exit(op_id).await == TaskExit::Orphaned {
+        if self.confirm_operation_exit(op_id, exit_deadline).await == TaskExit::Orphaned {
             self.release_stale_registration(op_id);
         }
     }
@@ -518,8 +518,11 @@ impl AppState {
     /// registration that is gone — cleared by the task's own guard drop or
     /// replaced by a newer operation — is the confirmation that this operation
     /// no longer owns any state.
-    async fn confirm_operation_exit(&self, op_id: u64) -> TaskExit {
-        let exit_deadline = task_exit_deadline();
+    async fn confirm_operation_exit(
+        &self,
+        op_id: u64,
+        exit_deadline: std::time::Duration,
+    ) -> TaskExit {
         let deadline = tokio::time::Instant::now() + exit_deadline;
         loop {
             let registered = {
@@ -731,7 +734,6 @@ impl AppState {
     pub async fn discussion_focus(&self) -> DiscussionFocus {
         self.discussion_focus.lock().await.clone()
     }
-
     /// Replaces the discussion focus anchor, broadcasting a change event only
     /// when the anchor actually changes, and returns the resulting focus.
     pub async fn set_discussion_focus(&self, focus: DiscussionFocus) -> DiscussionFocus {
@@ -745,13 +747,7 @@ impl AppState {
             }
         };
         if changed {
-            self.out.send_event(&Event {
-                method: events::DISCUSSION_FOCUS_CHANGED.to_string(),
-                params: serde_json::to_value(DiscussionFocusChangedEvent {
-                    focus: focus.clone(),
-                })
-                .ok(),
-            });
+            self.broadcast_focus_change(&focus);
         }
         focus
     }
@@ -759,6 +755,43 @@ impl AppState {
     /// Clears the discussion focus anchor, returning the resulting focus.
     pub async fn clear_discussion_focus(&self) -> DiscussionFocus {
         self.set_discussion_focus(DiscussionFocus::None).await
+    }
+
+    /// Releases the discussion focus when it is anchored on `anchor`,
+    /// returning whether the anchor was actually released.
+    ///
+    /// The comparison and the mutation are one critical section. Sampling the
+    /// anchor and clearing it afterwards, in a second lock acquisition, would
+    /// let a focus installed in between be wiped even though it never
+    /// addressed the released entity: `discussion/setFocus` shares no mutual
+    /// exclusion with the `plan/delete` and `review/delete` callers, so the
+    /// release would drop a live anchor and broadcast a change the client
+    /// cannot explain.
+    pub async fn release_discussion_focus_anchored_on(&self, anchor: &DiscussionTarget) -> bool {
+        let released = {
+            let mut guard = self.discussion_focus.lock().await;
+            if guard.target() == Some(anchor) {
+                *guard = DiscussionFocus::None;
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.broadcast_focus_change(&DiscussionFocus::None);
+        }
+        released
+    }
+
+    /// Publishes the resulting focus anchor so every client adopts or drops it.
+    fn broadcast_focus_change(&self, focus: &DiscussionFocus) {
+        let event = DiscussionFocusChangedEvent {
+            focus: focus.clone(),
+        };
+        self.out.send_event(&Event {
+            method: events::DISCUSSION_FOCUS_CHANGED.to_string(),
+            params: serde_json::to_value(event).ok(),
+        });
     }
 
     /// Returns the identifier of the current REPL dialogue session.
@@ -1188,6 +1221,67 @@ mod tests {
             repeated_session,
             state.session_uuid().await,
             "an empty transient context must not rotate the session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A deletion releases exactly the anchor bound to the deleted entity; a
+    /// focus installed on any other entity survives the release untouched.
+    #[tokio::test]
+    async fn release_discussion_focus_anchored_on_clears_only_the_named_anchor() {
+        let root = scratch_root("state-focus-release");
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let deleted = DiscussionTarget::Plan {
+            id: "plan-1".to_string(),
+        };
+        let neighbour = DiscussionTarget::Plan {
+            id: "plan-2".to_string(),
+        };
+        let review = DiscussionTarget::Review {
+            id: "review-1".to_string(),
+        };
+
+        // A neighbour of the same kind and an anchor of the other kind both
+        // outlive a release that does not name them.
+        for survivor in [&neighbour, &review] {
+            state
+                .set_discussion_focus(DiscussionFocus::from_target(
+                    (*survivor).clone(),
+                    Vec::new(),
+                ))
+                .await;
+            assert!(
+                !state.release_discussion_focus_anchored_on(&deleted).await,
+                "a focus anchored elsewhere must never be released"
+            );
+            assert_eq!(
+                state.discussion_focus().await.target(),
+                Some(survivor),
+                "the surviving anchor must stay installed"
+            );
+        }
+
+        // The anchor bound to the deleted entity is released exactly once.
+        state
+            .set_discussion_focus(DiscussionFocus::from_target(deleted.clone(), Vec::new()))
+            .await;
+        assert!(
+            state.release_discussion_focus_anchored_on(&deleted).await,
+            "the anchor bound to the deleted entity must be released"
+        );
+        assert_eq!(
+            state.discussion_focus().await,
+            DiscussionFocus::None,
+            "the released anchor must leave no focus behind"
+        );
+        assert!(
+            !state.release_discussion_focus_anchored_on(&deleted).await,
+            "a repeated release finds nothing to clear"
         );
 
         let _ = std::fs::remove_dir_all(&root);

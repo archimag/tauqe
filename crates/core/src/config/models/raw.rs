@@ -225,7 +225,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ModelsConfigRaw {
     #[serde(default)]
-    pub(super) primary: Vec<RoleModelSpec>,
+    pub(super) repl: Vec<RoleModelSpec>,
     #[serde(default)]
     pub(super) coder: Option<Vec<RoleModelSpec>>,
     #[serde(default)]
@@ -234,6 +234,8 @@ pub(crate) struct ModelsConfigRaw {
     pub(super) reviewer: Option<Vec<RoleModelSpec>>,
     #[serde(default)]
     pub(super) scribe: Option<ModelReference>,
+    #[serde(default)]
+    pub(super) gatekeeper: Option<ModelReference>,
     #[serde(default)]
     pub(super) auto_level_up: bool,
 }

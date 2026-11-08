@@ -120,18 +120,14 @@ async fn relay_contour_events(
 ) -> ContourRelaySummary {
     let mut summary = ContourRelaySummary::default();
     while let Some(event) = events_rx.recv().await {
-        // The gate wraps the whole iteration, so every forwarded coordinate —
-        // text, reasoning, context snapshots, turn phases, tier escalations,
-        // repo-map reports, connection retries, and the withdrawal notice —
-        // follows the pacing contract: a client that keeps its pipe open but
-        // stops reading pauses the synthesis instead of growing daemon memory.
-        // Only the terminal `Done` is exempt, because it ends the relay and
-        // must never wait for the stall it reports. A raised cancellation
-        // releases the gate, so an interrupted operation still reaches its
-        // terminal events without a reader.
-        if !matches!(event, StreamEvent::Done) {
-            state.out.wait_for_headroom(&mut cancel).await;
-        }
+        // The transport owns the pacing classification, so the relay applies
+        // the shared policy instead of carrying an exemption set of its own: a
+        // terminal notice publishes immediately, while every other coordinate
+        // waits for the writer to catch up. A client that keeps its pipe open
+        // but stops reading therefore pauses the synthesis instead of growing
+        // daemon memory, without ever parking the completion, cancellation, or
+        // failure the stream reports.
+        state.out.pace_event(&event, &mut cancel).await;
         match event {
             StreamEvent::TextDelta(delta) => {
                 summary.assistant_text.push_str(&delta);
@@ -331,8 +327,9 @@ pub(crate) async fn run_contour_synthesis(
     let resolver = Arc::new(ArchitectProviderResolver::new(Arc::clone(state), config));
 
     // The usage window wraps the whole synthesis, so every round and every tier
-    // it climbs report into the same accounting window. The relay closes it.
-    let usage = state.begin_usage().await;
+    // it climbs report into the same accounting window under the identifier the
+    // surrounding operation already announced. The relay closes it.
+    let usage = state.begin_usage(op_id).await;
     let relay = tokio::spawn(relay_contour_events(
         Arc::clone(state),
         op_id.to_string(),
@@ -506,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn relay_translates_contour_events_and_closes_the_usage_window() {
         let (state, mut rx, root) = test_state("relay");
-        let usage = state.begin_usage().await;
+        let usage = state.begin_usage("op-relay").await;
 
         let (events_tx, events_rx) = mpsc::channel(64);
         let (_cancel_tx, cancel) = watch::channel(false);
@@ -631,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn relay_reports_cancellation_and_failure_on_the_summary() {
         let (state, mut rx, root) = test_state("relay-cancel");
-        let usage = state.begin_usage().await;
+        let usage = state.begin_usage("op-cancel").await;
 
         let (events_tx, events_rx) = mpsc::channel(16);
         let (_cancel_tx, cancel) = watch::channel(false);
@@ -844,7 +841,7 @@ mod tests {
         let (state, rx, root) = test_state("relay-pacing");
         stall_outbound_transport(&state);
 
-        let usage = state.begin_usage().await;
+        let usage = state.begin_usage("op-paced").await;
         let (events_tx, events_rx) = mpsc::channel(16);
         let (_cancel_tx, cancel) = watch::channel(false);
         let mut relay = tokio::spawn(relay_contour_events(
@@ -910,7 +907,7 @@ mod tests {
         let (state, mut rx, root) = test_state("relay-pacing-cancel");
         stall_outbound_transport(&state);
 
-        let usage = state.begin_usage().await;
+        let usage = state.begin_usage("op-paced-cancel").await;
         let (events_tx, events_rx) = mpsc::channel(16);
         let (cancel_tx, cancel) = watch::channel(false);
         let relay = tokio::spawn(relay_contour_events(
@@ -959,5 +956,80 @@ mod tests {
         assert_eq!(maps[0]["tokens"], 512);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A terminal notice a provider reports on its own must reach the client
+    /// even while the outbound queue is stalled and no hard cancel was raised.
+    ///
+    /// Gating the notice parked the relay — and with it the joined contour and
+    /// the operation slot it owns — until the client drained its pipe, so a
+    /// cooperative `Cancelled` or a terminal `Error` could hang the synthesis
+    /// indefinitely. The transport exempts every terminal notice from pacing,
+    /// which is what this regression pins.
+    #[tokio::test]
+    async fn terminal_notices_reach_a_stalled_client_without_a_drain() {
+        let cancellation = StreamEvent::Cancelled;
+        let failure = StreamEvent::Error("provider rejected the request".to_string());
+        let cases = [
+            ("cancelled", cancellation, events::MODEL_CANCELLED),
+            ("error", failure, events::MODEL_ERROR),
+        ];
+
+        for (label, notice, method) in cases {
+            let cancelled = matches!(notice, StreamEvent::Cancelled);
+            let (state, mut rx, root) = test_state(&format!("relay-terminal-{label}"));
+            stall_outbound_transport(&state);
+
+            let usage = state.begin_usage(&format!("op-terminal-{label}")).await;
+            let (events_tx, events_rx) = mpsc::channel(16);
+            // No hard cancel is raised: the provider reports the notice on its
+            // own, exactly as a stream that ends in `Cancelled` or `Error` does.
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let relay = tokio::spawn(relay_contour_events(
+                Arc::clone(&state),
+                format!("op-terminal-{label}"),
+                usage,
+                events_rx,
+                cancel,
+            ));
+            events_tx
+                .send(notice)
+                .await
+                .expect("the relay is listening");
+            events_tx
+                .send(StreamEvent::Done)
+                .await
+                .expect("the relay is listening");
+            drop(events_tx);
+
+            let summary = tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .expect("a stalled client must not park a terminal notice")
+                .expect("the relay joins");
+            assert_eq!(
+                summary.cancelled, cancelled,
+                "the relay must classify the terminal notice it relayed"
+            );
+            if cancelled {
+                assert!(summary.error.is_none());
+            } else {
+                assert_eq!(
+                    summary.error.as_deref(),
+                    Some("provider rejected the request")
+                );
+            }
+
+            let mut raw_events = Vec::new();
+            while let Ok(raw) = rx.try_recv() {
+                raw_events.push(raw);
+            }
+            assert_eq!(
+                collect(&raw_events, method).len(),
+                1,
+                "the terminal notice must reach the client without a drain"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

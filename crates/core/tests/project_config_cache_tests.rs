@@ -114,7 +114,7 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
         repo_root.join("tauqe.toml"),
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project]\n",
             "runner = \"just\"\n",
@@ -250,7 +250,7 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
         repo_root.join("tauqe.toml"),
         concat!(
             "[models]\n",
-            "primary = [\"openrouter:mock/model\"]\n",
+            "repl = [\"openrouter:mock/model\"]\n",
             "\n",
             "[project]\n",
             "runner = \"just\"\n",

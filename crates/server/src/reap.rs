@@ -209,6 +209,25 @@ mod tests {
         }
     }
 
+    /// Budget after which a deliberate non-yielding stretch ends on its own.
+    ///
+    /// The stretch exists to prove what an abort cannot reach, so it spins
+    /// synchronously instead of parking on an abort landing point. The budget is
+    /// the second line of defence behind the test's release guard: the runtime
+    /// the stretch belongs to waits for its pinned worker when it shuts down, so
+    /// an unbounded spin would turn one failed assertion into a hung suite.
+    const PINNED_STRETCH_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Releases a pinned stretch on drop, so a failing assertion never leaves a
+    /// task spinning after the test has returned.
+    struct StretchRelease(Arc<AtomicBool>);
+
+    impl Drop for StretchRelease {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// A task parked at a suspension point observes its abort at once, so the
     /// confirmation completes long before the deadline expires.
     #[tokio::test]
@@ -245,6 +264,9 @@ mod tests {
             .expect("the pinned runtime starts");
 
         let released = Arc::new(AtomicBool::new(false));
+        // The pinned stretch spins on this flag, and its runtime waits for the
+        // pinned worker when it shuts down, so the flag is released on drop.
+        let _release_guard = StretchRelease(Arc::clone(&released));
         let exited = Arc::new(AtomicBool::new(false));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -255,8 +277,10 @@ mod tests {
                 let _marker = marker;
                 let _ = entered_tx.send(());
                 // A non-yielding stretch: the task reaches no suspension point,
-                // so the abort cannot land while it spins.
-                while !released.load(Ordering::SeqCst) {
+                // so the abort cannot land while it spins. Its budget ends the
+                // spin even when the release guard never fires.
+                let deadline = std::time::Instant::now() + PINNED_STRETCH_BUDGET;
+                while !released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
                 }
             })

@@ -22,6 +22,11 @@ pub enum EditError {
     #[error("Target path '{0}' already exists.")]
     DestinationExists(String),
 
+    #[error(
+        "Target path '{path}' cannot be created: its parent '{blocked_by}' exists and is not a directory. A destination is created only beneath a chain of directories; choose a path whose ancestors are directories or do not exist yet."
+    )]
+    ParentNotDirectory { path: String, blocked_by: String },
+
     #[error("Target path '{0}' is invalid: {1}")]
     InvalidPath(String, String),
 

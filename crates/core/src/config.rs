@@ -28,7 +28,7 @@ pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
     serialize_model_ref_opt, ModelsConfig, BUILTIN_DEFAULT_ARCHITECT_MODEL,
-    BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_PRIMARY_MODEL,
+    BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_REPL_MODEL,
     BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
 pub use modules::{ensure_no_module_conflict, module_owners, ModuleOwners};
@@ -497,7 +497,7 @@ mod tests {
     fn test_models_config_and_roles_resolution() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:google/gemini-flash-latest"]
+repl = ["openrouter:google/gemini-flash-latest"]
 scribe = "openrouter:anthropic/claude-haiku-latest"
 coder = ["openrouter:google/gemini-flash-latest"]
 architect = ["openrouter:anthropic/claude-sonnet-latest"]
@@ -534,7 +534,7 @@ auto_level_up = true
             ModelRef::openrouter("anthropic/claude-sonnet-latest")
         );
         assert_eq!(
-            roles.primary,
+            roles.repl,
             ModelRef::openrouter("google/gemini-flash-latest")
         );
         assert_eq!(
@@ -546,7 +546,7 @@ auto_level_up = true
         assert_eq!(models_summary.scribe, roles.scribe);
         assert_eq!(models_summary.coder, roles.coder);
         assert_eq!(models_summary.architect, roles.architect);
-        assert_eq!(models_summary.primary, roles.primary);
+        assert_eq!(models_summary.repl, roles.repl);
         assert_eq!(models_summary.reviewer, roles.reviewer);
 
         let specific = ModelRef::openrouter("custom/model");
@@ -568,7 +568,7 @@ auto_level_up = true
         );
         assert_eq!(
             config.resolve_model(&ModelSelection::Role(ModelRole::REPL)),
-            roles.primary
+            roles.repl
         );
         assert_eq!(
             config.resolve_model(&ModelSelection::Role(ModelRole::Reviewer)),
@@ -580,7 +580,7 @@ auto_level_up = true
     fn test_app_config_models_effort_resolution() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:google/gemini-flash-latest"]
+repl = ["openrouter:google/gemini-flash-latest"]
 coder = [
     { model = "openrouter:deepseek/deepseek-chat", effort = "medium" },
     { model = "openrouter:google/gemini-flash-latest", effort = "high" },
@@ -606,14 +606,14 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
         let empty_cfg = ModelsConfig::default();
         assert!(empty_cfg.validate().is_err());
 
-        let primary_only = ModelsConfig {
-            primary: vec![ModelRef::openrouter("qwen/coder").into()],
+        let repl_only = ModelsConfig {
+            repl: vec![ModelRef::openrouter("qwen/coder").into()],
             ..Default::default()
         };
-        assert!(primary_only.validate().is_ok());
+        assert!(repl_only.validate().is_ok());
 
         let empty_coder = ModelsConfig {
-            primary: vec![ModelRef::openrouter("qwen/coder").into()],
+            repl: vec![ModelRef::openrouter("qwen/coder").into()],
             coder: Some(Vec::new()),
             ..Default::default()
         };
@@ -624,7 +624,7 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
     fn test_single_model_fallback_closes_all_roles() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:anthropic/claude-3.7-sonnet"]
+repl = ["openrouter:anthropic/claude-3.7-sonnet"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert!(config.models.validate().is_ok());
@@ -639,16 +639,16 @@ primary = ["openrouter:anthropic/claude-3.7-sonnet"]
     }
 
     #[test]
-    fn test_specialized_roles_inherit_primary_list() {
+    fn test_specialized_roles_inherit_repl_list() {
         let config: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:alpha/model", "openrouter:beta/model"]
+repl = ["openrouter:alpha/model", "openrouter:beta/model"]
 "#,
         )
         .expect("parse config");
 
-        // A specialized role without its own list inherits the primary list.
+        // A specialized role without its own list inherits the repl list.
         let expected = ModelRef::openrouter("alpha/model");
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
@@ -656,7 +656,7 @@ primary = ["openrouter:alpha/model", "openrouter:beta/model"]
         assert_eq!(config.resolve_role(ModelRole::REPL), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
 
-        // The coder escalation ladder inherits the full primary list.
+        // The coder escalation ladder inherits the full repl list.
         let ladder = config.models.coder_ladder();
         assert_eq!(ladder.len(), 2);
         assert_eq!(ladder[0].model, ModelRef::openrouter("alpha/model"));
@@ -684,7 +684,7 @@ models = ["custom/external-fallback"]
     fn test_available_models_include_all_roles() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:d/primary"]
+repl = ["openrouter:d/repl"]
 scribe = "openrouter:a/scribe"
 coder = ["openrouter:b/coder"]
 architect = ["openrouter:c/architect"]
@@ -699,7 +699,7 @@ models = ["e/extra", "a/scribe"]
         assert!(available.contains(&ModelRef::openrouter("a/scribe")));
         assert!(available.contains(&ModelRef::openrouter("b/coder")));
         assert!(available.contains(&ModelRef::openrouter("c/architect")));
-        assert!(available.contains(&ModelRef::openrouter("d/primary")));
+        assert!(available.contains(&ModelRef::openrouter("d/repl")));
         assert!(available.contains(&ModelRef::openrouter("r/reviewer")));
     }
 
@@ -858,7 +858,7 @@ max_scratchpad_chars = 1500
     fn test_typed_provider_models_config() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:openai/gpt-4o"]
+repl = ["openrouter:openai/gpt-4o"]
 
 [providers.openrouter]
 models = ["deepseek/deepseek-chat", "openai/gpt-4o"]
@@ -885,7 +885,7 @@ models = [
 ]
 
 [models]
-primary = ["Deep"]
+repl = ["Deep"]
 scribe = "Deep"
 coder = [{ model = "Deep", effort = "high" }]
 "#;
@@ -926,7 +926,7 @@ coder = [{ model = "Deep", effort = "high" }]
 models = ["deepseek/deepseek-chat"]
 
 [models]
-primary = ["anthropc:claude"]
+repl = ["anthropc:claude"]
 "#,
         )
         .unwrap();
@@ -943,7 +943,7 @@ primary = ["anthropc:claude"]
         let config = AppConfig::default();
         assert_eq!(
             config.active_model(),
-            ModelRef::openrouter(BUILTIN_DEFAULT_PRIMARY_MODEL)
+            ModelRef::openrouter(BUILTIN_DEFAULT_REPL_MODEL)
         );
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
         assert_eq!(config.repl.protocol, EditProtocolKind::Structured);
@@ -956,7 +956,7 @@ primary = ["anthropc:claude"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:anthropic/claude-3.5-sonnet\"]\n",
+            "[models]\nrepl = [\"openrouter:anthropic/claude-3.5-sonnet\"]\n",
         )
         .unwrap();
 
@@ -985,7 +985,7 @@ primary = ["anthropc:claude"]
         let custom_cfg = temp_dir.path().join("my-custom.toml");
         std::fs::write(
             &custom_cfg,
-            "[models]\nprimary = [\"openrouter:deepseek/deepseek-chat\"]\n",
+            "[models]\nrepl = [\"openrouter:deepseek/deepseek-chat\"]\n",
         )
         .unwrap();
 
@@ -1037,7 +1037,7 @@ primary = ["anthropc:claude"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:test/model\"]\ncoder = []\n",
+            "[models]\nrepl = [\"openrouter:test/model\"]\ncoder = []\n",
         )
         .unwrap();
 
@@ -1076,7 +1076,7 @@ primary = ["anthropc:claude"]
             temp_dir.path().join("tauqe.toml"),
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "cargo"
@@ -1103,7 +1103,7 @@ args = ["test"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
         )
         .unwrap();
 
@@ -1132,7 +1132,7 @@ args = ["test"]
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
             concat!(
-                "[models]\nprimary = [\"openrouter:a/b\"]\n",
+                "[models]\nrepl = [\"openrouter:a/b\"]\n",
                 "\n[project.verify]\ncommand = \"@missing\"\n",
             ),
         )
@@ -1149,7 +1149,7 @@ args = ["test"]
         // A configuration that only assigns model roles is complete:
         // verification is a declared capability, not a mandatory barrier.
         let models_only: AppConfig =
-            toml::from_str("[models]\nprimary = [\"openrouter:a/b\"]\n").expect("parse config");
+            toml::from_str("[models]\nrepl = [\"openrouter:a/b\"]\n").expect("parse config");
         assert!(
             models_only.validate().is_ok(),
             "a configuration without a verification command must be valid"
@@ -1163,7 +1163,7 @@ args = ["test"]
         let declared: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "cargo"
@@ -1187,7 +1187,7 @@ args = ["test"]
         let cyclic: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "@first"
@@ -1205,7 +1205,7 @@ command = "@first"
         let unknown: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "@missing"
@@ -1219,7 +1219,7 @@ command = "@missing"
         let reused: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "@check"
@@ -1300,7 +1300,7 @@ args = ["check", "--all-targets"]
         assert!(default_cfg.review.validate().is_ok());
 
         let absent: AppConfig =
-            toml::from_str("[models]\nprimary = [\"openrouter:a/b\"]\n").expect("parse config");
+            toml::from_str("[models]\nrepl = [\"openrouter:a/b\"]\n").expect("parse config");
         assert!(absent.review.presets.is_empty());
     }
 
@@ -1308,7 +1308,7 @@ args = ["check", "--all-targets"]
     fn test_review_section_parses_named_presets() {
         let toml_str = r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "cargo"
@@ -1472,7 +1472,7 @@ name = "backend"
         let no_paths: AppConfig = toml::from_str(
             r#"
 [models]
-primary = ["openrouter:a/b"]
+repl = ["openrouter:a/b"]
 
 [project.verify]
 command = "cargo"
@@ -1600,7 +1600,7 @@ paths = ["crates/core/src"]
     #[test]
     fn test_module_layers_merge_sections_with_the_base_document() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[context]\nrepomap_token_budget = 6000\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n[context]\nrepomap_token_budget = 6000\n",
             &[("10-research.toml", "[context]\nmax_research_rounds = 9\n")],
         );
 
@@ -1620,7 +1620,7 @@ paths = ["crates/core/src"]
     #[test]
     fn test_module_layers_concatenate_arrays_of_tables_in_lexical_order() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n\n\
+            "[models]\nrepl = [\"openrouter:a/b\"]\n\n\
              [[review.presets]]\nname = \"base\"\n\n\
              [[review.presets.groups]]\nname = \"core\"\npaths = [\"crates/core/src\"]\n",
             &[
@@ -1656,11 +1656,8 @@ paths = ["crates/core/src"]
     #[test]
     fn test_module_layer_scalar_collision_names_both_files_and_the_key() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
-            &[(
-                "10-models.toml",
-                "[models]\nprimary = [\"openrouter:c/d\"]\n",
-            )],
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
+            &[("10-models.toml", "[models]\nrepl = [\"openrouter:c/d\"]\n")],
         );
 
         let config = load_config(Some(dir.path()));
@@ -1677,7 +1674,7 @@ paths = ["crates/core/src"]
             "the module must be named: {err}"
         );
         assert!(
-            err.contains("models.primary"),
+            err.contains("models.repl"),
             "the colliding key must be named: {err}"
         );
     }
@@ -1685,7 +1682,7 @@ paths = ["crates/core/src"]
     #[test]
     fn test_module_layer_syntax_error_names_the_file_and_the_line() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
             &[("20-broken.toml", "[context]\nrepomap_token_budget = = 1\n")],
         );
 
@@ -1717,11 +1714,11 @@ paths = ["crates/core/src"]
     #[test]
     fn test_modules_resolve_from_the_repository_root_not_the_explicit_config() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
             &[("10-context.toml", "[context]\nmax_research_rounds = 11\n")],
         );
         let external = dir.path().join("external.toml");
-        std::fs::write(&external, "[models]\nprimary = [\"openrouter:c/d\"]\n").unwrap();
+        std::fs::write(&external, "[models]\nrepl = [\"openrouter:c/d\"]\n").unwrap();
 
         let config = load_config_with_options(ConfigLoadOptions {
             repo_root: Some(dir.path()),
@@ -1743,22 +1740,19 @@ paths = ["crates/core/src"]
     #[test]
     fn test_validate_project_config_on_disk_rejects_a_module_collision() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
-            &[(
-                "10-models.toml",
-                "[models]\nprimary = [\"openrouter:c/d\"]\n",
-            )],
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
+            &[("10-models.toml", "[models]\nrepl = [\"openrouter:c/d\"]\n")],
         );
 
         let err = validate_project_config_on_disk(dir.path())
             .expect_err("a module collision must fail the on-disk check");
-        assert!(err.contains("models.primary"), "got: {err}");
+        assert!(err.contains("models.repl"), "got: {err}");
     }
 
     #[test]
     fn test_module_owners_names_the_layer_declaring_each_key() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
             &[
                 (
                     "10-models.toml",
@@ -1780,7 +1774,7 @@ paths = ["crates/core/src"]
         assert_eq!(owner("models.scribe").as_deref(), Some("10-models.toml"));
         assert_eq!(owner("repl.workflow").as_deref(), Some("20-repl.toml"));
         assert!(
-            !owners.contains_key("models.primary"),
+            !owners.contains_key("models.repl"),
             "the base document owns its own keys"
         );
     }
@@ -1788,21 +1782,18 @@ paths = ["crates/core/src"]
     #[test]
     fn test_ensure_no_module_conflict_reports_a_key_a_module_already_declares() {
         let dir = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
-            &[(
-                "10-models.toml",
-                "[models]\nprimary = [\"openrouter:c/d\"]\n",
-            )],
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
+            &[("10-models.toml", "[models]\nrepl = [\"openrouter:c/d\"]\n")],
         );
         let target = dir.path().join("tauqe.toml");
 
         let err = ensure_no_module_conflict(DEFAULT_CONFIG_TEMPLATE, &target, Some(dir.path()))
             .expect_err("the template declares the same key");
-        assert!(err.contains("models.primary"), "got: {err}");
+        assert!(err.contains("models.repl"), "got: {err}");
 
         // A module that owns an independent key does not block the create.
         let free = layered_repo(
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nrepl = [\"openrouter:a/b\"]\n",
             &[("10-history.toml", "[history]\ntail_turns = 5\n")],
         );
         let free_target = free.path().join("tauqe.toml");

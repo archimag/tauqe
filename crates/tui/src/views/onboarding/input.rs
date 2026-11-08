@@ -5,6 +5,7 @@ use tauqe_protocol::methods;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, OnboardingStep, ViewMode};
+use crate::command::is_bare_press;
 use crate::i18n::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
@@ -13,6 +14,43 @@ use crate::rpc::{send_request, RpcConnection};
 fn fill(template: &str, args: &[&str]) -> String {
     args.iter()
         .fold(template.to_string(), |acc, arg| acc.replacen("{}", arg, 1))
+}
+
+/// Applies the dismissal transition shared by the navigation steps.
+///
+/// Returns `Some(InputResult::Exit)` when the flow cannot be abandoned at the
+/// current step, so the caller ends the interface exactly as `Esc` does.
+fn dismiss_step(st: &mut AppState) -> Option<InputResult> {
+    st.onboarding.clear_messages();
+    if st.onboarding.step == OnboardingStep::Config {
+        st.onboarding.config_skipped = true;
+    }
+    if st.onboarding.step == OnboardingStep::Gatekeeper || st.onboarding.step == OnboardingStep::Git
+    {
+        return Some(InputResult::Exit);
+    }
+    if st.onboarding.step == OnboardingStep::Modifier {
+        st.onboarding.step = OnboardingStep::Workstation;
+        st.onboarding.selected_index = 0;
+    } else if st.onboarding.has_api_key {
+        st.view_mode = ViewMode::Repl;
+    } else {
+        st.onboarding.step = OnboardingStep::Gatekeeper;
+        st.onboarding.selected_index = 0;
+    }
+    None
+}
+
+/// Moves the step cursor by one row inside `total_options` rows.
+fn move_selection(st: &mut AppState, forward: bool, total_options: usize) {
+    let index = st.onboarding.selected_index;
+    if forward {
+        if index + 1 < total_options {
+            st.onboarding.selected_index = index + 1;
+        }
+        return;
+    }
+    st.onboarding.selected_index = index.saturating_sub(1);
 }
 
 /// Outcome of the blocking workstation persistence job.
@@ -239,32 +277,29 @@ pub async fn handle_onboarding_key(
         };
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                st.onboarding.clear_messages();
-                if st.onboarding.step == OnboardingStep::Config {
-                    st.onboarding.config_skipped = true;
-                }
-                if st.onboarding.step == OnboardingStep::Gatekeeper
-                    || st.onboarding.step == OnboardingStep::Git
-                {
-                    return Ok(InputResult::Exit);
-                } else if st.onboarding.step == OnboardingStep::Modifier {
-                    st.onboarding.step = OnboardingStep::Workstation;
-                    st.onboarding.selected_index = 0;
-                } else if st.onboarding.has_api_key {
-                    st.view_mode = ViewMode::Repl;
-                } else {
-                    st.onboarding.step = OnboardingStep::Gatekeeper;
-                    st.onboarding.selected_index = 0;
+            // `Esc` always dismisses. The dismissal letter is a bare press, so
+            // a command chord or the AltGr compose chord never abandons the
+            // setup flow the developer is mid-way through (Conventions §5.2).
+            KeyCode::Esc => {
+                if let Some(result) = dismiss_step(&mut st) {
+                    return Ok(result);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                st.onboarding.selected_index = st.onboarding.selected_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if st.onboarding.selected_index + 1 < total_options {
-                    st.onboarding.selected_index += 1;
+            KeyCode::Char('q') if is_bare_press(key.modifiers) => {
+                if let Some(result) = dismiss_step(&mut st) {
+                    return Ok(result);
                 }
+            }
+            // The movement letters answer to a bare press only, so a command
+            // chord or the AltGr compose chord moves nothing; the dedicated
+            // arrows keep their behaviour under any modifier (Conventions §5.2).
+            KeyCode::Up => move_selection(&mut st, false, total_options),
+            KeyCode::Char('k') if is_bare_press(key.modifiers) => {
+                move_selection(&mut st, false, total_options)
+            }
+            KeyCode::Down => move_selection(&mut st, true, total_options),
+            KeyCode::Char('j') if is_bare_press(key.modifiers) => {
+                move_selection(&mut st, true, total_options)
             }
             KeyCode::Enter => {
                 st.onboarding.clear_messages();
@@ -432,4 +467,71 @@ pub async fn handle_onboarding_key(
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Presses one key against the setup flow over an in-memory transport.
+    async fn press(state: &Arc<Mutex<AppState>>, event: KeyEvent) {
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_onboarding_key(event, state, &mut conn)
+            .await
+            .expect("an in-memory transport never fails");
+    }
+
+    /// A setup step parked on the credentials prompt of a keyless project.
+    fn navigation_state() -> AppState {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Onboarding;
+        st.onboarding.step = OnboardingStep::Credentials;
+        st.onboarding.selected_index = 1;
+        st
+    }
+
+    /// A command chord or the AltGr compose chord never moves the setup cursor
+    /// and never abandons the step, so a chord aimed at the terminal leaves the
+    /// flow exactly where the developer left it (Conventions §5.2).
+    #[tokio::test]
+    async fn command_modified_letters_are_refused_by_the_navigation_step() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let state = Arc::new(Mutex::new(navigation_state()));
+
+            for character in ['j', 'k', 'q'] {
+                press(&state, KeyEvent::new(KeyCode::Char(character), modifiers)).await;
+            }
+
+            let st = state.lock().await;
+            assert_eq!(st.onboarding.selected_index, 1);
+            assert!(matches!(st.onboarding.step, OnboardingStep::Credentials));
+            assert_eq!(st.view_mode, ViewMode::Onboarding);
+        }
+    }
+
+    /// The guard never over-blocks: the bare movement letters still walk the
+    /// options, and the bare dismissal letter still leaves the step.
+    #[tokio::test]
+    async fn bare_letters_still_move_and_dismiss() {
+        let state = Arc::new(Mutex::new(navigation_state()));
+
+        press(&state, key(KeyCode::Char('j'))).await;
+        assert_eq!(state.lock().await.onboarding.selected_index, 2);
+
+        press(&state, key(KeyCode::Char('k'))).await;
+        assert_eq!(state.lock().await.onboarding.selected_index, 1);
+
+        press(&state, key(KeyCode::Char('q'))).await;
+        let st = state.lock().await;
+        assert!(matches!(st.onboarding.step, OnboardingStep::Gatekeeper));
+    }
 }

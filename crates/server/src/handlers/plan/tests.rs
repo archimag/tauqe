@@ -455,7 +455,7 @@ async fn test_handle_plan_refine_defaults_to_architect_role() {
         "test/architect-model",
     )
     .into()]);
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("test/repl-model").into()];
 
     let refine_output = serde_json::json!({
         "status": "success",
@@ -662,7 +662,7 @@ async fn test_plan_execute_preflight_is_torn_down_by_a_hard_cancel() {
     // for the whole duration after a hard cancel.
     std::fs::write(
         dir.path().join("tauqe.toml"),
-        "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
+        "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
     )
     .unwrap();
     let state = test_state(&dir);
@@ -1690,7 +1690,7 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/one"), None),
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/two"), None),
@@ -1886,7 +1886,7 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![tauqe_protocol::ModelEntry::new(
         tauqe_protocol::ModelRef::openrouter("planner/one"),
         None,
@@ -3153,7 +3153,7 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
         tier_with_attempts("coder/one", 1),
         tier_with_attempts("coder/mid", 1),
@@ -3243,7 +3243,7 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_retries = 2;
     config.models.auto_level_up = true;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/mid"), None),
@@ -3329,7 +3329,7 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
     let mut manual_entry = tauqe_protocol::ModelEntry::new(manual_model.clone(), None);
     manual_entry.level_up = Some(false);
@@ -3456,7 +3456,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
@@ -3549,7 +3549,7 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
-    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
         tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
@@ -3735,8 +3735,12 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
     );
 
     // The sanctioned force-termination path makes the parked task exit; the
-    // batch then reports its cancelled outcome.
-    state.abort_stalled_operation(op_id).await;
+    // batch then reports its cancelled outcome. The confirmation deadline is
+    // compressed instead of the production value: the parked task exits at its
+    // first suspension point, so the abort lands immediately.
+    state
+        .abort_stalled_operation_with_deadline(op_id, std::time::Duration::from_secs(1))
+        .await;
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), batch)
         .await
         .expect("the cancelled batch must resolve once its step task exited")
@@ -4161,6 +4165,25 @@ impl Drop for ExitMarker {
     }
 }
 
+/// Budget after which a deliberate non-yielding stretch ends on its own.
+///
+/// The stretch exists to prove what an abort cannot reach, so it spins
+/// synchronously instead of parking on an abort landing point. The budget is the
+/// second line of defence behind the test's release guard: the wedged runtime
+/// waits for its pinned worker when it shuts down, so an unbounded spin would
+/// turn one failed assertion into a hung suite.
+const PINNED_STRETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Releases a pinned stretch on drop, so a failing assertion never leaves a
+/// wedged task spinning after the test has returned.
+struct StretchRelease(Arc<AtomicBool>);
+
+impl Drop for StretchRelease {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// A hard cancel must survive a task that never confirms its exit: the stale
 /// registration is released within the shared task-exit deadline, the slot admits
 /// the next operation, and the superseded guard a wedged task still owns wipes
@@ -4183,6 +4206,9 @@ fn test_abort_stalled_operation_releases_a_registration_that_never_confirms() {
         .expect("the confirmation runtime starts");
 
     let stretch_ends = Arc::new(AtomicBool::new(false));
+    // The pinned stretch spins on this flag, and its runtime waits for the
+    // pinned worker when it shuts down, so the flag is released on drop.
+    let _stretch_guard = StretchRelease(Arc::clone(&stretch_ends));
     let exited = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -4198,7 +4224,8 @@ fn test_abort_stalled_operation_releases_a_registration_that_never_confirms() {
                 let _guard = guard;
                 let _marker = ExitMarker(Arc::clone(&exited));
                 let _ = entered_tx.send(());
-                while !stretch_ends.load(Ordering::SeqCst) {
+                let deadline = std::time::Instant::now() + PINNED_STRETCH_BUDGET;
+                while !stretch_ends.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
                 }
                 std::future::pending::<()>().await
@@ -4219,14 +4246,16 @@ fn test_abort_stalled_operation_releases_a_registration_that_never_confirms() {
             .expect("the wedged task must reach its non-yielding stretch")
             .expect("the wedged task signals that its stretch began");
 
-        // The confirmation deadline is resolved in this task, so a compressed
-        // value keeps the expiry path deterministic.
+        // The confirmation deadline is passed explicitly, so a compressed
+        // value keeps the expiry path deterministic without relying on a
+        // task-local the spawner would have to propagate.
         let started = std::time::Instant::now();
-        crate::reap::with_task_exit_deadline(
-            std::time::Duration::from_millis(50),
-            state.abort_stalled_operation(operation_id),
-        )
-        .await;
+        state
+            .abort_stalled_operation_with_deadline(
+                operation_id,
+                std::time::Duration::from_millis(50),
+            )
+            .await;
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "the exit confirmation must be bounded"

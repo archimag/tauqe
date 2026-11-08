@@ -191,6 +191,66 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.confirm_quit.activity_draft", "You have an unsubmitted prompt draft in the editor.", "Confirm-quit activity line with a prompt draft", None),
         item("dialog.confirm_quit.activity_squash_applying", "Squash operation is currently being applied.", "Confirm-quit activity line while a squash applies", None),
         item("dialog.confirm_quit.activity_squash_message", "You have an uncommitted squash message in progress.", "Confirm-quit activity line with a squash message", None),
+        item(
+            "dialog.confirm_quit.activity_squash_custom_base",
+            "You have an unsubmitted custom squash base reference.",
+            "Confirm-quit activity line with a custom squash base reference",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_review_launch_prompt",
+            "You have typed review instructions that were not launched.",
+            "Confirm-quit activity line with typed review instructions",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_review_launch_path",
+            "You have typed review target paths that were not launched.",
+            "Confirm-quit activity line with typed review target paths",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_plan_refine",
+            "You have typed plan refinement instructions that were not submitted.",
+            "Confirm-quit activity line with typed plan refinement instructions",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_plan_create",
+            "You have typed engineering directives for a new plan.",
+            "Confirm-quit activity line with typed plan creation directives",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_review_execute",
+            "You have typed implementation directives for a review finding.",
+            "Confirm-quit activity line with typed review-execution directives",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_discussion_prompt",
+            "You have an unsubmitted discussion message.",
+            "Confirm-quit activity line with a typed discussion message",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_locale",
+            "You have typed a target language for the interface.",
+            "Confirm-quit activity line with a typed interface language",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_context_path",
+            "You have typed a file path in the Context view.",
+            "Confirm-quit activity line with a typed Context file path",
+            None,
+        ),
+        item(
+            "dialog.confirm_quit.activity_onboarding",
+            "You have typed setup input that was not submitted.",
+            "Confirm-quit activity line with unsubmitted setup input",
+            None,
+        ),
         item("dialog.confirm_quit.activity_default", "Active session work may be lost.", "Confirm-quit default activity line", None),
         item("dialog.confirm_quit.exit_note", "Exiting now will terminate the session and discard active work.", "Confirm-quit note about discarding active work", None),
 
@@ -232,12 +292,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             None,
         ),
         item(
-            "review.group_step_scope",
-            "Plan step '{}' of review group '{}'",
-            "Execute-review scope naming one step of a review group root-cause plan targeted by point execution",
-            None,
-        ),
-        item(
             "review.session_queue_scope",
             "All remaining TODO findings",
             "Execute-review scope naming the actionable finding queue of one session or of every session; the confirmation appends the finding count itself",
@@ -264,7 +318,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         ),
         item("dialog.execute_review.title_point", "Resolve Review Finding", "Title for point execution of a single finding or implementation step", None),
         item("dialog.execute_review.finding_label", " Finding: ", "Execute-review finding field label", None),
-        item("dialog.execute_review.step_label", " Step: ", "Execute-review implementation step field label", None),
         item("dialog.execute_review.model_list_title", " Coder Model ", "Execute-review coder model list title with a single entry", None),
         item("dialog.execute_review.model_list_counter", " Coder Model  [{} of {}] ", "Execute-review coder model list title with a position counter", None),
         item("dialog.execute_review.no_models", "  (no coder models configured)", "Execute-review empty coder model list placeholder", None),
@@ -993,7 +1046,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.execute_all", "Execute all Todo findings across all sessions (with confirmation)", "Review command description", None),
         item("cmd.review.execute", "Execute the selected finding, group root-cause plan, or all Todo findings in the session", "Review command description", None),
         item("cmd.review.run", "Run a code review on the current context", "Review command description", None),
-        item("cmd.review.analyze", "Classify the findings of the selected session with the Architect post-analysis", "Review command description", None),
+        item("cmd.review.analyze", "Run the Architect post-analysis over the selected review session", "Review command description", None),
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
         item("cmd.review.refresh", "Refresh the review sessions from the server", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
@@ -1355,6 +1408,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.turn_completed_summary", "Turn completed: {}", "Notification for a completed turn with a summary", None),
         item("notify.turn_completed_hash_summary", "Turn completed ({}): {}", "Notification for a completed turn with a hash and summary", None),
         item("notify.edit_desync", "Edit state desynchronized: server finished without sending edit/finished", "Notification when the edit state desynchronizes", None),
+        item(
+            "notify.edit_desync_phase",
+            "Edit state desynchronized: server finished without sending edit/finished; the edit cycle was still open in the {} phase",
+            "Last-resort diagnostic of a turn that settled while its edit cycle stayed open; the placeholder receives the localized label of the bounded-turn phase the turn was in",
+            None,
+        ),
         // A plan mutation the harness refused or a plan status it had to repair
         // is a real event of the plan lifecycle: the daemon reports both typed
         // beside the turn result, so the interface raises one warning whose text
@@ -1588,12 +1647,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
 
         // ------------------------------------------------------------------
         // Model selection dialog. The picker presents strictly the configured
-        // primary tiers, so it carries one title, one intro, and one footer
+        // repl tiers, so it carries one title, one intro, and one footer
         // instead of a per-source set (c-2).
         // ------------------------------------------------------------------
-        item("dialog.model_select.title_primary", "Select Primary Model", "Model picker title when choosing a configured primary entry", None),
-        item("dialog.model_select.intro_primary", " Models configured under [models.primary] in tauqe.toml", "Model picker intro for the configured primary entries", None),
-        item("dialog.model_select.footer_primary", "1-9 quick select • ↑ / ↓ navigate • PgUp / PgDn page • Enter select • Esc dismiss", "Model picker footer hint for the configured primary entries", None),
+        item("dialog.model_select.title_primary", "Select REPL Model", "Model picker title when choosing a configured repl entry", None),
+        item("dialog.model_select.intro_primary", " Models configured under [models.repl] in tauqe.toml", "Model picker intro for the configured repl entries", None),
+        item("dialog.model_select.footer_primary", "1-9 quick select • ↑ / ↓ navigate • PgUp / PgDn page • Enter select • Esc dismiss", "Model picker footer hint for the configured repl entries", None),
 
         // ------------------------------------------------------------------
         // Model escalation marker: the trailing badge naming a configured model
@@ -1843,7 +1902,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.locale_reset_unsaved", "Interface language reset to English, but the saved locale could not be removed: {}", "Locale notification when reset to English fails to delete file", None),
         item("notify.config_reload_error", "{}; keeping previous TUI settings", "Notification when config reload encounters error", None),
         item("notify.model_select_busy", "Cannot change model while model is generating", "Notification when model selection attempted while busy", None),
-        item("notify.model_select_empty", "No primary models are configured; declare at least one entry under [models.primary]", "Notification when the model picker is requested before the configured primary tiers reach the client", None),
+        item("notify.model_select_empty", "No repl models are configured; declare at least one entry under [models.repl]", "Notification when the model picker is requested before the configured repl tiers reach the client", None),
         item("notify.quit_hint", "Press Ctrl+Q to quit TAUQE, or ? for help", "Notification hint for quitting tauqe or opening help", None),
         item("dialog.squash.status_checking_base", "Checking base '{}'...", "Squash dialog status message when checking base commit", None),
         item("dialog.squash.status_no_session_base", "Session base commit not available (no AI commits in session).", "Squash dialog status message when session base unavailable", None),
@@ -2130,7 +2189,7 @@ mod tests {
         }
     }
 
-    /// The picker offers strictly the configured primary tiers: no key may
+    /// The picker offers strictly the configured repl tiers: no key may
     /// advertise an escape hatch into the full provider catalog, and the empty
     /// list reports itself through its own notification (c-2).
     #[test]

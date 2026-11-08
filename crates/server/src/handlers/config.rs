@@ -45,14 +45,14 @@ pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
         scribe: cfg.models.resolve_effort(ModelRole::Scribe),
         coder: cfg.models.resolve_effort(ModelRole::Coder),
         architect: cfg.models.resolve_effort(ModelRole::Architect),
-        primary: cfg.models.resolve_effort(ModelRole::REPL),
+        repl: cfg.models.resolve_effort(ModelRole::REPL),
         reviewer: cfg.models.resolve_effort(ModelRole::Reviewer),
     });
     summary.entries = Some(ModelRolesEntries {
         scribe: cfg.models.role_entries(ModelRole::Scribe),
         coder: cfg.models.role_entries(ModelRole::Coder),
         architect: cfg.models.role_entries(ModelRole::Architect),
-        primary: cfg.models.role_entries(ModelRole::REPL),
+        repl: cfg.models.role_entries(ModelRole::REPL),
         reviewer: cfg.models.role_entries(ModelRole::Reviewer),
         catalog: provider_catalog(cfg),
     });
@@ -774,7 +774,7 @@ mod tests {
         cfg.models.architect = Some(vec![
             ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
         ]);
-        cfg.models.primary = vec![ModelRef::openrouter("google/gemini-2.5-flash").into()];
+        cfg.models.repl = vec![ModelRef::openrouter("google/gemini-2.5-flash").into()];
         cfg.models.reviewer = Some(vec![
             ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
         ]);
@@ -798,10 +798,7 @@ mod tests {
             roles.architect,
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")
         );
-        assert_eq!(
-            roles.primary,
-            ModelRef::openrouter("google/gemini-2.5-flash")
-        );
+        assert_eq!(roles.repl, ModelRef::openrouter("google/gemini-2.5-flash"));
         assert_eq!(
             roles.reviewer,
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")
@@ -1058,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_set_is_refused_while_an_operation_is_registered() {
         let mut cfg = AppConfig::default();
-        cfg.models.primary = vec![
+        cfg.models.repl = vec![
             ModelRef::openrouter("alpha/model").into(),
             ModelRef::openrouter("beta/model").into(),
         ];
@@ -1128,7 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_config_set_rotates_the_session_on_a_model_change() {
         let mut cfg = AppConfig::default();
-        cfg.models.primary = vec![
+        cfg.models.repl = vec![
             ModelRef::openrouter("alpha/model").into(),
             ModelRef::openrouter("beta/model").into(),
         ];
@@ -1159,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_config_set_keeps_the_session_when_the_model_is_unchanged() {
         let mut cfg = AppConfig::default();
-        cfg.models.primary = vec![
+        cfg.models.repl = vec![
             ModelRef::openrouter("alpha/model").into(),
             ModelRef::openrouter("beta/model").into(),
         ];
@@ -1194,7 +1191,7 @@ mod tests {
         let root = scratch_root("reload");
         std::fs::write(
             root.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:deepseek/deepseek-chat\"]\n",
+            "[models]\nrepl = [\"openrouter:deepseek/deepseek-chat\"]\n",
         )
         .unwrap();
 
@@ -1237,7 +1234,7 @@ mod tests {
         let root = scratch_root("module-conflict");
         std::fs::write(
             root.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:alpha/model\"]\n",
+            "[models]\nrepl = [\"openrouter:alpha/model\"]\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join("tauqe.d")).unwrap();

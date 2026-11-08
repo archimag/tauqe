@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod modals;
 
 pub use modals::{ActiveModal, ModalState};
@@ -198,8 +199,14 @@ impl ModelChoice {
                 ModelRole::Scribe => roles.scribe.clone(),
                 ModelRole::Coder => roles.coder.clone(),
                 ModelRole::Architect => roles.architect.clone(),
-                ModelRole::REPL => roles.primary.clone(),
+                ModelRole::REPL => roles.repl.clone(),
                 ModelRole::Reviewer => roles.reviewer.clone(),
+                // The acceptance role is derived, not stored: the role summary
+                // carries no dedicated acceptance entry, so the role follows
+                // the engine chain (an explicit `gatekeeper`, then the Scribe
+                // model, then the base `repl` entry) through the Scribe model,
+                // which is already resolved through that fallback (c-1).
+                ModelRole::Gatekeeper => roles.scribe.clone(),
             }),
         }
     }
@@ -246,9 +253,9 @@ pub fn help_open_hint(primary: crate::config::PrimaryModifier) -> String {
     HELP_OPEN_CHORD.replace("C-", primary.emacs_prefix())
 }
 
-/// State of the primary model picker (`C-m`).
+/// State of the REPL model picker (`C-m`).
 ///
-/// The picker is a thin shell over [`ModelSelector`]: the configured primary
+/// The picker is a thin shell over [`ModelSelector`]: the configured repl
 /// rungs, the highlighted one, the cyclic navigation, the digit quick-select,
 /// the scroll arithmetic, and the row rendering all live in the single model
 /// selection component. The dialog therefore stores nothing but that selector,
@@ -505,17 +512,15 @@ pub struct ConfirmExecuteReviewState {
     /// Identifier of the architectural group whose unified plan is executed.
     ///
     /// `None` keeps the finding-level targets: one finding (`item_id`), a
-    /// session queue, or the cross-session queue. A group without a `step_id`
-    /// confirms the whole root-cause plan, while a group with one confirms that
-    /// single step of the plan (c-1, c-4, c-5).
+    /// session queue, or the cross-session queue. A group always confirms the
+    /// whole root-cause plan, because the unified pipeline executes the whole
+    /// remaining horizon of the group as one coherent change set
+    /// (c-1, c-4, c-5).
     pub group_id: Option<String>,
     /// Display title of that group, captured when the dialog opens.
     pub group_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
-    /// Concrete implementation step targeted by point execution, when the developer
-    /// confirmed from a finding's step row or from one step of a group plan.
-    pub step_id: Option<String>,
     pub items: Vec<tauqe_protocol::ReviewIssue>,
     /// Whether the confirmation queues the whole review session instead of one
     /// isolated section of it (c-2).
@@ -541,15 +546,14 @@ pub struct ConfirmExecuteReviewState {
 impl ConfirmExecuteReviewState {
     /// Builds a review-execution confirmation over the configured Coder entries.
     ///
-    /// One constructor serves both shapes: point execution (one finding or one
-    /// subplan step, which exposes the Coder selector and the directives editor)
-    /// (concept #c-3).
+    /// One constructor serves the point-execution form: exactly one finding,
+    /// which is the shape that exposes the Coder selector and the directives
+    /// editor (concept #c-3, #c-4).
     pub fn new(
         review_id: Option<String>,
         review_title: String,
         scope_title: String,
         item_id: Option<u32>,
-        step_id: Option<String>,
         items: Vec<tauqe_protocol::ReviewIssue>,
         coder_entries: Vec<tauqe_protocol::ModelEntry>,
     ) -> Self {
@@ -560,7 +564,6 @@ impl ConfirmExecuteReviewState {
             group_title: String::new(),
             scope_title,
             item_id,
-            step_id,
             items,
             whole_session: false,
             selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
@@ -583,8 +586,8 @@ impl ConfirmExecuteReviewState {
     /// Targets the unified plan of one architectural group.
     ///
     /// A group owns a single root-cause plan, so the confirmation names the
-    /// group instead of one of its findings. With a `step_id` the same state
-    /// addresses one step of that plan, which keeps the explicit Coder form
+    /// group instead of one of its findings, and the unified pipeline executes
+    /// the whole remaining horizon of that plan as one coherent change set
     /// (c-1, c-4, c-5).
     pub fn with_group(mut self, group_id: String, group_title: String) -> Self {
         self.group_id = Some(group_id);
@@ -597,21 +600,18 @@ impl ConfirmExecuteReviewState {
         self.selector.selected_entry()
     }
 
-    /// Whether point execution targets exactly one finding or one group step.
+    /// Whether point execution targets exactly one finding.
     ///
     /// Only this shape exposes the Coder selector and the directives editor; a
     /// session queue, the cross-session batch, and the unified plan of an
     /// architectural group run autonomously on the configured role defaults
-    /// (concept #c-3, #c-4, #c-5). A step of a group plan is a single targeted
-    /// unit of work even though the group owns it, so it keeps the explicit
-    /// Coder choice while the whole group plan renders the binary confirmation.
-    /// A whole-session queue names no single unit of work at all, so the flag
-    /// always keeps it out of the point form (c-2).
+    /// (concept #c-3, #c-4, #c-5). A whole-session queue names no single unit
+    /// of work at all, so the flag always keeps it out of the point form (c-2).
     pub fn is_single_target(&self) -> bool {
         if self.whole_session {
             return false;
         }
-        (self.item_id.is_some() && self.items.len() == 1) || self.step_id.is_some()
+        self.item_id.is_some() && self.items.len() == 1
     }
 }
 
@@ -621,7 +621,6 @@ impl Default for ConfirmExecuteReviewState {
             None,
             String::new(),
             String::new(),
-            None,
             None,
             Vec::new(),
             Vec::new(),
@@ -2176,10 +2175,10 @@ impl AppState {
         );
     }
 
-    /// Opens the primary model picker presenting models configured under
-    /// `[models.primary]`.
+    /// Opens the REPL model picker presenting models configured under
+    /// `[models.repl]`.
     ///
-    /// The picker presents strictly the configured primary tiers: `primary` is
+    /// The picker presents strictly the configured repl tiers: `[models.repl]` is
     /// mandatory in the configuration contract, so an empty list means the role
     /// summary has not reached the client yet. The picker then stays closed and
     /// reports that condition instead of offering an alternative model source
@@ -2190,7 +2189,7 @@ impl AppState {
             .roles
             .as_ref()
             .and_then(|r| r.entries.as_ref())
-            .map(|e| e.primary.clone())
+            .map(|e| e.repl.clone())
             .unwrap_or_default();
 
         if entries.is_empty() {
@@ -2353,139 +2352,19 @@ impl AppState {
         // in the modal stack, yet it still blocks background interaction.
         self.active_modal().is_some() || self.context_view.adding_file
     }
-    /// Whether a text buffer currently captures printable characters.
-    ///
-    /// The answer describes the surface that owns the keyboard. While a modal is
-    /// open, only the editor it focuses captures text, because that modal receives
-    /// every keystroke and the view behind it receives none; without a modal, the
-    /// active view decides. A surface that merely lists rows, toggles buttons, or
-    /// confirms an action captures nothing, so a printable key pressed there stays
-    /// a command (Conventions §5.1).
-    ///
-    /// The capturing editors are read from the focus fields of the modal
-    /// subsystems themselves instead of a hand-written inventory: the discussion
-    /// prompt, the review target-path rows and prompt, the locale language field,
-    /// the squash commit message and its custom base-ref input, the plan-refine
-    /// instructions, the review-execution directives, the REPL prompt, the
-    /// inline Context path input, and the onboarding fields.
-    ///
-    /// This is the single source of truth the keyboard dispatcher consults before
-    /// it treats a key as a command at all, so the capture boundary cannot drift
-    /// between dispatch paths (c-text-capture-boundary).
-    pub fn text_input_capturing(&self) -> bool {
-        match self.active_modal() {
-            Some(modal) => self.modal_captures_text(modal),
-            None => self.view_captures_text(),
-        }
-    }
-
-    /// Whether the focused surface of `modal` is an editor capturing text.
-    ///
-    /// The match over the modal stack is exhaustive on purpose: a new modal
-    /// surface must state whether it captures text, so a dialog holding a text
-    /// field can never be silently treated as a command surface
-    /// (c-text-capture-boundary).
-    fn modal_captures_text(&self, modal: ActiveModal) -> bool {
-        match modal {
-            ActiveModal::Squash => self.modals.squash_dialog.as_ref().is_some_and(|dialog| {
-                dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor
-            }),
-            ActiveModal::Review => self.modals.review_dialog.as_ref().is_some_and(|dialog| {
-                dialog.focus.is_path_editor() || dialog.focus.is_prompt_editor()
-            }),
-            ActiveModal::Prompt => self
-                .modals
-                .prompt_modal
-                .as_ref()
-                .is_some_and(|state| state.focus.is_editor()),
-            ActiveModal::Locale => self
-                .modals
-                .locale_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.focus.is_editor()),
-            ActiveModal::CreatePlan => self
-                .modals
-                .create_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.focus.is_instructions_editor()),
-            ActiveModal::RefineDialog => self
-                .modals
-                .refine_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.focus.is_instructions_editor()),
-            // Only the point-execution form exposes the directives editor; a batch
-            // queue confirms as a binary card whose focus never reaches a text
-            // field.
-            ActiveModal::ExecuteReview => {
-                self.modals
-                    .confirm_execute_review
-                    .as_ref()
-                    .is_some_and(|target| {
-                        target.is_single_target() && target.focus.is_instructions_editor()
-                    })
-            }
-            ActiveModal::ServerDisconnected
-            | ActiveModal::ReviewTruncation
-            | ActiveModal::ConfirmCancel
-            | ActiveModal::ConfirmQuit
-            | ActiveModal::BatchCancel
-            | ActiveModal::ClearAuto
-            | ActiveModal::ClearUser
-            | ActiveModal::RemoveContextFile
-            | ActiveModal::OuterDocsCacheRemove
-            | ActiveModal::OuterDocsCache
-            | ActiveModal::ConfirmDetachFocus
-            | ActiveModal::ClearHorizon
-            | ActiveModal::ClearHorizonFinal
-            | ActiveModal::DeletePlan
-            | ActiveModal::DeletePlanFinal
-            | ActiveModal::DeleteReview
-            | ActiveModal::ReviewAnalyze
-            | ActiveModal::ExecutePipeline
-            | ActiveModal::ExecuteScope
-            | ActiveModal::RefineBlocked
-            | ActiveModal::ClearHistory
-            | ActiveModal::Status
-            | ActiveModal::Selection
-            | ActiveModal::DiffInspector
-            | ActiveModal::ThemeSelector
-            | ActiveModal::UsageSummary
-            | ActiveModal::Help => false,
-        }
-    }
-
-    /// Whether the active view exposes a text buffer that captures characters.
-    ///
-    /// The REPL prompt is always present, the inline Context path input exists
-    /// only while a file path is typed, and the onboarding fields capture only on
-    /// the steps that ask for input; every structural view is a command surface.
-    fn view_captures_text(&self) -> bool {
-        match self.view_mode {
-            ViewMode::Repl => true,
-            ViewMode::Context => self.context_view.adding_file,
-            ViewMode::Onboarding => self.onboarding.input_active,
-            ViewMode::Plans | ViewMode::Review | ViewMode::History => false,
-        }
-    }
     /// Reports whether the application has active background work or unsubmitted
     /// input that would be lost on exit.
+    ///
+    /// The answer is the declared quit-guard scan of the capture boundary
+    /// (`AppState::quit_guard_reason`), so the exit gate and the confirmation
+    /// card classify the same work from one source: a capturing editor the
+    /// boundary declares cannot be missing from a hand-maintained subset
+    /// (c-text-capture-boundary, #31).
     ///
     /// When this returns `false`, exiting the application is safe and requires no
     /// confirmation modal.
     pub fn has_lossy_work(&self) -> bool {
-        self.model.is_busy()
-            || self.review.running
-            || !self.input_editor.is_empty()
-            || self
-                .modals
-                .squash_dialog
-                .as_ref()
-                .is_some_and(|d| d.applying || !d.message_editor.is_empty())
-            || self
-                .modals
-                .prompt_modal
-                .as_ref()
-                .is_some_and(|m| !m.prompt_editor.is_empty())
+        self.quit_guard_reason().is_some()
     }
     pub fn active_notification(&self) -> Option<&AppNotification> {
         if let Some(ref notif) = self.notification {
@@ -3016,7 +2895,7 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("primary-model"),
+                repl: ModelRef::openrouter("repl-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: None,
@@ -3037,7 +2916,7 @@ mod tests {
         );
         assert_eq!(
             choice.resolve(&ModelSelection::Role(ModelRole::REPL)),
-            Some(ModelRef::openrouter("primary-model"))
+            Some(ModelRef::openrouter("repl-model"))
         );
         assert_eq!(
             choice.resolve(&ModelSelection::Role(ModelRole::Reviewer)),
@@ -3046,21 +2925,20 @@ mod tests {
     }
 
     #[test]
-    fn test_open_model_dialog_presents_primary_entries() {
+    fn test_open_model_dialog_presents_repl_entries() {
         let mut state = test_state();
-        let primary_entry =
-            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-model"), None);
+        let repl_entry = tauqe_protocol::ModelEntry::new(ModelRef::openrouter("repl-model"), None);
         state.model_choice = ModelChoice {
             selection: ModelSelection::Role(ModelRole::REPL),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("primary-model"),
+                repl: ModelRef::openrouter("repl-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
-                    primary: vec![primary_entry.clone()],
+                    repl: vec![repl_entry.clone()],
                     ..Default::default()
                 }),
             }),
@@ -3072,19 +2950,19 @@ mod tests {
             .selection_dialog
             .expect("dialog should be opened");
         assert_eq!(dialog.selector.len(), 1);
-        assert_eq!(dialog.selector.selected_entry(), Some(&primary_entry));
+        assert_eq!(dialog.selector.selected_entry(), Some(&repl_entry));
         assert_eq!(dialog.selector.selected_index(), 0);
     }
 
-    /// The picker is built strictly from `[models.primary]`: entries configured
+    /// The picker is built strictly from `[models.repl]`: entries configured
     /// for another role never leak in, and no provider-catalog rung exists to
     /// widen the list beyond the configured ladder (c-1, c-2).
     #[test]
-    fn test_open_model_dialog_presents_only_the_primary_ladder() {
-        let primary = vec![
-            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-a"), None),
+    fn test_open_model_dialog_presents_only_the_repl_ladder() {
+        let repl = vec![
+            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("repl-a"), None),
             tauqe_protocol::ModelEntry::new(
-                ModelRef::openrouter("primary-b"),
+                ModelRef::openrouter("repl-b"),
                 Some(ReasoningEffort::High),
             ),
         ];
@@ -3095,11 +2973,11 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("primary-a"),
+                repl: ModelRef::openrouter("repl-a"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
-                    primary: primary.clone(),
+                    repl: repl.clone(),
                     coder: vec![tauqe_protocol::ModelEntry::new(
                         ModelRef::openrouter("coder-model"),
                         None,
@@ -3115,10 +2993,10 @@ mod tests {
             .selection_dialog
             .expect("dialog should be opened");
 
-        // Exactly the primary rungs are selectable: the coder entry configured
+        // Exactly the repl rungs are selectable: the coder entry configured
         // alongside them is not a picker row.
-        assert_eq!(dialog.selector.len(), primary.len());
-        for (index, entry) in primary.iter().enumerate() {
+        assert_eq!(dialog.selector.len(), repl.len());
+        for (index, entry) in repl.iter().enumerate() {
             dialog.selector.select_index(index);
             assert_eq!(dialog.selector.selected_entry(), Some(entry));
         }
@@ -3126,28 +3004,30 @@ mod tests {
 
     /// The picker presents strictly the configured primary tiers: an empty list
     /// keeps it closed and reports the condition instead of offering an
+    /// The picker presents strictly the configured repl tiers: an empty list
+    /// keeps it closed and reports the condition instead of offering an
     /// alternative model source (c-2).
     #[test]
-    fn test_open_model_dialog_reports_an_empty_primary_list() {
+    fn test_open_model_dialog_reports_an_empty_repl_list() {
         let mut state = test_state();
 
         assert!(!state.open_model_dialog());
         assert!(
             state.modals.selection_dialog.is_none(),
-            "the picker must not open without configured primary tiers"
+            "the picker must not open without configured repl tiers"
         );
         let notif = state
             .active_notification()
             .expect("the closed picker explains why");
         assert_eq!(notif.level, NotificationLevel::Warning);
-        assert!(notif.text.contains("[models.primary]"));
+        assert!(notif.text.contains("[models.repl]"));
     }
 
     /// Reopening the picker highlights the rung the developer picked, not the
     /// first entry that happens to share its model (c-2).
     #[test]
     fn test_open_model_dialog_highlights_the_selected_tier() {
-        let model = ModelRef::openrouter("primary-model");
+        let model = ModelRef::openrouter("repl-model");
         let weak = tauqe_protocol::ModelEntry::new(model.clone(), Some(ReasoningEffort::Low));
         let strong = tauqe_protocol::ModelEntry::new(model.clone(), Some(ReasoningEffort::High));
 
@@ -3158,11 +3038,11 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: model.clone(),
+                repl: model.clone(),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
-                    primary: vec![weak.clone(), strong.clone()],
+                    repl: vec![weak.clone(), strong.clone()],
                     ..Default::default()
                 }),
             }),
@@ -3913,16 +3793,16 @@ mod tests {
         assert_eq!(st.active_modal(), Some(ActiveModal::Review));
     }
 
-    /// The whole plan of an architectural group is a queue and renders the
-    /// binary confirmation, while one step of that plan keeps the explicit Coder
-    /// form (c-4, c-5).
+    /// The unified plan of an architectural group always renders the binary
+    /// confirmation, because the pipeline executes the whole remaining horizon
+    /// of the group as one coherent change set and never dispatches a single
+    /// step of it alone (c-1, c-4, c-5).
     #[test]
-    fn test_group_plan_is_binary_while_a_group_step_is_a_form() {
+    fn test_group_plan_is_binary_and_never_a_point_form() {
         let group_plan = ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "Unified auth guard".to_string(),
-            None,
             None,
             Vec::new(),
             Vec::new(),
@@ -3933,21 +3813,6 @@ mod tests {
         assert!(
             !group_plan.is_single_target(),
             "a whole group plan confirms as a binary card"
-        );
-
-        let group_step = ConfirmExecuteReviewState::new(
-            Some("rev-1".to_string()),
-            "Session rev-1".to_string(),
-            "Unified auth guard".to_string(),
-            None,
-            Some("1.1".to_string()),
-            Vec::new(),
-            Vec::new(),
-        )
-        .with_group("arch-auth".to_string(), "Unified auth guard".to_string());
-        assert!(
-            group_step.is_single_target(),
-            "one step of a group plan keeps the explicit Coder form"
         );
     }
 
@@ -3961,7 +3826,6 @@ mod tests {
             "Session rev-1".to_string(),
             "All remaining TODO findings".to_string(),
             None,
-            None,
             Vec::new(),
             Vec::new(),
         )
@@ -3974,7 +3838,6 @@ mod tests {
             "Session rev-1".to_string(),
             "Local Issues".to_string(),
             None,
-            None,
             Vec::new(),
             Vec::new(),
         );
@@ -3985,6 +3848,9 @@ mod tests {
     }
     #[test]
     fn test_has_lossy_work() {
+        use crate::app::capture::{CaptureSite, QuitGuardReason};
+        use crate::views::plans::PlanRefineDialogState;
+
         let mut st = test_state();
         assert!(!st.has_lossy_work());
 
@@ -4001,7 +3867,36 @@ mod tests {
         assert!(!st.has_lossy_work());
 
         st.review.running = true;
+        assert_eq!(st.quit_guard_reason(), Some(QuitGuardReason::ReviewRunning));
         assert!(st.has_lossy_work());
+        st.review.running = false;
+        assert!(!st.has_lossy_work());
+
+        // The predicate is the declared quit-guard scan, so a capturing editor
+        // of a dialog the active modal does not even expose now guards the exit
+        // as well (c-text-capture-boundary, #31).
+        let mut refine =
+            PlanRefineDialogState::new("plan-1".to_string(), "Plan 1".to_string(), Vec::new());
+        refine
+            .instructions_editor
+            .insert_str("split the second step");
+        st.modals.refine_dialog = Some(refine);
+        assert_eq!(
+            st.quit_guard_reason(),
+            Some(QuitGuardReason::Editor(CaptureSite::PlanRefineInstructions))
+        );
+        assert!(st.has_lossy_work());
+
+        // A second quit request over the confirmation card still finds the text
+        // of the dialog the card covers.
+        st.modals.confirm_quit = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
+        assert!(st.has_lossy_work());
+
+        st.modals.confirm_quit = false;
+        st.modals.refine_dialog = None;
+        assert_eq!(st.quit_guard_reason(), None);
+        assert!(!st.has_lossy_work());
     }
 
     /// The published model-display snapshot is fully determined by the mirrored
@@ -4015,7 +3910,7 @@ mod tests {
                 scribe: ModelRef::openrouter("model-a"),
                 coder: ModelRef::openrouter("model-a"),
                 architect: ModelRef::openrouter("model-a"),
-                primary: ModelRef::openrouter("model-a"),
+                repl: ModelRef::openrouter("model-a"),
                 reviewer: ModelRef::openrouter("model-a"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
@@ -4250,9 +4145,22 @@ mod tests {
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "Unified auth guard".to_string(),
-            None,
-            Some("1.1".to_string()),
-            Vec::new(),
+            Some(1),
+            vec![tauqe_protocol::ReviewIssue {
+                id: 1,
+                title: "Finding 1".to_string(),
+                uuid: None,
+                commit: None,
+                group: None,
+                model: None,
+                issue_type: tauqe_protocol::IssueType::Bug,
+                status: tauqe_protocol::IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
+                files: Vec::new(),
+                readonly_files: Vec::new(),
+                note: None,
+            }],
             Vec::new(),
         );
         point.focus = RefineDialogFocus::InstructionsEditor;
@@ -4272,7 +4180,6 @@ mod tests {
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "All remaining findings".to_string(),
-            None,
             None,
             Vec::new(),
             Vec::new(),

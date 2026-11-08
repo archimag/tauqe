@@ -77,6 +77,12 @@ use super::common::{emit, offload_review, publish_review};
 /// session carrying it, so the client renders the new layer without a follow-up
 /// fetch.
 ///
+/// The operation slot is claimed before the session is read, so the whole
+/// read-modify-write cycle, including the identity healing that rewrites the
+/// stored session, runs inside the exclusion window it relies on: a bounded
+/// update or a deletion that samples the slot while the round holds it is
+/// refused instead of being overwritten by the heal save.
+///
 /// A session with nothing to classify is refused by the shared procedure before
 /// any provider call, exactly as a session that cannot be resolved is refused
 /// here. An optional Architect selection travels to that procedure, so the
@@ -115,6 +121,24 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
         );
     }
 
+    // Post-analysis rewrites the stored session, so it claims the single
+    // operation slot before it reads anything: the whole read-modify-write
+    // cycle, including the identity healing below, runs inside the exclusion
+    // window it relies on. A bounded update or a deletion that samples the slot
+    // after this point is refused instead of having its write overwritten by
+    // the heal save, and a session deleted before the claim is never resurrected
+    // by it. Every early return below releases the slot through the guard.
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => guard,
+        Err(()) => {
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            )
+        }
+    };
+
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let load_root = repo_root.clone();
     let load_id = review_id.clone();
@@ -130,19 +154,6 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
             }
             Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
         };
-
-    // Post-analysis mutates the stored session, so it takes the single operation
-    // slot: a concurrent turn or batch must never rewrite the same layer.
-    let operation = match state.try_begin_operation() {
-        Ok(guard) => guard,
-        Err(()) => {
-            return Response::err(
-                req.id,
-                errors::OPERATION_IN_PROGRESS,
-                "Another operation is already running",
-            )
-        }
-    };
 
     let analyzed = run_review_post_analysis(
         state,
@@ -176,6 +187,11 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
 /// exception is the identity: a finding that carries none is healed with a UUIDv7
 /// before the prompt is built, because a classification can only reference what
 /// the stored session can name.
+///
+/// The heal save is a whole-document write, so the caller must already own the
+/// operation slot and have read the session inside it: a read taken outside the
+/// exclusion window the save relies on could overwrite a bounded update or
+/// resurrect a deleted session.
 ///
 /// `is_batch` declares the execution context of the round: `false` for a
 /// standalone request, `true` for a member of a running batch. It is copied
@@ -311,7 +327,7 @@ pub(super) async fn run_review_post_analysis(
 
     // The guard opens the accounting window before the provider call, so the
     // analysis is charged even when it fails or is cancelled.
-    let usage_guard = state.begin_usage().await;
+    let usage_guard = state.begin_usage(&op_id).await;
 
     let mut cancel_rx = operation.cancel_receiver();
     let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
@@ -341,22 +357,16 @@ pub(super) async fn run_review_post_analysis(
     // `summary` string, so the verdict reaches the client while JSON syntax stays
     // server-side and the whole payload stays available for decoding.
     let mut filter = JsonFieldStreamFilter::<PostAnalysisOutput>::new("summary");
-    let mut usage: Option<ModelUsageInfo> = None;
     let mut failure: Option<String> = None;
     let mut stream_cancelled = false;
 
-    // The verdict arrives at token granularity, so a client that keeps its pipe
-    // open but stopped reading pauses the relay here instead of growing the
-    // outbound queue for the rest of the round. Only the arms that break this
-    // loop are exempted, because they publish the terminal notice of the round:
-    // a stall must never delay the cancellation or the failure it reports.
+    // The relay applies the transport-owned pacing policy instead of restating
+    // an exemption set of its own: a terminal notice publishes immediately, and
+    // every other variant waits for the writer to catch up, so a client that
+    // keeps its pipe open but stopped reading pauses the relay here instead of
+    // growing the outbound queue for the rest of the round.
     while let Some(event) = rx.recv().await {
-        if !matches!(
-            event,
-            StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_)
-        ) {
-            state.out.wait_for_headroom(&mut cancel_rx).await;
-        }
+        state.out.pace_event(&event, &mut cancel_rx).await;
         match event {
             StreamEvent::ReasoningDelta(delta) => emit(
                 &state.out,
@@ -380,7 +390,11 @@ pub(super) async fn run_review_post_analysis(
                     );
                 }
             }
-            StreamEvent::Usage(reported) => usage = Some(reported),
+            // Fold every report the provider makes into the accounting window as
+            // it arrives: a round that reported usage on an intermediate chunk, or
+            // whose retry resumed after an aborted attempt had already reported
+            // its tokens, must not lose the earlier reports.
+            StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
             StreamEvent::Done => break,
             // The provider may report cancellation as an explicit stream event even
             // when the turn's cancel signal has not been observed yet, so the event
@@ -414,17 +428,21 @@ pub(super) async fn run_review_post_analysis(
 
     // Account for the tokens, cost, and duration the analysis consumed before any
     // early return, so a failed or cancelled round is still charged.
-    let reported_usage = usage.unwrap_or_default();
-    usage_guard.observe(&reported_usage).await;
+    // Every report was already folded into the window as it arrived, so the
+    // flush below charges the whole round instead of its last report alone.
     usage_guard.flush().await;
-    let session_total_cost = state.usage_snapshot().await.session.cost;
-    let current_cost = reported_usage.cost.unwrap_or(0.0);
+    let usage_snapshot = state.usage_snapshot().await;
+    // Both totals are read from the authoritative ledger: the operation scope
+    // the flush just closed and the session scope it was folded into.
+    let operation_usage: ModelUsageInfo = usage_snapshot.prev.to_usage_info();
+    let session_total_cost = usage_snapshot.session.cost;
+    let current_cost = usage_snapshot.prev.cost;
     emit(
         &state.out,
         events::MODEL_USAGE,
         serde_json::to_value(ModelUsageEvent {
             operation_id: op_id.clone(),
-            usage: reported_usage,
+            usage: operation_usage,
             session_total_cost,
             current_cost: Some(current_cost),
         })
@@ -979,7 +997,7 @@ mod tests {
     async fn configure_architect(fixture: &AnalysisFixture, entries: Vec<ModelEntry>) {
         let mut config = fixture.state.config.lock().await;
         config.config.models = ModelsConfig {
-            primary: vec![ModelEntry::from(ModelRef::openrouter("test/primary"))],
+            repl: vec![ModelEntry::from(ModelRef::openrouter("test/primary"))],
             architect: Some(entries),
             ..Default::default()
         };
@@ -1559,5 +1577,106 @@ mod tests {
 
         writing.abort();
         let _ = writing.await;
+    }
+    /// Builds a `review/analyze` request naming one session.
+    fn analyze_request(review_id: &str) -> Request {
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_ANALYZE.to_string(),
+            params: Some(serde_json::json!({ "review_id": review_id })),
+        }
+    }
+
+    /// The operation slot is claimed before the session is read, so a round owns
+    /// the exclusion window its identity-heal save depends on. The refusal
+    /// therefore precedes the resolution: a request naming a session that does
+    /// not exist is refused because another operation runs, not because the
+    /// session is missing. With a read that precedes the claim, a bounded update
+    /// or a deletion landing in that window would be overwritten or undone by
+    /// the heal save.
+    #[tokio::test]
+    async fn analyze_claims_the_operation_slot_before_it_resolves_the_session() {
+        let fixture = fixture("claim-before-load");
+        let operation = fixture
+            .state
+            .try_begin_operation()
+            .expect("the operation slot is free");
+
+        let refused = handle_review_analyze(analyze_request("rev-absent"), &fixture.state).await;
+        assert_eq!(
+            refused.error.expect("the request is refused").code,
+            errors::OPERATION_IN_PROGRESS,
+            "the slot refusal must precede the session resolution"
+        );
+
+        drop(operation);
+        let missing = handle_review_analyze(analyze_request("rev-absent"), &fixture.state).await;
+        assert_eq!(
+            missing.error.expect("the request is refused").code,
+            errors::NOT_FOUND,
+            "the same request resolves the session once the slot is free"
+        );
+        assert!(
+            !fixture.state.is_operation_active(),
+            "an unresolvable round must release the slot it claimed"
+        );
+    }
+
+    /// A round heals a session stored before finding identities existed and
+    /// persists the identities inside its exclusion window, before the provider
+    /// is called, so a classification can reference them even when the round
+    /// itself fails afterwards. Healing rewrites the loaded copy, never the
+    /// snapshot the caller passed in.
+    #[tokio::test]
+    async fn post_analysis_heals_missing_identities_before_the_provider_call() {
+        let fixture = fixture("heal");
+        let mut session = session();
+        for item in &mut session.items {
+            item.uuid = None;
+        }
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        // A payload whose verdict is empty is refused by the classification
+        // contract after the heal save, so the identities survive a round that
+        // produced no usable classification.
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            classification("", &[], &[]),
+        )]));
+        let injected: Arc<dyn LlmProvider> = provider.clone();
+        *fixture.state.provider_override.lock().await = Some(injected);
+
+        let err = analyze(&fixture, &session, None)
+            .await
+            .expect_err("a classification without a verdict is refused");
+        assert_eq!(err.code, errors::SCHEMA_ERROR);
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "the heal save precedes the only provider call of the round"
+        );
+
+        let stored = ReviewStorage::load_review(&fixture.root, "rev-analyze")
+            .unwrap()
+            .expect("the session is stored");
+        let minted: Vec<String> = stored
+            .items
+            .iter()
+            .map(|item| item.uuid.clone().expect("every finding was healed"))
+            .collect();
+        assert_eq!(minted.len(), 2);
+        for uuid in &minted {
+            assert!(
+                tauqe_core::review::uuid::is_valid_uuid_v7(uuid),
+                "a healed identity must be UUIDv7: {uuid}"
+            );
+        }
+        assert_ne!(
+            minted[0], minted[1],
+            "every finding receives its own identity"
+        );
+        assert!(
+            session.items.iter().all(|item| item.uuid.is_none()),
+            "healing rewrites the round's own copy, never the caller's snapshot"
+        );
     }
 }

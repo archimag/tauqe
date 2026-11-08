@@ -224,11 +224,20 @@ fn join_remote(base: &str, relative: &str) -> Result<String, String> {
     url.set_path(&directory);
     url.set_query(None);
     url.set_fragment(None);
-    url.join(relative)
-        .map(|joined| joined.to_string())
-        .map_err(|error| {
-            format!("the document `{relative}` does not resolve under `{base}`: {error}")
-        })
+    let joined = url.join(relative).map_err(|error| {
+        format!("the document `{relative}` does not resolve under `{base}`: {error}")
+    })?;
+    // The reference is resolved against the directory that holds the root
+    // document, so the joined address stays inside that directory. A reference
+    // the jail admitted cannot climb above it, and checking the joined path
+    // makes that a property of the address a host receives rather than of the
+    // spelling that produced it.
+    if !joined.path().starts_with(directory.as_str()) {
+        return Err(format!(
+            "the document `{relative}` resolves to `{joined}`, which is not below the document directory `{directory}` of `{base}`"
+        ));
+    }
+    Ok(joined.to_string())
 }
 
 /// Verifies that a cache path stays inside the repository.
@@ -1305,5 +1314,28 @@ mod tests {
             "unexpected reason: {error}"
         );
         assert!(!dir.path().join(document_cache_path(&doc)).exists());
+    }
+
+    /// A reference the jail admitted can never resolve above the directory that
+    /// holds the root document, whatever the joined address looks like.
+    #[test]
+    fn test_a_relative_reference_never_resolves_above_the_root_directory() {
+        let base = "https://example.com/book/index.md";
+        assert_eq!(
+            super::join_remote(base, "architecture.md").expect("the reference resolves"),
+            "https://example.com/book/architecture.md"
+        );
+        assert_eq!(
+            super::join_remote(base, "nested/api.md").expect("the reference resolves"),
+            "https://example.com/book/nested/api.md"
+        );
+        for escaping in ["../secret.md", "./../secret.md"] {
+            let error = super::join_remote(base, escaping)
+                .expect_err("a reference above the root directory is refused");
+            assert!(
+                error.contains("not below"),
+                "unexpected reason for {escaping}: {error}"
+            );
+        }
     }
 }

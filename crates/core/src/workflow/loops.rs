@@ -247,6 +247,7 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
         result,
         is_cancelled,
         blocked,
+        protocol_failure,
         has_terminal_success,
         plan_saved,
         plan_errors,
@@ -264,6 +265,7 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
     target.result = result;
     target.is_cancelled = is_cancelled;
     target.blocked = blocked;
+    target.protocol_failure = protocol_failure;
     target.has_terminal_success = has_terminal_success;
     target.plan_saved = plan_saved;
     target.skip_reason = skip_reason;
@@ -847,6 +849,7 @@ mod tests {
             },
             is_cancelled: false,
             blocked: None,
+            protocol_failure: None,
             has_terminal_success: false,
             plan_saved: false,
             plan_errors: vec![PlanRejection::payload_defect("first attempt rejection")],
@@ -861,6 +864,7 @@ mod tests {
             },
             is_cancelled: true,
             blocked: Some("blocked on the retried attempt".to_string()),
+            protocol_failure: Some("the retried attempt violated the edit protocol".to_string()),
             has_terminal_success: true,
             plan_saved: true,
             plan_errors: vec![PlanRejection::mode_forbidden("retried attempt rejection")],
@@ -886,6 +890,10 @@ mod tests {
         assert_eq!(
             target.blocked.as_deref(),
             Some("blocked on the retried attempt")
+        );
+        assert_eq!(
+            target.protocol_failure.as_deref(),
+            Some("the retried attempt violated the edit protocol")
         );
         assert!(target.has_terminal_success);
         assert!(target.plan_saved);

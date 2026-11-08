@@ -26,6 +26,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::handlers::common::spawn_escalation_relay;
 use crate::handlers::host::ServerImplementationHost;
 use crate::state::{AppState, OperationGuard};
 
@@ -177,7 +178,10 @@ pub(super) async fn run_plan_batch_with(
         config.clone(),
         repo_root.clone(),
     );
-    let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
+    let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1);
+    // The relay drains the batch channel for the whole run, so the executor
+    // never parks on a full queue and every promotion reaches the client.
+    let relay = spawn_escalation_relay(state.out.clone(), operation_id.clone(), stream_rx);
 
     let report = PlanImplementationPipeline::new(
         &repo_root,
@@ -199,6 +203,17 @@ pub(super) async fn run_plan_batch_with(
         &operation.soft_stop_receiver(),
     )
     .await;
+
+    // The last sender closes the batch channel, so the relay publishes the
+    // promotions of the run before the terminal report leaves.
+    drop(stream_tx);
+    if let Err(err) = relay.await {
+        tracing::warn!(
+            plan_id = plan_id,
+            error = %err,
+            "plan batch escalation relay terminated unexpectedly"
+        );
+    }
 
     // The transient context is released again once the horizon settles, so the
     // next run starts from the same clean basis.

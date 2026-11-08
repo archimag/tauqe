@@ -767,7 +767,7 @@ mod tests {
     /// Builds a models section declaring the given architect ladder.
     fn models(architect: &str) -> ModelsConfig {
         let declaration =
-            format!("[models]\nprimary = [\"openrouter:mock/base\"]\narchitect = [{architect}]\n");
+            format!("[models]\nrepl = [\"openrouter:mock/base\"]\narchitect = [{architect}]\n");
         let config: crate::config::AppConfig =
             toml::from_str(&declaration).expect("parse the architect ladder");
         config.models

@@ -81,11 +81,17 @@ pub fn build_patch_retry_prompt(
 }
 
 /// Filters out failed files that the model chose not to retry in the current set of edits.
+///
+/// The removed rejections are returned rather than discarded. A path the model
+/// left out of its corrected set was never staged, so its edit is not part of
+/// the change set that will be applied: removing the entry only stops the
+/// harness from asking for that file again, and the caller stays responsible
+/// for reporting the omission.
 pub fn retain_retried_failed_files(
     last_failed_errors: &mut HashMap<String, EditError>,
     context_manager: &ContextManager,
     edits: &[EditOperation],
-) {
+) -> HashMap<String, EditError> {
     let mut retried_paths = HashSet::new();
     for edit in edits {
         match edit {
@@ -111,7 +117,17 @@ pub fn retain_retried_failed_files(
             }
         }
     }
-    last_failed_errors.retain(|path, _| retried_paths.contains(path));
+    let recorded: Vec<String> = last_failed_errors.keys().cloned().collect();
+    let mut dropped = HashMap::new();
+    for path in recorded {
+        if retried_paths.contains(&path) {
+            continue;
+        }
+        if let Some(error) = last_failed_errors.remove(&path) {
+            dropped.insert(path, error);
+        }
+    }
+    dropped
 }
 
 /// Evicts any files that are being re-edited in the current retry from previously staged state
@@ -255,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_retried_failed_files_drops_unretried_paths() {
+    fn test_retain_retried_failed_files_reports_unretried_paths() {
         let dir = tempfile::tempdir().unwrap();
         let cm = ContextManager::new(dir.path().to_path_buf());
         let mut failed = HashMap::new();
@@ -276,12 +292,21 @@ mod tests {
             new_text: "new".to_string(),
         }];
 
-        retain_retried_failed_files(&mut failed, &cm, &edits);
+        let unretried = retain_retried_failed_files(&mut failed, &cm, &edits);
         assert!(!failed.contains_key("a.rs"));
         assert!(failed.contains_key("b.rs"));
+        assert_eq!(unretried.len(), 1);
+        assert!(
+            unretried.contains_key("a.rs"),
+            "an unretried failure is reported instead of being discarded"
+        );
 
-        retain_retried_failed_files(&mut failed, &cm, &[]);
+        let unretried = retain_retried_failed_files(&mut failed, &cm, &[]);
         assert!(failed.is_empty());
+        assert!(
+            unretried.contains_key("b.rs"),
+            "a failure left out of an empty retry set is reported as well"
+        );
     }
 
     #[test]

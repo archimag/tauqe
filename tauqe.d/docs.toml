@@ -1,3 +1,4 @@
+# OpenRouter
 [[outer_docs]]
 id = "openrouter/chat-completion"
 title = "OpenRouter Chat Completion API"
@@ -39,6 +40,11 @@ title = "OpenRouter Generation API"
 source = "https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation.md"
 
 [[outer_docs]]
+id = "openrouter/models-overview"
+title = "OpenRouter Models Overview API"
+source = "https://openrouter.ai/docs/guides/overview/models.md"
+
+[[outer_docs]]
 id = "openrouter/models"
-title = "OpenRouter Models API"
+title = "OpenRouter List Models API"
 source = "https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties.md"

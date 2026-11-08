@@ -1190,7 +1190,278 @@ fn test_finalize_on_an_unborn_branch_squashes_into_one_root_commit() {
     );
     assert!(!transaction_marker_path(path).exists());
 }
+#[test]
+fn test_finalize_refuses_a_foreign_commit_inside_the_recorded_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
 
+    // A clean tree opens the transaction without a checkpoint commit, so the
+    // proof range holds exactly the turn's own step commit below.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(!checkpoint.created_checkpoint_commit);
+    fs::write(path.join("ai_work.txt"), "ai work").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    // A developer commit without the Tauqe trailer lands inside the range.
+    fs::write(path.join("foreign.txt"), "foreign work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "foreign.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged_before =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+
+    let error = finalize_ai_commit(
+        path,
+        &checkpoint,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .expect_err("a foreign commit inside the recorded range must refuse finalization");
+    assert!(
+        error.to_string().contains("was not created by Tauqe AI"),
+        "{error}"
+    );
+
+    // Nothing was rewritten: the commit that landed stays at HEAD, its content
+    // stays on disk, the index is untouched, and the marker the turn opened
+    // still authorizes a later recovery.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap(),
+        staged_before
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("foreign.txt")).unwrap(),
+        "foreign work"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("ai_work.txt")).unwrap(),
+        "ai work"
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_finalize_refuses_a_recorded_base_that_is_not_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let current_branch =
+        crate::git::cmd::run_git(Some(path), &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+    // A commit that lives only on a side branch, recorded as the base of a
+    // transaction opened on the branch currently checked out.
+    crate::git::cmd::run_git(Some(path), &["checkout", "-b", "side"]).unwrap();
+    fs::write(path.join("side.txt"), "side work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "side.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "chore: side work",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let foreign_base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    crate::git::cmd::run_git(Some(path), &["checkout", current_branch.as_str()]).unwrap();
+    let checkpoint = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Commit(foreign_base),
+        phase: TransactionPhase::Established,
+        writer_pid: None,
+    };
+    write_transaction_marker(path, &checkpoint).unwrap();
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let error = finalize_ai_commit(
+        path,
+        &checkpoint,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .expect_err("a base outside the branch history must refuse finalization");
+    assert!(
+        error.to_string().contains("is not an ancestor of HEAD"),
+        "{error}"
+    );
+
+    // Resetting to a base outside the branch would discard commits the
+    // transaction never recorded, so HEAD stays put and the marker survives.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_pinned_finalize_return_refuses_a_born_head_that_moved_after_the_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A clean tree opens the transaction without a checkpoint commit, and the
+    // step commit is the verified progress the base return is proven against.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(!checkpoint.created_checkpoint_commit);
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_pinned_finalize_return(path, &checkpoint, &deadline)
+        .expect("the transaction's own commits are authorized for the base return");
+    assert!(pinned.is_some(), "the step commit resolves the branch");
+
+    // A commit lands between the proof and the soft reset.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged_before =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+
+    let error = perform_pinned_finalize_return(path, &checkpoint, pinned.as_deref(), &deadline)
+        .expect_err("a HEAD that moved after the proof must refuse the base return");
+    assert!(error.to_string().contains("HEAD moved"), "{error}");
+    assert!(
+        error.downcast_ref::<HeadDrift>().is_some(),
+        "the refusal must stay typed so a caller can tell it from a Git failure"
+    );
+
+    // The commit that landed survives at HEAD, and no history, index entry, or
+    // working-tree byte was rewritten.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    assert_eq!(
+        fs::read_to_string(path.join("later.txt")).unwrap(),
+        "later work"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("ai_work.txt")).unwrap(),
+        "ai step modification"
+    );
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap(),
+        staged_before
+    );
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_pinned_finalize_return_refuses_an_unborn_head_that_moved_after_the_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    // The transaction opens on the unborn base and records its work in a step
+    // commit, which is the identity the conditional deletion pins.
+    let checkpoint = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Unborn,
+        phase: TransactionPhase::Established,
+        writer_pid: None,
+    };
+    write_transaction_marker(path, &checkpoint).unwrap();
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let deadline = GitDeadline::default();
+    let pinned = resolve_pinned_finalize_return(path, &checkpoint, &deadline)
+        .expect("the transaction's own commit is authorized for the base return");
+    assert!(pinned.is_some(), "the step commit resolves the branch");
+
+    // A commit lands between the proof and the conditional deletion.
+    fs::write(path.join("later.txt"), "later work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "later.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let drifted = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let error = perform_pinned_finalize_return(path, &checkpoint, pinned.as_deref(), &deadline)
+        .expect_err("a HEAD that moved after the proof must refuse the deletion");
+    assert!(
+        format!("{error:#}").contains("Failed to soft reset to the unborn checkpoint base"),
+        "{error:#}"
+    );
+
+    // The conditional `<oldvalue>` operand made Git refuse the deletion: the
+    // branch keeps the commit that landed, and the index still records both
+    // files instead of holding the staged content of one squashed root.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, drifted);
+    let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+    assert!(tracked.contains("ai_work.txt"), "{tracked}");
+    assert!(tracked.contains("later.txt"), "{tracked}");
+    assert!(read_transaction_marker(path).is_some());
+}
 #[test]
 fn test_marker_decodes_the_legacy_head_literal_as_an_unborn_base() {
     let dir = tempfile::tempdir().unwrap();
@@ -3088,4 +3359,292 @@ fn test_staging_sibling_names_are_ignored_by_the_installed_rules() {
             "{candidate} must be covered by the installed exclude rules: {ignored:?}"
         );
     }
+}
+
+#[test]
+fn test_create_ai_commit_refuses_while_a_transaction_of_this_process_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The test process opens a real transaction, so the marker names a writer
+    // that provably still runs and owns the artifact recovery depends on.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(checkpoint.writer_pid, Some(std::process::id()));
+    fs::write(path.join("ai_work.txt"), "ai work").unwrap();
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged_before =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+
+    let error = create_ai_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .expect_err("an isolated commit must not strand a live transaction");
+
+    let expected = format!("(pid {}) is still running", std::process::id());
+    assert!(error.to_string().contains(&expected), "{error}");
+
+    // The refusal precedes every mutation: the open transaction keeps its
+    // marker, no commit is created, and the index still holds what it staged.
+    assert!(read_transaction_marker(path).is_some());
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert_eq!(
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap(),
+        staged_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_create_ai_commit_resumes_once_the_concurrent_writer_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The marker attributes an open transaction to a process that is still
+    // running, which is the shape an isolated commit must never strand.
+    let mut child = live_child();
+    let writer_pid = child.id();
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head.clone()),
+            phase: TransactionPhase::Established,
+            writer_pid: Some(writer_pid),
+        },
+    )
+    .unwrap();
+    fs::write(path.join("ai_work.txt"), "ai work").unwrap();
+
+    let error = create_ai_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .expect_err("a marker a live writer owns must refuse the isolated commit");
+    let expected = format!("(pid {writer_pid}) is still running");
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert!(read_transaction_marker(path).is_some());
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_after, head);
+
+    // Once the writer is reaped the surviving marker owns nothing, so the
+    // isolated commit proceeds and clears it.
+    let _ = child.kill();
+    let _ = child.wait();
+    let hash = create_ai_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    assert!(!hash.is_empty());
+    assert!(read_transaction_marker(path).is_none());
+    let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(subject, "feat: add the generated file");
+}
+
+#[test]
+fn test_create_ai_commit_clears_an_unattributed_or_absent_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A marker written by an earlier revision names no writer, so it proves
+    // nothing about ownership and keeps the previous clearing behavior.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
+            writer_pid: None,
+        },
+    )
+    .unwrap();
+    fs::write(path.join("first.txt"), "first work").unwrap();
+    let hash = create_ai_commit(
+        path,
+        &["first.txt".to_string()],
+        "feat: add the first file",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    assert!(!hash.is_empty());
+    assert!(read_transaction_marker(path).is_none());
+
+    // An absent marker is the state a closed transaction leaves behind, so the
+    // next isolated commit finds nothing to clear and proceeds as before.
+    fs::write(path.join("second.txt"), "second work").unwrap();
+    let hash = create_ai_commit(
+        path,
+        &["second.txt".to_string()],
+        "feat: add the second file",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    assert!(!hash.is_empty());
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[test]
+fn test_create_ai_commit_gates_the_empty_change_set_on_transaction_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The empty change set reports no commit, but it still has to respect the
+    // transaction whose marker it would otherwise erase.
+    create_checkpoint(path, GitHooks::Bypass).unwrap();
+    let error = create_ai_commit(path, &[], "draft only", GitHooks::Bypass)
+        .expect_err("the empty change set must observe the same ownership gate");
+    let expected = format!("(pid {}) is still running", std::process::id());
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert!(read_transaction_marker(path).is_some());
+
+    // An unattributed marker carries no owner, so the empty change set closes it
+    // and reports the absence of a commit.
+    forget_marker_writer(path);
+    let hash = create_ai_commit(path, &[], "draft only", GitHooks::Bypass).unwrap();
+    assert!(hash.is_empty());
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_create_checkpoint_refuses_a_marker_a_live_writer_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A transaction another process is still driving owns its marker.
+    let mut child = live_child();
+    let writer_pid = child.id();
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let owned = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Commit(head),
+        phase: TransactionPhase::Established,
+        writer_pid: Some(writer_pid),
+    };
+    write_transaction_marker(path, &owned).unwrap();
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+
+    let error = create_checkpoint(path, GitHooks::Bypass)
+        .expect_err("a marker a live writer owns must refuse the capture");
+    let expected = format!("(pid {writer_pid}) is still running");
+    assert!(error.to_string().contains(&expected), "{error}");
+
+    // The refusal precedes every mutation: the transaction that owns the marker
+    // keeps it, no capture commit was created, and the developer's work stays
+    // exactly where it was.
+    assert_eq!(read_transaction_marker(path), Some(owned));
+    let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(subject, "chore: initial commit");
+    assert_eq!(
+        fs::read_to_string(path.join("user_work.txt")).unwrap(),
+        "uncommitted work"
+    );
+
+    // Once the writer is reaped the surviving marker owns nothing, so a later
+    // capture replaces it exactly as before.
+    let _ = child.kill();
+    let _ = child.wait();
+    let captured = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(captured.created_checkpoint_commit);
+    assert_eq!(captured.writer_pid, Some(std::process::id()));
+}
+
+#[test]
+fn test_create_checkpoint_replaces_the_marker_this_process_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A capture this process opened earlier left its marker behind, so a later
+    // capture replaces it instead of refusing its own work.
+    let first = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(first.writer_pid, Some(std::process::id()));
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+
+    let second = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(second.created_checkpoint_commit);
+    assert_eq!(read_transaction_marker(path), Some(second));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_create_checkpoint_replaces_a_dead_or_unattributed_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // A writer that is provably gone left the marker behind: a startup recovery
+    // resolves that state, so a fresh capture replaces the marker instead of
+    // treating it as a live transaction.
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head.clone()),
+            phase: TransactionPhase::Established,
+            writer_pid: Some(dead_process_id()),
+        },
+    )
+    .unwrap();
+    let captured = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(captured.writer_pid, Some(std::process::id()));
+    assert_eq!(captured.base, TransactionBase::Commit(head.clone()));
+
+    // A marker written by an earlier revision names no writer at all, so it
+    // proves nothing about ownership and the capture replaces it as well.
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
+            writer_pid: None,
+        },
+    )
+    .unwrap();
+    let captured = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(captured.writer_pid, Some(std::process::id()));
 }

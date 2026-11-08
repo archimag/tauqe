@@ -18,11 +18,14 @@ pub mod tree;
 pub use self::input::{handle_plans_key, PLANS_COMMAND_MAP};
 pub use self::render::render_plans_view;
 
-// Tree-line rendering lives in its own module; the facade re-exports the three
-// entry points its renderer and the Review view consume, so those callers keep
-// importing one tree vocabulary from the plans module.
+// Tree-line rendering lives in its own module; the facade re-exports the entry
+// points its renderer and the Review view consume, so those callers keep
+// importing one tree vocabulary from the plans module. The slice-taking
+// renderer exists only for the regression tests, so it is compiled with them.
+#[cfg(test)]
+pub(crate) use self::tree::compute_unified_plan_lines;
 pub(crate) use self::tree::{
-    architect_badge, compute_unified_plan_lines, measure_plan_rows_from, status_style,
+    architect_badge, measure_plan_rows_from, render_plan_lines_from, status_style,
 };
 
 /// Saturating conversion for scroll arithmetic; avoids wrap-around on a very
@@ -492,13 +495,59 @@ impl PlansViewState {
         }
     }
 
+    /// True only when every plan, section, concept item, and step is expanded.
+    ///
+    /// The predicate answers one question — is the tree in its fully expanded
+    /// state — so the global fold key (`a`) stays a clean binary toggle: it
+    /// collapses the tree only when nothing is left folded and expands it
+    /// otherwise. Reading the plan headers and the section headers alone is not
+    /// enough, because opening a plan header reveals its concept items and
+    /// steps folded and leaves the tree only partially expanded; such a tree
+    /// must be expanded by the next press, never collapsed (Conventions.md §4).
+    ///
+    /// The fold keys this walk requires are exactly the keys `expand_all`
+    /// writes, so the two functions are exact inverses, and the contract
+    /// mirrors `ReviewViewState::is_all_expanded` (c-4).
     pub fn is_all_expanded(&self) -> bool {
-        !self.plans.is_empty()
-            && self
-                .plans
+        if self.plans.is_empty() || !self.collapsed_sections.is_empty() {
+            return false;
+        }
+        self.plans.iter().all(|plan| {
+            self.expanded_plans.contains(&plan.id)
+                && plan
+                    .concept
+                    .iter()
+                    .all(|item| self.concept_subtree_expanded(&plan.id, item))
+                && plan
+                    .implementation
+                    .items
+                    .iter()
+                    .all(|item| self.item_subtree_expanded(&plan.id, item))
+        })
+    }
+
+    /// Whether one concept subtree stays unfolded at every level.
+    ///
+    /// Mirrors `collect_concept_keys` inside `expand_all` branch for branch: a
+    /// subtree counts as expanded exactly when `expand_all` would have written
+    /// the keys of the item and of every descendant.
+    fn concept_subtree_expanded(&self, plan_id: &str, item: &ConceptItem) -> bool {
+        self.is_concept_item_expanded(plan_id, &item.id)
+            && item
+                .children
                 .iter()
-                .all(|p| self.expanded_plans.contains(&p.id))
-            && self.collapsed_sections.is_empty()
+                .all(|child| self.concept_subtree_expanded(plan_id, child))
+    }
+
+    /// Whether one step subtree stays unfolded at every level.
+    ///
+    /// Mirrors `collect_item_keys` inside `expand_all` branch for branch.
+    fn item_subtree_expanded(&self, plan_id: &str, item: &PlanItem) -> bool {
+        self.is_item_expanded(plan_id, &item.id)
+            && item
+                .children
+                .iter()
+                .all(|child| self.item_subtree_expanded(plan_id, child))
     }
 
     pub fn expand_all(&mut self) {
@@ -1950,6 +1999,89 @@ mod tests {
 
         view.collapse_all();
         assert_row_count_matches(&view, "every row is collapsed");
+    }
+
+    /// The global fold key must be a clean binary toggle: a tree that is only
+    /// partially expanded is expanded, and only a fully expanded tree is
+    /// collapsed. The view previously answered "fully expanded" as soon as
+    /// every plan header was open, so the first press collapsed a tree whose
+    /// steps were folded (c-4).
+    #[test]
+    fn test_fold_all_is_a_reversible_binary_toggle() {
+        let mut view = row_count_fixture();
+
+        // Default state: the plan is collapsed and every item is folded, which
+        // is neither fully expanded nor fully collapsed.
+        assert!(!view.is_all_expanded());
+
+        // First press: expand every plan, section, concept item, and step.
+        view.toggle_fold_all();
+        assert!(view.is_all_expanded());
+        assert!(view.is_plan_expanded("count-plan"));
+        assert!(view.is_concept_item_expanded("count-plan", "c-1"));
+        assert!(view.is_concept_item_expanded("count-plan", "c-1.1"));
+        assert!(view.is_item_expanded("count-plan", "1"));
+        assert!(view.is_item_expanded("count-plan", "1.1"));
+
+        // Second press: collapse everything into the dense overview.
+        view.toggle_fold_all();
+        assert!(!view.is_all_expanded());
+        assert!(!view.is_plan_expanded("count-plan"));
+        assert!(!view.is_concept_item_expanded("count-plan", "c-1"));
+        assert!(!view.is_item_expanded("count-plan", "1"));
+
+        // Third press: the cycle is reversible and returns to fully expanded.
+        view.toggle_fold_all();
+        assert!(view.is_all_expanded());
+        assert!(view.is_concept_item_expanded("count-plan", "c-1.1"));
+        assert!(view.is_item_expanded("count-plan", "1.1"));
+    }
+
+    /// Opening a plan header reveals its concept items and steps folded, so the
+    /// tree is only partially expanded and the global fold key must expand it
+    /// instead of collapsing it again (c-4).
+    #[test]
+    fn test_open_plan_with_folded_items_is_not_fully_expanded() {
+        let mut view = row_count_fixture();
+        view.toggle_plan_expanded("count-plan");
+        assert!(view.is_plan_expanded("count-plan"));
+
+        assert!(
+            !view.is_all_expanded(),
+            "an open plan whose items are folded is only partially expanded"
+        );
+
+        view.toggle_fold_all();
+        assert!(
+            view.is_plan_expanded("count-plan"),
+            "the fold key must expand the folded items, not collapse the plan"
+        );
+        assert!(view.is_concept_item_expanded("count-plan", "c-1"));
+        assert!(view.is_item_expanded("count-plan", "1"));
+        assert!(view.is_all_expanded());
+    }
+
+    /// While every plan header is open, a single folded step is enough to make
+    /// the tree partially expanded; the next press expands that step and never
+    /// collapses the tree (c-4).
+    #[test]
+    fn test_a_single_folded_step_makes_the_tree_partially_expanded() {
+        let mut view = row_count_fixture();
+        view.expand_all();
+        assert!(view.is_all_expanded());
+
+        view.toggle_item_expanded("count-plan", "1");
+        assert!(
+            !view.is_all_expanded(),
+            "one folded step is enough to make the tree partially expanded"
+        );
+
+        view.toggle_fold_all();
+        assert!(view.is_item_expanded("count-plan", "1"));
+        assert!(
+            view.is_all_expanded(),
+            "the fold key must expand the folded step instead of collapsing the tree"
+        );
     }
 
     #[test]

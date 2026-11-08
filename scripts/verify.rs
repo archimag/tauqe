@@ -22,6 +22,19 @@ fn find_repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn run_step(label: &str, program: &str, args: &[String]) {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .unwrap_or_else(|err| {
+            eprintln!("verify: failed to execute {label}: {err}");
+            exit(1);
+        });
+    if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() {
     let repo_root = find_repo_root();
     if let Err(err) = env::set_current_dir(&repo_root) {
@@ -175,15 +188,22 @@ fn main() {
     );
 
     if run_cargo {
-        let mut cmd = Command::new("just");
-        cmd.arg("verify-cargo").args(&cargo_args);
-        let status = cmd.status().unwrap_or_else(|err| {
-            eprintln!("verify: failed to execute `just verify-cargo`: {err}");
-            exit(1);
-        });
-        if !status.success() {
-            exit(status.code().unwrap_or(1));
-        }
+        let mut check_args = vec!["check".to_string()];
+        check_args.extend(cargo_args.iter().cloned());
+        check_args.push("--all-targets".to_string());
+        run_step("`cargo check`", "cargo", &check_args);
+
+        let mut clippy_args = vec!["clippy".to_string()];
+        clippy_args.extend(cargo_args.iter().cloned());
+        clippy_args.extend(["--all-targets", "--", "-D", "warnings"].map(String::from));
+        run_step("`cargo clippy`", "cargo", &clippy_args);
+
+        // The task runner owns the test invocation. Its `test` recipe decides
+        // which runner executes the suite, how failures are reported, and that
+        // the doctest pass follows, so the script never re-derives that policy.
+        let mut test_args = vec!["test".to_string()];
+        test_args.extend(cargo_args.iter().cloned());
+        run_step("`just test`", "just", &test_args);
     }
 
     exit(0);

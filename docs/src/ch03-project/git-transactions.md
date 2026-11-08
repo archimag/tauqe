@@ -162,6 +162,16 @@ same recorded process id through one shared helper, so the marker gate and the
 sibling sweep cannot drift. A marker that names a live writer is skipped with the
 marker preserved, and a marker that names none keeps the previous behavior.
 
+The same ownership decision governs a clear the caller does not own. An isolated
+commit opens no transaction of its own, so before it stages anything it reads the
+marker and refuses while the recorded writer still runs, naming that process id.
+A marker that is absent, a marker attributed to a provably dead writer, and an
+unattributed legacy marker all keep the previous clearing behavior, while a
+marker a live writer owns is preserved for the transaction that opened it: its
+own rollback or a later startup recovery resolves it. The refusal precedes every
+mutation, so the commit, the index, the working tree, and the marker stay exactly
+as they were.
+
 The marker is persisted through the substrate's atomic-write policy end to
 end. The directories a first write needs are created durably, with the parent
 of every created directory synced, so a fresh `.tauqe/` entry is durable in the
@@ -250,17 +260,31 @@ turn records no further progress (section 3.10).
 
 On success the harness:
 
-1. soft-resets to the recorded base, so every step commit becomes staged work;
-   an unborn base holds no commit to reset to, so its soft reset deletes the
-   branch ref while leaving the index untouched, and the step commits
-   collapse into the single squashed root commit;
+1. resolves the commit `HEAD` names once, proves the recorded base still
+   accounts for it, and only then returns to that base, so every step commit
+   becomes staged work; an unborn base holds no commit to reset to, so its
+   return deletes the branch ref conditionally on the pinned commit while
+   leaving the index untouched, and the step commits collapse into the single
+   squashed root commit;
 2. unwinds the checkpoint commit so user uncommitted changes stay in
    the working tree;
 3. clears the transaction marker;
 4. stages exactly the turn's change set;
 5. commits them with the `commit_message` the success outcome declared and the
    co-author trailer.
-
+Nothing is rewritten before that proof settles. The commit `HEAD` names is
+resolved once, and the recorded base must still account for it: the base has to
+remain an ancestor of that commit, and every commit in the `base..HEAD` range
+must carry the co-author trailer — the same proof crash recovery settles, read
+through the same helpers. The pinned commit is re-asserted immediately before
+the soft reset, so a commit that lands while the proof runs is refused through
+the typed refusal instead of being folded into the squash, and an unborn base
+deletes the branch ref through the conditional `git update-ref -d HEAD
+<pinned>` form, which Git refuses as soon as `HEAD` names another commit. Every
+refusal precedes all mutation: no ref moves, nothing is staged, no commit is
+created, and the transaction marker the turn opened stays in place, so the
+concurrent commit, the turn's own commits, and the artifact a later recovery
+needs all survive.
 The change set is resolved before the reset, from three sources read off the real
 tree: the paths the patch wrote, the artifacts the declared post-hook produced, and
 the working-copy differential against the baseline captured when the first change set
@@ -498,6 +522,10 @@ crash recovery, which distinguishes a capture that committed from one that did n
   a process that still runs is skipped with the marker preserved, and no branch
   is reset; only a provably gone writer, or a marker that names none, authorizes
   the history-rewriting branches.
+- **It is not a marker clear by a process that does not own the transaction.** An
+  isolated commit that finds a marker attributed to a live writer refuses before
+  it stages anything, so the open transaction keeps the artifact its recovery
+  needs and its own commits stay on the branch.
 - **It is not an unbounded wait.** Every Git child of a transaction runs under
   `[git].timeout_secs` inside its own process group, and the capture and the step
   commit also observe the turn's cancellation.
@@ -519,6 +547,12 @@ crash recovery, which distinguishes a capture that committed from one that did n
 - **It is not a commit message the harness writes.** The subject of the isolated
   commit is the `commit_message` the success outcome declared, never a summary
   the harness derives from the paths it staged.
+- **It is not a finalization that trusts the moving `HEAD`.** The base return
+  resolves `HEAD` once, requires the recorded base to remain an ancestor of it,
+  requires every commit in between to carry the co-author trailer, and
+  re-asserts the pinned commit immediately before the soft reset — deleting an
+  unborn base's branch ref conditionally on it — so a commit that landed while
+  the proof ran refuses finalization instead of being folded into the squash.
 
 ---
 

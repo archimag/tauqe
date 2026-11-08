@@ -1,3 +1,5 @@
+use std::path::Path;
+
 /// Resolves a candidate file path against a list of permitted editable paths.
 /// For `create` operations, suffix matching is disabled to prevent accidental overwrites.
 /// For `replace`/`delete`, exact match is preferred; ambiguous suffix matches return an error.
@@ -53,6 +55,29 @@ pub fn resolve_target_path(candidate: &str, editable_paths: &[String]) -> String
     })
 }
 
+/// Resolves a model-named path the streaming preview is about to read from disk.
+///
+/// The streaming filters resolve a path before the authoritative staging engine
+/// validates the change set, and they read the source of the preview from the
+/// working tree. The candidate therefore passes the repository boundary the engine
+/// enforces: the decoration a model may wrap it in is stripped, `.` and `..`
+/// collapse without climbing above the repository root, an absolute path is
+/// refused, and a symbolic link that resolves outside the repository is refused. A
+/// path the check refuses never reaches the file system, so a change that names a
+/// location above the root cannot disclose a file outside the repository through a
+/// streamed preview, even though the staging engine rejects that same change
+/// afterwards.
+pub(crate) fn resolve_preview_read_path(
+    repo_root: &Path,
+    candidate: &str,
+) -> Result<String, String> {
+    let cleaned = candidate.trim().trim_matches('`').trim();
+    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    tauqe_tools::paths::normalize_repo_path(repo_root, cleaned).map_err(|reason| {
+        format!("Path '{candidate}' cannot be read for a streaming preview: {reason}")
+    })
+}
+
 /// Normalizes line breaks and whitespace around content.
 pub fn normalize_content(raw: &str) -> String {
     let s = if let Some(stripped) = raw.strip_prefix("\r\n") {
@@ -97,5 +122,20 @@ mod tests {
     fn test_normalize_content() {
         assert_eq!(normalize_content("\nhello\n   "), "hello\n");
         assert_eq!(normalize_content("\r\nhello"), "hello");
+    }
+
+    /// A previewed path keeps the segments that stay inside the repository and
+    /// is refused when it names an absolute location or climbs above the root.
+    #[test]
+    fn preview_read_path_collapses_dot_segments_and_refuses_an_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            resolve_preview_read_path(root, "./src/../lib.rs").unwrap(),
+            "lib.rs"
+        );
+        assert!(resolve_preview_read_path(root, "/etc/passwd").is_err());
+        assert!(resolve_preview_read_path(root, "../lib.rs").is_err());
     }
 }

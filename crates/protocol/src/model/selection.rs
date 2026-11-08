@@ -122,7 +122,7 @@ mod tests {
             scribe: ModelRef::openrouter("s"),
             coder: ModelRef::openrouter("c"),
             architect: ModelRef::openrouter("a"),
-            primary: ModelRef::openrouter("ad"),
+            repl: ModelRef::openrouter("ad"),
             reviewer: ModelRef::openrouter("rev"),
             efforts: None,
             entries: None,

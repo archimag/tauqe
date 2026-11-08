@@ -180,6 +180,11 @@ pub use review::{
     LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
 };
 
+pub use review::{
+    ReviewExecuteTarget, ReviewFindingTarget, ReviewFindingsTarget, ReviewGroupTarget,
+    ReviewSessionTarget,
+};
+
 #[cfg(test)]
 mod wire_contract_tracking {
     use std::collections::{BTreeMap, BTreeSet};

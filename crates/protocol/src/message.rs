@@ -65,7 +65,9 @@ fn is_token_metric_key(normalized: &str) -> bool {
 /// as `access_token`, `refresh_token`, `client_secret`, `authorization`, and
 /// `bearer` cannot slip through in plaintext. The families also cover the
 /// alternative spellings `auth`, `passwd`, `pwd`, and `passphrase`, which name
-/// a credential without containing any of those stems.
+/// a credential without containing any of those stems. An index glued
+/// directly to a family stem is recognized as well, so `apikey2` and
+/// `keys1` name credentials even though no separator precedes the index.
 ///
 /// Testing components instead of the whole collapsed key keeps ordinary words
 /// readable: `keyword` and `keyword_v2` carry no credential component and stay
@@ -87,6 +89,10 @@ fn is_sensitive_key(key: &str) -> bool {
 /// component. An empty component, produced by adjacent or leading separators,
 /// matches no family.
 ///
+/// A trailing numeric index is stripped before the families are tested, so a
+/// rotated credential such as `apikey2`, `sshkey2`, or `keys1` reaches the
+/// same family as `apikey` and `keys`.
+///
 /// Most families are matched as substrings, so an alternative spelling such as
 /// `passwd`, `pwd`, or `passphrase` is recognized wherever it appears. `auth`
 /// is the exception: a substring test would also capture `author`, `authors`,
@@ -95,23 +101,29 @@ fn is_sensitive_key(key: &str) -> bool {
 /// credentials while the `author` family stays readable.
 fn is_sensitive_component(component: &str) -> bool {
     let normalized = component.to_ascii_lowercase();
+    // A trailing numeric index carries no credential meaning of its own: a
+    // rotated or multiplexed credential is often stored under `apikey1`,
+    // `sshkey2`, or `keys2`, which name the same family as `apikey` and
+    // `keys`. Dropping the index before the family tests keeps recognition
+    // family-based instead of enumerating every possible suffix.
+    let stem = normalized.trim_end_matches(char::is_numeric);
 
-    normalized.ends_with("key")
-        || normalized.ends_with("keys")
-        || normalized.contains("token")
-        || normalized.contains("secret")
-        || normalized.contains("password")
-        || normalized.contains("passwd")
-        || normalized.contains("passphrase")
-        || normalized.contains("pwd")
-        || normalized.contains("credential")
-        || normalized.contains("authorization")
-        || normalized.contains("bearer")
+    stem.ends_with("key")
+        || stem.ends_with("keys")
+        || stem.contains("token")
+        || stem.contains("secret")
+        || stem.contains("password")
+        || stem.contains("passwd")
+        || stem.contains("passphrase")
+        || stem.contains("pwd")
+        || stem.contains("credential")
+        || stem.contains("authorization")
+        || stem.contains("bearer")
         // A component that ends with the `auth` stem (`auth`, `proxy_auth`,
         // `oauth`) or begins with it (`auth`, `authn`, `authentication`) names
         // authentication, unless it belongs to the ordinary `author` family.
-        || normalized.ends_with("auth")
-        || (normalized.starts_with("auth") && !normalized.starts_with("author"))
+        || stem.ends_with("auth")
+        || (stem.starts_with("auth") && !stem.starts_with("author"))
 }
 
 /// Normalizes a JSON object key into its comparison form.
@@ -724,6 +736,11 @@ mod tests {
             "db_pwd",
             "passphrase",
             "passphrase_v2",
+            "apikey1",
+            "apikey2",
+            "sshkey2",
+            "key1",
+            "keys2",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
@@ -739,6 +756,8 @@ mod tests {
             "author",
             "authors",
             "authority",
+            "keyword1",
+            "author1",
         ] {
             assert!(
                 !is_sensitive_key(key),
@@ -1009,5 +1028,33 @@ mod tests {
         // The `author` family names a person or a document rather than a
         // credential, so its value stays readable.
         assert!(rendered.contains("Ada Lovelace"));
+    }
+    #[test]
+    fn test_debug_redacts_indexed_credential_keys() {
+        let req = Request {
+            id: RequestId::Number(11),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "apikey1": "sk-indexed-original",
+                "apikey2": "sk-indexed-rotated",
+                "sshkey2": "sk-indexed-ssh",
+                "key1": "sk-indexed-key",
+                "keys2": "sk-indexed-keys",
+                "keyword1": "visible_keyword"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        for secret in [
+            "sk-indexed-original",
+            "sk-indexed-rotated",
+            "sk-indexed-ssh",
+            "sk-indexed-key",
+            "sk-indexed-keys",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked into Debug");
+        }
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("visible_keyword"));
     }
 }

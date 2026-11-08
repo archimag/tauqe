@@ -240,6 +240,53 @@ pub fn verify_path_within_repo_for_write(repo_root: &Path, relative_path: &str) 
     }
 }
 
+/// Reports the ancestor of `relative_path` that blocks its creation.
+///
+/// [`verify_path_within_repo_for_write`] answers whether the destination is
+/// reachable, not whether its missing suffix can be created: the walk stops at
+/// the first component it cannot inspect and treats the remainder as absent,
+/// which holds for a directory that does not exist yet but not for one that
+/// already exists as a regular file. A destination such as `src/new/a.rs`
+/// beneath a regular file `src/new` therefore passes the boundary check and
+/// fails only when the disk commit creates its staging sibling, with `ENOTDIR`
+/// and an opaque filesystem error instead of a typed, per-member refusal.
+///
+/// Only the strict ancestors of the destination are asked, because the
+/// destination itself is the file an overwrite or a replacement addresses
+/// legitimately. A symbolic link is followed, since a link to a directory is a
+/// usable parent and the boundary check has already proved that it resolves
+/// inside the repository. A component that cannot be inspected proves nothing
+/// and ends the walk, exactly as the boundary check degrades.
+///
+/// The answer is the repository-relative spelling of the blocking component.
+pub fn blocking_ancestor(repo_root: &Path, relative_path: &str) -> Option<String> {
+    let components: Vec<_> = Path::new(relative_path).components().collect();
+    let (_, ancestors) = components.split_last()?;
+    let mut current = PathBuf::from(repo_root);
+    let mut names: Vec<String> = Vec::with_capacity(ancestors.len());
+    for component in ancestors {
+        // Normalized repository paths carry normal components only, so any
+        // other kind means an unnormalized path slipped through and the walk
+        // has no answer to give.
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        names.push(name.to_string_lossy().into_owned());
+        current.push(name);
+        match std::fs::metadata(&current) {
+            // A directory, or a symbolic link to one, is a usable parent.
+            Ok(metadata) if metadata.is_dir() => {}
+            // The component exists and is a file, so nothing beneath it can
+            // ever be created.
+            Ok(_) => return Some(names.join("/")),
+            // A missing component leaves the rest of the chain equally absent,
+            // and one that cannot be inspected proves nothing.
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Walks every component of `relative_path` and rejects a symlink that resolves
 /// outside `canonical_root`.
 fn verify_path_components(
@@ -315,7 +362,7 @@ fn verify_path_components(
 
 #[cfg(test)]
 mod tests {
-    use super::is_excluded_path;
+    use super::{blocking_ancestor, is_excluded_path};
 
     #[test]
     fn rejects_service_directories_at_any_depth() {
@@ -325,5 +372,38 @@ mod tests {
         assert!(is_excluded_path("node_modules/pkg/index.js"));
         assert!(!is_excluded_path("crates/core/src/lib.rs"));
         assert!(!is_excluded_path("docs/target-design.md"));
+    }
+    #[test]
+    fn only_a_strict_ancestor_that_is_not_a_directory_blocks_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("file"), b"content").unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("dir", root.join("link")).unwrap();
+
+        // The destination itself is the file a write addresses legitimately, so
+        // it never blocks its own creation.
+        assert_eq!(blocking_ancestor(root, "file"), None);
+        // A directory, an absent chain, and a link to a directory are usable
+        // parents.
+        assert_eq!(blocking_ancestor(root, "dir/child.rs"), None);
+        assert_eq!(
+            blocking_ancestor(root, "dir/missing/child.rs"),
+            None,
+            "a chain that stops at a missing component proves nothing"
+        );
+        #[cfg(unix)]
+        assert_eq!(blocking_ancestor(root, "link/child.rs"), None);
+        // A component that exists as a file blocks everything beneath it.
+        assert_eq!(
+            blocking_ancestor(root, "file/child.rs").as_deref(),
+            Some("file")
+        );
+        assert_eq!(
+            blocking_ancestor(root, "dir/file/child.rs"),
+            None,
+            "the walk stops at the first component that does not exist"
+        );
     }
 }
