@@ -233,6 +233,29 @@ impl fmt::Display for LlmCapability {
     }
 }
 
+/// A mutually exclusive operational branch of capabilities.
+///
+/// In a single round, an agent or model can operate within exactly one branch
+/// (for example, either performing discovery or applying modifications),
+/// enforcing mutual exclusion at the protocol and schema level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityBranch {
+    /// Machine-readable identifier of the branch (e.g. "research", "execution").
+    pub kind: String,
+    /// Capabilities contained in this branch.
+    pub capabilities: CapabilitySet,
+}
+
+impl CapabilityBranch {
+    /// Creates a new capability branch.
+    pub fn new(kind: impl Into<String>, capabilities: CapabilitySet) -> Self {
+        Self {
+            kind: kind.into(),
+            capabilities,
+        }
+    }
+}
+
 /// Declarative placement of one turn regime's capabilities across the prompt.
 ///
 /// A regime profile is a pair of typed capability lists. The `core` list is
@@ -262,7 +285,7 @@ impl CapabilityProfile {
         &self.core
     }
 
-    /// Capabilities rendered into the contour delta of the trailing message.
+    /// Capabilities rendered into the contour delta of the trailing user message.
     pub fn delta(&self) -> &CapabilitySet {
         &self.delta
     }
@@ -280,6 +303,12 @@ impl CapabilityProfile {
             }
         }
         surface
+    }
+
+    /// Decomposes this profile's active surface into invariant ambient capabilities
+    /// and mutually exclusive operational branches.
+    pub fn branches(&self) -> (CapabilitySet, Vec<CapabilityBranch>) {
+        self.surface().branches()
     }
 
     /// Free interactive REPL dialogue: the whole dialogue surface in the head.
@@ -332,6 +361,7 @@ impl CapabilityProfile {
             CapabilitySet::new(),
         )
     }
+
     /// Architect research: plan mutation moves to the delta, the discovery
     /// surface stays.
     ///
@@ -455,6 +485,57 @@ impl CapabilitySet {
                 .filter(|capability| capability.phase() == phase)
                 .collect(),
         }
+    }
+
+    /// Decomposes the surface into invariant ambient capabilities and mutually
+    /// exclusive operational branches.
+    ///
+    /// The textual answer, the scratchpad, and the detected language accompany
+    /// every round, so they form no branch of their own; the discovery commands
+    /// form the research branch, and every command the harness acts upon forms
+    /// the execution branch. The decomposition is a pure projection of the
+    /// declared surface, so the prompt, the response schema, and the decoder read
+    /// one declaration instead of restating the grouping.
+    pub fn branches(&self) -> (CapabilitySet, Vec<CapabilityBranch>) {
+        let mut ambient = CapabilitySet::new();
+        let mut research = CapabilitySet::new();
+        let mut execution = CapabilitySet::new();
+
+        for capability in self.iter() {
+            match capability {
+                LlmCapability::TextMessage
+                | LlmCapability::Scratchpad
+                | LlmCapability::UserLanguage => {
+                    ambient.insert(*capability);
+                }
+                LlmCapability::Research
+                | LlmCapability::DocRequest
+                | LlmCapability::OuterDocRequest => {
+                    research.insert(*capability);
+                }
+                LlmCapability::FileEdits
+                | LlmCapability::ToolchainVerify
+                | LlmCapability::PlanCreation
+                | LlmCapability::PlanUpdate
+                | LlmCapability::ReviewUpdate
+                | LlmCapability::Outcome
+                | LlmCapability::Blocked
+                | LlmCapability::Abort
+                | LlmCapability::CustomTools => {
+                    execution.insert(*capability);
+                }
+            }
+        }
+
+        let mut branches = Vec::new();
+        if !research.is_empty() {
+            branches.push(CapabilityBranch::new("research", research));
+        }
+        if !execution.is_empty() {
+            branches.push(CapabilityBranch::new("execution", execution));
+        }
+
+        (ambient, branches)
     }
 
     /// Free interactive REPL dialogue capability set.
@@ -972,5 +1053,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_capability_profile_branches() {
+        let repl = CapabilityProfile::interactive_repl();
+        let (ambient, branches) = repl.branches();
+        assert!(ambient.contains(LlmCapability::TextMessage));
+        assert!(ambient.contains(LlmCapability::Scratchpad));
+        assert!(ambient.contains(LlmCapability::UserLanguage));
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].kind, "research");
+        assert!(branches[0].capabilities.contains(LlmCapability::Research));
+        assert_eq!(branches[1].kind, "execution");
+        assert!(branches[1].capabilities.contains(LlmCapability::FileEdits));
+    }
+
+    #[test]
+    fn test_capability_set_branches_follow_the_declared_surface() {
+        // A surface that carries no discovery command has nothing to exclude,
+        // so it declares only the branch it can actually emit.
+        let set =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
+        let (ambient, branches) = set.branches();
+        assert!(ambient.contains(LlmCapability::TextMessage));
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].kind, "execution");
+        assert!(branches[0].capabilities.contains(LlmCapability::FileEdits));
     }
 }

@@ -11,7 +11,7 @@
 //! and the `plan_refinement` schema; only the user prompt differs, because it
 //! carries the audit ([`build_plan_reconciliation_prompt`]).
 
-use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
+use crate::edits::stream::json::decode::first_json_object_str;
 use crate::escape::{escape_xml_text, single_line};
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus};
@@ -113,8 +113,7 @@ impl PlanCritiqueOutput {
 /// first, and a payload surrounded by wrapper prose yields its outermost
 /// balanced JSON object.
 pub fn parse_plan_critique_output(raw_json: &str) -> anyhow::Result<PlanCritiqueOutput> {
-    let unfenced = strip_code_fence(raw_json);
-    let error = match serde_json::from_str::<PlanCritiqueOutput>(unfenced) {
+    let error = match serde_json::from_str::<PlanCritiqueOutput>(raw_json.trim()) {
         Ok(output) => return Ok(output),
         Err(error) => error,
     };

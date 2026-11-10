@@ -859,6 +859,46 @@ mod tests {
     use crate::history::HistoryEntry;
     use crate::prompt::xml::XmlPromptProtocol;
 
+    /// Lifts the operational branch envelope of a composed schema into one surface.
+    ///
+    /// The wire keeps the operational branches mutually exclusive, so a field of
+    /// a branch is addressed through the envelope that owns it. A test that reads
+    /// the property of a capability reads the schema after this lift, so it names
+    /// the field rather than the branch that carries it.
+    fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+        let mut objects = vec![schema];
+        if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+            objects.extend(branches.iter());
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for object in objects {
+            let Some(fields) = object["properties"].as_object() else {
+                continue;
+            };
+            for (name, field) in fields {
+                if name.as_str() == "action" || name.as_str() == "kind" {
+                    continue;
+                }
+                if properties.contains_key(name) {
+                    continue;
+                }
+                properties.insert(name.clone(), field.clone());
+                required.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        let mut flat = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if let Some(definitions) = schema.get("$defs") {
+            flat["$defs"] = definitions.clone();
+        }
+        flat
+    }
+
     #[test]
     fn test_build_squash_commit_prompt() {
         let commits = vec![
@@ -1596,8 +1636,9 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let render =
             PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::SearchReplace);
-        let interactive =
-            registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render);
+        let interactive = flattened_surface(
+            &registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render),
+        );
         assert!(interactive["properties"]
             .get("tauqe_doc_requests")
             .is_some());
@@ -1608,7 +1649,9 @@ mod tests {
         // The composed schema is a projection of the capability set, so a turn
         // that cannot consult the documentation never advertises a field its
         // decoder would reject.
-        let step = registry.compose_structured_schema(&CapabilitySet::isolated_step(), &render);
+        let step = flattened_surface(
+            &registry.compose_structured_schema(&CapabilitySet::isolated_step(), &render),
+        );
         assert!(step["properties"].get("tauqe_doc_requests").is_none());
         assert!(step["properties"].get("doc_requests").is_none());
         assert!(step["properties"].get("changes").is_some());

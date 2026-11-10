@@ -461,6 +461,12 @@ impl PlanStorage {
 
         let mut normalized = plan.clone();
         normalized.implementation.normalize_leaf_files();
+        // Provenance is harness-authored: a commit belongs to a finished step and a
+        // blocker report to a stalled one. Dropping an unearned claim here, where
+        // every mutation source converges, is what keeps the documented invariant
+        // true on disk, and it keeps the probe that runs this same preparation
+        // predicting the application's verdict exactly.
+        normalized.implementation.normalize_lifecycle_provenance();
         normalized.implementation.refresh_parent_statuses();
 
         let (target_file, existing) = if let Some(snapshot) = snapshot {

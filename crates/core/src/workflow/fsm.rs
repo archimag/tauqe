@@ -9,7 +9,7 @@
 //! persistence is delegated to an [`ApplyPolicy`], so the FSM never touches Git
 //! directly and stays independent of any single wire format.
 
-mod cache;
+pub mod cache;
 pub(crate) mod guard;
 mod healing;
 mod kernel;
@@ -617,6 +617,35 @@ fn has_investigation_commands(step: &ProposalStep) -> bool {
     step.has_research_commands() || !step.custom_tools().is_empty()
 }
 
+/// Reports a round that crossed the operational branch exclusion.
+///
+/// Discovery widens what the model can see before it proposes a change set, so
+/// a round that proposes edits and asks for repository material at once has
+/// mixed the two operational branches. Answering the request and re-entering
+/// the proposal round discards the change set the model had already produced,
+/// which is how a turn that visibly edited files ends as an answer without
+/// edits. The proposed edits are therefore kept and the requests are dropped,
+/// and both the turn stream and the recorded answer name the half that
+/// survived.
+async fn announce_mixed_round(ctx: &mut TurnKernel<'_>, step: &ProposalStep) {
+    let notice = format!(
+        "\n\n---\n\u{26a0}\u{fe0f} **[Operational Branch Mixed]** This round proposed {} file edit(s) and also requested repository material. The two branches are mutually exclusive, so the request(s) were not answered and the proposed edits continue to staging.\n\n",
+        step.edits().len()
+    );
+    tracing::warn!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        isolated_step = ctx.intent.is_isolated_step(),
+        edits = step.edits().len(),
+        "proposal round mixed file edits with a discovery request"
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TextDelta(notice.clone()))
+        .await;
+    ctx.accumulated_text.push_str(&notice);
+}
+
 /// Runs the FSM turn cycle without session bookkeeping.
 ///
 /// Performs discovery, staging, verification, and healing against the shared
@@ -732,7 +761,19 @@ pub(super) async fn run_fsm_turn_body(
 
     let mut pending = step;
     let step = loop {
-        let step = match ctx.run_research_phase(pending).await? {
+        // Discovery widens what the model can see before it proposes a change
+        // set, so the two operational branches are mutually exclusive. A round
+        // that already carries edits keeps them: answering its discovery
+        // request and re-entering the proposal round would discard the change
+        // set the model had already produced, which is how a turn that visibly
+        // edited files ends as an answer without edits.
+        let research = if pending.edits().is_empty() || !pending.has_research_commands() {
+            ctx.run_research_phase(pending).await?
+        } else {
+            announce_mixed_round(&mut ctx, &pending).await;
+            ResearchPhase::Continue(Box::new(pending))
+        };
+        let step = match research {
             ResearchPhase::Terminate(outcome) => return Ok(*outcome),
             ResearchPhase::BudgetExceeded(limit) => {
                 let warn = format!(
@@ -777,6 +818,14 @@ pub(super) async fn run_fsm_turn_body(
         if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
             return Ok(outcome);
         }
+        // A round that stated a change set and a terminal failure at once has
+        // answered nothing the harness can settle, so the contradiction is
+        // resolved before the failure ends the turn and discards the work
+        // beside it.
+        let step = match heal_branch_conflict(&mut ctx, step).await? {
+            BranchCoherence::Accepted(step) => *step,
+            BranchCoherence::Terminate(outcome) => return Ok(*outcome),
+        };
         if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
             return Ok(outcome);
         }
@@ -905,6 +954,179 @@ pub(super) async fn run_fsm_turn_body(
     }
 }
 
+/// Number of corrective rounds granted to a round that stated a change set and
+/// a terminal failure at once.
+///
+/// One round is enough: the directive names both statements the contradicted
+/// round made, so a second attempt either states a single one or shows that the
+/// round cannot resolve the contradiction, and repeating it would spend
+/// provider rounds without teaching the model anything.
+const MAX_BRANCH_CONFLICT_RETRIES: usize = 1;
+
+/// Directive appended to the journal when a round contradicted itself.
+///
+/// The wording names the two statements and never their content, so it
+/// generalizes across tasks, languages, and both wire contours.
+const BRANCH_CONFLICT_DIRECTIVE: &str = "<branch_conflict_directive>\nYour previous response stated a change set and a terminal error outcome together, and the harness cannot settle both: a change set is work the turn applies, while a terminal error ends the turn without applying anything.\n\nState one of them again, alone:\n- the complete change set, with an outcome that declares no failure, when the edits are correct;\n- the error outcome with an empty change set, when no file must change.\n\nThis round answers for that single statement.\n</branch_conflict_directive>";
+
+/// Reports whether a round stated a change set and a terminal failure at once.
+///
+/// A change set is work the harness stages and verifies, while a terminal error
+/// ends the turn without applying anything. Both wire contours can express the
+/// two statements in one response, so the contradiction is read from the
+/// decoded proposal rather than from the encoding that carried it.
+fn states_a_change_set_and_a_failure(step: &ProposalStep) -> bool {
+    !step.edits().is_empty() && extract_error_message(step.terminal_outcome.as_ref()).is_some()
+}
+
+/// Outcome of the branch-coherence phase of a proposal round.
+enum BranchCoherence {
+    /// The round states one operational branch.
+    Accepted(Box<ProposalStep>),
+    /// The turn must terminate immediately with the carried outcome.
+    Terminate(Box<FsmTurnOutcome>),
+}
+
+/// Resolves a round that stated a change set and a terminal failure at once.
+///
+/// The round has answered nothing the harness can settle: staging a change set
+/// the model declared failed would apply work it withdrew, while honouring the
+/// failure would discard a change set the turn already paid for. The round
+/// therefore buys one corrective exchange that names both statements it made
+/// and asks for one of them alone, exactly as a refused plan payload does.
+///
+/// The terminal signals of the contradicted round leave the turn state before
+/// the corrective round runs, because a round asked to state its own outcome
+/// must not inherit the failure it was asked to resolve.
+async fn heal_branch_conflict(
+    ctx: &mut TurnKernel<'_>,
+    step: ProposalStep,
+) -> anyhow::Result<BranchCoherence> {
+    if !states_a_change_set_and_a_failure(&step) {
+        return Ok(BranchCoherence::Accepted(Box::new(step)));
+    }
+
+    let edits = step.edits().len();
+    tracing::warn!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        isolated_step = ctx.intent.is_isolated_step(),
+        edits = edits,
+        "proposal round stated a change set and a terminal failure together"
+    );
+    let banner = format!(
+        "\n\n---\n\u{26a0}\u{fe0f} **[Branch Conflict {} / {}]** This round stated {} file edit(s) and declared the turn failed. The two statements contradict each other, so one corrective round asks for a single one.\n\n",
+        MAX_BRANCH_CONFLICT_RETRIES,
+        MAX_BRANCH_CONFLICT_RETRIES,
+        edits
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TextDelta(banner.clone()))
+        .await;
+    ctx.accumulated_text = merge_text(std::mem::take(&mut ctx.accumulated_text), &banner, "");
+
+    log_fsm_phase(
+        ctx.workflow_name,
+        ctx.model,
+        ctx.intent.is_isolated_step(),
+        tauqe_protocol::TurnPhase::Proposal,
+        Some(MAX_BRANCH_CONFLICT_RETRIES),
+        Some(MAX_BRANCH_CONFLICT_RETRIES),
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TurnPhase {
+            phase: tauqe_protocol::TurnPhase::Proposal,
+            round: Some(MAX_BRANCH_CONFLICT_RETRIES),
+            max_rounds: Some(MAX_BRANCH_CONFLICT_RETRIES),
+            detail: Some("Branch conflict".to_string()),
+        })
+        .await;
+
+    // A corrective round states its own outcome, so the failure the contradicted
+    // round declared leaves the turn state with the payload it belonged to.
+    ctx.state.terminal_outcome = None;
+
+    // The correction keeps the knowledge the turn already paid for: the task
+    // first, the accumulated journal next, the directive last.
+    let prompt = ctx
+        .journal
+        .compose_user_prompt(ctx.prompt, Some(BRANCH_CONFLICT_DIRECTIVE));
+    let next = ctx.propose(&prompt, None).await?;
+
+    if next.is_cancelled {
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        return Ok(BranchCoherence::Terminate(Box::new(
+            FsmTurnOutcome::cancelled(std::mem::take(&mut ctx.accumulated_text)),
+        )));
+    }
+
+    ctx.state.absorb(&next);
+    ctx.accumulated_text = merge_text(std::mem::take(&mut ctx.accumulated_text), "", next.text());
+
+    if let Some(outcome) = finish_on_abort_outcome(ctx).await {
+        return Ok(BranchCoherence::Terminate(Box::new(outcome)));
+    }
+
+    if let Some(reason) = ctx.state.blocked.clone() {
+        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+        let outcome = finalize_blocked_turn(
+            ctx.policy,
+            ctx.context_manager,
+            ctx.stream_tx,
+            ctx.repo_root,
+            reason,
+            accumulated,
+            &ctx.state.plans,
+            ctx.plan_mode,
+        )
+        .await;
+        return Ok(BranchCoherence::Terminate(Box::new(outcome)));
+    }
+
+    if states_a_change_set_and_a_failure(&next) {
+        // The budget bought one round and it stated the contradiction again, so
+        // the turn keeps the failure the model declared. The change set it wrote
+        // travels with the result instead of disappearing behind that failure.
+        let unsaved = next.edits().to_vec();
+        tracing::warn!(
+            workflow = ctx.workflow_name,
+            model = %ctx.model,
+            isolated_step = ctx.intent.is_isolated_step(),
+            edits = unsaved.len(),
+            "the corrective round repeated the branch conflict; the turn keeps its declared failure"
+        );
+        if let Some(mut outcome) = finish_on_error_outcome(ctx).await {
+            carry_unsaved_edits(&mut outcome, unsaved);
+            return Ok(BranchCoherence::Terminate(Box::new(outcome)));
+        }
+    }
+
+    Ok(BranchCoherence::Accepted(Box::new(next)))
+}
+
+/// Records the change set of a contradicted round on its terminal result.
+///
+/// The round declared a terminal failure, so nothing is staged and nothing
+/// reaches disk. The edits it wrote are still recorded, because a change set the
+/// model already produced is work the turn paid for, and a result that reports
+/// only the failure hides that work from the developer and from the journal.
+fn carry_unsaved_edits(outcome: &mut FsmTurnOutcome, unsaved: Vec<EditOperation>) {
+    let count = unsaved.len();
+    if count == 0 {
+        return;
+    }
+    if let ModelResult::Edit { edits, summary, .. } = &mut outcome.result {
+        *edits = unsaved;
+        *summary = format!("Terminal error with {} unsaved file edit(s)", count);
+    }
+    outcome.assistant_text.push_str(&format!(
+        "\n\n---\n\u{26a0}\u{fe0f} The turn declared a terminal failure, so the {} file edit(s) it also stated were not applied.\n\n",
+        count
+    ));
+}
+
 /// Finalizes the turn when the model emitted a terminal `<error>` outcome.
 ///
 /// Rolled back and recorded identically to a semantic block: the working tree
@@ -934,7 +1156,7 @@ async fn finish_on_error_outcome(ctx: &mut TurnKernel<'_>) -> Option<FsmTurnOutc
         .await;
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
-        summary: "Execution blocked".to_string(),
+        summary: "Execution ended with a terminal error".to_string(),
         edits: Vec::new(),
         proposal: None,
         outcome: EditOutcome {
@@ -2899,6 +3121,145 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the payload of a mixed round is settled after verification"
+        );
+    }
+    /// A round that states a change set and a terminal failure at once has
+    /// answered nothing the harness can settle, so one corrective round asks it
+    /// to state a single branch, and the corrected round applies its change set.
+    #[tokio::test]
+    async fn a_change_set_beside_a_terminal_failure_buys_one_corrective_round() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let edit = edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
+        let contradicted = format!("{}<error message=\"The change set is incomplete\" />", edit);
+        let corrected = edit.clone();
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(contradicted),
+            MockResponse::text(corrected),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "the corrected round must apply its change set: {:?}",
+            outcome.result
+        );
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+
+        // The corrective request carries the directive it answers.
+        let corrective_prompt = provider.requests()[1]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            corrective_prompt.contains("<branch_conflict_directive>"),
+            "the corrective round must carry the directive"
+        );
+    }
+
+    /// A corrective round that states the same contradiction again ends the turn
+    /// with the failure the model declared, and the change set it wrote travels
+    /// with the result instead of disappearing behind that failure.
+    #[tokio::test]
+    async fn a_repeated_branch_conflict_keeps_its_change_set_and_its_failure() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let contradicted = format!(
+            "{}<error message=\"The change set is incomplete\" />",
+            edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )
+        );
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(contradicted.clone()),
+            MockResponse::text(contradicted),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, edits, .. } => {
+                assert!(!outcome.applied);
+                assert_eq!(
+                    edits.len(),
+                    1,
+                    "the change set the round wrote must survive its failure"
+                );
+                assert_eq!(
+                    outcome.error.as_deref(),
+                    Some("The change set is incomplete")
+                );
+            }
+            other => panic!("expected an unapplied change set, got {other:?}"),
+        }
+        assert_eq!(
+            provider.requests().len(),
+            1 + MAX_BRANCH_CONFLICT_RETRIES,
+            "the corrective budget must be spent before the failure concludes the turn"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            TARGET,
+            "a change set the model declared failed must never reach the working tree"
         );
     }
 }

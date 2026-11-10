@@ -643,6 +643,15 @@ enum LexPhase {
 /// of the element under construction, and reports each element as soon as its
 /// closing brace arrives. The per-chunk cost therefore follows the appended
 /// bytes instead of the accumulated payload length.
+/// One container the header scan has entered.
+#[derive(Debug, Clone, Copy)]
+enum HeaderContainer {
+    /// A JSON object; `expect_key` marks the next string as a key.
+    Object { expect_key: bool },
+    /// A JSON array.
+    Array,
+}
+
 #[derive(Debug, Default)]
 struct ChangesLex {
     /// What the lexer is currently looking for.
@@ -653,8 +662,8 @@ struct ChangesLex {
     started: bool,
     /// Nesting depth relative to the container the phase tracks.
     depth: usize,
-    /// Header: whether the next depth-1 string is an object key.
-    expect_key: bool,
+    /// Containers open in the header scan, innermost last.
+    containers: Vec<HeaderContainer>,
     /// Absolute offset of the opening quote of the string being scanned.
     string_start: usize,
     /// Absolute offset from which an in-progress string body is resumed.
@@ -718,29 +727,36 @@ impl ChangesLex {
         self.phase == LexPhase::Done
     }
 
-    /// Classifies one byte of the top-level object header.
+    /// Classifies one byte of the payload header.
+    ///
+    /// The scan tracks the containers it enters instead of a bare depth, so the
+    /// `changes` key is recognized wherever the surface declares it: at the top
+    /// level of a flat response, or inside the operational branch envelope of an
+    /// exclusive surface.
     fn step_header(&mut self, bytes: &[u8]) {
         let Some(&byte) = bytes.get(self.pos) else {
             return;
         };
         match byte {
-            b'{' | b'[' => {
-                self.depth += 1;
-                if self.depth == 1 {
-                    self.expect_key = true;
-                }
+            b'{' => {
+                self.containers
+                    .push(HeaderContainer::Object { expect_key: true });
+                self.pos += 1;
+            }
+            b'[' => {
+                self.containers.push(HeaderContainer::Array);
                 self.pos += 1;
             }
             b'}' | b']' => {
-                self.depth = self.depth.saturating_sub(1);
+                self.containers.pop();
                 self.pos += 1;
-                if self.depth == 0 {
+                if self.containers.is_empty() {
                     self.phase = LexPhase::Done;
                 }
             }
             b',' => {
-                if self.depth == 1 {
-                    self.expect_key = true;
+                if let Some(HeaderContainer::Object { expect_key }) = self.containers.last_mut() {
+                    *expect_key = true;
                 }
                 self.pos += 1;
             }
@@ -821,10 +837,16 @@ impl ChangesLex {
 
     /// Records a completed header string as the key or the value it was.
     fn after_string(&mut self, buffer: &str) {
-        if self.phase != LexPhase::Header || self.depth != 1 || !self.expect_key {
+        if self.phase != LexPhase::Header {
             return;
         }
-        self.expect_key = false;
+        let Some(HeaderContainer::Object { expect_key }) = self.containers.last_mut() else {
+            return;
+        };
+        if !*expect_key {
+            return;
+        }
+        *expect_key = false;
         let content = buffer
             .get(self.string_start + 1..self.pos.saturating_sub(1))
             .unwrap_or_default();

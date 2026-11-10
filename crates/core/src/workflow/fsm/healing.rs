@@ -28,7 +28,7 @@ use crate::workflow::verification::{
     run_workflow_verification_with_config, VerificationOutcome,
 };
 
-use super::guard::{finish_turn, TransactionRollbackGuard};
+use super::guard::{finish_turn, ApplyTemporaryError, TransactionRollbackGuard};
 use super::kernel::{propose_round, TurnKernel};
 use super::plans::{settle_plans, TurnQualification};
 use super::proposal::{extract_commit_message, log_fsm_phase, merge_text};
@@ -96,12 +96,17 @@ pub(super) async fn run_apply_and_verify_phase(
         return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
     }
 
-    let mut total_changed_files = match guard.apply_temporary(&proposal).await {
+    let (mut total_changed_files, post_hook_failure) = match guard.apply_temporary(&proposal).await
+    {
         Ok(files) => {
             guard.arm();
-            files
+            (files, None)
         }
-        Err(error) => {
+        Err(ApplyTemporaryError::PostHook(err, files)) => {
+            guard.arm();
+            (files, Some(err))
+        }
+        Err(ApplyTemporaryError::Policy(error)) => {
             guard.rollback().await;
             let ctx_state = guard.context_manager.get_state();
             let _ = ctx
@@ -185,16 +190,23 @@ pub(super) async fn run_apply_and_verify_phase(
         // checks from it, so it is assembled before the first round runs.
         let mut verify_files = total_changed_files.clone();
         merge_changed_files(&mut verify_files, guard.worktree_changes());
-        let mut verify_outcome = run_workflow_verification_with_config(
-            ctx.repo_root,
-            &project,
-            &verify_files,
-            &verify_request,
-            ctx.stream_tx,
-            false,
-            Some(ctx.cancel_rx),
-        )
-        .await;
+        let mut verify_outcome = if let Some(hook_error) = post_hook_failure {
+            VerificationOutcome {
+                status: VerificationStatus::Failed,
+                report: format!("Project post-hook failed:\n{hook_error}"),
+            }
+        } else {
+            run_workflow_verification_with_config(
+                ctx.repo_root,
+                &project,
+                &verify_files,
+                &verify_request,
+                ctx.stream_tx,
+                false,
+                Some(ctx.cancel_rx),
+            )
+            .await
+        };
         if verify_outcome.is_cancelled() {
             let accumulated = std::mem::take(&mut ctx.accumulated_text);
             return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
@@ -502,7 +514,14 @@ pub(super) async fn run_apply_and_verify_phase(
                         .await;
                     }
                 }
-                Err(error) => {
+                Err(ApplyTemporaryError::PostHook(hook_error, _)) => {
+                    merge_changed_files(&mut total_changed_files, guard.worktree_changes());
+                    verify_outcome = VerificationOutcome {
+                        status: VerificationStatus::Failed,
+                        report: format!("Project post-hook failed:\n{hook_error}"),
+                    };
+                }
+                Err(ApplyTemporaryError::Policy(error)) => {
                     // A refused repair may still have published some of its
                     // files. The guard observes the tree once here and reports
                     // every path that changed since the transaction baseline, so
@@ -1048,6 +1067,85 @@ mod tests {
                 .trim()
                 .is_empty(),
             "the turn must not leave unaccounted files behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_hook_failure_triggers_verification_healing() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", "pub fn value() -> i32 { 0 }\n"),
+            (
+                "tauqe.toml",
+                concat!(
+                    "[models]\n",
+                    "repl = [\"openrouter:mock/model\"]\n",
+                    "\n",
+                    "[project.verify]\n",
+                    "command = \"true\"\n",
+                    "\n",
+                    "[project.post_hook]\n",
+                    "command = \"sh\"\n",
+                    "args = ['-c', 'grep -q \"pub fn value() -> i32 { 42 }\" a.rs']\n",
+                ),
+            ),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let first = concat!(
+            "<tauqe_edits summary=\"Attempt 1\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\npub fn value() -> i32 { 0 }\n</search>\n",
+            "<replace>\npub fn value() -> i32 { 1 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>\n",
+        );
+        let second = concat!(
+            "<tauqe_edits summary=\"Attempt 2\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\npub fn value() -> i32 { 1 }\n</search>\n",
+            "<replace>\npub fn value() -> i32 { 42 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>\n",
+        );
+        let provider =
+            MockLlmProvider::scripted([MockResponse::text(first), MockResponse::text(second)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let turn = run_fsm_turn(
+            "Update value",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .expect("bounded turn executes");
+
+        match &turn.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(outcome.applied, "the healed change set must be committed");
+                assert!(outcome.error.is_none());
+            }
+            other => panic!("expected applied edits, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn value() -> i32 { 42 }\n"
         );
     }
 

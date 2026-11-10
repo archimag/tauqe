@@ -1,4 +1,4 @@
-use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
+use crate::edits::stream::json::decode::first_json_object_str;
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus, RepoSearchRequest};
@@ -76,8 +76,7 @@ where
 /// prose the outermost balanced JSON object is extracted instead of failing on
 /// trailing or leading characters.
 pub fn parse_plan_refinement_output(raw_json: &str) -> anyhow::Result<PlanRefinementOutput> {
-    let unfenced = strip_code_fence(raw_json);
-    let error = match serde_json::from_str::<PlanRefinementOutput>(unfenced) {
+    let error = match serde_json::from_str::<PlanRefinementOutput>(raw_json.trim()) {
         Ok(output) => return Ok(output),
         Err(error) => error,
     };
@@ -179,7 +178,7 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
                 { "type": "string" },
                 { "type": "null" }
             ],
-            "description": "Identifier of the Git commit that already completed this step, or null for a step that has not run yet. The harness records a commit for a finished step and reproduces it verbatim, so a horizon never invents one."
+            "description": "Identifier of the Git commit that already completed this step, or null for a step that has not run yet. The harness records a commit for a finished step and reproduces it verbatim, so a horizon never invents one; a returned step is a proposal, so it states null and any other value is dropped before the horizon is persisted."
         }),
     );
 
@@ -339,6 +338,7 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str("2. Horizon Synthesis Contract:\n");
     out.push_str("   - Return ONLY the new, unfinished steps of the horizon; every returned step carries `status: \"todo\"`.\n");
     out.push_str("   - Do NOT restate, re-emit, or reorder the completed (DONE) steps shown to you: the harness preserves them verbatim and concatenates them ahead of your output. Emitting a DONE step is a hard contract violation.\n");
+    out.push_str("   - A returned step is a proposal, not a report of work: it carries `commit: null`, because the harness records the commit of a step only after its own turn verified and committed the change set.\n");
     out.push_str("   - Reproject the WHOLE remaining horizon on every call: the horizon is a fresh, coherent plan for the remaining work, not a patch layered on an earlier draft.\n\n");
     out.push_str("3. Strict Blocker Protocol (Refusal to Plan):\n");
     out.push_str("   - If you discover an insurmountable contradiction, technical blocker, missing prerequisite, or flawed assumption in the codebase or requirements:\n");
@@ -527,7 +527,7 @@ pub fn build_plan_horizon_user_prompt(
 
     out.push_str("## Architect Instructions:\n");
     out.push_str("1. Conduct deep technical dependency analysis using the repository outline and the loaded context files.\n");
-    out.push_str("2. Synthesize the COMPLETE unfinished horizon as dependency-ordered leaf steps with `status: \"todo\"`. Do NOT include any DONE step; the harness preserves the completed foundation verbatim and prepends it.\n");
+    out.push_str("2. Synthesize the COMPLETE unfinished horizon as dependency-ordered leaf steps with `status: \"todo\"`. Do NOT include any DONE step; the harness preserves the completed foundation verbatim and prepends it. State `commit: null` on every returned step: the harness records a commit only for a step whose own turn verified and committed the change set.\n");
     out.push_str("3. Follow the Architect Research Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract by requesting the relevant source files or searching for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("4. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with an exact `reason`.\n");
     out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, external specifications the project publishes in `outer_docs` (`id` for a declared root, `id/relative.md` for a document below it), addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Declare `outer_docs` whenever the step must be implemented against an external contract, so the harness pre-loads the specification and the executor spends no discovery round on it. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");

@@ -618,17 +618,58 @@ fn narrowed_surface(protocol: &dyn PromptProtocol, intent: TurnIntent) -> Capabi
     protocol.with_capability_set(narrowed).capability_set()
 }
 
-/// Returns the top-level property names of a composed response schema.
+/// Lifts the operational branch envelope of a composed schema into one surface.
+///
+/// A surface that admits more than one operational branch declares them as an
+/// exclusive `action` envelope, so the fields of a branch live in that object
+/// rather than beside the ambient ones. The envelope is wire vocabulary, so a
+/// test that asserts the field set of a surface reads the schema after this
+/// lift and names the field rather than the branch that carries it.
+fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+    let mut objects = vec![schema.clone()];
+    if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+        objects.extend(branches.iter().cloned());
+    }
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<serde_json::Value> = Vec::new();
+    for object in &objects {
+        let Some(fields) = object["properties"].as_object() else {
+            continue;
+        };
+        for (name, field) in fields {
+            if name.as_str() == "action" || name.as_str() == "kind" {
+                continue;
+            }
+            if properties.contains_key(name) {
+                continue;
+            }
+            properties.insert(name.clone(), field.clone());
+            required.push(serde_json::Value::String(name.clone()));
+        }
+    }
+    let mut flat = serde_json::json!({
+        "type": "object",
+        "properties": serde_json::Value::Object(properties),
+        "required": required,
+        "additionalProperties": false
+    });
+    if let Some(definitions) = schema.get("$defs") {
+        flat["$defs"] = definitions.clone();
+    }
+    flat
+}
+
+/// Returns the property names of a composed response schema, envelope lifted.
 fn property_names(schema: &serde_json::Value) -> Vec<String> {
-    schema["properties"]
+    flattened_surface(schema)["properties"]
         .as_object()
         .map(|properties| properties.keys().cloned().collect())
         .unwrap_or_default()
 }
 
-/// Returns the `required` entries of a composed response schema.
+/// Returns the `required` entries of a composed response schema, envelope lifted.
 fn required_names(schema: &serde_json::Value) -> Vec<String> {
-    schema["required"]
+    flattened_surface(schema)["required"]
         .as_array()
         .map(|required| {
             required
@@ -771,16 +812,19 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
     let project = project_with_commands(&["check"]);
     // A project that declares no command publishes no `custom_tools` rule, so the
     // property leaves the schema together with the instruction describing it.
-    let bare = composed_schema(&narrowed_surface(&structured, TurnIntent::InteractiveRepl));
+    let bare = flattened_surface(&composed_schema(&narrowed_surface(
+        &structured,
+        TurnIntent::InteractiveRepl,
+    )));
     assert!(bare["properties"].get("custom_tools").is_none());
     assert!(!required_names(&bare)
         .iter()
         .any(|field| field == "custom_tools"));
 
-    let repl = composed_schema_with_project(
+    let repl = flattened_surface(&composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::InteractiveRepl),
         Some(&project),
-    );
+    ));
     for field in ["plan_update", "abort", "custom_tools", "outer_doc_requests"] {
         assert!(
             repl["properties"].get(field).is_some(),
@@ -788,19 +832,19 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
         );
     }
 
-    let step = composed_schema_with_project(
+    let step = flattened_surface(&composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::IsolatedStep),
         Some(&project),
-    );
+    ));
     assert!(step["properties"].get("abort").is_some());
     assert!(step["properties"].get("outer_doc_requests").is_some());
 
     // A plan discussion carries the whole dialogue surface, so its composed
     // schema declares the change set, the plan payload, and every escape.
-    let discussion = composed_schema_with_project(
+    let discussion = flattened_surface(&composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::PlanDiscussion),
         Some(&project),
-    );
+    ));
     for field in [
         "plan_update",
         "changes",
@@ -827,7 +871,9 @@ fn the_review_decision_field_follows_the_review_discussion_surface() {
     let advertised = structured
         .capability_set()
         .with(LlmCapability::ReviewUpdate);
-    let review = composed_schema(&TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised));
+    let review = flattened_surface(&composed_schema(
+        &TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised),
+    ));
     assert!(review["properties"].get("review_update").is_some());
     let mut declared = property_names(&review);
     declared.sort();
@@ -849,7 +895,7 @@ fn the_review_decision_field_follows_the_review_discussion_surface() {
         TurnIntent::PlanDiscussion,
         TurnIntent::IsolatedStep,
     ] {
-        let schema = composed_schema(&intent.narrow_capabilities(&advertised));
+        let schema = flattened_surface(&composed_schema(&intent.narrow_capabilities(&advertised)));
         assert!(
             schema["properties"].get("review_update").is_none(),
             "{intent:?} declares the review decision"
@@ -1022,7 +1068,7 @@ fn the_documentation_channel_decodes_both_spellings_identically() {
 
     // The composed schema advertises the canonical field alone, so the alias is
     // asserted on the decoder rather than on the schema.
-    let schema = composed_schema(&CapabilitySet::interactive_repl());
+    let schema = flattened_surface(&composed_schema(&CapabilitySet::interactive_repl()));
     assert!(schema["properties"].get("tauqe_doc_requests").is_some());
     assert!(schema["properties"].get("doc_requests").is_none());
 

@@ -47,6 +47,11 @@ pub fn merge_subplan(
         combined,
     );
     wrapper.implementation.normalize_leaf_files();
+    // A returned horizon is a proposal, never a report of work: the harness owns
+    // the commit of a finished step and the blocker report of a stalled one, so a
+    // synthesized step that claims either is repaired before the horizon can
+    // reach disk.
+    wrapper.implementation.normalize_lifecycle_provenance();
     wrapper.implementation.refresh_parent_statuses();
     validate_synthesized_horizon(&wrapper)?;
 
@@ -506,6 +511,48 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "1");
         assert_eq!(merged[1].id, "2");
+    }
+
+    #[test]
+    fn test_merge_subplan_drops_unearned_lifecycle_provenance() {
+        // A returned horizon is a proposal, never a report of work: a stale or
+        // hallucinated commit and a blocker report left over from an earlier
+        // attempt must not survive the merge, because the harness records both
+        // claims for a step it actually ran.
+        let existing = vec![PlanItem {
+            id: "1".to_string(),
+            title: "Completed".to_string(),
+            status: PlanItemStatus::Done,
+            commit: Some("0123456789abcdef".to_string()),
+            ..Default::default()
+        }];
+        let new_horizon = vec![
+            PlanItem {
+                id: "2".to_string(),
+                title: "Never ran, yet claims a commit".to_string(),
+                status: PlanItemStatus::Todo,
+                commit: Some("fedcba9876543210".to_string()),
+                files: vec!["src/step2.rs".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "3".to_string(),
+                title: "No longer blocked, yet keeps its report".to_string(),
+                status: PlanItemStatus::Todo,
+                blocked_reason: Some("Missing capability: cargo nextest".to_string()),
+                files: vec!["src/step3.rs".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let merged = merge_subplan(&existing, new_horizon).unwrap();
+
+        // The finished foundation keeps the commit it earned.
+        assert_eq!(merged[0].status, PlanItemStatus::Done);
+        assert_eq!(merged[0].commit.as_deref(), Some("0123456789abcdef"));
+        // The synthesized steps carry no provenance they did not earn.
+        assert!(merged[1].commit.is_none());
+        assert!(merged[2].blocked_reason.is_none());
     }
 
     #[test]

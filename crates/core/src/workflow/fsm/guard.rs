@@ -112,6 +112,15 @@ pub(crate) async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Pa
 /// Ensures that early `?`-returns (e.g. LLM provider errors during verification
 /// healing), task cancellations, or panics do not leave dirty working trees,
 /// step commits, or transaction markers behind.
+/// Error encountered while applying a change set temporarily to disk.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyTemporaryError {
+    #[error("failed to apply changes to disk: {0}")]
+    Policy(#[source] anyhow::Error),
+    #[error("{0}")]
+    PostHook(String, Vec<String>),
+}
+
 pub(super) struct TransactionRollbackGuard<'a> {
     policy: &'a mut dyn ApplyPolicy,
     pub(super) context_manager: &'a mut ContextManager,
@@ -198,7 +207,7 @@ impl<'a> TransactionRollbackGuard<'a> {
     pub(super) async fn apply_temporary(
         &mut self,
         proposal: &EditProposal,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> Result<Vec<String>, ApplyTemporaryError> {
         // The change set is about to reach the disk, so the observation recorded
         // before this call describes a working copy that no longer exists. It
         // stays empty until the writes below have landed, which is also what
@@ -207,11 +216,28 @@ impl<'a> TransactionRollbackGuard<'a> {
         let mut changed_files = self
             .policy
             .apply_temporary(self.repo_root, self.project, self.context_manager, proposal)
-            .await?;
+            .await
+            .map_err(ApplyTemporaryError::Policy)?;
 
-        for artifact in self.run_post_hook(&changed_files).await? {
-            if !changed_files.contains(&artifact) {
-                changed_files.push(artifact);
+        match self.run_post_hook(&changed_files).await {
+            Ok(artifacts) => {
+                for artifact in artifacts {
+                    if !changed_files.contains(&artifact) {
+                        changed_files.push(artifact);
+                    }
+                }
+            }
+            Err(err) => {
+                if self.worktree_observation.is_none() {
+                    self.observe_worktree();
+                }
+                if self.worktree_baseline.is_none() {
+                    self.worktree_baseline = self.worktree_observation.clone();
+                }
+                return Err(ApplyTemporaryError::PostHook(
+                    err.to_string(),
+                    changed_files,
+                ));
             }
         }
 

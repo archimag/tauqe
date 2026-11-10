@@ -16,7 +16,7 @@ use crate::prompt::ContextBlockCache;
 
 /// Per-turn memoization of deterministic proposal inputs.
 #[derive(Default)]
-pub(super) struct TurnInputCache {
+pub struct TurnInputCache {
     /// Repo map captured on the first proposal round of the turn.
     ///
     /// `Some` marks the map as generated, so an empty map is frozen as well
@@ -144,7 +144,7 @@ impl TurnInputCache {
     /// round added files to the context and thereby narrowed the set of paths the
     /// map describes: dropping those nodes mid-turn would shorten the map block
     /// and invalidate the prompt prefix the provider has already cached.
-    pub(super) async fn repo_map(
+    pub(crate) async fn repo_map(
         &mut self,
         repo_root: &Path,
         targetable_paths: &[String],
@@ -208,7 +208,7 @@ impl TurnInputCache {
     /// byte for byte, and the chronological layout reads the recorded context
     /// watermarks from the same material. Records appended while the turn runs
     /// never reach the snapshot, so the prompt prefix stays byte-identical.
-    pub(super) async fn history_snapshot(
+    pub(crate) async fn history_snapshot(
         &mut self,
         history_manager: &HistoryManager,
         intent: TurnIntent,
@@ -258,7 +258,7 @@ impl TurnInputCache {
     /// byte-identical and the provider keeps matching its cached prefix. Files
     /// anchored by the pinned context layer are marked, so the model never
     /// searches for conventions that already travelled with the prompt.
-    pub(super) async fn repo_dirs(
+    pub(crate) async fn repo_dirs(
         &mut self,
         repo_root: &Path,
         pinned_patterns: &[String],
@@ -311,7 +311,7 @@ impl TurnInputCache {
     /// staging, the declared post-hook, verification, and project commands —
     /// reads this snapshot through `TurnKernel::project`, so a patch retry or
     /// a healing round never spawns the runner again.
-    pub(super) async fn project(
+    pub(crate) async fn project(
         &mut self,
         repo_root: &Path,
         cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
@@ -342,7 +342,7 @@ impl TurnInputCache {
     /// failed offload is reported to the caller instead of silently shrinking
     /// the context. Every returned file carries the insertion watermark of its
     /// context entry, so a layout places it where it actually arrived.
-    pub(super) async fn context_files(
+    pub(crate) async fn context_files(
         &mut self,
         repo_root: &Path,
         items: &[tauqe_protocol::ContextItem],
@@ -429,7 +429,7 @@ impl TurnInputCache {
     /// rounds that widened the context render only the files they added. An
     /// unchanged file therefore keeps the exact bytes — and the exact line
     /// anchors — the previous round already sent to the provider.
-    pub(super) fn context_cache(&mut self) -> &mut ContextBlockCache {
+    pub(crate) fn context_cache(&mut self) -> &mut ContextBlockCache {
         &mut self.context_block
     }
 }

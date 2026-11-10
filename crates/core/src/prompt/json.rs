@@ -426,6 +426,46 @@ mod tests {
     use super::*;
     use tauqe_protocol::{ContextAccess, EditOperation};
 
+    /// Lifts the operational branch envelope of a composed schema into one surface.
+    ///
+    /// The wire keeps the operational branches mutually exclusive, so a field of
+    /// a branch is addressed through the envelope that owns it. A test that reads
+    /// the property of a capability reads the schema after this lift, so it names
+    /// the field rather than the branch that carries it.
+    fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+        let mut objects = vec![schema];
+        if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+            objects.extend(branches.iter());
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for object in objects {
+            let Some(fields) = object["properties"].as_object() else {
+                continue;
+            };
+            for (name, field) in fields {
+                if name.as_str() == "action" || name.as_str() == "kind" {
+                    continue;
+                }
+                if properties.contains_key(name) {
+                    continue;
+                }
+                properties.insert(name.clone(), field.clone());
+                required.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        let mut flat = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if let Some(definitions) = schema.get("$defs") {
+            flat["$defs"] = definitions.clone();
+        }
+        flat
+    }
+
     #[test]
     fn test_name_and_capabilities() {
         let protocol = JsonPromptProtocol::default();
@@ -490,6 +530,42 @@ mod tests {
         assert!(
             has_error,
             "Invalid structured change should produce ProtocolError command"
+        );
+    }
+
+    #[test]
+    fn test_decode_malformed_change_set_reports_a_protocol_error() {
+        // A `content` of a wrong type deserializes no change entry, so the
+        // whole structured payload fails to decode. Reading such a round as
+        // an answer without edits would silently discard the change set the
+        // model promised, so the defect travels through the protocol-error
+        // channel where the bounded turn can retry it.
+        let protocol = JsonPromptProtocol::edits();
+        let output = r#"{
+            "message": "Editing",
+            "changes": [
+                {
+                    "op": "create",
+                    "path": "src/new.rs",
+                    "to": "",
+                    "start": "",
+                    "end": "",
+                    "content": 5
+                }
+            ]
+        }"#;
+        let commands = protocol.decode(output, &[]);
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. })),
+            "a change the decoder cannot read must be a protocol error: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, LlmCommand::Edit { .. })),
+            "no edit reaches staging from a payload the decoder rejected"
         );
     }
 
@@ -808,7 +884,7 @@ mod tests {
         let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
             panic!("edit mode composes a JSON schema");
         };
-        let schema = &json_schema.schema;
+        let schema = flattened_surface(&json_schema.schema);
         assert!(schema["properties"].get("changes").is_some());
         assert!(schema["properties"].get("plan_update").is_some());
         assert!(schema["properties"].get("context_requests").is_some());

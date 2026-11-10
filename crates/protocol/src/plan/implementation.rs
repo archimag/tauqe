@@ -383,6 +383,39 @@ impl PlanImplementation {
         walk(&mut self.items);
     }
 
+    /// Clears lifecycle provenance a step cannot legitimately carry.
+    ///
+    /// A step records a commit only once it is `Done`, and a blocker report only
+    /// while it is `Blocked`; both are written by the harness, never by a model.
+    /// A synthesized horizon, a hand-edited document, or a rejected attempt can
+    /// therefore arrive carrying a hash for work that never ran, or a report for a
+    /// stall the step already left behind. This normalizer is the single place
+    /// that drops such a claim, so the two trees that render a step can never
+    /// advertise provenance the step did not earn.
+    ///
+    /// Only executable leaves carry provenance of their own: a container is never
+    /// executed, so its provenance is cleared unconditionally, exactly as its file
+    /// declarations are cleared by [`Self::normalize_leaf_files`].
+    pub fn normalize_lifecycle_provenance(&mut self) {
+        fn walk(items: &mut [PlanItem]) {
+            for item in items.iter_mut() {
+                if item.children.is_empty() {
+                    if item.status != PlanItemStatus::Done {
+                        item.commit = None;
+                    }
+                    if item.status != PlanItemStatus::Blocked {
+                        item.blocked_reason = None;
+                    }
+                } else {
+                    item.commit = None;
+                    item.blocked_reason = None;
+                }
+                walk(&mut item.children);
+            }
+        }
+        walk(&mut self.items);
+    }
+
     /// Updates the status of a step and refreshes the aggregated status of its
     /// ancestors.
     ///

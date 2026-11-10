@@ -26,8 +26,12 @@ use tauqe_protocol::events;
 /// closing without an applied change set always explains itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditTermination {
-    /// The turn finished normally without applying a change set.
-    Completed,
+    /// The turn concluded with a conversational answer and proposed no file edits.
+    Answered,
+    /// The turn proposed file edits, but they could not be converged or applied by virtual staging.
+    StagingRefused,
+    /// The turn streamed edits in an earlier round, but a subsequent round completed without edits.
+    Superseded,
     /// The operation was cancelled by the developer.
     Cancelled,
     /// The streamed attempt was withdrawn and its edits are void.
@@ -48,7 +52,11 @@ impl EditTermination {
     /// Human-readable reason carried by an unapplied closing.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Completed => "The turn completed without applying any file change.",
+            Self::Answered => "The turn concluded with an answer without proposing any file change.",
+            Self::StagingRefused => "The proposed edits could not be staged or applied to the repository.",
+            Self::Superseded => {
+                "Edits proposed in an earlier round were superseded when the turn finished without edits."
+            }
             Self::Cancelled => "The operation was cancelled before the edits were applied.",
             Self::Withdrawn => {
                 "The streamed attempt was withdrawn, so its proposed edits were discarded."
@@ -182,8 +190,10 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    const ALL: [EditTermination; 7] = [
-        EditTermination::Completed,
+    const ALL: [EditTermination; 9] = [
+        EditTermination::Answered,
+        EditTermination::StagingRefused,
+        EditTermination::Superseded,
         EditTermination::Cancelled,
         EditTermination::Withdrawn,
         EditTermination::ProviderError,
@@ -217,6 +227,21 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn silent_endings_carry_distinct_descriptions() {
+        assert_ne!(
+            EditTermination::Answered.description(),
+            EditTermination::StagingRefused.description()
+        );
+        assert_ne!(
+            EditTermination::Answered.description(),
+            EditTermination::Superseded.description()
+        );
+        assert_ne!(
+            EditTermination::StagingRefused.description(),
+            EditTermination::Superseded.description()
+        );
+    }
 
     #[test]
     fn a_second_closing_publishes_nothing() {
@@ -227,7 +252,7 @@ mod tests {
 
         assert!(cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None));
         assert!(!cycle.close_unapplied(EditTermination::ProviderError, Vec::new(), None));
-        assert!(!cycle.close_outcome(EditTermination::Completed, EditOutcome::default()));
+        assert!(!cycle.close_outcome(EditTermination::Answered, EditOutcome::default()));
 
         let events = drain(&mut rx);
         assert_eq!(
@@ -244,7 +269,7 @@ mod tests {
     fn a_closing_without_an_open_cycle_publishes_nothing() {
         let (out, mut rx) = OutChannel::new();
         let cycle = EditCycle::new(out, "op-2");
-        assert!(!cycle.close_unapplied(EditTermination::Completed, Vec::new(), None));
+        assert!(!cycle.close_unapplied(EditTermination::Answered, Vec::new(), None));
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -279,7 +304,7 @@ mod tests {
 
         cycle.open();
         cycle.close_outcome(
-            EditTermination::Completed,
+            EditTermination::Answered,
             EditOutcome {
                 applied: true,
                 error: Some("stale".to_string()),
@@ -359,7 +384,7 @@ mod tests {
         assert!(cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None));
         assert!(cycle.open());
         assert!(cycle.is_open());
-        assert!(cycle.close_unapplied(EditTermination::Completed, Vec::new(), None));
+        assert!(cycle.close_unapplied(EditTermination::Answered, Vec::new(), None));
         assert_eq!(
             methods(&drain(&mut rx)),
             vec![

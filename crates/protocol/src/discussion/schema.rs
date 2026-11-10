@@ -250,7 +250,7 @@ fn plan_item_definition(level: usize) -> serde_json::Value {
                     { "type": "string" },
                     { "type": "null" }
                 ],
-                "description": "Identifier of the Git commit that completed this step. The harness records it when the step reaches 'done', and a mutation that reproduces a finished step reproduces its commit verbatim."
+                "description": "Identifier of the Git commit that completed this step. The harness records it when the step reaches 'done', and a mutation that reproduces a finished step reproduces its commit verbatim. A step that is not 'done' carries no commit: a value supplied for it is dropped before the mutation is persisted."
             },
             "files": {
                 "type": "array",

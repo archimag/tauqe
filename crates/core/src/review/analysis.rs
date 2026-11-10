@@ -24,7 +24,7 @@ pub use tauqe_protocol::review::{
 
 use std::borrow::Cow;
 
-use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
+use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 /// Strict JSON Schema for the review post-analysis output.
@@ -162,8 +162,7 @@ pub fn post_analysis_response_format() -> ResponseFormat {
 /// Structured Output contour and a failure to decode it is a real failure
 /// rather than recoverable prose.
 pub fn parse_post_analysis(raw: &str) -> anyhow::Result<PostAnalysisOutput> {
-    let unfenced = strip_code_fence(raw);
-    let error = match serde_json::from_str::<PostAnalysisOutput>(unfenced) {
+    let error = match serde_json::from_str::<PostAnalysisOutput>(raw.trim()) {
         Ok(output) => return Ok(output),
         Err(error) => error,
     };

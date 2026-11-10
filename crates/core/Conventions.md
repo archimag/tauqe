@@ -37,6 +37,13 @@ The interaction protocol between Tauqe and large language models is strictly div
 - **Cryptographic Turn Binding:** The turn marker defends the tagged command channel from injection, so the engine generates its unpredictable alphanumeric value (`generate_turn_marker`) only for a turn whose active protocol uses the XML contour (`Xml` and `Mixed`). System prompt instructions append that suffix to every control tag (`<{base}_{marker}>`). A structured turn emits no control tag at all, so it never mints a marker: the value stays `None` on every server and FSM level that would otherwise carry it, and the system prompt appends no suffix.
 - **Strict Normalization and Injection Defense:** Active execution parsers (`MarkedXmlEditProtocol`) strictly decode only marker-suffixed tags via `normalize_marked_xml`. Unsuffixed tags occurring in source code, diffs, conversational text, or documentation are protected as literals (`restore_xml_literals`) and must NEVER trigger commands, context mutations, repository searches, plan changes, or patch staging.
 - **Streaming Suppression:** Stream filters (`XmlStreamFilter`, `find_next_control_tag`) detect marker-suffixed tags during generation and suppress them from leaking into the user-facing `TextDelta` stream.
+### 1.4. Mutually Exclusive Operational Branches
+
+- **One response follows exactly one branch.** A turn surface decomposes into invariant ambient capabilities — the conversational text, the turn scratchpad, and the detected language — and into mutually exclusive operational branches. The decomposition declares `research`, which carries the discovery commands, and `execution`, which carries every command the harness acts upon. A response states one branch and emits only that branch's commands, because discovery and patching are phases of a turn rather than one round.
+- **The decomposition has one definition.** `CapabilitySet::branches` (`crates/protocol/src/command/capability.rs`) projects an advertised surface onto its ambient part and its branches, and every consumer derives its behavior from that projection: the contract rule names the branches, the structured schema nests them under one discriminator, and the turn kernel classifies a round by them. A parallel list of tags, a hand-written branch table, or a per-contour grouping is prohibited.
+- **Each contour enforces the exclusion in its own vocabulary.** The structured contour expresses it grammatically: a surface that admits two branches declares them as `action.anyOf`, each branch a strict object carrying a constant `kind`, so a response which names the research branch holds no `changes` property to emit. The XML contour has no discriminator, so the same exclusion reaches the model as the `Operational Branch Exclusion` contract rule and is enforced by the turn kernel as a typed decision.
+- **A surface with one branch excludes nothing.** A capability set that carries no discovery command declares only the branch it can emit, and neither the rule nor the envelope is rendered, exactly as a disabled capability contributes neither a rule nor a schema fragment.
+- **The engine never discards a change set a round produced.** A mixed round is a protocol defect rather than a command. Its change set still reaches staging, because file content the model already wrote is work the turn already paid for, while the discovery half is reported back as the defect to correct in a later round. Precedence belongs to the change set: a proposal about file content is checked by staging and verification, whereas a request for more material is checked by nothing, so discarding the proposal would let a turn that produced code reach the boundary looking like a turn that produced nothing.
 
 ---
 
@@ -107,9 +114,10 @@ The interaction protocol between Tauqe and large language models is strictly div
    - If an artifact can be resolved from Git, Tree-sitter, project manifests, or compiler output, resolve it through deterministic Rust routines, never LLM generation.
 2. **Fail-Fast on Verification Failure:**
    - Autonomous execution pipelines must abort immediately upon encountering compiler errors or test failures, rolling back dirty working trees to the pre-turn Git checkpoint.
-3. **Rejected Paths Are Reported, Never Retried Blindly:**
-   - A change set the substrate refuses because a path is excluded by the repository ignore rules never reaches disk, so the engine reports the typed rejection to the model and lets it choose a tracked path within the same turn. The staging rules themselves are declared once in `crates/tools/Conventions.md`.
-
+k4Nb | 3. **Rejected Paths Are Reported, Never Retried Blindly:**
+kgUZ |    - A change set the substrate refuses because a path is excluded by the repository ignore rules never reaches disk, so the engine reports the typed rejection to the model and lets it choose a tracked path within the same turn. The staging rules themselves are declared once in `crates/tools/Conventions.md`.
+     | 4. **Post-Hook Failures Trigger Verification Healing:**
+     |    - The declared post-hook (`[project.post_hook]`) runs immediately after proposed edits reach disk to generate code or refresh manifests. A failing hook (non-zero exit code or compilation error) is captured as a verification failure (`VerificationStatus::Failed`) rather than an unrecoverable disk error, routing diagnostics into the Verification Healing loop so the model can fix the generator within its retry budget.
 ---
 
 ## 5. Instant Provider Cancellation
@@ -471,3 +479,58 @@ The interaction protocol between Tauqe and large language models is strictly div
 The concept chapter `docs/src/ch02-perception/reference-registry.md` owns the declaration,
 the cache, and the trust boundary; this section states only the engine-side consequence of
 the lifecycle those mechanisms share.
+
+---
+
+## 13. Functional Control Loops Architecture (`crates/core/src/control`)
+
+1. **Functional Decomposition over Single-Method Traits:**
+   - Execution flows are implemented strictly as nested, composable plain `async` functions adhering to the canonical naming standard: `run_<domain>_loop` (`run_sequence_loop` -> `run_step_loop` -> `run_edit_loop` -> `run_staging_loop`).
+   - Single-method execution traits (e.g. `ExecutionLoop`) and dynamic trait dispatch (`Box<dyn ...>`) are strictly forbidden. Control flow is composed functionally through direct asynchronous function calls.
+
+2. **Canonical Execution Context (`LoopContext`):**
+   - Ambient operational infrastructure is encapsulated in a lightweight `LoopContext` passed by mutable reborrow:
+     - `cancel: &CancellationToken` — cooperative cancellation token raced across network and toolchain futures via `tokio::select!`.
+     - `events: &EventSink` — typed domain event emitter isolating the domain engine from TUI, sockets, and transport channels.
+     - `capabilities: CapabilitySet` — active model capability surface for the current execution branch.
+     - `repo_root: &Path` — root of the working tree every loop addresses.
+     - `context_manager: &mut ContextManager` — live context a loop mutates (e.g. during research context expansion) and snapshots through.
+      - `journal: &mut TurnResearchJournal` — turn-scoped cumulative epistemic journal collecting findings and scratchpad notes.
+      - `policy: &mut dyn ApplyPolicy` — transactional apply policy governing checkpointing, staging, step commits, and rollback.
+      - `capabilities: CapabilitySet` — active model capability surface for the current execution branch.
+      - `target_language: Option<String>` — natural language determined for user-facing responses and diagnostics.
+      - `prompt_builder: PromptBuilder` — model round assembly and execution builder.
+   - **Prohibition of `Clone` on `LoopContext`:** `LoopContext` must NEVER derive or implement `Clone`. It holds exclusive mutable references to execution state (`context_manager`, `journal`). Subordinate loops obtain narrowed or extended contexts exclusively via explicit reborrowing (`ctx.reborrow_with_capabilities(...)`, `ctx.reborrow_extending_capabilities(...)`).
+
+3. **Principle of Least-Privilege Configuration Cascading:**
+   - Passing monolithic `AppConfig` or broad global configurations into control loops is strictly prohibited.
+   - Domain configurations cascade downward, narrowed exclusively to the immediate parameters the specific loop governs (`SequenceLoopConfig` -> `StepLoopConfig` -> `EditLoopConfig`).
+   - Loops that require no local tuning parameters omit the configuration parameter entirely (`Option<&Config>` or omitted).
+
+4. **Input Continuity Bridging (`initial_response`):**
+   - To eliminate code duplication between conversational REPL turns and headless batch step execution, `run_edit_loop` accepts `initial_response: Option<LlmProposal>`.
+   - When an interactive turn has already generated a candidate code proposal, `run_edit_loop` skips prompt assembly and LLM generation, proceeding directly to virtual in-memory staging and toolchain verification. When `None`, it initiates execution from the research/prompting phase.
+
+5. **Three-Tier Outcome Classification & Drainable Response Envelope (`LoopResult<T>`):**
+   - Control loops return `Result<LoopResult<T>, SystemError>` to cleanly decouple infrastructure failures from domain outcomes:
+     - `Err(SystemError)` — Infrastructure failure (exhausted network retries, Git repository corruption, disk I/O failure, cancellation). System errors **never consume model attempts** and immediately propagate upward for transaction rollback or pause.
+      - `Ok(LoopResult::Success(LoopSuccess<T>))` — Target artifact `T` successfully obtained and validated (e.g. `StagedEdits`). Wraps the drainable `ResponseEnvelope` carrying remaining companion capabilities.
+      - `Ok(LoopResult::Diverged(ResponseEnvelope))` — Legitimate alternative output permitted by active capabilities (e.g. `<blocked>`, explanation text) that the local loop does not govern. The envelope is forwarded upward untouched for higher-level replanning or user display.
+     - `Ok(LoopResult::Exhausted(FailureReport))` — The model attempted the target task, but local iterations (e.g. patch-retries or verification healing) exceeded their budget. Signals the caller to decrement the coder tier attempt and escalate.
+    - **Drainable Envelope Pattern (Consumable `ResponseEnvelope`):**
+      - Rather than a monolithic "God-struct" with static fields for every conceivable command, `ResponseEnvelope` is an envelope of semantic commands indexed by `LlmCapability` (`cmd.capability()`).
+     - Control loops consume only the capabilities in their domain via `envelope.take(LlmCapability)` or `envelope.take_any(&[...])`. As the envelope travels upward through the loop hierarchy, it shrinks ("худеет").
+      - `run_staging_loop` drains `LlmCapability::FileEdits`; `run_edit_loop` drains `LlmCapability::ToolchainVerify`; `run_step_loop` drains `LlmCapability::Outcome`; `run_repl_loop` drains `LlmCapability::TextMessage`, `PlanCreation`, and `PlanUpdate`.
+      - **Prohibition of Ad-hoc Convenience Extractors:** `ResponseEnvelope` provides strictly generic capability-based draining (`take` and `take_any`). Adding typed helper methods for specific capabilities (such as `take_edits`, `take_text`, `take_outcome`, `take_blocked`, etc.) to `ResponseEnvelope` is strictly forbidden. Each loop or subsystem knows exactly which `LlmCapability` variants belong to its domain, calls `take(...)`, and pattern-matches the resulting `LlmCommand` items locally.
+   - **Top-Level Anti-Leak Invariant:**
+     - At the top-level turn completion boundary, `envelope.is_empty()` MUST be true. Any remaining commands (`envelope.remaining_capabilities()`) indicate commands emitted by the model that no level of the control hierarchy handled, triggering structured diagnostic logging.
+
+6. **Protocol Sanitization Boundary:**
+   - Model output violating structural contracts (unrecognized tags outside `capabilities`, invalid JSON/XML syntax, mixed operational branches) is a protocol defect, not a semantic divergence.
+   - Loops intercept protocol violations locally via dedicated sanitizers (`heal_protocol_violation`), requesting format repair without leaking raw defects into domain logic.
+
+7. **Strictly Localized Transaction and Error Boundaries:**
+   - Virtual patch-application and anchor-matching retries are confined to `run_staging_loop`.
+   - Compiler verification and self-healing iterations are confined to `run_edit_loop`.
+   - Git checkpoints, coder ladder attempt accounting, gatekeeper acceptance, and commit squashing are confined to `run_step_loop`.
+   - Task ordering, dependency evaluation, and architect replanning triggers are confined to `run_sequence_loop`.

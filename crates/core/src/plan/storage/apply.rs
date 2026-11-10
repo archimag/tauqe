@@ -488,6 +488,12 @@ impl PlanStorage {
                                     if !update.readonly_files.is_empty() {
                                         item.readonly_files = update.readonly_files.clone();
                                     }
+                                    // A leaf names the external documents its implementation
+                                    // obeys, so a delta update binds them the same way it
+                                    // binds `files` and `readonly_files`.
+                                    if !update.outer_docs.is_empty() {
+                                        item.outer_docs = update.outer_docs.clone();
+                                    }
                                     if !update.concept_refs.is_empty() {
                                         item.concept_refs = update.concept_refs.clone();
                                     }
@@ -2123,5 +2129,56 @@ Step 1 is done:
             PlanStorage::load_active_id(root).unwrap(),
             Some("batch-b".to_string())
         );
+    }
+    /// A delta `update` patches every field of an established step, including the
+    /// external documents its implementation must obey. The field is part of the
+    /// leaf contract, so an update that names `outer_docs` must reach storage
+    /// instead of being dropped by the merge.
+    #[test]
+    fn test_update_patches_outer_docs_of_an_established_step() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let seeded = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("outer-docs-plan".to_string()),
+            title: Some("Outer Docs Plan".to_string()),
+            description: None,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/step1.rs".to_string()],
+                ..Default::default()
+            }],
+        };
+        let applied = PlanStorage::apply_discussion_plan_update(root, &seeded);
+        assert!(applied.errors.is_empty(), "Errors: {:?}", applied.errors);
+
+        let update = r#"
+<plan action="update" id="outer-docs-plan">
+  <item id="1" outer_docs="protocol-spec, wire-format" />
+</plan>
+"#;
+        let outcome = PlanStorage::apply_plan_tags(root, update);
+        assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied.len(), 1);
+
+        let stored = PlanStorage::load_plan(root, "outer-docs-plan")
+            .unwrap()
+            .unwrap();
+        let step = stored
+            .implementation
+            .find_item("1")
+            .expect("step 1 must exist");
+        assert_eq!(step.outer_docs, vec!["protocol-spec", "wire-format"]);
+        // The rest of the leaf contract survives the patch untouched.
+        assert_eq!(step.files, vec!["src/step1.rs"]);
     }
 }

@@ -9,6 +9,7 @@ pub mod blocking;
 pub mod capabilities;
 pub mod config;
 pub mod context;
+pub mod control;
 pub(crate) mod docs;
 pub mod edits;
 pub(crate) mod escape;

@@ -53,8 +53,9 @@ impl CapabilityRegistry {
     /// Composes the core rules that render into the byte-stable head.
     ///
     /// The pass opens with the shared trunk, states the context surface of the
-    /// active layout, adds the operational tag rule for the XML contour, and then
-    /// folds the core rules of the modules the regime profile places in the head.
+    /// active layout, adds the operational tag rule for the XML contour, declares
+    /// the invariant that forbids mixing the branches it enumerates, and then folds
+    /// the core rules of the modules the regime profile places in the head.
     /// Those rules are intent-independent by contract, so the head stays
     /// byte-identical for the REPL, a plan discussion, and a review discussion.
     pub fn compose_core_contract_rules(
@@ -65,10 +66,22 @@ impl CapabilityRegistry {
         let profile = ctx.intent.regime_profile();
         let mut rules = regime::shared_trunk_rules(ctx, set);
         rules.insert(rules.len().min(1), context_surface_rule(ctx));
+        // The opening rules describe the surface a response is read against, so
+        // each one sits behind its predecessor: the tag list first, then the
+        // invariant that forbids mixing the branches that list enumerates.
+        let mut insert_at = 2;
         if ctx.protocol == EditProtocolKind::Xml {
             if let Some(rule) = self.operational_tags_rule(set, ctx) {
-                rules.insert(rules.len().min(2), rule);
+                rules.insert(rules.len().min(insert_at), rule);
+                insert_at += 1;
             }
+        }
+        // The invariant is stated over the capabilities the head itself enables,
+        // so every dialogue contour renders identical bytes and a contour that
+        // cannot discover or cannot patch claims no branch it cannot emit.
+        let head = restrict_to_head(set, profile.core());
+        if let Some(rule) = self.exclusive_branch_rule(&head, ctx) {
+            rules.insert(rules.len().min(insert_at), rule);
         }
         for module in self.enabled_in(set, profile.core()) {
             if let Some(rule) = module.render_contract_rule(ctx) {
@@ -76,6 +89,93 @@ impl CapabilityRegistry {
             }
         }
         render_contract_rules(&rules)
+    }
+
+    /// Renders the invariant that one response belongs to exactly one branch.
+    ///
+    /// The branches are decomposed from the capabilities the byte-stable head
+    /// enables, so a contour that cannot discover or cannot patch claims no branch
+    /// it can never emit. The commands of each branch follow the active contour:
+    /// the XML transport names its control tags, the structured transport names
+    /// the fields of its schema, so the rule never mentions the vocabulary of the
+    /// other contour.
+    fn exclusive_branch_rule(
+        &self,
+        head: &CapabilitySet,
+        ctx: &ContractContext<'_>,
+    ) -> Option<ContractRule> {
+        let (_, branches) = head.branches();
+        if branches.len() < 2 {
+            return None;
+        }
+        let mut listed: Vec<String> = Vec::new();
+        for branch in &branches {
+            let commands = self.branch_commands(&branch.capabilities, ctx);
+            if commands.is_empty() {
+                continue;
+            }
+            listed.push(format!(
+                "the {} branch ({})",
+                branch.kind,
+                commands.join(", ")
+            ));
+        }
+        let (last, rest) = listed.split_last()?;
+        if rest.is_empty() {
+            return None;
+        }
+        let scope = format!("{} or {}", rest.join(", "), last);
+        Some(ContractRule::new(
+            "Operational Branch Exclusion",
+            format!(
+                "A single response belongs to exactly one operational branch: {scope}. \
+                 A branch is answered before the next round begins, so the commands of \
+                 two branches are never stated together; a response that mixes them is \
+                 a protocol defect rather than a request. State the change set only in \
+                 a round that carries no discovery command."
+            ),
+        ))
+    }
+
+    /// Commands one branch may emit in the active contour, in declaration order.
+    fn branch_commands(
+        &self,
+        capabilities: &CapabilitySet,
+        ctx: &ContractContext<'_>,
+    ) -> Vec<String> {
+        let mut commands: Vec<String> = Vec::new();
+        match ctx.protocol {
+            EditProtocolKind::Xml => {
+                let strategy = StrategyProfile::of(ctx.render.patch_strategy);
+                for tag in self.operational_xml_tags(capabilities) {
+                    if !strategy.advertises_operational_tag(&tag) {
+                        continue;
+                    }
+                    push_unique(&mut commands, format!("`<{}>`", ctx.tag_name(&tag)));
+                }
+            }
+            EditProtocolKind::Structured => {
+                for capability in capabilities.iter() {
+                    let Some(module) = self.module(*capability) else {
+                        continue;
+                    };
+                    let Some(fragment) = module.json_schema_fragment_ctx(&ctx.render) else {
+                        continue;
+                    };
+                    let Some(fields) = fragment.as_object() else {
+                        continue;
+                    };
+                    for field in fields.keys() {
+                        push_unique(&mut commands, format!("`{field}`"));
+                    }
+                }
+            }
+            // `Mixed` never reaches the contract: assembly hands over the kind of
+            // the concrete protocol, so the branch list names the vocabulary of a
+            // transport that actually decodes commands.
+            EditProtocolKind::Mixed => {}
+        }
+        commands
     }
 
     /// Composes the contour delta that renders into the trailing user message.
@@ -152,6 +252,31 @@ impl CapabilityRegistry {
             }
         }
         blocks.join("\n")
+    }
+}
+
+/// Keeps the capabilities of `set` that `head` also enables.
+///
+/// A rule stated over the head must name exactly the surface the head renders, so
+/// the intersection is taken before the branch decomposition: a regime that places
+/// a capability in its delta never states it as a head command.
+fn restrict_to_head(set: &CapabilitySet, head: &CapabilitySet) -> CapabilitySet {
+    let mut surface = CapabilitySet::new();
+    for capability in set.iter() {
+        if head.contains(*capability) {
+            surface.insert(*capability);
+        }
+    }
+    surface
+}
+
+/// Appends `command` to `commands` unless the branch already published it.
+///
+/// Two capabilities may own one command — plan creation and plan update both emit
+/// the plan container — so the list keeps one spelling per command.
+fn push_unique(commands: &mut Vec<String>, command: String) {
+    if !commands.contains(&command) {
+        commands.push(command);
     }
 }
 
@@ -1109,17 +1234,23 @@ impl CapabilityRegistry {
         set: &CapabilitySet,
         ctx: &PromptRenderContext<'_>,
     ) -> serde_json::Value {
-        let mut properties = serde_json::Map::new();
         let mut definitions = serde_json::Map::new();
+        // The operational fields of a surface that admits more than one branch
+        // travel inside the `action` envelope, so the composed schema can make
+        // the branches mutually exclusive: a strict schema cannot forbid a
+        // non-empty field, but it can refuse to declare two shapes at once. A
+        // surface that admits a single branch has nothing to exclude and keeps
+        // every field flat.
+        let (ambient, branches) = set.branches();
+        let exclusive = branches.len() >= 2;
+        let mut fragments: Vec<(LlmCapability, serde_json::Map<String, serde_json::Value>)> =
+            Vec::new();
         for module in self.enabled(set) {
-            if let Some(fragment) = module.json_schema_fragment_ctx(ctx) {
-                if let Some(fields) = fragment.as_object() {
-                    for (name, schema) in fields {
-                        properties
-                            .entry(name.clone())
-                            .or_insert_with(|| schema.clone());
-                    }
-                }
+            if let Some(fields) = module
+                .json_schema_fragment_ctx(ctx)
+                .and_then(|fragment| fragment.as_object().cloned())
+            {
+                fragments.push((module.capability(), fields));
             }
             if let Some(fragment) = module.json_schema_defs() {
                 if let Some(entries) = fragment.as_object() {
@@ -1130,6 +1261,63 @@ impl CapabilityRegistry {
                     }
                 }
             }
+        }
+
+        let mut properties = serde_json::Map::new();
+        let mut grouped: Vec<serde_json::Map<String, serde_json::Value>> =
+            vec![serde_json::Map::new(); branches.len()];
+        for (capability, fields) in fragments {
+            let destination = if exclusive && !ambient.contains(capability) {
+                branches
+                    .iter()
+                    .position(|branch| branch.capabilities.contains(capability))
+                    .map(|index| &mut grouped[index])
+                    .unwrap_or(&mut properties)
+            } else {
+                &mut properties
+            };
+            for (name, schema) in fields {
+                destination.entry(name).or_insert(schema);
+            }
+        }
+
+        if exclusive {
+            let mut variants: Vec<serde_json::Value> = Vec::with_capacity(branches.len());
+            for (branch, fields) in branches.iter().zip(grouped) {
+                let mut branch_properties = serde_json::Map::new();
+                branch_properties.insert(
+                    "kind".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": [branch.kind.clone()],
+                        "description": format!(
+                            "Operational branch this response follows: '{}'. A response follows exactly one branch, so the commands of another branch are never stated in the same round.",
+                            branch.kind
+                        )
+                    }),
+                );
+                for (name, schema) in fields {
+                    branch_properties.entry(name).or_insert(schema);
+                }
+                let required: Vec<serde_json::Value> = branch_properties
+                    .keys()
+                    .map(|name| serde_json::Value::String(name.clone()))
+                    .collect();
+                variants.push(serde_json::json!({
+                    "type": "object",
+                    "properties": serde_json::Value::Object(branch_properties),
+                    "required": required,
+                    "additionalProperties": false
+                }));
+            }
+            properties.insert(
+                "action".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Single operational branch of this response: either the discovery commands or the change set, never both",
+                    "anyOf": variants
+                }),
+            );
         }
 
         let required: Vec<serde_json::Value> = properties
@@ -1244,6 +1432,14 @@ mod tests {
                 prefix.parse::<usize>().ok()
             })
             .collect()
+    }
+
+    /// Returns the rendered line that states `title`.
+    fn rule_line<'a>(rendered: &'a str, title: &str) -> &'a str {
+        rendered
+            .lines()
+            .find(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("missing the {title} rule"))
     }
 
     /// Builds the default contract context for a plain interactive turn.
@@ -1375,6 +1571,43 @@ mod tests {
         assert_eq!(discussion, repl);
         assert!(discussion.contains("Minimal Coherent Change"));
         assert!(discussion.contains("Local Engineering Plans"));
+    }
+
+    #[test]
+    fn branch_rule_states_the_exclusion_of_the_enabled_branches() {
+        let registry = CapabilityRegistry::global();
+        let set = CapabilitySet::interactive_repl();
+
+        let repl = registry.compose_core_contract_rules(&set, &plain_context());
+        let line = rule_line(&repl, "Operational Branch Exclusion");
+        assert!(line.contains("the research branch"), "{line}");
+        assert!(line.contains("the execution branch"), "{line}");
+        // The XML transport names its control tags.
+        assert!(line.contains("`<context_request>`"), "{line}");
+        assert!(line.contains("`<outer_doc_request>`"), "{line}");
+        assert!(line.contains("`<verify>`"), "{line}");
+        // Plan mutation belongs to a discussion delta, so the shared head never
+        // claims it as a command the REPL may emit.
+        assert!(!line.contains("plan_update"), "{line}");
+
+        // The structured contour names the fields of its own schema instead.
+        let structured_ctx = ContractContext::new(
+            TurnIntent::InteractiveRepl,
+            EditProtocolKind::Structured,
+            PromptRenderContext::new(&[], None),
+        );
+        let structured = registry.compose_core_contract_rules(&set, &structured_ctx);
+        let line = rule_line(&structured, "Operational Branch Exclusion");
+        assert!(line.contains("`context_requests`"), "{line}");
+        assert!(line.contains("`changes`"), "{line}");
+        assert!(!line.contains("<context_request>"), "{line}");
+
+        // A surface that can emit one branch only has nothing to exclude.
+        let single =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
+        assert!(!registry
+            .compose_core_contract_rules(&single, &plain_context())
+            .contains("Operational Branch Exclusion"));
     }
 
     #[test]
@@ -1679,6 +1912,45 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Lifts the branch envelope of a composed schema into one surface.
+    ///
+    /// The wire keeps the operational branches mutually exclusive, so a field of
+    /// a branch is addressed through the envelope that owns it. A test that
+    /// asserts the composed surface reads it after this lift, so it names the
+    /// field rather than the branch that carries it.
+    fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+        let mut objects = vec![schema];
+        if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+            objects.extend(branches.iter());
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for object in objects {
+            let Some(fields) = object["properties"].as_object() else {
+                continue;
+            };
+            for (name, field) in fields {
+                if name.as_str() == "action" || name.as_str() == "kind" {
+                    continue;
+                }
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| field.clone());
+                required.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        let mut flat = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if let Some(definitions) = schema.get("$defs") {
+            flat["$defs"] = definitions.clone();
+        }
+        flat
+    }
+
     #[test]
     fn structured_schema_is_composed_from_the_enabled_modules() {
         let registry = CapabilityRegistry::global();
@@ -1688,8 +1960,9 @@ mod tests {
         let render = PromptRenderContext::new(&[], None)
             .with_patch_strategy(PatchStrategy::SearchReplace)
             .with_project(Some(&project));
-        let schema =
-            registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render);
+        let schema = flattened_surface(
+            &registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render),
+        );
 
         assert_eq!(schema["type"], serde_json::json!("object"));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
@@ -1753,10 +2026,10 @@ mod tests {
             LlmCapability::FileEdits,
             LlmCapability::PlanCreation,
         ]);
-        let schema = registry.compose_structured_schema(
+        let schema = flattened_surface(&registry.compose_structured_schema(
             &with_plans,
             &schema_render_context(PatchStrategy::SearchReplace),
-        );
+        ));
 
         assert!(schema_properties(&schema).contains(&"plan_update".to_string()));
         let definitions = schema["$defs"]

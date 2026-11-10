@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use serde::Deserialize;
 use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue};
 
-use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
+use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 /// Strict JSON Schema for the review synthesis output.
@@ -249,8 +249,7 @@ fn normalize_list(items: Vec<String>) -> Vec<String> {
 
 /// Deserializes a review payload, tolerating code fences and wrapper prose.
 fn parse_findings_output(raw: &str) -> Option<ReviewFindingsOutput> {
-    let cleaned = strip_code_fence(raw);
-    if let Ok(output) = serde_json::from_str::<ReviewFindingsOutput>(cleaned) {
+    if let Ok(output) = serde_json::from_str::<ReviewFindingsOutput>(raw.trim()) {
         return Some(output);
     }
 

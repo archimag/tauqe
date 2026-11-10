@@ -78,6 +78,10 @@ pub struct PlanItem {
     /// Present only while the step is blocked: it records why the bounded turn
     /// could not proceed, so the reason survives the interrupted turn on disk
     /// and in the interface instead of being lost with the transient session.
+    ///
+    /// A report carried by a step that is no longer `Blocked` is dropped by
+    /// `PlanImplementation::normalize_lifecycle_provenance`, so the field never
+    /// describes a stall the step already left behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     /// Identifier of the Git commit that completed this step.
@@ -87,6 +91,11 @@ pub struct PlanItem {
     /// produced it. Present only alongside `Done`: a step that never ran carries
     /// no commit, and the value is part of the immutable record of a completed
     /// step.
+    ///
+    /// A value supplied for a step that is not `Done` is dropped by
+    /// `PlanImplementation::normalize_lifecycle_provenance` before the step
+    /// reaches disk, so a mutation can never assert a change set it did not
+    /// produce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

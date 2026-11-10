@@ -66,6 +66,13 @@ A research round is one model interaction that may carry any number of typed
 research commands. The round first materializes the declared external documents it
 addresses, then the dispatcher resolves repository facts once, hands them to every
 handler that owns a command, and folds the results into one outcome.
+A round carries research commands only. Discovery is its own operational branch
+of the capability surface, so a round that opens files or searches the tree
+proposes no change set, and a round that patches the tree asks for nothing. A
+response that mixes the two is a protocol defect: the turn keeps its change set
+and reports the discovery request as the defect to correct in a later round (*The
+Autonomous Bounded Turn FSM* §3.3.2), so exploration never silently costs the
+model the edits it already wrote.
 
 ### 2.2 Commands and handlers
 
@@ -367,6 +374,9 @@ keeps asking for what it already holds cannot loop forever.
   the turn ends.
 - **It is not unbounded.** Rounds, queries, outlines, listings, and tokens all have
   configured ceilings.
+- **It is not a branch of the proposal.** A research round carries discovery
+  commands only; a round that proposes a change set carries none, and a mixed
+  round is a protocol defect the turn resolves in favor of its change set.
 - **It is not silent truncation.** Every cap is reported in the feedback block.
 - **It is not a replacement for curation.** Loading known files up front removes
   rounds and spends fewer tokens.

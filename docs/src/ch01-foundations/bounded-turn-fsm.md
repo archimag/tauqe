@@ -152,6 +152,22 @@ The code modification contour publishes the canonical `edits` container; the old
 `tauqe_edits` spelling remains a declared alias, so transcripts, sessions, and
 model output written before the rename stream and decode exactly like the
 canonical tag.
+A capability surface splits into invariant ambient channels and mutually
+exclusive operational branches. The conversational text, the turn scratchpad, and
+the detected language accompany every round, so they belong to no branch. The
+discovery commands form the `research` branch, and every command the harness acts
+upon — file edits, toolchain verification, plan authoring, project tools, and the
+terminal outcomes — forms the `execution` branch. One round follows exactly one
+branch: it discovers or it patches, never both.
+
+The split is a projection of the advertised surface, never a second list. The
+structured contour states it grammatically, nesting the two branches under one
+`action` envelope whose constant `kind` discriminator names the branch a response
+follows, so a research round holds no `changes` field at all. The XML contour has
+no discriminator, so the same exclusion reaches the model as the `Operational
+Branch Exclusion` contract rule over its control tags, and the kernel enforces it
+as a typed decision (§3.3.2). A surface that carries a single branch excludes
+nothing and renders no envelope.
 
 ### 3.2.4 Tool Categories: Terminal vs. Diagnostic Inspection
 
@@ -354,6 +370,16 @@ because a proposal that mutated storage would settle a question the developer ha
 not answered yet. The round still closes with its terminal success tag, so an
 accepted or declined offer is a completed turn rather than an unfinished one, and
 the plan itself is written only after explicit confirmation (*Local Plans*).
+A round that violates the branch exclusion — a change set together with a
+discovery request — is a protocol defect rather than a command, and the kernel
+resolves it without losing work. The change set proceeds to staging, because file
+content the model already produced is work the turn already paid for, while the
+discovery half is reported back as the defect to correct in a later round.
+Precedence belongs to the change set: a proposal about file content is checked by
+staging and verification, whereas a request for more material is checked by
+nothing. Discarding the proposal instead would let a turn that produced code reach
+the boundary looking like a turn that produced nothing, and would report as
+silence exactly the round the machine refuses to accept as silence.
 
 ### 3.3.3 Silence Is Re-Asked, Never Accepted
 
@@ -766,6 +792,11 @@ learns what to decompose instead of watching a turn fail anonymously.
   field, not a non-empty string, so the schema and the prompt state the payload
   obligation while the authoritative test runs after decoding, on the typed
   commands. A schema never decides by itself whether a turn is finished.
+- **It does not let one round both discover and patch.** A capability surface
+  splits into invariant ambient channels and mutually exclusive operational
+  branches, so a round that carries a change set carries no discovery request. A
+  mixed round is a protocol defect, and the kernel resolves it in favor of the
+  change set instead of discarding work the turn already paid for.
 - **It does not let the dialogue language reach the commit.** `commit_message` is
   an English Conventional Commits header whatever language the turn answered in;
   the language directive governs the answer, never the Git history.

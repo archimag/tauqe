@@ -795,7 +795,7 @@ impl CapabilityModule for PlanCreationModule {
         // letting a payload assert a state the mutation can never assign.
         Some(ContractRule::new(
             "Local Engineering Plans",
-            format!("{trunk}\n{PLAN_STEP_STATUS_LIFECYCLE_INVARIANT}"),
+            format!("{trunk}\n{PLAN_STEP_STATUS_LIFECYCLE_INVARIANT}\nProvenance Invariant: a step that is not 'done' carries no commit and a step that is not 'blocked' carries no blocker report, because the harness records both claims and drops a value the step did not earn."),
         ))
     }
 
@@ -1611,6 +1611,46 @@ mod tests {
     use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent};
 
     use super::*;
+
+    /// Lifts the operational branch envelope of a composed schema into one surface.
+    ///
+    /// The wire keeps the operational branches mutually exclusive, so a field of
+    /// a branch is addressed through the envelope that owns it. A test that reads
+    /// the property of a capability reads the schema after this lift, so it names
+    /// the field rather than the branch that carries it.
+    fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+        let mut objects = vec![schema];
+        if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+            objects.extend(branches.iter());
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for object in objects {
+            let Some(fields) = object["properties"].as_object() else {
+                continue;
+            };
+            for (name, field) in fields {
+                if name.as_str() == "action" || name.as_str() == "kind" {
+                    continue;
+                }
+                if properties.contains_key(name) {
+                    continue;
+                }
+                properties.insert(name.clone(), field.clone());
+                required.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        let mut flat = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if let Some(definitions) = schema.get("$defs") {
+            flat["$defs"] = definitions.clone();
+        }
+        flat
+    }
     /// Decodes `text` through `module` with a fence index of that same text.
     ///
     /// The module under test resolves every tag family against this one index,
@@ -2502,8 +2542,9 @@ mod tests {
 
         // The composed schema carries the contract of the property it declares,
         // so a structured turn reads it from the schema of its own turn.
-        let schema = crate::capabilities::registry::CapabilityRegistry::global()
+        let composed = crate::capabilities::registry::CapabilityRegistry::global()
             .compose_structured_schema(&tauqe_protocol::CapabilitySet::interactive_repl(), &render);
+        let schema = flattened_surface(&composed);
         let description = schema["properties"]["outcome"]["properties"]["commit_message"]
             ["description"]
             .as_str()

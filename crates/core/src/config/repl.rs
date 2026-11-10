@@ -39,6 +39,9 @@ pub struct ReplConfig {
     pub max_retries: usize,
     #[serde(default = "default_max_replans")]
     pub max_replans: usize,
+    /// Temporary flag to enable functional control loops migration
+    #[serde(default)]
+    pub use_control_loops: bool,
 }
 
 /// Backwards-compatible alias for the legacy `[edit]` configuration section.
@@ -61,6 +64,7 @@ impl Default for ReplConfig {
             prompt_layout: None,
             max_retries: default_max_retries(),
             max_replans: default_max_replans(),
+            use_control_loops: false,
         }
     }
 }

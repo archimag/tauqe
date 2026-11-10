@@ -7,34 +7,8 @@
 //! escapes — including UTF-16 surrogate pairs — incrementally as provider chunks
 //! arrive, without ever slicing a multi-byte character at a non-boundary offset.
 //!
-//! It is also the single authoritative source for markdown code-fence stripping
-//! (`strip_code_fence`) and balanced-object scanning (`balanced_object_end`),
-//! reused by every structured-output parser across the engine.
-
-/// Removes a surrounding markdown code fence from `input`, returning the inner
-/// payload.
-///
-/// A ```` ```json ```` fence is preferred over a bare ```` ``` ```` fence, and
-/// the fence may be preceded by wrapper prose. Input without a fence is returned
-/// trimmed and unchanged. Only single-byte ASCII delimiters are inspected, so
-/// multi-byte UTF-8 content is never sliced across a scalar boundary.
-///
-/// This is the single authoritative fence stripper reused by every
-/// structured-output parser.
-pub(crate) fn strip_code_fence(input: &str) -> &str {
-    let trimmed = input.trim();
-    let after = if let Some(idx) = trimmed.find("```json") {
-        &trimmed[idx + 7..]
-    } else if let Some(idx) = trimmed.find("```") {
-        &trimmed[idx + 3..]
-    } else {
-        return trimmed;
-    };
-    match after.find("```") {
-        Some(end) => after[..end].trim(),
-        None => after.trim(),
-    }
-}
+//! It is also the authoritative source for balanced-object scanning
+//! (`balanced_object_end`), reused by structured-output parsers across the engine.
 
 /// Returns the exclusive end offset of the balanced JSON object or array that
 /// starts at `start` (an opening `{` or `[`), or `None` when it is not closed.
@@ -91,19 +65,19 @@ pub(crate) fn first_json_object_str(raw: &str) -> Option<&str> {
     None
 }
 
-/// Strips markdown fences and trims `buffer` to the outermost balanced JSON
-/// object so a strictly typed payload can be deserialized.
+/// Trims `buffer` to the outermost balanced JSON object so a strictly typed payload
+/// can be deserialized.
 pub(crate) fn prepare_json_payload(buffer: &str) -> String {
-    let unfenced = strip_code_fence(buffer);
-    match unfenced.find('{') {
+    let trimmed = buffer.trim();
+    match trimmed.find('{') {
         Some(start) => {
-            let candidate = &unfenced[start..];
+            let candidate = &trimmed[start..];
             match balanced_object_end(candidate, 0) {
                 Some(end) => candidate[..end].to_string(),
                 None => candidate.to_string(),
             }
         }
-        None => unfenced.to_string(),
+        None => trimmed.to_string(),
     }
 }
 

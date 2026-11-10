@@ -454,6 +454,13 @@ async fn run_prepared_turn(
     prepared: PreparedTurn,
     mut policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
+    if prepared.app_config.repl.use_control_loops
+        && (prepared.intent.is_interactive_repl()
+            || prepared.intent.is_plan_discussion()
+            || prepared.intent.is_review_discussion())
+    {
+        return run_prepared_turn_control_loops(state, prompt, prepared, policy).await;
+    }
     let PreparedTurn {
         provider,
         model,
@@ -1016,7 +1023,8 @@ async fn run_prepared_turn(
                 // attempt — its classification and its named error alike —
                 // before any terminal event of the turn is published.
                 edit_cycle.open();
-                edit_cycle.close_outcome(termination_of(&wf_result), outcome.clone());
+                let termination = termination_of(&wf_result, true);
+                edit_cycle.close_outcome(termination, outcome.clone());
 
                 if let Some(hash) = &outcome.commit_hash {
                     state.out.send_event(&Event {
@@ -1107,7 +1115,7 @@ async fn run_prepared_turn(
             // A turn that ended with an answer while edit events were open
             // produced no change set: the cycle still closes, unapplied, before
             // the terminal result is published.
-            let termination = termination_of(&wf_result);
+            let termination = termination_of(&wf_result, edit_cycle.is_open());
             edit_cycle.close_unapplied(termination, Vec::new(), None);
 
             state.out.send_event(&Event {
@@ -1268,6 +1276,660 @@ async fn run_prepared_turn(
         is_batch,
         turn_status(&turn_result),
         &final_usage,
+        turn_result.error.as_deref(),
+        work_context.as_ref(),
+    );
+
+    Ok(turn_result)
+}
+
+async fn run_prepared_turn_control_loops(
+    state: &Arc<AppState>,
+    prompt: String,
+    prepared: PreparedTurn,
+    policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
+) -> Result<ModelTurnResult, ResponseError> {
+    use tauqe_core::control::context::{CancellationToken, EventSink, LoopContext};
+    use tauqe_core::control::outcome::LoopResult;
+    use tauqe_core::control::prompt::PromptBuilder;
+    use tauqe_core::control::repl::{run_repl_loop, ReplArtifact, ReplLoopConfig};
+    use tauqe_core::workflow::research::journal::TurnResearchJournal;
+    use tauqe_protocol::{HistoryFileChange, ModelResult};
+
+    let PreparedTurn {
+        provider,
+        model,
+        app_config,
+        op_id,
+        intent,
+        is_batch,
+        work_context,
+        operation,
+        marker,
+        session_id,
+        phase_out: _,
+        reasoning_effort,
+    } = prepared;
+
+    let mut cancel_rx = operation.cancel_receiver();
+    let protocol = resolve_turn_protocol(intent, app_config.repl.protocol, marker.as_deref());
+    let (event_sink, mut event_rx) = EventSink::channel();
+
+    let state_clone = Arc::clone(state);
+    let model_clone = model.clone();
+    let prompt_clone = prompt.clone();
+    let cancel_token = CancellationToken::from_receiver(cancel_rx.clone());
+    let repo_root = state.repo_root().await;
+    let focus = state.discussion_focus().await;
+    let focus_target = focus.target().cloned();
+
+    let (turn_id, history_snapshot) = {
+        let mut history = state.history.lock().await;
+        let snapshot = history.snapshot().ok();
+        let context_files: Vec<String> = state
+            .context
+            .read()
+            .await
+            .read_context_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let turn_id = history
+            .record_turn(&prompt, context_files)
+            .ok()
+            .and_then(|e| e.id());
+        (turn_id, snapshot)
+    };
+
+    let loop_config = {
+        let mut cfg = ReplLoopConfig::from_app_config(&app_config);
+        cfg.edit.staging.reasoning_effort = reasoning_effort;
+        cfg
+    };
+    let history_snapshot_clone = history_snapshot.clone();
+    let app_config_clone = app_config.clone();
+    let loop_task = tokio::spawn(async move {
+        let _session_guard = state_clone.session_lock.lock().await;
+        let mut context_manager = state_clone.context.read().await.clone();
+        let mut journal = TurnResearchJournal::default();
+        let mut input_cache = tauqe_core::workflow::fsm::cache::TurnInputCache::default();
+        let mut policy = policy;
+
+        let capabilities = tauqe_core::control::repl_capabilities(focus_target.as_ref());
+        let prompt_builder = PromptBuilder::new(
+            provider.as_ref(),
+            &model_clone,
+            protocol.as_ref(),
+            &mut input_cache,
+        )
+        .with_session_id(session_id)
+        .with_prompt(Some(prompt_clone))
+        .with_history(history_snapshot_clone.as_ref())
+        .with_repo_map_config(
+            app_config_clone.context.include_repo_map,
+            app_config_clone.context.repomap_token_budget,
+        )
+        .with_patch_strategy(app_config_clone.repl.patch_strategy)
+        .with_prompt_layout(Some(app_config_clone.resolve_prompt_layout(intent)))
+        .with_workflow(app_config_clone.repl.workflow.to_string())
+        .with_outer_docs(app_config_clone.outer_docs.clone())
+        .with_intent(intent)
+        .with_reasoning_effort(reasoning_effort);
+
+        let mut ctx = LoopContext::new(
+            &cancel_token,
+            &event_sink,
+            &repo_root,
+            &mut context_manager,
+            &mut journal,
+            policy.as_mut(),
+            capabilities,
+            prompt_builder,
+        );
+        let result = run_repl_loop(&mut ctx, &loop_config, focus_target.as_ref()).await;
+
+        (result, context_manager)
+    });
+
+    let wf_task = loop_task;
+    operation.set_abort_handle(wf_task.abort_handle());
+
+    let mut raw_streamed_text = String::new();
+    let mut usage_guard = Some(state.begin_usage(&op_id).await);
+    let edit_cycle = EditCycle::new(state.out.clone(), op_id.clone());
+    let mut is_cancelled = false;
+    let mut is_error = false;
+    let mut stream_error_msg = None;
+
+    while let Some(event) = event_rx.recv().await {
+        state.out.pace_event(&event, &mut cancel_rx).await;
+        match event {
+            StreamEvent::ReasoningDelta(delta) => {
+                state.out.send_event(&Event {
+                    method: events::MODEL_REASONING_DELTA.to_string(),
+                    params: Some(serde_json::json!({
+                        "operation_id": op_id.clone(),
+                        "delta": delta,
+                    })),
+                });
+            }
+            StreamEvent::TextDelta(delta) => {
+                raw_streamed_text.push_str(&delta);
+                state.out.send_event(&Event {
+                    method: events::MODEL_TEXT_DELTA.to_string(),
+                    params: Some(serde_json::json!({
+                        "operation_id": op_id.clone(),
+                        "delta": delta,
+                    })),
+                });
+            }
+            StreamEvent::ContextChanged(ctx_state) => {
+                state.out.send_event(&Event {
+                    method: events::CONTEXT_CHANGED.to_string(),
+                    params: Some(serde_json::json!({ "state": ctx_state })),
+                });
+            }
+            StreamEvent::EditStarted => {
+                edit_cycle.open();
+            }
+            StreamEvent::EditFileStarted { path, op_type } => {
+                edit_cycle.open();
+                state.out.send_event(&Event {
+                    method: events::EDIT_FILE_STARTED.to_string(),
+                    params: serde_json::to_value(EditFileStartedEvent {
+                        operation_id: op_id.clone(),
+                        path,
+                        op_type,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::EditHunk {
+                path,
+                hunk_index,
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+                context_hint,
+                old_text,
+                new_text,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::EDIT_HUNK.to_string(),
+                    params: serde_json::to_value(EditHunkEvent {
+                        operation_id: op_id.clone(),
+                        path,
+                        hunk_index,
+                        old_start,
+                        old_lines,
+                        new_start,
+                        new_lines,
+                        context_hint,
+                        old_text,
+                        new_text,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::EditFileDone {
+                path,
+                status,
+                error,
+                hunks_count,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::EDIT_FILE_DONE.to_string(),
+                    params: serde_json::to_value(EditFileDoneEvent {
+                        operation_id: op_id.clone(),
+                        path,
+                        status,
+                        error,
+                        hunks_count,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::EditFileRetrying {
+                path,
+                attempt,
+                max_retries,
+                reason,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::EDIT_FILE_RETRYING.to_string(),
+                    params: serde_json::to_value(EditFileRetryingEvent {
+                        operation_id: op_id.clone(),
+                        path,
+                        attempt,
+                        max_retries,
+                        reason,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::TurnPhase {
+                phase,
+                round,
+                max_rounds,
+                detail,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::TURN_PHASE.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
+                        operation_id: op_id.clone(),
+                        phase,
+                        round,
+                        max_rounds,
+                        detail,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::ToolchainStarted { command } => {
+                state.out.send_event(&Event {
+                    method: events::TOOLCHAIN_STARTED.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::ToolchainStartedEvent {
+                        operation_id: op_id.clone(),
+                        command,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::ToolchainFinished {
+                command,
+                success,
+                message,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::TOOLCHAIN_FINISHED.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
+                        operation_id: op_id.clone(),
+                        command,
+                        success,
+                        message,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::Usage(usage) => {
+                if let Some(guard) = usage_guard.as_ref() {
+                    guard.observe(&usage).await;
+                }
+                emit_legacy_usage_event(state, &op_id).await;
+            }
+            StreamEvent::RepoMapTokens(tokens) => {
+                state.out.send_event(&Event {
+                    method: events::TURN_REPOMAP.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::RepoMapInfoEvent {
+                        operation_id: op_id.clone(),
+                        tokens,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::RetryingConnection {
+                attempt,
+                max_attempts,
+                delay_secs,
+                reason,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::MODEL_CONNECTION_RETRYING.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::ModelConnectionRetryingEvent {
+                        operation_id: op_id.clone(),
+                        attempt,
+                        max_attempts,
+                        delay_secs,
+                        reason,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::ResetStream => {
+                edit_cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None);
+                withdraw_streamed_attempt(&state.out, &op_id, || raw_streamed_text.clear());
+            }
+            StreamEvent::Cancelled => {
+                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+                state.out.send_event(&Event {
+                    method: events::MODEL_CANCELLED.to_string(),
+                    params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
+                });
+                is_cancelled = true;
+                break;
+            }
+            StreamEvent::Error(err) => {
+                close_failed(
+                    &edit_cycle,
+                    EditTermination::ProviderError,
+                    format!("Operation failed before edits were applied: {}", err),
+                );
+                state.out.send_event(&Event {
+                    method: events::MODEL_ERROR.to_string(),
+                    params: Some(serde_json::json!({
+                        "operation_id": op_id.clone(),
+                        "message": err.clone(),
+                    })),
+                });
+                stream_error_msg = Some(err);
+                is_error = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if is_cancelled || is_error {
+        if is_cancelled {
+            if let Some(id) = turn_id {
+                let mut history = state.history.lock().await;
+                let _ = history.rollback_entry(id, "Operation cancelled");
+            }
+        } else {
+            let text = if !raw_streamed_text.trim().is_empty() {
+                raw_streamed_text.clone()
+            } else {
+                stream_error_msg
+                    .clone()
+                    .unwrap_or_else(|| "Operation error".to_string())
+            };
+            let mut history = state.history.lock().await;
+            let _ = history.record_response(&text, None, None, Vec::new());
+        }
+        let snapshot = flush_usage(state, &mut usage_guard).await;
+        emit_legacy_usage_event(state, &op_id).await;
+        let error = if is_cancelled {
+            Some("Operation cancelled".to_string())
+        } else {
+            stream_error_msg
+        };
+        let status = if is_cancelled { "cancelled" } else { "error" };
+        log_turn_finished(
+            &op_id,
+            &model,
+            is_batch,
+            status,
+            &snapshot.prev,
+            error.as_deref(),
+            work_context.as_ref(),
+        );
+        return Ok(ModelTurnResult {
+            operation_id: op_id,
+            result: None,
+            is_cancelled,
+            error,
+            has_terminal_success: false,
+            blocked: None,
+            abort: None,
+        });
+    }
+
+    let (loop_res, local_context) = match wf_task.await {
+        Ok(res) => res,
+        Err(join_err) => {
+            let text = format!("Workflow task failed: {}", join_err);
+            {
+                let mut history = state.history.lock().await;
+                let _ = history.record_response(&text, None, None, Vec::new());
+            }
+            let _ = flush_usage(state, &mut usage_guard).await;
+            emit_legacy_usage_event(state, &op_id).await;
+            let cancelled = *cancel_rx.borrow();
+            return Ok(ModelTurnResult {
+                operation_id: op_id,
+                result: None,
+                is_cancelled: cancelled,
+                error: Some(join_err.to_string()),
+                has_terminal_success: false,
+                blocked: None,
+                abort: None,
+            });
+        }
+    };
+
+    let snapshot = flush_usage(state, &mut usage_guard).await;
+    emit_legacy_usage_event(state, &op_id).await;
+    let operation_totals = snapshot.prev.clone();
+    let (artifact, error_msg) = match loop_res {
+        Ok(LoopResult::Success(success)) => (Some(success.value), None),
+        Ok(LoopResult::Diverged(_)) => (None, Some("Execution diverged".to_string())),
+        Ok(LoopResult::Exhausted(report)) => (None, Some(report.reason)),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
+    let (plans_applied, plan_rejections, plan_warnings, review_decisions_applied) = match &artifact
+    {
+        Some(a) => (
+            a.plans_applied,
+            a.plan_rejections.clone(),
+            a.plan_warnings.clone(),
+            a.review_decisions_applied.clone(),
+        ),
+        None => (false, Vec::new(), Vec::new(), Vec::new()),
+    };
+    if let Err(err) = state
+        .mutate_context(move |ctx| ctx.merge_turn_context(&local_context))
+        .await
+    {
+        tracing::warn!(error = %err, "Failed to merge the turn context");
+    }
+
+    let model_result = match artifact {
+        Some(ReplArtifact {
+            message,
+            modified_paths,
+            plans_applied: _,
+            plan_rejections: _,
+            plan_warnings: _,
+            review_decisions_applied: _,
+            envelope: _,
+            commit_hash,
+        }) => {
+            let text = message.unwrap_or_else(|| {
+                if !raw_streamed_text.trim().is_empty() {
+                    raw_streamed_text
+                } else {
+                    "Research completed.".to_string()
+                }
+            });
+            if !modified_paths.is_empty() {
+                if let Some(hash) = &commit_hash {
+                    state.out.send_event(&Event {
+                        method: events::GIT_COMMIT_CREATED.to_string(),
+                        params: serde_json::to_value(GitCommitCreatedEvent {
+                            commit_hash: hash.clone(),
+                            summary: "REPL changes".to_string(),
+                            changed_files: modified_paths.clone(),
+                        })
+                        .ok(),
+                    });
+
+                    let repo_root = state.repo_root().await;
+                    match offload(move || {
+                        let root = repo_root.as_path();
+                        tauqe_core::git::get_repository_state(Some(root))
+                    })
+                    .await
+                    {
+                        Ok(repo_state) => {
+                            state.out.send_event(&Event {
+                                method: events::GIT_STATE_CHANGED.to_string(),
+                                params: Some(serde_json::json!({ "repository": repo_state })),
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "Failed to read repository state after commit");
+                        }
+                    }
+                }
+
+                let outcome = EditOutcome {
+                    applied: true,
+                    error: None,
+                    changed_files: modified_paths.clone(),
+                    commit_hash: commit_hash.clone(),
+                    verification: Some(tauqe_protocol::VerificationVerdict::Passed),
+                };
+
+                edit_cycle.open();
+                edit_cycle.close_outcome(EditTermination::Answered, outcome.clone());
+
+                {
+                    let mut history = state.history.lock().await;
+                    let files = modified_paths
+                        .iter()
+                        .map(|p| HistoryFileChange::plain(p.clone()))
+                        .collect();
+                    let _ = history.record_response(
+                        &text,
+                        commit_hash,
+                        Some("REPL changes".to_string()),
+                        files,
+                    );
+                }
+
+                let _ = state.clear_transient_context().await;
+                state.reset_session_uuid().await;
+
+                ModelResult::Edit {
+                    summary: "REPL changes".to_string(),
+                    edits: Vec::new(),
+                    proposal: None,
+                    outcome,
+                }
+            } else {
+                edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+                {
+                    let mut history = state.history.lock().await;
+                    let _ = history.record_response(&text, None, None, Vec::new());
+                }
+                ModelResult::Answer { text }
+            }
+        }
+        None => {
+            let text = if !raw_streamed_text.trim().is_empty() {
+                raw_streamed_text
+            } else {
+                error_msg
+                    .clone()
+                    .unwrap_or_else(|| "Operation failed".to_string())
+            };
+            edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+            {
+                let mut history = state.history.lock().await;
+                let _ = history.record_response(&text, None, None, Vec::new());
+            }
+            ModelResult::Answer { text }
+        }
+    };
+
+    let ctx_state = state.context.read().await.get_state();
+    state.out.send_event(&Event {
+        method: events::CONTEXT_CHANGED.to_string(),
+        params: Some(serde_json::json!({ "state": ctx_state })),
+    });
+
+    if plans_applied {
+        let repo_root = state.repo_root().await;
+        let (active_id, plans) = offload(move || {
+            let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
+                .ok()
+                .flatten();
+            let plans = tauqe_core::plan::storage::PlanStorage::load_all(&repo_root).ok();
+            (active, plans)
+        })
+        .await
+        .unwrap_or((None, None));
+
+        if let Some(plans) = plans {
+            if let Some(ref aid) = active_id {
+                if let Some(active_plan) = plans.iter().find(|p| &p.id == aid) {
+                    state.out.send_event(&Event {
+                        method: events::PLAN_UPDATED.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
+                            plan: active_plan.clone(),
+                            is_save: true,
+                        })
+                        .ok(),
+                    });
+                }
+            }
+            state.out.send_event(&Event {
+                method: events::PLAN_LIST_CHANGED.to_string(),
+                params: serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
+                    plans,
+                    active_id,
+                })
+                .ok(),
+            });
+        }
+    }
+
+    if !review_decisions_applied.is_empty() {
+        let review_id_opt = match focus.target() {
+            Some(tauqe_protocol::DiscussionTarget::Review { id }) => Some(id.clone()),
+            Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
+                Some(session_id.clone())
+            }
+            _ => None,
+        };
+        if let Some(review_id) = review_id_opt {
+            if let Some(session) = load_review_session(state, &review_id).await {
+                for _ in &review_decisions_applied {
+                    state.out.send_event(&Event {
+                        method: events::REVIEW_UPDATED.to_string(),
+                        params: serde_json::to_value(ReviewUpdatedEvent {
+                            session: session.clone(),
+                        })
+                        .ok(),
+                    });
+                }
+            }
+        }
+    }
+
+    let full_text = match &model_result {
+        ModelResult::Answer { text } => text.clone(),
+        ModelResult::Edit { summary, .. } => summary.clone(),
+    };
+
+    state.out.send_event(&Event {
+        method: events::MODEL_RESULT.to_string(),
+        params: Some(serde_json::json!(ModelResultEvent {
+            operation_id: op_id.clone(),
+            result: model_result.clone(),
+            usage: Some(operation_totals.to_usage_info()),
+            session_total_cost: Some(snapshot.session.cost),
+            current_cost: Some(operation_totals.cost),
+            plan_rejections,
+            plan_warnings,
+        })),
+    });
+    state.out.send_event(&Event {
+        method: events::MODEL_FINISHED.to_string(),
+        params: Some(serde_json::json!({
+            "operation_id": op_id.clone(),
+            "full_text": full_text,
+        })),
+    });
+
+    let turn_result = ModelTurnResult {
+        operation_id: op_id,
+        result: Some(model_result),
+        is_cancelled: false,
+        error: error_msg,
+        has_terminal_success: true,
+        blocked: None,
+        abort: None,
+    };
+
+    log_turn_finished(
+        &turn_result.operation_id,
+        &model,
+        is_batch,
+        turn_status(&turn_result),
+        &operation_totals,
         turn_result.error.as_deref(),
         work_context.as_ref(),
     );
@@ -1679,7 +2341,10 @@ fn plan_mutation_fields(
 /// closes it with a stated reason. A semantic ending outranks a protocol
 /// violation: a turn that was cancelled, blocked, or aborted reports that
 /// ending even when its last proposal also violated the edit protocol.
-fn termination_of(result: &tauqe_core::workflow::WorkflowExecutionResult) -> EditTermination {
+fn termination_of(
+    result: &tauqe_core::workflow::WorkflowExecutionResult,
+    edits_streamed: bool,
+) -> EditTermination {
     if result.is_cancelled {
         EditTermination::Cancelled
     } else if result.blocked.is_some() {
@@ -1689,7 +2354,20 @@ fn termination_of(result: &tauqe_core::workflow::WorkflowExecutionResult) -> Edi
     } else if result.protocol_failure.is_some() {
         EditTermination::ProtocolFailure
     } else {
-        EditTermination::Completed
+        silent_ending(result, edits_streamed)
+    }
+}
+
+fn silent_ending(
+    result: &tauqe_core::workflow::WorkflowExecutionResult,
+    edits_streamed: bool,
+) -> EditTermination {
+    match &result.result {
+        tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
+            EditTermination::StagingRefused
+        }
+        _ if edits_streamed => EditTermination::Superseded,
+        _ => EditTermination::Answered,
     }
 }
 
@@ -1757,40 +2435,53 @@ mod tests {
     #[test]
     fn test_termination_of_reads_the_typed_state() {
         let mut result = turn_result(Vec::new(), Vec::new());
-        assert_eq!(termination_of(&result), EditTermination::Completed);
+        assert_eq!(termination_of(&result, false), EditTermination::Answered);
+        assert_eq!(termination_of(&result, true), EditTermination::Superseded);
+
+        result.result = ModelResult::Edit {
+            summary: String::new(),
+            edits: Vec::new(),
+            proposal: None,
+            outcome: EditOutcome {
+                applied: false,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            termination_of(&result, true),
+            EditTermination::StagingRefused
+        );
 
         result.blocked = Some("the invariant cannot hold".to_string());
-        assert_eq!(termination_of(&result), EditTermination::Blocked);
+        assert_eq!(termination_of(&result, true), EditTermination::Blocked);
 
         result.is_cancelled = true;
         assert_eq!(
-            termination_of(&result),
+            termination_of(&result, true),
             EditTermination::Cancelled,
             "a cancellation outranks every other ending"
         );
     }
-    /// The typed protocol-failure fact of a turn is what classifies an
-    /// unapplied cycle, and a semantic ending outranks it: only a turn that
-    /// ended for no other stated reason is reported as a protocol violation.
+
     #[test]
     fn test_termination_of_maps_the_protocol_failure_fact() {
         let mut result = turn_result(Vec::new(), Vec::new());
         assert_eq!(
-            termination_of(&result),
-            EditTermination::Completed,
+            termination_of(&result, false),
+            EditTermination::Answered,
             "a turn without a stated ending keeps the fallback"
         );
 
         result.protocol_failure = Some("unclosed <edit>".to_string());
         assert_eq!(
-            termination_of(&result),
+            termination_of(&result, false),
             EditTermination::ProtocolFailure,
             "the typed fact classifies the ending without reading its wording"
         );
 
         result.blocked = Some("the invariant cannot hold".to_string());
         assert_eq!(
-            termination_of(&result),
+            termination_of(&result, false),
             EditTermination::Blocked,
             "a semantic block outranks the protocol violation"
         );
@@ -1801,14 +2492,14 @@ mod tests {
             recommendation: "install the missing package".to_string(),
         });
         assert_eq!(
-            termination_of(&result),
+            termination_of(&result, false),
             EditTermination::Aborted,
             "an abort outranks the protocol violation"
         );
 
         result.is_cancelled = true;
         assert_eq!(
-            termination_of(&result),
+            termination_of(&result, false),
             EditTermination::Cancelled,
             "a cancellation outranks every other ending"
         );

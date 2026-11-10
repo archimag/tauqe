@@ -34,7 +34,7 @@ use tauqe_protocol::{
 };
 
 use crate::edits::stream::discussion::DiscussionStreamFilter;
-use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
+use crate::edits::stream::json::decode::first_json_object_str;
 use crate::edits::stream::EditStreamFilter;
 use crate::plan::prompt::{
     parse_plan_refinement_output, plan_refine_response_schema,
@@ -166,7 +166,7 @@ fn contract_values(schema: &serde_json::Value, pointer: &str) -> Vec<String> {
 /// prose-wrapped payload is inspected identically. A `null` field is the idle
 /// representation of an untouched plan and is not a defect.
 pub fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(strip_code_fence(raw_text))
+    let value = serde_json::from_str::<serde_json::Value>(raw_text.trim())
         .ok()
         .or_else(|| {
             first_json_object_str(raw_text).and_then(|object| serde_json::from_str(object).ok())

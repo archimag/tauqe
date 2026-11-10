@@ -19,7 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use tauqe_protocol::{LocaleGenerateParams, LocaleGenerateResult};
 
-use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
+use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 /// Builds the system prompt for the semantic locale translation role.
@@ -149,8 +149,7 @@ pub fn parse_locale_output(raw: &str) -> BTreeMap<String, String> {
 
 /// Deserializes a locale payload, tolerating code fences and wrapper prose.
 fn parse_locale_output_inner(raw: &str) -> Option<LocaleModelOutput> {
-    let cleaned = strip_code_fence(raw);
-    if let Ok(output) = serde_json::from_str::<LocaleModelOutput>(cleaned) {
+    if let Ok(output) = serde_json::from_str::<LocaleModelOutput>(raw.trim()) {
         return Some(output);
     }
 

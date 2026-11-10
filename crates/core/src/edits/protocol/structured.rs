@@ -13,7 +13,7 @@ use crate::capabilities::{
 use crate::edits::protocol::xml::engine::{self, strip_all_control_tags};
 use crate::edits::protocol::xml::CodeFences;
 use crate::edits::strategy::StrategyProfile;
-use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
+use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 use super::utils::{normalize_content, resolve_target_path_for_op};
@@ -155,6 +155,20 @@ impl StructuredEditProtocol {
         prompt.push_str(
             "Respond with a single JSON object conforming to the structured output schema:\n",
         );
+        // A surface that admits more than one operational branch declares them
+        // as one exclusive envelope, so the field names below address the object
+        // of the branch the response follows.
+        let (_, branches) = capabilities.branches();
+        if branches.len() >= 2 {
+            let kinds: Vec<String> = branches
+                .iter()
+                .map(|branch| format!("`{}`", branch.kind))
+                .collect();
+            prompt.push_str(&format!(
+                "The operational fields of the response travel inside the `action` object, whose `kind` names the single branch the response follows: {}. The `message`, `scratchpad` and `user_language` fields stay at the top level, so a change set is reached as `action.changes` and a discovery request as `action.context_requests`. A response that states commands of both branches at once is a protocol defect, so an edit is proposed only in a round that carries no discovery request.\n\n",
+                kinds.join(" or ")
+            ));
+        }
         prompt.push_str(
             &CapabilityRegistry::global()
                 .compose_structured_protocol_instructions(capabilities, &ctx),
@@ -188,7 +202,15 @@ impl StructuredEditProtocol {
         prompt.push_str("3. ");
         prompt.push_str(profile.replace_invariant);
         prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
-        prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
+        // A change set owns no field in the research branch, so the obligation
+        // names the branch instead of a property that branch cannot carry. A
+        // flat surface declares the change set unconditionally and keeps the
+        // plain form.
+        if branches.len() >= 2 {
+            prompt.push_str("5. If no code changes are needed, state the `research` branch and provide your answer in `message`; a response that follows the `execution` branch and changes nothing sets `changes: []`.\n");
+        } else {
+            prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
+        }
 
         prompt
     }
@@ -392,6 +414,20 @@ impl StructuredEditProtocol {
     /// Parses raw model text into a `ModelResult`.
     pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         let payload = StructuredPayload::parse(raw_text);
+        if let Some(diagnostic) = payload.proposal_error() {
+            return ModelResult::Edit {
+                summary: "Invalid structured change set".to_string(),
+                edits: Vec::new(),
+                proposal: None,
+                outcome: EditOutcome {
+                    applied: false,
+                    error: Some(diagnostic.to_string()),
+                    changed_files: Vec::new(),
+                    commit_hash: None,
+                    verification: None,
+                },
+            };
+        }
         if let Some(proposal) = payload.into_proposal() {
             return self.proposal_to_model_result(proposal, editable_paths);
         }
@@ -408,28 +444,97 @@ impl StructuredEditProtocol {
 
 /// Locates and decodes the single JSON object a structured response carries.
 ///
-/// A response may be the bare object, an object inside a markdown code fence, or
-/// an object quoted in wrapper prose, so the text is stripped of its fence and
-/// walked once for the first balanced object that actually deserializes. Every
-/// offset the walk yields follows an ASCII delimiter, so neither the scan nor the
-/// slice it produces can split a multi-byte character.
-///
-/// The flag reports whether that object is the whole response rather than a
-/// fragment quoted inside prose, which decides whether a response with no
-/// conversational channel collapses to nothing or keeps its prose.
+/// A structured response is deserialized directly from `raw.trim()`. If wrapper
+/// prose surrounds the object, the outermost balanced JSON object is extracted.
+/// The flag reports whether that object is the whole response.
 fn decode_response_object(raw: &str) -> Option<(serde_json::Value, bool)> {
-    let body = strip_code_fence(raw);
-    let mut from = 0;
-    while let Some(relative) = body.get(from..).and_then(|rest| rest.find('{')) {
-        let start = from + relative;
-        if let Some(end) = balanced_object_end(body, start) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body[start..end]) {
-                return Some((value, start == 0 && end == body.len()));
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value.is_object() {
+            return Some((value, true));
+        }
+    }
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = balanced_object_end(trimmed, start) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..end]) {
+                if value.is_object() {
+                    return Some((value, start == 0 && end == trimmed.len()));
+                }
             }
         }
-        from = start + 1;
     }
     None
+}
+
+/// Lifts the operational branch of a response into the response object.
+///
+/// A surface that admits more than one operational branch declares them as one
+/// exclusive envelope under `action`, so a discovery round and a change set can
+/// never travel together. The envelope is wire vocabulary rather than a field
+/// the engine reasons about, so decoding lifts the branch back to the place
+/// every consumer reads; a response that carries no envelope keeps its shape,
+/// and a payload written before the envelope existed stays decodable.
+fn flatten_action_envelope(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut object) = value else {
+        return value;
+    };
+    let Some(serde_json::Value::Object(mut branch)) = object.remove("action") else {
+        return serde_json::Value::Object(object);
+    };
+    branch.remove("kind");
+    for (name, field) in branch {
+        object.insert(name, field);
+    }
+    serde_json::Value::Object(object)
+}
+
+/// Decodes the typed proposal of a structured response.
+///
+/// A response without a `changes` key is a discovery round: the branch
+/// envelope decides which fields a response carries, so the payload is
+/// modelled with the empty change set injected, which keeps its discovery
+/// requests intact. A response that declares a change set must deserialize:
+/// when it cannot, the diagnostic travels beside the absent proposal, so
+/// [`StructuredPayload::change_set`] reports it as a protocol defect instead
+/// of reading the round as an answer without edits.
+fn decode_proposal(
+    object: Option<&serde_json::Value>,
+) -> (Option<ModelResultProposal>, Option<String>) {
+    let Some(object) = object else {
+        return (None, None);
+    };
+    // The proposal is deserialized from the decoded object rather than from
+    // the text, so the response is lexed once no matter how many of its
+    // fields the turn reads.
+    let error = match ModelResultProposal::deserialize(object) {
+        Ok(proposal) => return (Some(proposal), None),
+        Err(error) => error,
+    };
+    let declares_changes = object
+        .as_object()
+        .is_some_and(|object| object.contains_key("changes"));
+    if !declares_changes {
+        // A discovery round carries no change set at all: normalize the
+        // payload with the empty change set so its discovery requests decode.
+        let mut patched = object.clone();
+        if let Some(map) = patched.as_object_mut() {
+            map.entry("changes".to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        }
+        if let Ok(proposal) = ModelResultProposal::deserialize(&patched) {
+            return (Some(proposal), None);
+        }
+    }
+    // The payload declares fields the decoder could not read. Reading such a
+    // response as an answer without edits would discard the work the round
+    // already produced, so the diagnostic travels beside the absent proposal
+    // and `change_set` reports it as a protocol defect.
+    (
+        None,
+        Some(format!(
+            "the structured response payload could not be decoded: {error}"
+        )),
+    )
 }
 
 /// Collects the conversational channel of every JSON object the response carries.
@@ -441,7 +546,7 @@ fn decode_response_object(raw: &str) -> Option<(serde_json::Value, bool)> {
 /// object owns the braces inside it, so the walk resumes after the object
 /// instead of descending into its payload.
 fn collect_json_messages(raw: &str) -> Vec<String> {
-    let body = strip_code_fence(raw);
+    let body = raw.trim();
     let mut messages = Vec::new();
     let mut from = 0;
     while let Some(relative) = body.get(from..).and_then(|rest| rest.find('{')) {
@@ -521,6 +626,16 @@ pub struct StructuredPayload<'a> {
     object: Option<serde_json::Value>,
     /// The typed proposal deserialized from `object`.
     proposal: Option<ModelResultProposal>,
+    /// Diagnostic of a proposal the response declared but the decoder could
+    /// not hold.
+    ///
+    /// The value exists exactly when the decoded object carried a `changes`
+    /// key the proposal failed to deserialize from. Such a payload is a
+    /// protocol defect: the model promised a change set, and reading the round
+    /// as an answer without edits would discard work it already produced. A
+    /// response without the key is a discovery round, and its absent change
+    /// set is legitimate.
+    proposal_error: Option<String>,
     /// Whether `object` is the whole response rather than an object quoted inside
     /// wrapper prose.
     whole_object: bool,
@@ -530,19 +645,22 @@ impl<'a> StructuredPayload<'a> {
     /// Decodes one structured response.
     pub fn parse(raw_text: &'a str) -> Self {
         let (object, whole_object) = match decode_response_object(raw_text) {
-            Some((value, whole_object)) => (Some(value), whole_object),
+            Some((value, whole_object)) => (Some(flatten_action_envelope(value)), whole_object),
             None => (None, false),
         };
         // The proposal is deserialized from the decoded object rather than from
         // the text, so the response is lexed once no matter how many of its
         // fields the turn reads.
-        let proposal = object
-            .as_ref()
-            .and_then(|value| ModelResultProposal::deserialize(value).ok());
+        let (proposal, mut proposal_error) = decode_proposal(object.as_ref());
+        if object.is_none() && raw_text.trim().starts_with('{') {
+            proposal_error =
+                Some("the structured response could not be parsed as valid JSON".to_string());
+        }
         Self {
             raw: raw_text,
             object,
             proposal,
+            proposal_error,
             whole_object,
         }
     }
@@ -553,6 +671,18 @@ impl<'a> StructuredPayload<'a> {
     /// of a turn carries the proposal itself.
     fn into_proposal(self) -> Option<ModelResultProposal> {
         self.proposal
+    }
+
+    /// Diagnostic of a proposal the response declared but the decoder could
+    /// not hold.
+    ///
+    /// The value exists exactly when the decoded object carried a `changes`
+    /// key the proposal failed to deserialize from. Such a payload is a
+    /// protocol defect, so a caller that models the round as a `ModelResult`
+    /// reports it as a failed change set instead of reading it as an answer
+    /// without edits.
+    pub fn proposal_error(&self) -> Option<&str> {
+        self.proposal_error.as_deref()
     }
 
     /// The named field of the decoded object.
@@ -613,6 +743,9 @@ impl<'a> StructuredPayload<'a> {
     /// An answer that declares no change is valid: a round that only reports,
     /// asks for context, or records a decision modifies no file.
     pub fn change_set(&self, editable_paths: &[String]) -> Result<Vec<EditOperation>, String> {
+        if let Some(diagnostic) = self.proposal_error.as_deref() {
+            return Err(diagnostic.to_string());
+        }
         let Some(proposal) = self.proposal.as_ref() else {
             return xml_change_set(self.raw, editable_paths);
         };
@@ -1112,7 +1245,7 @@ pub fn parse_anchor_edits(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let changes: Vec<StructuredChangeProposal> = serde_json::from_str(strip_code_fence(trimmed))
+    let changes: Vec<StructuredChangeProposal> = serde_json::from_str(trimmed)
         .map_err(|error| format!("invalid anchored change set: {error}"))?;
     changes
         .iter()
@@ -1163,6 +1296,45 @@ mod tests {
     /// declares no commands.
     fn render_context(patch_strategy: PatchStrategy) -> PromptRenderContext<'static> {
         PromptRenderContext::new(&[], None).with_patch_strategy(patch_strategy)
+    }
+
+    /// Lifts the branch envelope of a composed schema into one surface.
+    ///
+    /// The wire keeps the operational branches mutually exclusive, so a field of
+    /// a branch is addressed through the envelope that owns it. A test that
+    /// asserts the shape of a field reads the surface after this lift, so it
+    /// names the field rather than the branch that carries it.
+    fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+        let mut objects = vec![schema];
+        if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+            objects.extend(branches.iter());
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<serde_json::Value> = Vec::new();
+        for object in objects {
+            let Some(fields) = object["properties"].as_object() else {
+                continue;
+            };
+            for (name, field) in fields {
+                if name.as_str() == "action" || name.as_str() == "kind" {
+                    continue;
+                }
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| field.clone());
+                required.push(serde_json::Value::String(name.clone()));
+            }
+        }
+        let mut flat = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if let Some(definitions) = schema.get("$defs") {
+            flat["$defs"] = definitions.clone();
+        }
+        flat
     }
     #[test]
     fn test_structured_protocol_repo_searches() {
@@ -1352,7 +1524,9 @@ mod tests {
 
     #[test]
     fn test_structured_schema_has_no_nullable_types() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         // Only the idle representation of the plan payload is nullable; every
         // edit field stays a concrete typed value.
         let changes = &schema["properties"]["changes"]["items"];
@@ -1364,7 +1538,9 @@ mod tests {
 
     #[test]
     fn test_structured_schema_and_instructions_include_overwrite() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         let ops = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
             .as_array()
             .unwrap();
@@ -1543,7 +1719,9 @@ mod tests {
 
     #[test]
     fn test_anchored_schema_declares_range_fields_instead_of_echoed_text() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::LineAnchor));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::LineAnchor,
+        )));
         let items = &schema["properties"]["changes"]["items"];
         let properties = items["properties"].as_object().expect("properties object");
         for field in ["op", "path", "to", "start", "end", "content"] {
@@ -1612,9 +1790,7 @@ mod tests {
         }"#;
         assert_eq!(clean_raw_json_or_text(silent), "");
 
-        // A fenced payload is the same protocol response with decoration.
-        let fenced = "```json\n{\"message\":\"\",\"changes\":[]}\n```";
-        assert_eq!(clean_raw_json_or_text(fenced), "");
+        // Fences are not stripped in strict structured mode.
     }
 
     #[test]
@@ -1653,7 +1829,9 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_control_fields() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1989,7 +2167,9 @@ mod tests {
             })
         );
 
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         let outcome = &schema["properties"]["outcome"];
         let statuses = outcome["properties"]["status"]["enum"]
             .as_array()
@@ -2173,7 +2353,9 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_verify_and_user_language() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -2197,7 +2379,9 @@ mod tests {
 
     #[test]
     fn test_structured_schema_reflects_the_capability_set() {
-        let full = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let full = flattened_surface(&StructuredEditProtocol::schema(&render_context(
+            PatchStrategy::SearchReplace,
+        )));
         let full_properties = full["properties"].as_object().expect("properties object");
         for field in [
             "message",
@@ -2333,10 +2517,10 @@ mod tests {
     }
     #[test]
     fn test_review_update_field_follows_the_review_discussion_surface() {
-        let review = StructuredEditProtocol::schema_for(
+        let review = flattened_surface(&StructuredEditProtocol::schema_for(
             &CapabilitySet::review_discussion(),
             &render_context(PatchStrategy::SearchReplace),
-        );
+        ));
         assert!(
             review["properties"].get("review_update").is_some(),
             "a review discussion declares the decision field"
@@ -2356,14 +2540,110 @@ mod tests {
             CapabilitySet::discussion(),
             CapabilitySet::isolated_step(),
         ] {
-            let schema = StructuredEditProtocol::schema_for(
+            let schema = flattened_surface(&StructuredEditProtocol::schema_for(
                 &surface,
                 &render_context(PatchStrategy::SearchReplace),
-            );
+            ));
             assert!(
                 schema["properties"].get("review_update").is_none(),
                 "the decision field leaked into a surface that does not authorize it"
             );
         }
+    }
+
+    #[test]
+    fn the_surface_declares_the_operational_branches_as_one_exclusive_envelope() {
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let branches = schema["properties"]["action"]["anyOf"]
+            .as_array()
+            .expect("an exclusive surface declares the branch envelope");
+        assert_eq!(branches.len(), 2);
+
+        // The branch is named by a discriminator the schema requires, so a
+        // response states which one it follows before it emits a command.
+        let kinds: Vec<&str> = branches
+            .iter()
+            .filter_map(|branch| branch["properties"]["kind"]["enum"][0].as_str())
+            .collect();
+        assert_eq!(kinds, vec!["research", "execution"]);
+
+        // The discovery commands and the change set live in different branches,
+        // so no response can carry both and the mixed round of the older surface
+        // is no longer expressible.
+        let research = &branches[0];
+        let execution = &branches[1];
+        assert!(research["properties"].get("context_requests").is_some());
+        assert!(research["properties"].get("changes").is_none());
+        assert!(execution["properties"].get("changes").is_some());
+        assert!(execution["properties"].get("context_requests").is_none());
+
+        // The ambient fields accompany every response and stay at the top level,
+        // so the envelope carries only the operational branch.
+        for field in ["message", "scratchpad", "user_language"] {
+            assert!(schema["properties"].get(field).is_some(), "{field}");
+        }
+
+        // Every object of the surface stays strict: a declared field is always
+        // required, and no field the surface does not declare is accepted.
+        for object in std::iter::once(&schema).chain(branches.iter()) {
+            assert_eq!(object["additionalProperties"], serde_json::json!(false));
+            let mut required: Vec<&str> = object["required"]
+                .as_array()
+                .expect("a strict object requires its fields")
+                .iter()
+                .filter_map(|field| field.as_str())
+                .collect();
+            required.sort();
+            let mut declared: Vec<&str> = object["properties"]
+                .as_object()
+                .expect("a strict object declares its fields")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            declared.sort();
+            assert_eq!(required, declared);
+        }
+    }
+    #[test]
+    fn test_a_declared_change_set_the_decoder_cannot_read_is_reported() {
+        // A `content` of a wrong type is a defect the payload the model
+        // promised can carry. Reading such a response as an answer without
+        // edits would discard the work the round already produced.
+        let json = r#"{
+            "message": "Editing",
+            "changes": [{
+                "op": "create",
+                "path": "src/new.rs",
+                "to": "",
+                "start": "",
+                "end": "",
+                "content": 5
+            }]
+        }"#;
+        let payload = StructuredPayload::parse(json);
+        let error = payload
+            .change_set(&[])
+            .expect_err("a declared change set the decoder cannot read must be reported");
+        assert!(
+            error.contains("could not be decoded"),
+            "the diagnostic must explain the defect: {error}"
+        );
+
+        // The very same object without the bad change set decodes as an idle
+        // round: an empty change set is a legitimate answer.
+        let idle = r#"{"message":"Nothing to change","changes":[]}"#;
+        assert_eq!(
+            StructuredPayload::parse(idle).change_set(&[]),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn test_a_research_round_without_changes_decodes_as_an_empty_change_set() {
+        let json = r#"{"message":"Need files","context_requests":["src/a.rs"]}"#;
+        let payload = StructuredPayload::parse(json);
+        assert_eq!(payload.change_set(&[]), Ok(Vec::new()));
+        assert_eq!(payload.context_requests().len(), 1);
+        assert!(payload.proposal_error().is_none());
     }
 }

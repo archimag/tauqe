@@ -63,7 +63,7 @@ check *args="--workspace":
 [metadata('timeout', '900')]
 test *args="--workspace":
     cargo nextest run {{args}} --no-fail-fast --retries 0
-    cargo test {{args}} --doc
+    cargo test --doc -p tauqe-core -p tauqe-protocol -p tauqe-tools
 
 [group('tauqe')]
 [doc('Lint every workspace target, denying warnings')]

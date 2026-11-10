@@ -17,7 +17,7 @@
 //! while the transition lasts.
 
 mod apply;
-mod atomic;
+pub(crate) mod atomic;
 pub mod protocol;
 mod stage;
 pub(crate) mod strategy;

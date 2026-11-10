@@ -92,6 +92,46 @@ fn commit_fixture(repo_root: &Path, files: &[&str]) {
         .expect("commit fixture files");
 }
 
+/// Lifts the operational branch envelope of a composed schema into one surface.
+///
+/// The wire keeps the operational branches mutually exclusive, so a field of a
+/// branch is addressed through the envelope that owns it. A test that reads the
+/// property of a capability reads the schema after this lift, so it names the
+/// field rather than the branch that carries it.
+fn flattened_surface(schema: &serde_json::Value) -> serde_json::Value {
+    let mut objects = vec![schema];
+    if let Some(branches) = schema["properties"]["action"]["anyOf"].as_array() {
+        objects.extend(branches.iter());
+    }
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<serde_json::Value> = Vec::new();
+    for object in objects {
+        let Some(fields) = object["properties"].as_object() else {
+            continue;
+        };
+        for (name, field) in fields {
+            if name.as_str() == "action" || name.as_str() == "kind" {
+                continue;
+            }
+            if properties.contains_key(name) {
+                continue;
+            }
+            properties.insert(name.clone(), field.clone());
+            required.push(serde_json::Value::String(name.clone()));
+        }
+    }
+    let mut flat = serde_json::json!({
+        "type": "object",
+        "properties": serde_json::Value::Object(properties),
+        "required": required,
+        "additionalProperties": false
+    });
+    if let Some(definitions) = schema.get("$defs") {
+        flat["$defs"] = definitions.clone();
+    }
+    flat
+}
+
 /// Creates a stream channel whose receiver is already dropped, so producers
 /// observe a closed channel and can never block the turn.
 fn event_channel() -> (mpsc::Sender<StreamEvent>, watch::Receiver<bool>) {
@@ -2070,7 +2110,7 @@ fn plan_discussion_intent_carries_the_dialogue_surface() {
 
     match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace, None) {
         Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-            let schema = &json_schema.schema;
+            let schema = flattened_surface(&json_schema.schema);
             assert!(schema["properties"].get("changes").is_some());
             assert!(schema["properties"].get("plan_update").is_some());
         }
@@ -5852,7 +5892,7 @@ async fn line_anchor_turn_advertises_a_schema_without_the_overwrite_operation() 
     // operations the model can select, so it is read from the recorded request.
     let schema = match provider.requests()[0].response_format.clone() {
         Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-            json_schema.schema
+            flattened_surface(&json_schema.schema)
         }
         other => panic!("expected a JSON-schema response format, got {other:?}"),
     };
@@ -5879,7 +5919,7 @@ async fn line_anchor_turn_advertises_a_schema_without_the_overwrite_operation() 
     let echoed =
         match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace, None) {
             Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-                json_schema.schema
+                flattened_surface(&json_schema.schema)
             }
             other => panic!("expected a JSON-schema response format, got {other:?}"),
         };
@@ -8693,7 +8733,7 @@ args = [\"check\"]
 
         let schema = match provider.requests()[0].response_format.clone() {
             Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-                json_schema.schema
+                flattened_surface(&json_schema.schema)
             }
             other => panic!("expected a JSON-schema response format, got {other:?}"),
         };

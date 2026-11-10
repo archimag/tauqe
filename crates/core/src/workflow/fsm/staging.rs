@@ -2290,4 +2290,82 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         );
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
     }
+    /// A round that proposes edits and asks for repository material at once
+    /// has crossed the branch exclusion, so its edits must survive.
+    ///
+    /// Answering the request instead and re-entering the proposal round
+    /// discards the change set the model had already produced, which is how a
+    /// turn that visibly edited files ended as an answer without edits.
+    #[tokio::test]
+    async fn a_mixed_round_keeps_its_edits_instead_of_discarding_them() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("helper.rs", "pub const ANSWER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let mixed = format!(
+            "{}\n<context_request path=\"helper.rs\" access=\"read_only\" />",
+            edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )
+        );
+        // A second response is scripted so a turn that wrongly keeps cycling
+        // shows up in the recorded request count instead of stalling here.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(mixed),
+            MockResponse::text("The change set is complete."),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "the edits of a mixed round must reach staging: {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "a mixed round must not buy a discovery round trip"
+        );
+        assert!(
+            outcome.assistant_text.contains("Operational Branch Mixed"),
+            "the answer must name the half of the round that survived: {}",
+            outcome.assistant_text
+        );
+        let mut streamed = String::new();
+        while let Ok(event) = stream_rx.try_recv() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(streamed.contains("Operational Branch Mixed"));
+    }
 }

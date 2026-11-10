@@ -3,7 +3,7 @@ use tauqe_protocol::{
 };
 use tracing::{info, warn};
 
-use super::json::decode::{balanced_object_end, strip_code_fence, StringFieldCursor};
+use super::json::decode::{balanced_object_end, StringFieldCursor};
 use super::json::extract_streamed_string_field;
 use super::EditStreamFilter;
 use crate::providers::StreamEvent;
@@ -130,7 +130,7 @@ impl DiscussionStreamFilter {
                     None
                 }
             } else {
-                serde_json::from_str::<serde_json::Value>(strip_code_fence(&self.buffer))
+                serde_json::from_str::<serde_json::Value>(self.buffer.trim())
                     .ok()
                     .and_then(|v| {
                         v.get(&self.target_field)
@@ -167,7 +167,7 @@ impl DiscussionStreamFilter {
 
     /// Robustly parses a raw model output into `DiscussionResponse` with resilient fallbacks.
     pub fn parse_response(raw: &str) -> DiscussionResponse {
-        let clean = strip_code_fence(raw);
+        let clean = raw.trim();
         if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(clean) {
             Self::sanitize_plan_update(&mut resp);
             return resp;
