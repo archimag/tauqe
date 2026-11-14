@@ -35,6 +35,11 @@ serde = { version = "1.0", features = ["derive"] }
 # the structural fields. Cargo unifies features across the whole workspace, so
 # the feature is declared once here and every member consumes the plain entry.
 serde_json = { version = "1.0", features = ["preserve_order"] }
+# The strict response schema is derived from the command types themselves, so a
+# command and the schema that constrains it share one declaration and cannot
+# drift. Deriving a schema performs no I/O, which keeps `crates/protocol` a pure
+# leaf crate (Conventions §12.4).
+schemars = { version = "0.8", features = ["derive"] }
 tokio = { version = "1.54", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json", "time"] }

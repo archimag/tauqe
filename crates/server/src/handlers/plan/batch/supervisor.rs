@@ -15,8 +15,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::super::common::{offload_plan, publish_plan};
+use crate::handlers::common::{cleanup_transient_context, emit, spawn_escalation_relay};
+use crate::handlers::host::ServerImplementationHost;
+use crate::state::{AppState, OperationGuard};
 use tauqe_core::plan::storage::PlanStorage;
-use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::implementation::{
     ExecutionScope, PlanImplementationOptions, PlanImplementationPipeline,
     PlanImplementationReport, PlanImplementationStop,
@@ -24,13 +27,6 @@ use tauqe_core::workflow::implementation::{
 use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ModelSelection, PlanBatchFinishedEvent,
 };
-use tokio::sync::mpsc;
-
-use crate::handlers::common::spawn_escalation_relay;
-use crate::handlers::host::ServerImplementationHost;
-use crate::state::{AppState, OperationGuard};
-
-use super::super::common::{cleanup_transient_context, emit, offload_plan, publish_plan};
 
 /// Outcome of a server-driven batch of plan steps.
 ///
@@ -167,56 +163,41 @@ pub(super) async fn run_plan_batch_with(
         "plan batch started"
     );
 
-    // The whole run shares one configuration snapshot, one operation, and one turn
-    // marker: a step promoted mid-run keeps decoding the protocol it started with,
-    // and a cancellation reaches every member through the same channels.
-    let config = state.config.lock().await.config.clone();
-    let marker = state.next_turn_marker().await;
-    let host = ServerImplementationHost::new(
+    let cfg_snapshot = state.config.lock().await.config.clone();
+    let host = Arc::new(ServerImplementationHost::new(
         Arc::clone(state),
         Arc::clone(operation),
-        config.clone(),
+        cfg_snapshot.clone(),
         repo_root.clone(),
-    );
-    let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1);
-    // The relay drains the batch channel for the whole run, so the executor
-    // never parks on a full queue and every promotion reaches the client.
+    ));
+
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
     let relay = spawn_escalation_relay(state.out.clone(), operation_id.clone(), stream_rx);
 
-    let report = PlanImplementationPipeline::new(
+    let marker = None;
+    let pipeline_options = PlanImplementationOptions {
+        selection: options.model.clone(),
+        instructions: None,
+        marker,
+    };
+    let scope = ExecutionScope::Plan {
+        plan_id: plan_id.to_string(),
+        step_id: options.step_id.clone(),
+    };
+    let pipeline = PlanImplementationPipeline::new(
         &repo_root,
-        ExecutionScope::Plan {
-            plan_id: plan_id.to_string(),
-            step_id: options.step_id.clone(),
-        },
-        &host,
-        config,
-        PlanImplementationOptions {
-            selection: options.model.clone(),
-            instructions: None,
-            marker,
-        },
-    )
-    .run(
-        &stream_tx,
-        &operation.cancel_receiver(),
-        &operation.soft_stop_receiver(),
-    )
-    .await;
+        scope,
+        host.as_ref(),
+        cfg_snapshot,
+        pipeline_options,
+    );
 
-    // The last sender closes the batch channel, so the relay publishes the
-    // promotions of the run before the terminal report leaves.
+    let cancel_rx = operation.cancel_receiver();
+    let soft_stop_rx = operation.soft_stop_receiver();
+    let report = pipeline.run(&stream_tx, &cancel_rx, &soft_stop_rx).await;
     drop(stream_tx);
-    if let Err(err) = relay.await {
-        tracing::warn!(
-            plan_id = plan_id,
-            error = %err,
-            "plan batch escalation relay terminated unexpectedly"
-        );
-    }
+    let _ = relay.await;
 
-    // The transient context is released again once the horizon settles, so the
-    // next run starts from the same clean basis.
     cleanup_transient_context(state).await;
     publish_plan_state(state, &repo_root, plan_id).await;
     finish_batch(state, &operation_id, plan_id, started_at, &report)

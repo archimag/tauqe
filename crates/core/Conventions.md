@@ -4,81 +4,69 @@ This document specifies mandatory architectural and operational conventions for 
 
 ---
 
-## 1. Dual-Contour Architecture: Structured Output vs XML Edits
+## 1. Protocol Architecture: Enforced Structured Output
 
-The interaction protocol between Tauqe and large language models is strictly divided into two orthogonal operational contours:
+All interaction between Tauqe and large language models is governed exclusively through enforced Structured Output (`response_format: json_schema`). Free-form text protocols, ad-hoc regex scrapers, and XML tag parsing for machine-consumed commands are strictly prohibited.
 
-### 1.1. Code Modification Contour (REPL & Step Execution)
-- **Protocol:** Strict XML marker protocol (`<edits_...>`, `<context_request_...>`, `<repo_search_...>`, `<verify_...>`, `<plan_...>`, etc.).
-- **Purpose:** Virtual in-memory staging, atomic search/replace patch application, toolchain verification healing, and deterministic Git transactions.
-- **Scope:** Used exclusively when the model is tasked with creating, editing, renaming, or deleting codebase files.
-
-### 1.2. Structured Output Contour (All Non-Code Operations)
-- **Protocol:** Enforced Structured Output (`response_format: json_schema` or typed JSON deserialization).
-- **Mandatory Invariant:** Any operation, subsystem, or workflow that does **NOT** directly produce code modifications MUST use Structured Output. Free-form text with heuristic markdown parsing for machine-consumed data is strictly prohibited.
+### 1.1. Mandatory Invariants
+- **Deterministic Schema Conformance:** Every model turn interacts through typed JSON schema validation, guaranteeing compile-time schema conformance and deterministic deserialization.
+- **Prompt Injection Defense:** Constrained decoding at the token level prevents prompt injection, instruction drift, and syntax discrepancies without requiring cryptographic turn markers or ad-hoc tag scanning.
+- **Decoupled Reasoning and Payloads:** Ambient cognitive reasoning (`message`, `scratchpad`) is isolated from structural operational commands (`action`).
 - **Covered Subsystems & Operations:**
-  1. **Structured Discussion Mode:** Interactive planning and review discussions (`DiscussionResponse` with optional typed `plan_update`).
-  2. **Code Review Synthesis:** Generating audit findings, severity classifications, and file locations.
-  3. **Commit Message Generation:** Synthesizing squash or checkpoint commit summaries.
-  4. **History & Plan Compaction:** Context summarization, state compaction, and progress checkpoints.
-  5. **Ontology & Triage Queries:** Any categorization or diagnostic tasks parsed by code.
-- **Architectural Rationale (Why):**
-  - Eliminates markdown parsing fragility and regex discrepancies.
-  - Prevents prompt injection and instruction drift.
-  - Guarantees compile-time schema conformance and deterministic deserialization.
-  - Decouples cognitive reasoning and conversational workflows from file-patching machinery.
+  1. **Interactive REPL & Discussions:** Natural language dialogue with optional typed `plan_update` or `review_update`.
+  2. **Code Modification:** Virtual in-memory staging, atomic search/replace patch application, and verification healing.
+  3. **Code Review Synthesis:** Generating audit findings, severity classifications, and file locations.
+  4. **Commit Message Generation:** Synthesizing squash or checkpoint commit summaries.
+  5. **History & Plan Compaction:** Context summarization, state compaction, and progress checkpoints.
 
-### 1.3. Turn-Marker Tag Protection Invariant (Unified XML Defense)
-- **Unified Registration SSOT:** Every structural XML control tag emitted by the model (`<edits>`, `<edit>`, `<search>`, `<replace>`, `<create>`, `<overwrite>`, `<delete>`, `<move>`, `<context_request>`, `<repo_search>`, `<doc_request>`, `<plan>`, `<verify>`, `<scratchpad>`, `<success>`, `<error>`, `<blocked>`, `<user_language>`) MUST participate in the unified turn-marker protection mechanism. A tag is declared exactly once as an `XmlTagSpec` in `XML_TAG_SPECS` (`crates/core/src/edits/protocol/xml/engine.rs`), and the capability modules in `crates/core/src/capabilities` resolve those specs by base name for their own prompt text, decoding, and sanitization. The protected base names, the marker tolerance, the accepted unmarked children, and the stream-suppression flags are all derived from that single registry. Introducing a control tag anywhere else — or reviving a parallel `XML_TAG_BASES` list — is strictly prohibited.
-- **Parametric Tag Machinery:** Boundary scanning (`find_next_tag`), attribute reading (`XmlTagMatch::attr`), stripping (`strip_tag_by_spec`), and streamed tag classification (`TextScan`) are implemented once and parametrized by the spec, and the incremental scanner resumes from the offsets it already cleared instead of rescanning the accumulated buffer. A tag therefore cannot drift between its scanner, its stripper, and its stream suppressor, and hand-written per-tag scanners in `tags/*.rs` must never be reintroduced.
-- **Capability Modules Own Their Tags:** Each capability module (`TextMessageModule`, `FileEditsModule`, `ResearchModule`, `DocRequestModule`, `ToolchainVerifyModule`, `PlanCreationModule`, `PlanUpdateModule`, `ReviewUpdateModule`, `ScratchpadModule`, `OutcomeModule`, `BlockedModule`, `UserLanguageModule`, `CustomToolsModule`) declares the canonical tag it owns where it owns one, the aliases it still accepts, the tag specifications it resolves, its delivery mode, the prompt fragments it contributes, and the decoder that produces its commands. A module whose capability owns no control tag declares none and contributes through the structured schema alone, exactly as `ReviewUpdateModule` publishes the decision field of a review discussion. Registering a new capability means adding one module to `CapabilityRegistry`, never editing a shared scanner or a monolithic prompt template.
-- **Canonical Tag with Declared Aliases:** A capability publishes exactly one canonical name and, where history requires it, the spellings an earlier revision emitted. Suppression, cleaning, and decoding resolve through the canonical specification, so an alias reproduces canonical behavior instead of surviving as a second code path. The edit container publishes the canonical name `edits`, while `tauqe_edits` stays a declared alias, so transcripts, sessions, and model output written before the rename keep decoding identically. A spelling that is neither the canonical name nor a declared alias is prohibited.
-- **Declared Delivery Mode:** Each capability states how its output reaches the harness — `LiveStreaming` for the contours consumed while tokens arrive (conversational text and file edits), `RoundDeferred` for the payloads decoded once a round finishes (discovery, documentation, verification, plans, scratchpad, outcome, blockers, language, project tools). Streaming scanners and round-level decoders read that declared property rather than a capability name or tag literal, so delivery stays orthogonal to capability phase.
-- **Cryptographic Turn Binding:** The turn marker defends the tagged command channel from injection, so the engine generates its unpredictable alphanumeric value (`generate_turn_marker`) only for a turn whose active protocol uses the XML contour (`Xml` and `Mixed`). System prompt instructions append that suffix to every control tag (`<{base}_{marker}>`). A structured turn emits no control tag at all, so it never mints a marker: the value stays `None` on every server and FSM level that would otherwise carry it, and the system prompt appends no suffix.
-- **Strict Normalization and Injection Defense:** Active execution parsers (`MarkedXmlEditProtocol`) strictly decode only marker-suffixed tags via `normalize_marked_xml`. Unsuffixed tags occurring in source code, diffs, conversational text, or documentation are protected as literals (`restore_xml_literals`) and must NEVER trigger commands, context mutations, repository searches, plan changes, or patch staging.
-- **Streaming Suppression:** Stream filters (`XmlStreamFilter`, `find_next_control_tag`) detect marker-suffixed tags during generation and suppress them from leaking into the user-facing `TextDelta` stream.
-### 1.4. Mutually Exclusive Operational Branches
-
-- **One response follows exactly one branch.** A turn surface decomposes into invariant ambient capabilities — the conversational text, the turn scratchpad, and the detected language — and into mutually exclusive operational branches. The decomposition declares `research`, which carries the discovery commands, and `execution`, which carries every command the harness acts upon. A response states one branch and emits only that branch's commands, because discovery and patching are phases of a turn rather than one round.
-- **The decomposition has one definition.** `CapabilitySet::branches` (`crates/protocol/src/command/capability.rs`) projects an advertised surface onto its ambient part and its branches, and every consumer derives its behavior from that projection: the contract rule names the branches, the structured schema nests them under one discriminator, and the turn kernel classifies a round by them. A parallel list of tags, a hand-written branch table, or a per-contour grouping is prohibited.
-- **Each contour enforces the exclusion in its own vocabulary.** The structured contour expresses it grammatically: a surface that admits two branches declares them as `action.anyOf`, each branch a strict object carrying a constant `kind`, so a response which names the research branch holds no `changes` property to emit. The XML contour has no discriminator, so the same exclusion reaches the model as the `Operational Branch Exclusion` contract rule and is enforced by the turn kernel as a typed decision.
-- **A surface with one branch excludes nothing.** A capability set that carries no discovery command declares only the branch it can emit, and neither the rule nor the envelope is rendered, exactly as a disabled capability contributes neither a rule nor a schema fragment.
-- **The engine never discards a change set a round produced.** A mixed round is a protocol defect rather than a command. Its change set still reaches staging, because file content the model already wrote is work the turn already paid for, while the discovery half is reported back as the defect to correct in a later round. Precedence belongs to the change set: a proposal about file content is checked by staging and verification, whereas a request for more material is checked by nothing, so discarding the proposal would let a turn that produced code reach the boundary looking like a turn that produced nothing.
+### 1.2. Mutually Exclusive Operational Branches
+- **One response follows exactly one branch.** A turn surface decomposes into the invariant ambient channel — the turn scratchpad — and into mutually exclusive operational branches (`research`, `edit`, `plan`, `review`). The conversational channel belongs to the branches: every operational branch declares the single `message` field of the response, so a composed wire carries exactly one `message` property because exactly one branch is selected. The name belongs to the answer alone: the error channel is the separate `error_message` property a branch declares beside it, so a failed turn reports through `error_message` while the user-facing answer keeps its one name. A discovery or planning branch reports through a short description of the action it performs, while a branch that answers or changes the working tree carries the full explanation. The answer language is not a channel of its own: the shared trunk states it once as an unconditional rule that user-facing output follows the language of the developer's request.
+- **Grammatical Branch Enforcement:** The structured protocol expresses mutual exclusion grammatically via `action.anyOf`, where each branch is a strict object carrying a constant `kind` discriminator. A response selecting `research` contains no `changes` or `commit_message` property, and a response selecting `edit` contains no flat discovery properties (`context_requests`, `repo_searches`, `repo_dirs`, `repo_maps`, `dir_lists`, `tauqe_doc_requests`, `outer_doc_requests`) or `plan_update`. Terminal signals travel as flat fields on the branch (`commit_message`, `error_message`, `reason`), each one named by the branch that declares it.
+- **Dialogue branches carry dialogue, not step signals.** A dialogue declares neither a `blocked` nor an `abort` branch: both escape hatches answer a condition only an unattended turn has to resolve, so they belong to the autonomous step contour alone. A dialogue branch also declares no step-termination signal, and only the branch that applies a change set carries `commit_message`, so a conversation is closed by the answer it was asked for instead of the vocabulary of a batch step.
+- **Plan payloads never share one level.** A dialogue anchored on a plan advertises both plan capabilities, so its plan branch wraps them in one discriminated union (`plan_action`) whose `kind` values are `create` and `modify`. `plan_create` and `plan_update` are therefore never declared at the same level and never become simultaneously required; a free dialogue advertises plan authorship alone and carries the leaf directly.
+- **Single Source of Truth:** `CapabilityExpr` projects an advertised surface onto its ambient part and its branches, and every consumer derives its behavior from that projection: the structured schema nests the branches under the discriminator, and the same tree decodes the response, so the branches the schema declares are the branches the decoder reads (§1.3).
+- **The schema alone guarantees the exclusion.** Branch exclusion is enforced by the strict schema and by nothing else: a round that selects one branch carries no property of another because the schema forbids it, never because a prose rule restates the shape. The contract therefore speaks semantics — the role, the task, the engineering discipline — and never enumerates a branch or a field the schema already declares.
+- **The engine never discards a change set a round produced.** A mixed round is a protocol defect rather than a command. Precedence belongs to the change set: a proposal about file content is checked by staging and verification, whereas a request for more material is checked by nothing, so discarding the proposal would let a turn that produced code reach the boundary looking like a turn that produced nothing.
+### 1.3. Direct Capability Functions and the Capability Expression Tree
+- **Direct mapping per atomic capability.** Each atomic `LlmCapability` maps directly in `capabilities/schema.rs`, `capabilities/decode.rs`, and `capabilities/rules.rs`: `capability_schema(cap, ctx)` projects the `schemars`-derived strict JSON schema fragment for that capability, `decode_capability_expr(expr, node, ctx)` decodes its commands, and `contract_rule` / `delta_rule` / `structured_instruction` render its prompt rules and field instructions.
+- **One tree renders and decodes.** The strict `CapabilityExpr` tree is the single source of both the response schema and the parsing of the response. `capability_expr_schema(expr, ctx)` recursively walks the tree — calling `capability_schema` for each `Leaf`, merging properties for `Set`, and building an `anyOf` discriminated union with `kind` when `AnyOf` has two or more branches — and `decode_capability_expr(expr, node, ctx)` walks the same tree synchronously with the JSON response into a flat `Vec<LlmCommand>`, descending into `node[label]` by `kind` (returning `ProtocolError` on an unknown or missing `kind`) and deserializing each `Leaf` directly from the current `node`. Parsing reads exactly the surface the schema declares, so a command outside the active branch is never extracted from a response.
+- **Branch labels are data.** The label of an operational branch is `CapabilityBranch::kind`, set by the contour that builds the tree. Sniffing leaves for a label and special-casing branch names by string are prohibited (root `Conventions.md` §1.5).
+- **No flat capability set.** The only flat form of a surface is the leaf projection (`CapabilityExpr::leaves`, `Vec<LlmCapability>`); a tree is never reconstructed from a flat list. Every control loop — the interactive dialogue, the bounded turn, and the architect synthesis — declares its surface as one tree, and the former `CapabilitySet` type is deleted rather than reintroduced.
+- **The control loop owns the whole tree.** Each loop function is the single declaration of its contour's surface: `repl_capability_expr` in `control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis tree in `control/refine.rs`. A protocol surface is narrowed by intersecting it with that very tree, and no contour declares a second tree.
+- **The regime is a typed parameter, never a type.** The differences between contours travel as explicit typed parameters — whether the prompt carries the `<history>` block, whether plan mutation is authorized, and which prompt layout the turn runs under — so no enumeration of turn intents exists, and no rule is composed against a remainder of a surface.
+- **Descriptions are mandatory.** Every command and every property of every schema fragment carries a non-empty `description`, which is the control prompt of constrained decoding and the contract documentation at once. A property without a description is a defect, and a unit test walks the schema of every `LlmCapability` and composed surface to enforce it.
+- **The contour brief belongs to its governing loop.** The introductory brief of a contour — its kind, its role, the paradigm it serves, and the task it carries — is a typed `TurnBrief` that the loop function declares (`run_repl_loop`, `run_plan_step_loop`, `run_structured_refine`, and the server path of a single step), never text selected by a boolean flag. `PromptAssembly` renders the brief it receives and gates the mode-specific rules on the typed kind that brief carries; `is_isolated_step_surface` heuristics and `is_isolated_step` flags are eliminated across all loops, builders, and assemblies.
 
 ---
 
 ## 2. PromptProtocol Interchangeability Invariant
 
-1. **Fundamental Equivalence of Protocols:**
-   - All implementations of `PromptProtocol` (`XmlPromptProtocol`, `JsonPromptProtocol`, and any future protocol variants) must be strictly interchangeable architectural peers.
-   - The workflow engine, FSM turn runner, and server handlers must interact with LLM communication strictly through the generic `PromptProtocol` trait contract (`capabilities()`, `system_instructions()`, `response_format()`, `decode()`, `create_stream_filter()`).
-   - Branching on the concrete protocol type or hardcoding protocol-specific control paths in workflow loops or turn execution routines is strictly prohibited.
+1. **Unified PromptProtocol Contract:**
+   - The workflow engine, control loops, and server handlers interact with LLM communication strictly through the generic `PromptProtocol` trait contract (`capabilities()`, `system_instructions()`, `response_format()`, `decode()`, `create_stream_filter()`).
+   - Hardcoding protocol-specific control paths in workflow loops or turn execution routines is strictly prohibited. `JsonPromptProtocol` is the canonical implementation of the trait, leaving `PromptProtocol` as the single extension point.
 2. **Unified Semantic Representation (`Vec<LlmCommand>`):**
-   - Every protocol implementation is responsible for completely decoding raw model outputs into strongly typed semantic commands (`LlmCommand`), including text answers, file edits, plan operations, discovery requests, verification triggers, and terminal outcomes.
-   - Consumers of protocol output must never inspect raw wire markup, XML tags, or unparsed JSON keys.
+   - Every protocol implementation is responsible for completely decoding raw model outputs into strongly typed semantic commands (`LlmCommand`), including text answers, file edits, plan operations, discovery requests, and terminal outcomes.
+   - Consumers of protocol output must never inspect raw wire markup or unparsed JSON keys.
 3. **Clean Streaming Isolation:**
    - Every protocol implementation must provide an `EditStreamFilter` that isolates the user-facing interface from protocol scaffolding.
-   - In structured protocols, the target textual response field (such as `message` in discussion mode) must be streamed on the fly via `StreamEvent::TextDelta` with real-time unescaping, while structural metadata (`plan_update`, context requests, language tags) remains completely hidden from the REPL stream.
+   - The target textual response field (`message`) must be streamed on the fly via `StreamEvent::TextDelta` with real-time unescaping, while structural metadata (`action`, `changes`, `plan_update`, `error_message`, `commit_message`, `reason`) remains completely hidden from the REPL stream.
+   - The filter locates the single `message` field and the `changes` array at whatever depth the payload declares them — at the root of the response or inside `action` — because a branched wire nests them in the branch the round selected. It never models the branch envelope: uniqueness of `message` is a property of the capability tree (§1.2), so one filter serves a flat and a branched wire without knowing which it received. The error channel is metadata, not an answer: `error_message` is never streamed as the response text, so a failed turn cannot impersonate a written reply.
 4. **Declarative Prompt Composition:**
-   - The system prompt is composed from the enabled capability modules, never from a monolithic template. `CapabilityRegistry::compose_contract_rules`, `compose_xml_protocol_instructions`, and `compose_structured_protocol_instructions` fold each module's fragments through a `PromptRenderContext`, which applies the turn-marker suffix to every tag name it renders.
-   - The strict structured schema folds through the same `PromptRenderContext` as the protocol instructions, so a module whose rule is conditional on the project declaration declares its property under the same condition.
-   - A disabled capability therefore contributes no rule, no instruction, and no tag, so the prompt can never advertise a command the decoder would reject. Prompt text and decoding derive from the same `CapabilitySet`.
-   - **Contract Rule Composition:** The core system contract is assembled as an ordered sequence of typed `ContractRule { title, body }` values and rendered by one loop with monotonic numbering `1..N`. Rule numbers are never written into string literals, so enabling or disabling a capability (`doc_request`, `scratchpad`, `file_edits`) leaves neither gaps nor lettered surrogates such as `1a.` or `10a.`.
-   - Rule placement is decided by typed inputs (`TurnIntent` and `CapabilitySet`), never by text. The prohibition on heuristic intent analysis itself is stated once in the root `Conventions.md` (§1, *Typed Intent over Textual Inference*) and is not repeated here.
-   - **Contour Dictionary Dualism:** Every contract rule and every protocol instruction is rendered in the vocabulary of the active contour. The XML contour names its marker tags; the structured contour names the fields of its JSON Schema (`plan_update`, `repo_searches`, `outcome`, `blocked`, `abort`, `custom_tools`). A rule never mentions the vocabulary of the other contour.
-   - **Single Sanctioned Exception:** The prompt side — the `<context>` block, the `access` attribute, and the `<system_documentation>` block — is described identically in both contours, because it is payload the model reads rather than a command channel it emits.
-   - **Typed Branch Input:** The contour travels as typed knowledge, not as inferred text. Its input is `ContractContext.protocol` (`EditProtocolKind`) and its predicate is `ctx.protocol == EditProtocolKind::Xml`. `Mixed` never reaches the contract, because assembly hands over the kind of the concrete protocol; a `Mixed` project therefore renders XML rules for code editing and structured rules for every non-code contour.
-5. **Capability-Set-Scoped Decoding:**
-   - `CapabilityRegistry::decode_xml_commands` runs only the modules enabled by the active `CapabilitySet` and then retains only commands whose capability is enabled. `XmlPromptProtocol::with_capabilities` and `with_turn_marker` produce such scoped protocols.
-   - Role and regime profiles (`interactive_repl`, `isolated_step`, `discussion`, `architect_discovery`) are the only sanctioned way to narrow a protocol. A profile names a turn regime, never a wire format: both transports decode the same capability surface, so format-specific profile factories must not be reintroduced. Decoding must never be narrowed by ad-hoc tag filtering outside the registry.
-6. **Polymorphic Research Dispatch:**
-   - Research phase execution must dispatch through registered handlers implementing `ResearchCapabilityHandler` (`crates/core/src/workflow/research.rs`) instead of branching on command variants. Each handler owns the validation, disk work, and feedback text of its own capability.
-   - The dispatcher resolves repository facts once per round, folds every handler's findings into a single `ResearchRoundOutcome`, and halts the round as soon as the files token budget would be breached, so no later capability runs against a context that was never widened.
-   - Findings that are not repository files — search reports, directory listings, targeted outlines, and documentation chapters — never enter the `<context>` block. They accumulate in the turn-scoped `TurnResearchJournal` (`crates/core/src/workflow/research/journal.rs`), an append-only, de-duplicated tail of the user message that survives the whole turn, so Staging retries and Verification Healing rounds keep the knowledge Research already paid for. `TurnResearchJournal::compose_user_prompt` expresses the message order exactly once — task, journal, phase diagnostics — and the phase executors must obtain their round prompts through it instead of concatenating fragments themselves.
-7. **Delivery Declared by Capability, Not by Tag Literal:**
-   - `CapabilityDelivery` is a property of the capability itself, declared beside it in `crates/protocol`: `LiveStreaming` for the contours consumed while tokens arrive, `RoundDeferred` for the payloads decoded once the round finishes.
-   - A protocol advertises a capability set and the harness reads each capability's declared delivery, so protocols stay interchangeable and a future wire format inherits the same streaming and round-decoding behavior without touching a scanner.
-
+   - The system prompt is composed directly from the enabled capabilities, never from a monolithic template. `compose_contract_rules` folds the shared trunk, the rules the active contour brief selects, and every enabled capability's rule through one `ContractContext`, and `compose_structured_protocol_instructions` folds every enabled capability's instruction through one `PromptRenderContext`, both in `crates/core/src/capabilities/rules.rs`.
+   - `compose_structured_protocol_instructions` is the single source of the instruction field list: every instruction derives from the capability tree of the loop, so a narrowed tree removes a property from the instructions exactly as it removes it from the schema. A protocol whose mode differs renders its own heading and folds the same composition, so it never carries a hand-written list of fields its active tree does not declare.
+   - The strict structured schema folds through the same `PromptRenderContext` as the protocol instructions, so a capability whose rule is conditional on the project declaration or patch strategy declares its property under the same condition.
+   - **Single Source of Truth for Structure:** The strict JSON schema (derived via `schemars` and `capability_expr_schema`) is the authoritative single source of truth for response structure: field names, types, nesting, requiredness, and property descriptions. The prompt text is strictly reserved for engineering role, task semantics, and discipline invariants; it never re-enumerates schema fields or restates structural JSON schemas.
+   - **Conditional Section Gating:** Specialized documentation and tooling sections are rendered only when authorized by the active capability tree: the external documentation catalog and its contract rule appear strictly when `OuterDocRequest` is present, and project custom tools strictly when `CustomTools` is enabled.
+   - **Elimination of Host and Protocol Metadata:** The prompt omits ambient host file-system paths, Git transaction mechanics, and protocol implementation constants (`Project Metadata` block is eliminated); the model interacts with the codebase strictly through repository-relative paths and the provided `<context>` surface.
+   - The text rule follows the capability that declares it: a surface declaring `TextMessage` renders the conversational-response rule, and a surface declaring `ShortDescription` renders the concise-explanation rule. A dialogue that carries both in different branches states both in its contract, and the branch a round selects decides which of them its `message` obeys; neither rule widens the field, which is declared once per branch (§1.2).
+   - A disabled capability contributes no rule, no instruction, and no schema property. Prompt text and decoding derive from the same `CapabilityExpr`.
+   - **A rule travels with the functionality it describes.** A capability, a project declaration, or a contour that changes shape updates its rule, its instruction, and this document in the same step, so no rule outlives the behaviour it explains and no behaviour ships without the rule that states it.
+   - **Contract Rule Composition:** The core system contract is assembled as an ordered sequence of typed `ContractRule { title, body }` values and rendered by one loop with monotonic numbering `1..N`. Rule numbers are never written into string literals.
+5. **Polymorphic Research Dispatch:**
+   - Research phase execution dispatches through registered handlers implementing `ResearchCapabilityHandler` (`crates/core/src/workflow/research.rs`). Each handler owns the validation, disk work, and feedback text of its own capability.
+   - Findings that are not repository files accumulate in the turn-scoped `TurnResearchJournal` (`crates/core/src/workflow/research/journal.rs`), an append-only tail of the user message that survives the whole turn.
+6. **Delivery Declared by Capability:**
+   - `CapabilityDelivery` is a property of the capability itself: `LiveStreaming` for the contours consumed while tokens arrive, `RoundDeferred` for the payloads decoded once the round finishes.
 ---
 
 ## 3. Storage and Persistence Invariants
@@ -102,7 +90,7 @@ The interaction protocol between Tauqe and large language models is strictly div
    - Because a batch executes many steps, a step turn passes through the same budgeted
      compaction as a dialogue (`compact_history_if_needed_with_budget`), so the journal is
      bounded by the configured token budget instead of the length of the batch.
-   - `TurnIntent::suppresses_session_history` governs rendering only: it keeps the `<history>`
+   - The typed history parameter of the loop governs rendering only: it keeps the `<history>`
      block out of the prompt a step assembles, and it never suppresses the record the step
      writes to the journal.
 
@@ -214,14 +202,12 @@ kgUZ |    - A change set the substrate refuses because a path is excluded by the
 
    | Material | `SemanticLayout` | `ChronologicalLayout` |
    | --- | --- | --- |
-   | Core system contract, protocol instructions, project metadata | system head | system head |
+   | Core system contract, protocol instructions | system head | system head |
    | Repository outline (symbol map or directory tree, never both) | system head | system head |
-   | Language directive | system head | system head |
    | Context files | one `<context>` block in the system message | `<context>` groups interleaved with the history records |
    | Session history | one `<history>` block in the system message | one message per history record |
     | Active plan | system message tail | trailing user message |
-    | Regime delta (intent-specific contract rules) | leading block of the final user message | first block of the trailing user message, ahead of the active plan |
-   | Context manifest (paths and access, no content) | absent | trailing user message |
+    | Context manifest (paths and access, no content) | absent | trailing user message |
    | Turn scratchpad | system message tail | trailing user message |
    | Current task | final user message | final user message |
 
@@ -229,9 +215,10 @@ kgUZ |    - A change set the substrate refuses because a path is excluded by the
      material that legitimately grows, and an isolated volatile tail.
 3. **Byte-Stable Head:**
    - The head carries only blocks that are identical from one round of a turn to
+   - The head carries only blocks that are identical from one round of a turn to
      the next: the introduction, the Core System Contract, the protocol
-     instructions, the project metadata, the repository outline, and the language
-     directive.
+     instructions, and the repository outline.
+     instructions, the project metadata, and the repository outline.
    - The repository outline stays in the head under both policies. The dominant
      regime of a turn is exploration and planning, where the outline hardly
      changes, while the outline is also the largest block: placing it in the tail
@@ -322,12 +309,7 @@ kgUZ |    - A change set the substrate refuses because a path is excluded by the
         Reusing a session identifier across different models produces guaranteed
         cache misses or affinity routing conflicts. Changing only reasoning
         effort or reselecting the identical model preserves session affinity.
-   - Focus transitions never rotate the identifier. The prompt head renders the
-     main capability list and the shared trunk, so it is byte-identical for the
-     free REPL, the plan discussion, and the review discussion. Setting a focus,
-     replacing it, switching between a plan and a review target, starting a
-     dialogue from the Plans or Review view, or clearing the focus therefore
-     moves no head byte and keeps the provider session warm.
+   - Focus transitions never rotate the identifier. Rotation reads exactly two boundaries — the context block and the target model — and a focus moves neither, so setting a focus, replacing it, switching between a plan and a review target, starting a dialogue from the Plans or Review view, or clearing the focus keeps the provider session warm. The head states the capability surface the dialogue loop declares, so a focus that authorizes a capability the previous surface did not carry rewrites the head once, exactly as any other change of surface does.
 10. **Rationale (Why):**
     - A bounded turn issues several requests per turn: discovery rounds, the
       proposal, staging retries, and verification healing. Reusing the provider's
@@ -344,10 +326,7 @@ kgUZ |    - A change set the substrate refuses because a path is excluded by the
       a cold one: it asks the provider to reuse a node cache the next request can
       never match, which is why rotation is bound strictly to context shrinking
       and model changes rather than to a timer or a round counter.
-    - A focus transition is a non-event for the session for the same reason. One
-      head is shared by every dialogue contour, so switching the discussed entity
-      changes only the tail delta; rotating there would discard a prefix the next
-      request still sends.
+    - A focus transition is a non-event for the session for the same reason. The context block and the target model are what the identifier is bound to, and a focus moves neither, so the dialogue keeps the node cache its next request can still match; a head a newly declared intent rewrites is reprocessed once by the provider, which costs less than a cold session for every later round.
 ---
 
 ## 10. Model Catalog as the Single Source of Truth for Model Names
@@ -492,13 +471,12 @@ the lifecycle those mechanisms share.
    - Ambient operational infrastructure is encapsulated in a lightweight `LoopContext` passed by mutable reborrow:
      - `cancel: &CancellationToken` — cooperative cancellation token raced across network and toolchain futures via `tokio::select!`.
      - `events: &EventSink` — typed domain event emitter isolating the domain engine from TUI, sockets, and transport channels.
-     - `capabilities: CapabilitySet` — active model capability surface for the current execution branch.
+      - `capabilities: CapabilityExpr` — active model capability surface for the current execution branch.
      - `repo_root: &Path` — root of the working tree every loop addresses.
      - `context_manager: &mut ContextManager` — live context a loop mutates (e.g. during research context expansion) and snapshots through.
       - `journal: &mut TurnResearchJournal` — turn-scoped cumulative epistemic journal collecting findings and scratchpad notes.
       - `policy: &mut dyn ApplyPolicy` — transactional apply policy governing checkpointing, staging, step commits, and rollback.
-      - `capabilities: CapabilitySet` — active model capability surface for the current execution branch.
-      - `target_language: Option<String>` — natural language determined for user-facing responses and diagnostics.
+      - `capabilities: CapabilityExpr` — active model capability surface for the current execution branch.
       - `prompt_builder: PromptBuilder` — model round assembly and execution builder.
    - **Prohibition of `Clone` on `LoopContext`:** `LoopContext` must NEVER derive or implement `Clone`. It holds exclusive mutable references to execution state (`context_manager`, `journal`). Subordinate loops obtain narrowed or extended contexts exclusively via explicit reborrowing (`ctx.reborrow_with_capabilities(...)`, `ctx.reborrow_extending_capabilities(...)`).
 
@@ -520,7 +498,7 @@ the lifecycle those mechanisms share.
     - **Drainable Envelope Pattern (Consumable `ResponseEnvelope`):**
       - Rather than a monolithic "God-struct" with static fields for every conceivable command, `ResponseEnvelope` is an envelope of semantic commands indexed by `LlmCapability` (`cmd.capability()`).
      - Control loops consume only the capabilities in their domain via `envelope.take(LlmCapability)` or `envelope.take_any(&[...])`. As the envelope travels upward through the loop hierarchy, it shrinks ("худеет").
-      - `run_staging_loop` drains `LlmCapability::FileEdits`; `run_edit_loop` drains `LlmCapability::ToolchainVerify`; `run_step_loop` drains `LlmCapability::Outcome`; `run_repl_loop` drains `LlmCapability::TextMessage`, `PlanCreation`, and `PlanUpdate`.
+      - `run_staging_loop` drains the file-edit capabilities (`EditReplace`, `EditCreate`, `EditDelete`, `EditMove`, `EditMoveDir`, `EditOverwrite`); `run_edit_loop` drains `LlmCapability::ToolchainVerify`; `run_step_loop` drains the terminal outcome capabilities (`CommitMessage`, `TurnError`, `TurnSkip`); `run_repl_loop` drains `LlmCapability::TextMessage`, `PlanCreation`, and `PlanUpdate`.
       - **Prohibition of Ad-hoc Convenience Extractors:** `ResponseEnvelope` provides strictly generic capability-based draining (`take` and `take_any`). Adding typed helper methods for specific capabilities (such as `take_edits`, `take_text`, `take_outcome`, `take_blocked`, etc.) to `ResponseEnvelope` is strictly forbidden. Each loop or subsystem knows exactly which `LlmCapability` variants belong to its domain, calls `take(...)`, and pattern-matches the resulting `LlmCommand` items locally.
    - **Top-Level Anti-Leak Invariant:**
      - At the top-level turn completion boundary, `envelope.is_empty()` MUST be true. Any remaining commands (`envelope.remaining_capabilities()`) indicate commands emitted by the model that no level of the control hierarchy handled, triggering structured diagnostic logging.

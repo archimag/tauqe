@@ -9,32 +9,44 @@ use std::path::{Path, PathBuf};
 
 use similar::{ChangeTag, TextDiff};
 use tauqe_protocol::{
-    ContextAccess, EditFileOp, EditProposal, LlmCapability, LlmCommand, LlmOutcome, TurnPhase,
+    ContextAccess, EditFileOp, EditProposal, LlmCapability, LlmCommand, TurnPhase,
     VerificationVerdict,
 };
 
-use super::context::LoopContext;
-use super::outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
-use super::research::handle_research_commands;
+use super::research::{handle_research_commands, ResearchLoopConfig};
 use super::staging::{run_staging_loop, StagingLoopConfig};
+use crate::control::context::LoopContext;
+use crate::control::outcome::{
+    FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError,
+};
 use crate::edits::StagedEditsState;
 use crate::git::state::{changed_worktree_paths, snapshot_worktree};
 use crate::providers::StreamEvent;
 use crate::toolchain::{
-    effective_project_config, format_staged_content, run_post_hooks_with_config,
-    run_verification_pipeline_with_config, VerificationStatus,
+    format_staged_content, run_post_hooks_with_config, run_verification_pipeline_with_config,
+    VerificationStatus,
 };
-use crate::workflow::verification::{build_verification_retry_prompt, extract_error_paths};
+use crate::workflow::verification::{
+    build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
+};
 
 /// Capabilities processed by the atomic edits and verification contour.
-pub const EDIT_CAPABILITIES: &[LlmCapability] = &[LlmCapability::FileEdits];
-/// Configuration for the atomic edits and verification healing loop.
+pub const EDIT_CAPABILITIES: &[LlmCapability] = &[
+    LlmCapability::EditReplace,
+    LlmCapability::EditCreate,
+    LlmCapability::EditDelete,
+    LlmCapability::EditMove,
+    LlmCapability::EditMoveDir,
+    LlmCapability::EditOverwrite,
+];
 #[derive(Debug, Clone)]
 pub struct EditLoopConfig {
     /// Maximum verification healing attempts allowed when toolchain checks fail.
     pub max_healing_rounds: usize,
     /// In-memory staging and patch retry configuration.
     pub staging: StagingLoopConfig,
+    /// Research budgets the healing rounds inherit from the project configuration.
+    pub research: ResearchLoopConfig,
 }
 
 impl EditLoopConfig {
@@ -43,6 +55,17 @@ impl EditLoopConfig {
         Self {
             max_healing_rounds: config.max_retries,
             staging: StagingLoopConfig::from_repl_config(config),
+            research: ResearchLoopConfig::default(),
+        }
+    }
+
+    /// Creates edit and verification loop configuration from the authoritative
+    /// project configuration.
+    pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
+        Self {
+            max_healing_rounds: config.repl.max_retries,
+            staging: StagingLoopConfig::from_repl_config(&config.repl),
+            research: ResearchLoopConfig::from_context(&config.context),
         }
     }
 }
@@ -62,10 +85,20 @@ pub struct EditArtifact {
     pub verification: VerificationVerdict,
     /// Final squashed commit hash if changes were committed.
     pub commit_hash: Option<String>,
+    /// Diagnostic of a Git transaction that could not be finalized.
+    ///
+    /// The change set already reached the working tree and was verified, so a
+    /// failed finalization never withdraws it: the reason travels with the
+    /// artifact instead of being swallowed and reported as a turn without a
+    /// commit.
+    pub commit_error: Option<String>,
 }
 
-/// Local in-memory backup of disk files touched during edit application,
-/// providing clean rollback if verification fails or is cancelled.
+/// Local in-memory backup of disk files touched during edit application.
+///
+/// It is the last-resort rollback: [`rollback_turn`] restores the working tree
+/// through the transaction policy and replays this backup only when the policy
+/// restored nothing, so a restored tree is never overwritten with a stale copy.
 struct DiskBackup {
     root: PathBuf,
     files: HashMap<String, Option<Vec<u8>>>,
@@ -101,6 +134,11 @@ impl DiskBackup {
         }
     }
 
+    /// Replays the recorded pre-turn bytes over the working tree.
+    ///
+    /// This is the fallback of [`rollback_turn`]: it runs only when the
+    /// transaction policy restored no tree, so a developer's uncommitted work is
+    /// never replaced by the bytes a checkpoint already restored.
     fn rollback(&self) {
         for (path, original) in &self.files {
             let full = self.root.join(path);
@@ -117,6 +155,35 @@ impl DiskBackup {
             }
         }
     }
+}
+
+/// Restores the working tree after a change set that must not be committed.
+///
+/// The transaction policy is the authority on the working tree, so it restores
+/// the tree first and the local disk backup answers only when the policy
+/// restored nothing: a policy that holds no transaction, or a rollback that
+/// failed, leaves the pre-turn bytes to the backup. Writing the backup on top of
+/// a restored tree would replace the developer's own uncommitted work with the
+/// bytes the turn found, which is exactly what the checkpoint exists to protect.
+async fn rollback_turn(ctx: &mut LoopContext<'_>, backup: &DiskBackup) {
+    let repo_root = ctx.repo_root;
+    let restored = match ctx.policy.rollback(repo_root).await {
+        Ok(restored) => restored,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "failed to roll back the turn transaction; restoring the pre-turn bytes instead"
+            );
+            false
+        }
+    };
+    if !restored {
+        backup.rollback();
+    }
+    // The sweep only drops context paths that no longer exist on disk, so it
+    // runs off the async executor thread. The auto layer is deliberately kept:
+    // only a successful commit may shrink the context.
+    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
 }
 
 /// Runs the edit application, staging, toolchain verification, and healing loop.
@@ -138,17 +205,25 @@ pub async fn run_edit_loop(
     let declared_summary = declared_commit_message(&opening_envelope);
     let mut current_envelope = opening_envelope;
 
-    let project = effective_project_config(ctx.repo_root, Some(&ctx.cancel.receiver())).await;
+    let project = if let Some(ref p) = ctx.prompt_builder.project_config {
+        p.clone()
+    } else {
+        ctx.prompt_builder
+            .input_cache
+            .project(ctx.repo_root, Some(&ctx.cancel.receiver()))
+            .await
+    };
     let initial_worktree = crate::blocking::run_blocking(|| snapshot_worktree(ctx.repo_root));
     let mut backup = DiskBackup::new(ctx.repo_root);
     let mut total_modified_paths = Vec::new();
     let mut healing_attempt = 0usize;
+    let mut last_failure_report: Option<String> = None;
 
     loop {
         ctx.check_cancelled()?;
 
         // Drain any research commands first if present
-        let _ = handle_research_commands(ctx, &mut current_envelope).await?;
+        let _ = handle_research_commands(ctx, &mut current_envelope, &config.research).await?;
 
         // 1. Virtual in-memory staging with patch retry
         let staging_result = run_staging_loop(ctx, current_envelope, &config.staging).await?;
@@ -156,18 +231,51 @@ pub async fn run_edit_loop(
         let staging_success = match staging_result {
             LoopResult::Success(success) => success,
             LoopResult::Diverged(envelope) => {
-                let _ = ctx.policy.rollback(ctx.repo_root).await;
-                backup.rollback();
-                crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+                if healing_attempt > 0 {
+                    if let Some(ref report) = last_failure_report {
+                        if healing_attempt >= config.max_healing_rounds {
+                            rollback_turn(ctx, &backup).await;
+                            return Ok(LoopResult::Exhausted(FailureReport::new(
+                                "Code verification failed after healing attempts",
+                                healing_attempt,
+                                vec![report.clone()],
+                            )));
+                        }
+                        healing_attempt += 1;
+                        ctx.events.emit(StreamEvent::TurnPhase {
+                            phase: TurnPhase::Healing,
+                            round: Some(healing_attempt),
+                            max_rounds: Some(config.max_healing_rounds),
+                            detail: Some(format!(
+                                "Healing round {healing_attempt}/{}",
+                                config.max_healing_rounds
+                            )),
+                        });
+                        let retry_prompt = build_verification_missing_edits_prompt(report);
+                        current_envelope = ctx.request_healing(&retry_prompt).await?;
+                        continue;
+                    }
+                }
+                rollback_turn(ctx, &backup).await;
                 return Ok(LoopResult::Diverged(envelope));
             }
             LoopResult::Exhausted(report) => {
-                let _ = ctx.policy.rollback(ctx.repo_root).await;
-                backup.rollback();
-                crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+                rollback_turn(ctx, &backup).await;
                 return Ok(LoopResult::Exhausted(report));
             }
         };
+
+        if !staging_success.value.abandoned_failures.is_empty() {
+            let mut lines = Vec::new();
+            for (path, reason) in &staging_success.value.abandoned_failures {
+                lines.push(format!("- `{path}`: {reason}"));
+            }
+            let notice = format!(
+                "\n\n---\n⚠️ **[Change Set Incomplete]** The corrected edits do not retry the following failed file(s), so they stay out of this change set:\n{}\n\n",
+                lines.join("\n")
+            );
+            ctx.events.emit_text_delta(notice);
+        }
 
         let mut staged_state = staging_success.value.staged_state;
         current_envelope = staging_success.response;
@@ -190,9 +298,7 @@ pub async fn run_edit_loop(
             .await;
 
         if let Err(err) = apply_res {
-            let _ = ctx.policy.rollback(ctx.repo_root).await;
-            backup.rollback();
-            crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+            rollback_turn(ctx, &backup).await;
             return Ok(LoopResult::Exhausted(FailureReport::new(
                 format!("Failed to commit staged edits to disk: {err}"),
                 healing_attempt,
@@ -228,9 +334,7 @@ pub async fn run_edit_loop(
                     auto_register_error_files(ctx, &report).await;
 
                     if healing_attempt >= config.max_healing_rounds {
-                        let _ = ctx.policy.rollback(ctx.repo_root).await;
-                        backup.rollback();
-                        crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+                        rollback_turn(ctx, &backup).await;
                         return Ok(LoopResult::Exhausted(FailureReport::new(
                             "Project post-hook failed after healing attempts",
                             healing_attempt,
@@ -238,6 +342,7 @@ pub async fn run_edit_loop(
                         )));
                     }
                     healing_attempt += 1;
+                    last_failure_report = Some(report.clone());
                     ctx.events.emit(StreamEvent::TurnPhase {
                         phase: TurnPhase::Healing,
                         round: Some(healing_attempt),
@@ -247,8 +352,7 @@ pub async fn run_edit_loop(
                             config.max_healing_rounds
                         )),
                     });
-                    let retry_prompt =
-                        build_verification_retry_prompt(&report, ctx.target_language.as_deref());
+                    let retry_prompt = build_verification_retry_prompt(&report);
                     current_envelope = ctx.request_healing(&retry_prompt).await?;
                     continue;
                 }
@@ -270,9 +374,7 @@ pub async fn run_edit_loop(
                     auto_register_error_files(ctx, &report).await;
 
                     if healing_attempt >= config.max_healing_rounds {
-                        let _ = ctx.policy.rollback(ctx.repo_root).await;
-                        backup.rollback();
-                        crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+                        rollback_turn(ctx, &backup).await;
                         return Ok(LoopResult::Exhausted(FailureReport::new(
                             "Project post-hook error after healing attempts",
                             healing_attempt,
@@ -280,6 +382,7 @@ pub async fn run_edit_loop(
                         )));
                     }
                     healing_attempt += 1;
+                    last_failure_report = Some(report.clone());
                     ctx.events.emit(StreamEvent::TurnPhase {
                         phase: TurnPhase::Healing,
                         round: Some(healing_attempt),
@@ -289,8 +392,7 @@ pub async fn run_edit_loop(
                             config.max_healing_rounds
                         )),
                     });
-                    let retry_prompt =
-                        build_verification_retry_prompt(&report, ctx.target_language.as_deref());
+                    let retry_prompt = build_verification_retry_prompt(&report);
                     current_envelope = ctx.request_healing(&retry_prompt).await?;
                     continue;
                 }
@@ -317,9 +419,7 @@ pub async fn run_edit_loop(
         .await;
 
         if status == VerificationStatus::Cancelled || ctx.cancel.is_cancelled() {
-            let _ = ctx.policy.rollback(ctx.repo_root).await;
-            backup.rollback();
-            crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+            rollback_turn(ctx, &backup).await;
             ctx.events.emit(StreamEvent::ToolchainFinished {
                 command: "verify".into(),
                 success: false,
@@ -348,17 +448,44 @@ pub async fn run_edit_loop(
 
             emit_cumulative_diff(ctx, &backup);
             let summary = declared_summary.as_deref().unwrap_or("REPL changes");
-            let commit_hash = ctx
+            // The change set is already on disk and verified, so a transaction
+            // that could not be finalized must not hide behind a silent `None`
+            // hash: the reason travels with the artifact and the verified files
+            // stay in the working tree.
+            let (commit_hash, commit_error) = match ctx
                 .policy
                 .apply_final(ctx.repo_root, &total_modified_paths, summary)
                 .await
-                .ok()
-                .flatten();
+            {
+                Ok(commit_hash) => (commit_hash, None),
+                Err(err) => {
+                    let message = format!(
+                        "Changes were applied but the Git transaction could not be finalized: {err}"
+                    );
+                    tracing::error!(error = %err, "{}", message);
+                    (None, Some(message))
+                }
+            };
+
+            // A committed change set releases the whole transient context: the
+            // files discovery gathered and the external documents the registry
+            // materialized share one lifecycle, so neither outlives the edits it
+            // served. Clearing it recomputes the hierarchical pinned files
+            // through disk checks, so the sweep runs off the async executor
+            // thread. A failed finalization keeps the material, because the
+            // turn's decision is not durable yet.
+            if commit_error.is_none() {
+                crate::blocking::run_blocking(|| ctx.context_manager.clear_transient());
+                ctx.events
+                    .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
+            }
+
             return Ok(LoopResult::Success(LoopSuccess::new(
                 EditArtifact {
                     modified_paths: total_modified_paths,
                     verification: status.into(),
                     commit_hash,
+                    commit_error,
                 },
                 current_envelope,
             )));
@@ -377,9 +504,7 @@ pub async fn run_edit_loop(
         auto_register_error_files(ctx, &report).await;
 
         if healing_attempt >= config.max_healing_rounds {
-            let _ = ctx.policy.rollback(ctx.repo_root).await;
-            backup.rollback();
-            crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+            rollback_turn(ctx, &backup).await;
             return Ok(LoopResult::Exhausted(FailureReport::new(
                 "Code verification failed after healing attempts",
                 healing_attempt,
@@ -388,6 +513,7 @@ pub async fn run_edit_loop(
         }
 
         healing_attempt += 1;
+        last_failure_report = Some(report.clone());
         ctx.events.emit(StreamEvent::TurnPhase {
             phase: TurnPhase::Healing,
             round: Some(healing_attempt),
@@ -398,7 +524,7 @@ pub async fn run_edit_loop(
             )),
         });
 
-        let retry_prompt = build_verification_retry_prompt(&report, ctx.target_language.as_deref());
+        let retry_prompt = build_verification_retry_prompt(&report);
         current_envelope = ctx.request_healing(&retry_prompt).await?;
     }
 }
@@ -413,11 +539,7 @@ fn declared_commit_message(envelope: &ResponseEnvelope) -> Option<String> {
         .commands()
         .iter()
         .find_map(|command| match command {
-            LlmCommand::Outcome {
-                outcome: LlmOutcome::Success { commit_message },
-            } => commit_message
-                .as_deref()
-                .map(str::trim)
+            LlmCommand::CommitMessage(command) => Some(command.commit_message.trim())
                 .filter(|text| !text.is_empty())
                 .map(str::to_string),
             _ => None,
@@ -441,7 +563,7 @@ async fn format_staged_files(
     repo_root: &Path,
     project: &tauqe_protocol::ProjectConfig,
     staged: &mut StagedEditsState,
-    cancel: &super::context::CancellationToken,
+    cancel: &crate::control::context::CancellationToken,
 ) {
     if project.format.is_none() {
         return;
@@ -700,19 +822,20 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{CapabilitySet, EditOperation, LlmCapability, LlmCommand, ModelRef};
-
+    use tauqe_protocol::{
+        CapabilityExpr, EditReplace, LlmCapability, LlmCommand, ModelRef, TextCommand,
+    };
     struct Fixture {
         dir: tempfile::TempDir,
         context: ContextManager,
         journal: TurnResearchJournal,
         provider: MockLlmProvider,
         model: ModelRef,
-        protocol: XmlPromptProtocol,
-        cache: crate::workflow::fsm::cache::TurnInputCache,
+        protocol: JsonPromptProtocol,
+        cache: crate::control::cache::TurnInputCache,
         cancel: CancellationToken,
         events: EventSink,
         policy: crate::workflow::git_policy::GitTransactionPolicy,
@@ -742,8 +865,8 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: XmlPromptProtocol,
-                cache: crate::workflow::fsm::cache::TurnInputCache::default(),
+                protocol: JsonPromptProtocol::edits(),
+                cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
                 policy: crate::workflow::git_policy::GitTransactionPolicy::new(),
@@ -751,9 +874,14 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps =
-                CapabilitySet::from_slice(&[LlmCapability::FileEdits, LlmCapability::TextMessage]);
-            let prompt_builder = super::super::prompt::PromptBuilder::new(
+            let caps = CapabilityExpr::set(
+                EDIT_CAPABILITIES
+                    .iter()
+                    .copied()
+                    .chain([LlmCapability::TextMessage])
+                    .map(CapabilityExpr::leaf),
+            );
+            let prompt_builder = crate::control::prompt::PromptBuilder::new(
                 &self.provider,
                 &self.model,
                 &self.protocol,
@@ -775,9 +903,9 @@ mod tests {
     #[tokio::test]
     async fn edit_loop_diverges_when_envelope_has_no_edits() {
         let mut fixture = Fixture::new(&[("a.rs", "pub fn test() {}")], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text {
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand {
             content: "no edits here".to_string(),
-        }]);
+        })]);
         let mut ctx = fixture.context();
 
         let outcome = run_edit_loop(&mut ctx, Some(envelope), &EditLoopConfig::default())
@@ -789,13 +917,11 @@ mod tests {
     #[tokio::test]
     async fn edit_loop_succeeds_when_verification_not_configured() {
         let mut fixture = Fixture::new(&[("a.rs", "fn compute() -> i32 { 0 }")], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Edit {
-            operation: EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "fn compute() -> i32 { 0 }".to_string(),
-                new_text: "fn compute() -> i32 { 42 }".to_string(),
-            },
-        }]);
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "fn compute() -> i32 { 0 }".to_string(),
+            new_text: "fn compute() -> i32 { 42 }".to_string(),
+        })]);
         let mut ctx = fixture.context();
 
         let outcome = run_edit_loop(&mut ctx, Some(envelope), &EditLoopConfig::default())
@@ -813,17 +939,15 @@ mod tests {
     #[tokio::test]
     async fn edit_loop_emits_cumulative_diff_events() {
         let mut fixture = Fixture::new(&[("a.rs", "fn compute() -> i32 { 0 }\n")], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Edit {
-            operation: EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "fn compute() -> i32 { 0 }\n".to_string(),
-                new_text: "fn compute() -> i32 { 42 }\n".to_string(),
-            },
-        }]);
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "fn compute() -> i32 { 0 }\n".to_string(),
+            new_text: "fn compute() -> i32 { 42 }\n".to_string(),
+        })]);
         let (events, mut rx) = EventSink::channel();
-        let mut cache = crate::workflow::fsm::cache::TurnInputCache::default();
-        let caps = CapabilitySet::from_slice(&[LlmCapability::FileEdits]);
-        let prompt_builder = super::super::prompt::PromptBuilder::new(
+        let mut cache = crate::control::cache::TurnInputCache::default();
+        let caps = CapabilityExpr::set(EDIT_CAPABILITIES.iter().copied().map(CapabilityExpr::leaf));
+        let prompt_builder = crate::control::prompt::PromptBuilder::new(
             &fixture.provider,
             &fixture.model,
             &fixture.protocol,
@@ -899,5 +1023,129 @@ mod tests {
             edit_config.staging.patch_strategy,
             repl_config.patch_strategy
         );
+    }
+
+    #[tokio::test]
+    async fn edit_loop_emits_change_set_incomplete_notice_on_abandoned_failures() {
+        let fix_a_only = serde_json::json!({
+            "message": "Edit",
+            "changes": [{
+                "op": "replace",
+                "path": "a.rs",
+                "to": "",
+                "start": "",
+                "end": "",
+                "content": "",
+                "old_text": "fn compute_a() -> i32 { 0 }\n",
+                "new_text": "fn compute_a() -> i32 { 10 }\n"
+            }],
+            "commit_message": "Edit",
+            "reason": ""
+        })
+        .to_string();
+        let mut fixture = Fixture::new(
+            &[
+                ("a.rs", "fn compute_a() -> i32 { 0 }\n"),
+                ("b.rs", "fn compute_b() -> i32 { 0 }\n"),
+            ],
+            vec![MockResponse::text(fix_a_only)],
+        );
+        let (events, mut rx) = EventSink::channel();
+        let mut cache = crate::control::cache::TurnInputCache::default();
+        let caps = CapabilityExpr::set(EDIT_CAPABILITIES.iter().copied().map(CapabilityExpr::leaf));
+        let prompt_builder = crate::control::prompt::PromptBuilder::new(
+            &fixture.provider,
+            &fixture.model,
+            &fixture.protocol,
+            &mut cache,
+        );
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let mut ctx = LoopContext::new(
+            &fixture.cancel,
+            &events,
+            fixture.dir.path(),
+            &mut fixture.context,
+            &mut fixture.journal,
+            &mut policy,
+            caps,
+            prompt_builder,
+        );
+        let initial_envelope = ResponseEnvelope::from_commands(&[
+            LlmCommand::EditReplace(EditReplace {
+                path: "a.rs".to_string(),
+                old_text: "nonexistent a".to_string(),
+                new_text: "irrelevant".to_string(),
+            }),
+            LlmCommand::EditReplace(EditReplace {
+                path: "b.rs".to_string(),
+                old_text: "nonexistent b".to_string(),
+                new_text: "irrelevant".to_string(),
+            }),
+        ]);
+
+        let outcome = run_edit_loop(&mut ctx, Some(initial_envelope), &EditLoopConfig::default())
+            .await
+            .expect("runs loop");
+        assert!(outcome.is_success());
+
+        let mut notices = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::TextDelta(t) = ev {
+                if t.contains("Change Set Incomplete") {
+                    notices.push(t);
+                }
+            }
+        }
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn edit_loop_prompts_with_missing_edits_when_healing_round_returns_no_edits() {
+        let mut fixture = Fixture::new(
+            &[
+                ("a.rs", "fn compute() -> i32 { 0 }\n"),
+                ("tauqe.toml", "[project.verify]\ncommand = \"false\"\n"),
+            ],
+            vec![
+                MockResponse::text("I understand the error, here is my explanation without edits."),
+                MockResponse::text("Still just explaining."),
+            ],
+        );
+        let initial_envelope =
+            ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+                path: "a.rs".to_string(),
+                old_text: "fn compute() -> i32 { 0 }\n".to_string(),
+                new_text: "fn compute() -> i32 { 1 }\n".to_string(),
+            })]);
+        let mut ctx = fixture.context();
+        let config = EditLoopConfig {
+            max_healing_rounds: 2,
+            ..EditLoopConfig::default()
+        };
+
+        let outcome = run_edit_loop(&mut ctx, Some(initial_envelope), &config)
+            .await
+            .expect("runs loop");
+        assert!(outcome.is_exhausted());
+
+        let requests = fixture.provider.requests();
+        assert_eq!(requests.len(), 2);
+        let first_prompt = requests[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_prompt.contains("Code verification failed"));
+        assert!(!first_prompt.contains("did not include any code edits"));
+
+        let second_prompt = requests[1]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(second_prompt.contains("did not include any code edits"));
     }
 }

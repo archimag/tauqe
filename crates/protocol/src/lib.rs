@@ -22,7 +22,6 @@ pub mod events;
 pub mod git;
 pub mod glob;
 pub mod history;
-pub mod intent;
 pub mod lifecycle;
 pub mod locale;
 pub mod message;
@@ -56,8 +55,11 @@ pub mod review;
 // exceptions, so a helper is never lifted to the root and a contract name is
 // never left behind at its module.
 pub use command::{
-    CapabilityDelivery, CapabilityPhase, CapabilityProfile, CapabilitySet, DocTopic, LlmCapability,
-    LlmCommand, LlmOutcome, VerifyOnSuccess, VerifyTarget,
+    AbortCommand, BlockedCommand, CapabilityBranch, CapabilityDelivery, CapabilityExpr,
+    CapabilityPhase, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
+    DirListCommand, DocRequestCommand, DocTopic, LlmCapability, LlmCommand, OuterDocRequestCommand,
+    RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand, ShortDescriptionCommand,
+    TextCommand, TurnErrorCommand, TurnSkipCommand, VerifyCommand, VerifyOnSuccess, VerifyTarget,
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
@@ -69,17 +71,17 @@ pub use context::{
     ContextSetAccessParams, ContextState,
 };
 pub use discussion::{
-    custom_tool_call_schema, discussion_response_schema, discussion_response_schema_definition,
-    DirListRequest, DiscussionClearFocusParams, DiscussionClearFocusResult,
-    DiscussionContextRequest, DiscussionFocus, DiscussionFocusChangedEvent,
-    DiscussionGetFocusParams, DiscussionGetFocusResult, DiscussionPlanAction, DiscussionPlanUpdate,
-    DiscussionRequest, DiscussionResponse, DiscussionSetFocusParams, DiscussionSetFocusResult,
-    DiscussionTarget, RepoSearchRequest,
+    custom_tool_call_schema, DirListRequest, DiscussionClearFocusParams,
+    DiscussionClearFocusResult, DiscussionContextRequest, DiscussionFocus,
+    DiscussionFocusChangedEvent, DiscussionGetFocusParams, DiscussionGetFocusResult,
+    DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest, DiscussionResponse,
+    DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget, RepoSearchRequest,
 };
 pub use edit::{
-    EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
-    EditFinishedEvent, EditHunkEvent, EditOperation, EditOutcome, EditProposal, EditStartedEvent,
-    StructuredChangeProposal, VerificationVerdict,
+    EditCreate, EditDelete, EditFileDoneEvent, EditFileOp, EditFileRetryingEvent,
+    EditFileStartedEvent, EditFileStatus, EditFinishedEvent, EditHunkEvent, EditLineAnchor,
+    EditMove, EditMoveDir, EditOperation, EditOutcome, EditOverwrite, EditProposal, EditReplace,
+    EditStartedEvent, StructuredChangeProposal, VerificationVerdict,
 };
 pub use errors::{
     ADD_FAILED, ADD_PATTERN_FAILED, ARCHITECTURAL_GROUP_EXECUTION_REQUIRED, CANCELLED,
@@ -127,7 +129,6 @@ pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryEntryRolledBackEvent, HistoryEntryStatus,
     HistoryFileChange, HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
 };
-pub use intent::TurnIntent;
 pub use lifecycle::{CLIENT_SHUTDOWN_WAIT, SHUTDOWN_DRAIN_BUDGET};
 pub use locale::{LocaleCatalogItem, LocaleGenerateParams, LocaleGenerateResult};
 pub use message::{
@@ -279,6 +280,7 @@ mod wire_contract_tracking {
             include_str!("discussion/normalize.rs"),
         ),
         ("discussion/schema.rs", include_str!("discussion/schema.rs")),
+        ("edit/operation.rs", include_str!("edit/operation.rs")),
         ("edit/proposal.rs", include_str!("edit/proposal.rs")),
         ("model/batch.rs", include_str!("model/batch.rs")),
         ("model/catalog.rs", include_str!("model/catalog.rs")),
@@ -579,7 +581,6 @@ mod wire_contract_tracking {
         ("git", include_str!("git.rs")),
         ("glob", include_str!("glob.rs")),
         ("history", include_str!("history.rs")),
-        ("intent", include_str!("intent.rs")),
         ("lifecycle", include_str!("lifecycle.rs")),
         ("locale", include_str!("locale.rs")),
         ("message", include_str!("message.rs")),

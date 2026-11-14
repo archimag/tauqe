@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
+use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::plan::prompt::PlanHorizonDiagnostics;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT};
-use tauqe_core::workflow::fsm::structured::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::{
     errors, events, ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan,

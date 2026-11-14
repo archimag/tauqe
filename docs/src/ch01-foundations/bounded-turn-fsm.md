@@ -41,54 +41,65 @@ known recovery path.
 
 ## 3.2 Mental Model & Ontology ("What")
 
-### 3.2.1 TurnIntent
+### 3.2.1 The capability tree of a control loop
 
-Every turn runs in exactly one regime, declared as a typed value before the first
-token is generated:
+Every turn runs in exactly one regime, and the regime is declared by the loop function
+that runs it rather than by a value handed in from outside:
 
-- `InteractiveRepl` — free interactive dialogue started from the REPL,
-  including a dialogue anchored on a review finding;
-- `PlanDiscussion` — architectural discussion of a plan;
-- `IsolatedStep` — execution of one plan step or one review finding;
-- `ArchitectSynthesis` — the Architect projects the unfinished horizon of a
-  plan from repository evidence.
+- `run_repl_loop` — free interactive dialogue started from the REPL, including a
+  dialogue anchored on a plan or on a review finding;
+- `run_turn_loop` — execution of one plan step or one review finding;
+- the architect refinement contour — the Architect projects the unfinished horizon of
+  a plan from repository evidence.
 
-The intent is derived from typed request parameters, never from prompt text. It
-narrows the capability set, chooses the plan mutation mode, and decides whether
-the turn enters session history. Narrowing is a typed intersection: whatever a
-protocol advertises is cut down to the regime profile of the declared intent, so
-the prompt and the decoder observe one surface — a capability is never
-advertised while remaining undecodable, nor decoded while hidden from the
-instructions. The interactive REPL regime carries the dialogue head without plan
-mutation, and an isolated step carries no plan permission at all. Plan mutation
-reaches a turn exclusively through the plan-discussion regime, which is the
-regime the server assigns to a dialogue anchored on a plan. Plan creation is not
-mutation: it stays in the dialogue head, so a developer may request a plan at
-any moment of a dialogue. The transport is declared separately from the
-intent: a specialised plan discussion pins the structured discussion transport,
-while a REPL or step turn keeps the transport configured in `tauqe.toml` —
-`structured` by default, `xml`, or `mixed`. The transport changes the encoding
-only, never the capability surface: an XML turn and a structured turn advertise
-and decode the very same operational commands. No default value exists, so a
-forgotten argument cannot silently substitute a mode.
+Each of those functions owns the tree of its own surface and hands it to the shared
+kernel through `LoopContext::capabilities`. `repl_capability_expr` in
+`control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis tree
+in `control/refine.rs` are the only declarations of a capability surface: nothing else
+constructs one, and no enumeration of turn intents exists to be consulted instead.
 
-An Architect synthesis declares `ArchitectSynthesis`. Its surface is the
-architect research profile — research, plan creation, plan update, the
+The tree is composed from typed request parameters, never from prompt text, and it
+decides everything the regime implies — which capabilities narrow the protocol, whether
+plan mutation is authorized, whether the assembled prompt carries the `<history>` block,
+and which prompt layout the turn runs under. Narrowing is a typed intersection:
+whatever a protocol advertises is cut down to the tree the loop declares, so the prompt
+and the decoder observe one surface — a capability is never advertised while remaining
+undecodable, nor decoded while hidden from the instructions. The interactive dialogue
+loop carries the dialogue head without plan mutation, and the bounded turn carries no
+plan permission at all. Plan mutation reaches a turn exclusively through the dialogue
+loop, which adds it when the dialogue is anchored on a plan. Plan creation is not
+mutation: it stays in the dialogue head, so a developer may request a plan at any
+moment of a dialogue. Every turn uses the strict structured output protocol
+(`response_format: json_schema`), so all operational commands are typed properties
+within the strict schema, guaranteeing deterministic constrained decoding without
+protocol discrepancies.
+
+An Architect synthesis declares its own tree in `control/refine.rs`. Its surface is
+the architect research profile — research, plan creation, plan update, the
 scratchpad, and the abort escape hatch — with no file-edit capability and no
 toolchain verification, because a synthesis produces a horizon rather than a
 patch. The escape hatch travels with the profile because a synthesis runs
 unattended exactly as an isolated step does: a condition that only the
 developer can resolve on the host system cannot be improvised or downgraded into a
 blocked answer. It renders no session history,
-exactly as an isolated step does: neither regime continues the developer's
+exactly as an isolated step does: neither loop continues the developer's
 dialogue, so neither prompt carries the `<history>` block. Rendering is not
 recording: a step journals the two-sided card of its own event (§3.2.8), and a
 synthesis is recorded by the caller that started it, because only that caller
-knows the projection it produced. The regime is what puts the synthesis on the
+knows the projection it produced. The loop is what puts the synthesis on the
 machine as every other turn: the structured Architect contour is a policy layer
 over the shared turn kernel (§3.3.9), so it inherits the rounds, the prompt
 head, the discovery journal, the corrective budget of an empty answer, and the
 transport retries instead of re-implementing them.
+
+The loop also owns the brief of its contour. It hands the assembly a typed
+`TurnBrief` — the kind of the contour, the role the model fills, a short
+statement of the paradigm, and the task — so the prompt renders what the loop
+declared instead of selecting a text by a boolean flag. The flag survives only
+where it governs behaviour the prompt does not own: hiding the active plan, the
+dialogue session identifier, and the layout choice. The mode-specific rules of
+the prompt are gated on the typed kind the brief carries, never on a heuristic
+that infers a regime from the shape of a surface.
 
 ### 3.2.2 TurnPhase
 
@@ -110,84 +121,72 @@ per applied proposal.
 
 A protocol declares what it supports as a set of capabilities — text message, file
 edits, research, internal documentation requests, external project documentation
-requests, toolchain verification, plan creation, plan update, scratchpad, outcome,
-blocked, abort, user language, project custom
-tools. A capability set is the
-profile mask naming the capabilities enabled for one role or mode, and role and
-mode profiles are the only sanctioned way to narrow a protocol.
+requests, toolchain verification, plan creation, plan update, scratchpad, terminal
+signals (`commit_message`, `error_message`, `reason`), blocked, abort, project custom
+tools. A capability expression is a typed tree of those capabilities. A control loop
+declares its tree through its own `run_*_loop` function, and intersecting a protocol
+surface with that tree is the only sanctioned way to narrow a protocol. The same tree
+renders the response schema and decodes the round, so a capability is advertised
+exactly when it is decoded, and the label of an operational branch is data the
+contour sets rather than a value sniffed from the leaves.
 
 The `abort` capability closes a turn unconditionally when the remaining work
 needs an action only the developer can perform on the host system, such as
 installing a package or starting a service. The coder ladder never retries such a
-turn, because no stronger tier can supply a capability the host lacks.
+turn, because no stronger tier can supply a capability the host lacks. Both
+escape hatches are the property of the autonomous step contour: a dialogue
+declares neither `blocked` nor `abort` and carries no step-termination signal in
+any of its branches, because an unattended step is the only contour that has to
+report a condition its own turn cannot resolve.
 
-The tags named in this chapter and in the tool category table below are the
-spellings of the XML contour. The structured contour expresses the very same
-commands as fields of its JSON Schema, so the capability surface never depends on
-the configured encoding.
-
+All commands described in this chapter are typed operations within the strict JSON Schema,
+guaranteeing that the capability surface is enforced at the grammar sampling level.
 Each capability belongs to a phase (`Research`, `Execution`, `Verification`,
 `Outcome`). Model output is decoded into a normalized command list — text, edit,
 context request, repository search, documentation request, verification, plan,
-scratchpad, outcome, blocked, user language, protocol error — so no consumer ever
+scratchpad, a terminal signal, blocked, protocol error — so no consumer ever
 inspects raw markup.
 
-Capabilities are implemented as modules. One module owns the canonical tag it
-publishes, the aliases it still accepts, the prompt fragments it contributes, the
-decoder that produces its commands, and the sanitizer that removes its tags from
-conversational text. Because the same module supplies the tag, the instruction, and
-the decoder, the prompt can never advertise a command the decoder rejects, and a
-disabled capability leaves no trace in either the prompt or the command stream.
+Each atomic `LlmCapability` maps directly in `capabilities/schema.rs`, `capabilities/decode.rs`, and `capabilities/rules.rs` to its `schemars`-backed schema fragment (`capability_schema`), its tree-walking decoder (`decode_capability_expr`), and its contract rule and instruction (`contract_rule`, `structured_instruction`). Because schema generation, prompt composition, and decoding all walk the same `CapabilityExpr` tree under `PromptRenderContext`, the prompt can never advertise a command the decoder rejects, and a disabled capability leaves no trace in either the prompt or the command stream. The strict schema is the single source of the response structure — field names, required-ness, enum values, and the descriptions it carries from the doc comments of the command types — while the prompt text states the direction of the work: the role, the discipline, the semantics of `blocked` and `abort`, and the order of the phases. A rule therefore never restates a structural requirement the schema already declares, and the instruction list is rendered from the same tree, so a narrowed surface withholds a property from the instructions exactly as it withholds it from the schema.
 
 Each capability also declares how its output reaches the harness. `LiveStreaming`
 marks the contours consumed while tokens arrive — conversational text and file
 edits, which the interface renders as the model generates. `RoundDeferred` marks
 everything that only becomes meaningful once the round finishes — research,
-documentation, verification, plans, scratchpad, outcome, blockers, language, and
-project tool payloads. Streaming scanners and round-level decoders read that
+documentation, verification, plans, scratchpad, outcome, blockers, and project tool payloads.
 declared property instead of matching capability names, so delivery stays
 orthogonal to phase: the execution phase carries both.
 
-The code modification contour publishes the canonical `edits` container; the older
-`tauqe_edits` spelling remains a declared alias, so transcripts, sessions, and
-model output written before the rename stream and decode exactly like the
-canonical tag.
-A capability surface splits into invariant ambient channels and mutually
-exclusive operational branches. The conversational text, the turn scratchpad, and
-the detected language accompany every round, so they belong to no branch. The
-discovery commands form the `research` branch, and every command the harness acts
-upon — file edits, toolchain verification, plan authoring, project tools, and the
-terminal outcomes — forms the `execution` branch. One round follows exactly one
-branch: it discovers or it patches, never both.
+A capability surface splits into one invariant ambient channel and mutually
+exclusive operational branches (`research`, `edit`, `plan`, `review`). The turn scratchpad
+accompanies every round, so it belongs to no branch. The conversational channel belongs to
+the branches instead: every branch declares the single `message` field of the response, so a
+wire carries exactly one `message` property because exactly one branch is selected. A
+discovery or planning round reports through a short description of the action it performs,
+while a round that answers or changes the tree carries the full explanation. The language of
+the answer is not a channel either: the shared contract states it once, as an unconditional
+rule that user-facing output follows the language of the request.
+The discovery commands form the `research` branch, code modifications form the `edit` branch,
+and plan mutations form the `plan` branch, while a dialogue anchored on a plan wraps both
+plan capabilities in one `plan_action` union whose `kind` values are `create` and `modify`,
+so `plan_create` and `plan_update` never share one level. One round follows exactly one
+branch: it discovers, patches, or plans, never multiple in the same round.
 
-The split is a projection of the advertised surface, never a second list. The
-structured contour states it grammatically, nesting the two branches under one
-`action` envelope whose constant `kind` discriminator names the branch a response
-follows, so a research round holds no `changes` field at all. The XML contour has
-no discriminator, so the same exclusion reaches the model as the `Operational
-Branch Exclusion` contract rule over its control tags, and the kernel enforces it
-as a typed decision (§3.3.2). A surface that carries a single branch excludes
-nothing and renders no envelope.
-
+The split is enforced grammatically via the `action` union envelope whose constant `kind`
+discriminator names the branch a response follows, so a research round contains no `changes`
+field at all, and an edit round contains no research requests.
 ### 3.2.4 Tool Categories: Terminal vs. Diagnostic Inspection
 
 Tools and operations accessible to the model are partitioned into three distinct
 functional categories that govern their lifecycle within the bounded turn:
-
-| Tool Category | Operations / Tags | Lifecycle Effect | Terminates Turn? |
+| Tool Category | Operations / Fields | Lifecycle Effect | Terminates Turn? |
 | --- | --- | --- | --- |
-| **Perception (Research)** | `<context_request>`, `<repo_search>`, `<tauqe_doc_request>`, `<outer_doc_request>`, `<dir_list>`, `<repo_dirs>` | Widens context or provides authoritative reference | **No.** Triggers next Research round. |
-| **Inspection (Diagnostic Execution)** | Declared project commands (`CustomTool`, e.g. integration tests, linters, benchmarks) | Executes isolated CLI process; streams stdout/stderr back into the turn journal | **No.** Triggers next Proposal round for model reasoning. |
-| **Mutation (Terminal Outcome)** | `<edits>`, `<success>`, `<error>`, `<blocked>`, `<skip>` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
-
-Calling an inspection tool (such as running full integration tests) is an
-exploratory, diagnostic act: it implies that the turn is **not finished**. The model
-must receive the command's exit code, stdout, and stderr to analyze failures,
-inspect stack traces, and adapt its subsequent code edits.
-
+| **Perception (Research)** | `context_requests`, `repo_searches`, `dir_lists`, `repo_dirs`, `repo_maps`, `tauqe_doc_requests`, `outer_doc_requests` | Widens context or provides authoritative reference | **No.** Triggers next Research round. |
+| **Inspection (Diagnostic Execution)** | Declared project commands (`custom_tools`, e.g. integration tests, linters, benchmarks) | Executes isolated CLI process; streams stdout/stderr back into the turn journal | **No.** Triggers next Proposal round for model reasoning. |
+| **Mutation (Terminal Outcome)** | `changes`, flat terminal fields (`commit_message`, `message`, `error_message`, `reason`), `blocked`, `abort` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
 ### 3.2.5 Terminal outcomes
 
-Four typed tags close a turn:
+Four terminal outcomes close a turn, carried as flat fields on the response or its active branch:
 
 - success — the objective was implemented, staged, and committed under an explicit
   verification verdict;
@@ -196,12 +195,16 @@ Four typed tags close a turn:
   satisfied as stated;
 - skip — the finding was already addressed or is not reproducible.
 
+The branch a round selects decides which payload its status carries: the branch
+that applied a change set closes with `commit_message`, while a dialogue closes
+with the `message` of its own branch, while a failure reports through `error_message`,
+so no status names a field the selected branch does not declare.
 A blocked outcome is not a failure to retry: the transaction is rolled back, no
 patch retry or healing cycle runs, and the owning supervisor may replan instead of
 repeating.
 
 Every terminal status carries its own result: `success` carries the
-`commit_message` of its change set, `error` carries its message, `skip` carries
+`commit_message` of its change set, `error` carries its `error_message`, `skip` carries
 its reason. The decoders substitute a deterministic payload for `error` and
 `skip`, because for those two the status already means something. `success`
 cannot be completed that way — only the model can say what the turn achieved —
@@ -212,14 +215,12 @@ The field is named for its consumer, not for the moment it is written.
 `commit_message` is the Git commit message of the change set, so it is an
 English Conventional Commits header — `type(scope): description`, imperative
 mood, lower case, no trailing period, at most 72 characters — whatever language
-the conversation uses. Both contours spell it the same way: the attribute of the
-`<success>` tag and the property of the structured `outcome` object are both
-`commit_message`. The repository conventions already demand that shape from every
-commit (§6), so the harness aligns the wire field with the standard it feeds
-instead of inventing a second one. The language obligation therefore splits:
+the conversation uses. It travels as the flat `commit_message` field on the active
+branch, because the field is named for the commit (§6): the harness aligns the wire
+field with the standard it feeds instead of inventing a second one. The language
+obligation therefore splits:
 `message` answers the developer in the language of the dialogue, and
-`commit_message` is an English machine contract that `user_language` never
-reaches.
+`commit_message` is an English machine contract that the language of the dialogue never reaches.
 
 ### 3.2.6 Result-Bearing Elements and Auxiliary Channels
 
@@ -229,13 +230,12 @@ wrote. One classification decides it:
 | Channel | Elements | Advances the turn? |
 | --- | --- | --- |
 | Result-bearing | conversational text, file edits, research requests, plan updates, a verification request, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
-| Auxiliary | scratchpad notes, the user-language declaration | no |
+| Auxiliary | scratchpad notes | no |
 
-An auxiliary channel is memory and configuration, not work: it records what the
-model is thinking and which language it must answer in. It never widens the
-context, never stages a byte, and therefore never makes a round actionable on its
-own. A round carrying only auxiliary material is as empty as a round carrying
-nothing at all.
+An auxiliary channel is memory, not work: it records what the model is thinking.
+It never widens the context, never stages a byte, and therefore never makes a
+round actionable on its own. A round carrying only auxiliary material is as
+empty as a round carrying nothing at all.
 
 ### 3.2.7 ApplyPolicy
 
@@ -427,7 +427,7 @@ diagnostic investigation step rather than a terminal completion.
    answer round from the model with the updated journal. The
    model perceives the real command output, evaluates test failures or runtime
    panics, and either proposes corrective code edits, invokes another inspection tool,
-   or emits an explicit terminal outcome (`<success>` / `<blocked>`).
+or emits an explicit terminal outcome (`success` / `blocked`).
 4. **Shared Round Budget:** Diagnostic tool executions consume the turn's discovery
    round budget (`context.max_discovery_rounds`), preventing unbounded agentic loops
    while ensuring models have sufficient feedback to diagnose complex failures.
@@ -607,40 +607,22 @@ unchanged token prefix. Turning that prompt into a message sequence is a policy
 behind one trait, so the same rendered material can become different sequences:
 
 - `SemanticLayout` groups the material by kind: one system message carrying the
-  contract, the outline, the whole `<context>` block, the active plan, the language
-  directive, the `<history>` block, and the scratchpad.
+  contract, the outline, the whole `<context>` block, the active plan, the `<history>` block, and the scratchpad.
 - `ChronologicalLayout` turns the same material into an append-only transcript: a
   byte-stable head, one message per history record with the context files that
   record already observed placed right after it, and a volatile tail.
 
-Both policies place the regime delta — the contract rules that only the active
-intent states — on the user side of the sequence. Under the semantic order it is
-the leading block of the final user message; under the chronological order it is
-the first block of the trailing user message, ahead of the active plan, the
-context manifest, and the scratchpad. Round diagnostics (patch retry reports,
-verification failures) are appended after it, so a retry never cuts the cached
-prefix a second time. Inside one turn the delta is byte-stable, because the
-intent does not change between rounds.
+Both policies place the whole contract in the byte-stable head: the shared trunk and every rule the loop's capability tree authorizes, since that tree never changes between the rounds of one turn. Round diagnostics (patch retry reports, verification failures) travel as append-only extensions of the user message instead, so a retry never cuts the cached prefix a second time.
 
-The head renders the main capability list of the intent and the shared part of
-the regime trunk, so it is byte-identical for the free REPL, the plan discussion,
-and the review discussion. What a regime adds beyond that head travels in the
-regime delta instead: a plan discussion adds its plan mutation there, while a
-review discussion adds nothing, so its delta is empty. The invariant that a
-capability is advertised exactly when it is decoded survives, because the head,
-the delta, and the decoder are all read from the same typed profile — an
-interactive turn intersects the advertised set with the interactive regime and
-rejects plan mutation even when its protocol declares it.
+The head renders the whole contract of the loop's tree — its capability list, the shared trunk, and the rules that tree alone states — so every rule and every schema property derive from the tree the loop function returns, and the head is byte-identical for every round of one turn. What a loop adds reaches that same head: a dialogue anchored on a plan declares plan mutation there, while a free dialogue and a review dialogue declare exactly the interactive tree. The invariant that a capability is advertised exactly when it is decoded survives, because the head, the schema, and the decoder are all read from that one tree — an interactive turn intersects the advertised set with its own tree and rejects plan mutation even when its protocol declares it.
 
 | Material | Semantic | Chronological |
 | --- | --- | --- |
 | Contract, instructions, metadata | system head | system head |
 | Repository outline | system head | system head |
-| Language directive | system head | system head |
 | Context files | one `<context>` block | `<context>` groups in the transcript |
 | History | one `<history>` block | one message per record |
 | Active plan | system tail | trailing user message |
-| Regime delta | leading block of the final user message | first block of the trailing user message |
 | Context manifest | absent | trailing user message |
 | Scratchpad | system tail | trailing user message |
 
@@ -665,11 +647,7 @@ append-only event, never a fifth invalidation boundary beside the four documente
 ones; a file no watermark-bearing turn bounds falls back to the recorded starting
 context, and a file that carries no watermark at all closes the transcript.
 
-The tail carries everything that legitimately changes: the regime delta first,
-then the active plan, the context manifest of the chronological policy — paths and
-access, never content — and the turn scratchpad, while round feedback (research
-findings, patch retry reports, verification diagnostics) is appended after the
-delta.
+The tail carries everything that legitimately changes: the active plan, the context manifest of the chronological policy — paths and access, never content — and the turn scratchpad, while round feedback (research findings, patch retry reports, verification diagnostics) is appended after the user message.
 The user message keeps one fixed shape: task first, accumulated journal next, phase
 diagnostics last. A staging retry therefore differs from its own earlier attempt
 only in the trailing diagnostics.
@@ -778,8 +756,9 @@ learns what to decompose instead of watching a turn fail anonymously.
   run.
 - **It does not retry forever.** Every loop has a configured budget and a saturated
   terminal state.
-- **It does not infer the mode from text.** Intent is a typed value; a prompt that
-  merely resembles an internal heading cannot change the regime.
+- **It does not infer the mode from text.** The mode is a typed parameter of the loop
+  that runs the turn; a prompt that merely resembles an internal heading cannot
+  change the regime, and no boolean flag that resembles one selects the brief.
 - **It does not create a plan on its own initiative.** A broad request produces an
   offer inside the answer, never a plan document; storage changes only after the
   developer confirms.
@@ -799,7 +778,7 @@ learns what to decompose instead of watching a turn fail anonymously.
   change set instead of discarding work the turn already paid for.
 - **It does not let the dialogue language reach the commit.** `commit_message` is
   an English Conventional Commits header whatever language the turn answered in;
-  the language directive governs the answer, never the Git history.
+  the language of the answer follows the request, never the Git history.
 - **It does not keep an uncommitted prompt in the model context.** A turn that
   produced no result leaves no record behind, so the model never reads a task whose
   outcome it cannot see.

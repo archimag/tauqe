@@ -2,20 +2,20 @@
 //!
 //! A [`PromptProtocol`] decouples the concrete wire syntax of model output
 //! (XML markers, JSON schema) from the core execution pipeline. Each protocol
-//! advertises the declarative set of [`LlmCapability`] values it enables and
+//! advertises the declarative capability tree it enables and
 //! decodes raw model output into a uniform list of [`LlmCommand`] values. The
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
 use tauqe_protocol::{
-    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
+    CapabilityExpr, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
 };
 
 /// Decodes raw model output into normalized core commands.
 ///
 /// Implementors translate their protocol-specific syntax into the shared
 /// [`LlmCommand`] vocabulary, emitting commands only for the capabilities they
-/// advertise through [`PromptProtocol::capabilities`]. This keeps the execution
+/// advertise through [`PromptProtocol::capability_expr`]. This keeps the execution
 /// pipeline agnostic of the concrete wire format and makes protocols
 /// interchangeable.
 pub trait PromptProtocol: Send + Sync {
@@ -30,31 +30,32 @@ pub trait PromptProtocol: Send + Sync {
     /// tag while an XML prompt advertises no JSON field.
     fn kind(&self) -> EditProtocolKind;
 
-    /// Declarative set of interaction capabilities this protocol enables.
+    /// Strict capability tree this protocol advertises.
     ///
-    /// The core pipeline relies on this set to know which command kinds may
-    /// appear in decoded output.
-    fn capabilities(&self) -> &[LlmCapability];
+    /// The tree is the single source of truth of the protocol surface: it
+    /// composes the response schema and scopes the decoder, so a capability can
+    /// neither be advertised while remaining undecodable nor accepted while
+    /// being hidden from the instructions.
+    fn capability_expr(&self) -> CapabilityExpr;
+
+    /// Flat projection of the advertised tree, in first-seen depth-first order.
+    ///
+    /// The projection answers which capability kinds a round may emit; the tree
+    /// stays the authoritative declaration the schema and the decoder read.
+    fn capabilities(&self) -> Vec<LlmCapability> {
+        self.capability_expr().leaves()
+    }
 
     /// Reports whether the protocol enables the given capability.
     fn supports(&self, capability: LlmCapability) -> bool {
-        self.capabilities().contains(&capability)
+        self.capability_expr().contains(capability)
     }
 
-    /// Declarative capability set this protocol currently advertises.
-    ///
-    /// The default derives the set from [`PromptProtocol::capabilities`]. A
-    /// protocol that can be narrowed overrides it to report the narrowed set, so
-    /// prompt composition and decoding stay aligned with one source of truth.
-    fn capability_set(&self) -> CapabilitySet {
-        CapabilitySet::from_slice(self.capabilities())
-    }
-
-    /// Returns a variant of this protocol that advertises exactly `capabilities`.
+    /// Returns a variant of this protocol that advertises exactly `expr`.
     ///
     /// Every concrete protocol implements this, so a caller narrows a turn to a
-    /// capability set without branching on the concrete protocol type.
-    fn with_capability_set(&self, capabilities: CapabilitySet) -> Box<dyn PromptProtocol>;
+    /// capability tree without branching on the concrete protocol type.
+    fn with_capability_expr(&self, expr: CapabilityExpr) -> Box<dyn PromptProtocol>;
 
     /// Decodes raw model output into normalized core commands.
     ///
@@ -75,13 +76,13 @@ pub trait PromptProtocol: Send + Sync {
     /// instructions of its own.
     ///
     /// An implementor renders the instructions of the wire surface its narrowed
-    /// capability set selects: the edit reference when
-    /// [`LlmCapability::FileEdits`] is enabled, and the read-only discussion
-    /// schema otherwise. The narrowed [`CapabilitySet`] is the single typed
-    /// input carrying that decision — the caller narrows through
-    /// `TurnIntent::narrow_capabilities` and [`PromptProtocol::with_capability_set`]
-    /// before calling — so no parallel intent channel exists on this trait and
-    /// a second source of truth cannot appear.
+    /// capability set selects: the edit reference when a file-edit capability is
+    /// enabled, and the read-only discussion schema otherwise. The narrowed
+    /// capability tree is the single typed input carrying that decision — the
+    /// caller narrows the surface and hands it to
+    /// [`PromptProtocol::with_capability_expr`] before calling — so no parallel
+    /// regime channel exists on this trait and a second source of truth cannot
+    /// appear.
     ///
     /// `has_eager_repo_map` reports whether the prompt already carries the
     /// rendered repository symbol map, so the guidance never advertises an
@@ -96,23 +97,6 @@ pub trait PromptProtocol: Send + Sync {
         has_eager_repo_map: bool,
         patch_strategy: PatchStrategy,
     ) -> String;
-
-    /// Returns the active per-turn marker bound to this protocol, if any.
-    ///
-    /// Marker-bound protocols tag structural elements with a unique marker so
-    /// tag extraction stays unambiguous across concatenated turns. Protocols
-    /// without marker-bound syntax return `None`.
-    fn turn_marker(&self) -> Option<&str> {
-        None
-    }
-
-    /// Returns a marker-bound variant of this protocol.
-    ///
-    /// Protocols that tag their output with a marker produce a bound variant;
-    /// others return `None` and keep the unbound protocol.
-    fn with_turn_marker(&self, _marker: &str) -> Option<Box<dyn PromptProtocol>> {
-        None
-    }
 
     /// Returns the structured response format this protocol requires, if any.
     ///
@@ -150,6 +134,7 @@ pub trait PromptProtocol: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::TextCommand;
 
     /// Minimal protocol used to exercise the trait contract in tests.
     struct TextOnlyProtocol;
@@ -163,14 +148,14 @@ mod tests {
             EditProtocolKind::Structured
         }
 
-        fn capabilities(&self) -> &[LlmCapability] {
-            &[LlmCapability::TextMessage, LlmCapability::UserLanguage]
+        fn capability_expr(&self) -> CapabilityExpr {
+            CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)])
         }
 
         fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
-            vec![LlmCommand::Text {
+            vec![LlmCommand::Text(TextCommand {
                 content: raw_text.to_string(),
-            }]
+            })]
         }
 
         fn system_instructions(
@@ -182,8 +167,8 @@ mod tests {
             String::new()
         }
 
-        fn with_capability_set(&self, _capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
-            // The fixture advertises a fixed capability slice; narrowing is
+        fn with_capability_expr(&self, _expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
+            // The fixture advertises a fixed capability tree; narrowing is
             // exercised by the concrete protocols.
             Box::new(TextOnlyProtocol)
         }
@@ -195,7 +180,7 @@ mod tests {
             staged_contents: std::collections::HashMap<String, String>,
         ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
             Box::new(
-                crate::edits::stream::XmlStreamFilter::new(editable_paths, repo_root)
+                crate::edits::stream::JsonStreamFilter::new(editable_paths, repo_root)
                     .with_staged_contents(staged_contents),
             )
         }
@@ -206,19 +191,17 @@ mod tests {
         let protocol = TextOnlyProtocol;
         assert_eq!(protocol.name(), "text-only");
         assert!(protocol.supports(LlmCapability::TextMessage));
-        assert!(protocol.supports(LlmCapability::UserLanguage));
-        assert!(!protocol.supports(LlmCapability::FileEdits));
+        assert!(!protocol.supports(LlmCapability::EditReplace));
     }
-
     #[test]
     fn test_prompt_protocol_decodes_commands() {
         let protocol = TextOnlyProtocol;
         let commands = protocol.decode("Hello", &[]);
         assert_eq!(
             commands,
-            vec![LlmCommand::Text {
+            vec![LlmCommand::Text(TextCommand {
                 content: "Hello".to_string(),
-            }]
+            })]
         );
     }
 }

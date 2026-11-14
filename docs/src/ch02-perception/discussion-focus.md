@@ -72,19 +72,17 @@ decimal string form of finding identifiers for a review session.
 - **Quick focus** — setting the anchor from Plans or Review without leaving the
   view or typing a prompt.
 - **Stale anchor** — a focus whose entity no longer exists.
-- **Regime profile** — the two typed capability lists a regime declares: a main
-  surface rendered into the byte-stable head and shared by every dialogue, and a
-  delta rendered into the tail.
+- **Capability tree** — the single typed `CapabilityExpr` the dialogue loop declares through `repl_capability_expr`: it intersects the protocol surface and renders both the contract and the response schema, so a dialogue needs no second declaration of its own.
 
 ### 2.4 Intent mapping
 
-| Target | Turn intent | Capability surface |
+| Target | Loop parameter | Capability surface |
 | --- | --- | --- |
-| `Plan { id }` | `PlanDiscussion` | the main dialogue surface plus the plan-mutation delta |
-| `Review { id }` | `InteractiveRepl` | the main dialogue surface, with an empty profile delta |
+| `Plan { id }` | plan mutation authorized | the tree `repl_capability_expr` declares for a plan-anchored dialogue, which carries plan mutation |
+| `Review { id }` | plan mutation withheld | the interactive dialogue tree `repl_capability_expr` declares |
 
 The mapping is a typed decision, not a text check. It is the single place that
-decides which regime a focused dialogue runs in: both targets reach the same
+decides which surface a focused dialogue runs on: both targets reach the same
 editing surface, and only the plan target adds the capability that persists a
 plan change.
 
@@ -96,7 +94,7 @@ plan change.
 
 An explicit discussion request carries the target, the focused items, and the
 developer's comment. The server loads the entity, generates the discussion prompt
-from those typed fields, replaces the focus anchor, and derives the turn intent.
+from those typed fields, replaces the focus anchor, and hands that anchor to the dialogue loop, which derives its capability tree from it.
 
 Opening a focus does not reset the REPL session history: the developer keeps the
 running dialogue while switching the entity under discussion.
@@ -129,13 +127,7 @@ stream the answer while the rest of the payload is still arriving.
 
 ### 3.3 Capability surface
 
-A dialogue runs on the main capability surface of an interactive turn — text,
-discovery, documentation requests, file edits, verification, scratchpad, and the
-terminal outcomes — and each regime adds its own delta. A plan discussion adds
-the plan-mutation delta (`PlanUpdate`), which is what lets the same anchored
-dialogue refine a plan and persist the change. A review discussion adds no
-capability of its own today, so its delta is empty and its surface is exactly the
-main one.
+A dialogue runs on the capability tree `repl_capability_expr` declares — text, discovery, documentation requests, file edits, verification, scratchpad, and the terminal outcomes. A dialogue anchored on a plan declares plan mutation (`PlanUpdate`) beside that surface, which is what lets the same anchored dialogue refine a plan and persist the change, while a dialogue anchored on a review finding declares exactly the interactive dialogue tree.
 
 Because the main surface carries file edits, a focused dialogue reaches exactly
 the REPL transaction: edits are staged, verified, and committed as one atomic
@@ -227,6 +219,6 @@ state moves only on an explicit developer decision or a verified execution.
 - [Structured Code Review](../ch04-workflows/review.md) — findings, statuses, and
   resolution.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) —
-  `TurnIntent` and capability narrowing.
+  `run_*_loop` ownership of `CapabilityExpr` and capability narrowing.
 - [Keyboard-First Interface](../ch05-system/tui-ux.md) — the focus banner and
   dialog conventions.

@@ -120,10 +120,6 @@ impl PromptLayout for SemanticLayout {
             system_text.push_str(&plan_block);
         }
 
-        if let Some(language_block) = assembly.format_language_directive_block() {
-            system_text.push_str(&language_block);
-        }
-
         // The session history is the stable block that changes most often: it
         // grows after every completed turn, and a changed byte invalidates
         // every cached token that follows it. Rendering it after the context
@@ -151,18 +147,12 @@ impl PromptLayout for SemanticLayout {
             system_text.push_str(&scratchpad_block);
         }
 
-        // The regime delta opens the developer message while the task closes it,
-        // so the whole stable prefix stays byte-identical and only the tail states
-        // what the declared regime authorizes.
-        let mut user_text = String::new();
-        if let Some(delta) = assembly.format_regime_delta_section(protocol) {
-            user_text.push_str(&delta);
-        }
-        user_text.push_str(current_prompt);
-
+        // The task closes the sequence alone: the rules the declared regime
+        // authorizes are part of the system head, so the developer message
+        // carries no prompt material of its own.
         vec![
             ChatMessage::system(system_text),
-            ChatMessage::user(user_text),
+            ChatMessage::user(current_prompt.to_string()),
         ]
     }
 }
@@ -217,10 +207,6 @@ impl PromptLayout for ChronologicalLayout {
         if let Some(outline_block) = assembly.format_repository_outline_block() {
             head.push_str(&outline_block);
         }
-        if let Some(language_block) = assembly.format_language_directive_block() {
-            head.push_str(&language_block);
-        }
-
         let mut messages = vec![ChatMessage::system(head)];
 
         // Every context file is placed by its own arrival watermark: a file
@@ -251,12 +237,6 @@ impl PromptLayout for ChronologicalLayout {
         // end of the transcript, so a round that carries more working memory or
         // a wider context never moves a byte the provider already cached.
         let mut tail = String::new();
-        // The regime delta is the leading block of the trailing message: the
-        // transcript keeps every byte it already sent while the regime states the
-        // invariants only its own turn carries.
-        if let Some(delta) = assembly.format_regime_delta_section(protocol) {
-            tail.push_str(&delta);
-        }
         if let Some(plan_block) = assembly.format_active_plan_block() {
             tail.push_str(&plan_block);
         }
@@ -394,7 +374,7 @@ mod tests {
     use super::*;
     use crate::context::ContextFileContent;
     use crate::history::{HistoryEntry, HistorySnapshot};
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::prompt::json::JsonPromptProtocol;
     use tauqe_protocol::{ContextAccess, EditProtocolKind};
 
     /// Builds a context file carrying the arrival watermark it received.
@@ -451,7 +431,7 @@ mod tests {
             1,
             files,
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             Some(std::sync::Arc::new(HistorySnapshot::new(records))),
             None,
         )
@@ -477,8 +457,8 @@ mod tests {
                 response(4, "Second done"),
             ],
         );
-
-        let messages = assembly.assemble_chat_messages("Third task", &XmlPromptProtocol);
+        let messages =
+            assembly.assemble_chat_messages("Third task", &JsonPromptProtocol::default());
         assert_eq!(messages.len(), 9);
         assert_eq!(messages[0].role, "system");
 
@@ -522,8 +502,8 @@ mod tests {
                 legacy_turn(3, "Second task", &["pinned.rs", "later.rs"]),
             ],
         );
-
-        let messages = assembly.assemble_chat_messages("Third task", &XmlPromptProtocol);
+        let messages =
+            assembly.assemble_chat_messages("Third task", &JsonPromptProtocol::default());
         assert!(messages[2].content.contains("path=\"pinned.rs\""));
         assert!(!messages[2].content.contains("later.rs"));
         assert!(messages[5].content.contains("path=\"later.rs\""));
@@ -555,15 +535,14 @@ mod tests {
         };
 
         let during = chronological(files(), opening())
-            .assemble_chat_messages("Second task", &XmlPromptProtocol);
-
+            .assemble_chat_messages("Second task", &JsonPromptProtocol::default());
         // The next turn opens with the arrival already in its starting context,
         // and appends the response of the discovering turn plus its own prompt.
         let mut adopted_records = opening();
         adopted_records.push(response(4, "Second done"));
         adopted_records.push(turn(5, "Third task", &["pinned.rs", "discovered.rs"], 2));
         let adopted = chronological(files(), adopted_records)
-            .assemble_chat_messages("Fourth task", &XmlPromptProtocol);
+            .assemble_chat_messages("Fourth task", &JsonPromptProtocol::default());
 
         // The arrival closes the transcript of the turn that discovered it: no
         // later record existed when it was emitted.
@@ -597,16 +576,14 @@ mod tests {
             vec![turn(1, "First task", &["src/main.rs"], 1)],
         );
         assembly.repo_map = Some("crate\n  pub fn main".to_string());
-        assembly.target_language = Some("Russian".to_string());
 
-        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let messages = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
         let head = &messages[0].content;
 
         assert!(head.contains("## Repository Map"));
         assert!(head.contains("crate\n  pub fn main"));
-        assert!(head.contains("## Language Directive"));
-        assert!(head.contains("Target Response Language: Russian"));
-
+        assert!(!head.contains("## Language Directive"));
+        assert!(head.contains("Response Language"));
         // The context body travels through the transcript, never through the
         // byte-stable head.
         assert!(!head.contains("path=\"src/main.rs\""));
@@ -626,7 +603,7 @@ mod tests {
                 response(2, "First done"),
             ],
         )
-        .assemble_chat_messages("Second task", &XmlPromptProtocol);
+        .assemble_chat_messages("Second task", &JsonPromptProtocol::default());
 
         let after = chronological(
             vec![
@@ -641,8 +618,7 @@ mod tests {
                 turn(5, "Third task", &["pinned.rs", "fresh.rs"], 2),
             ],
         )
-        .assemble_chat_messages("Fourth task", &XmlPromptProtocol);
-
+        .assemble_chat_messages("Fourth task", &JsonPromptProtocol::default());
         assert!(after.len() > before.len());
         // The head is byte-identical and the transcript keeps every earlier
         // message as a prefix; the first divergence is the volatile tail.
@@ -664,8 +640,7 @@ mod tests {
             ],
             vec![turn(1, "Task", &["src/a.rs", "src/b.rs"], 2)],
         );
-
-        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let messages = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
         let tail = &messages[messages.len() - 2].content;
 
         assert!(tail.contains("<context_manifest>"));
@@ -683,14 +658,14 @@ mod tests {
         );
 
         // The semantic policy keeps the whole context inside the system message.
-        let semantic = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let semantic = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
         assert!(semantic[0].content.contains("alpha\n"));
         assert_eq!(semantic.len(), 2);
 
         // The chronological policy hands the body through the transcript and
         // closes the sequence with the developer message.
         assembly.prompt_layout = PromptLayoutKind::Chronological;
-        let transcript = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let transcript = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
         assert!(!transcript[0].content.contains("alpha\n"));
         assert!(transcript[1].content.contains("alpha\n"));
         assert!(transcript.len() > 2);
@@ -700,7 +675,7 @@ mod tests {
         );
     }
     #[test]
-    fn regime_delta_opens_the_trailing_user_message_in_both_policies() {
+    fn regime_rules_travel_in_the_system_head_in_both_policies() {
         let build = |layout: PromptLayoutKind| {
             let mut assembly = assembly(
                 vec![file("src/a.rs", ContextAccess::Editable, "alpha\n", 1)],
@@ -712,25 +687,17 @@ mod tests {
 
         for layout in [PromptLayoutKind::Semantic, PromptLayoutKind::Chronological] {
             let assembly = build(layout);
-            let delta = assembly
-                .format_regime_delta_section(&XmlPromptProtocol)
-                .expect("the interactive regime states a delta");
-            assert!(delta.starts_with("## Regime Delta\n"));
-            assert!(delta.contains("Action Authorization"));
-            assert!(delta.contains("Plan-First Proposal"));
-
-            let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
-            assert!(!messages[0].content.contains("Action Authorization"));
+            let messages = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
+            assert!(messages[0].content.contains("Action Authorization"));
+            assert!(messages[0].content.contains("Plan-First Proposal"));
             match layout {
                 PromptLayoutKind::Semantic => {
                     assert_eq!(messages.len(), 2);
-                    let user = &messages[1].content;
-                    assert!(user.starts_with(&delta));
-                    assert!(user.ends_with("Go"));
+                    assert_eq!(messages[1].content, "Go");
                 }
                 PromptLayoutKind::Chronological => {
                     let tail = &messages[messages.len() - 2].content;
-                    assert!(tail.starts_with(&delta));
+                    assert!(!tail.contains("Action Authorization"));
                     assert!(tail.contains("<context_manifest>"));
                     assert_eq!(
                         messages.last().map(|message| message.content.as_str()),

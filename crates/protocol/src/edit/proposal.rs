@@ -1,84 +1,18 @@
-//! Edit proposals: the typed change operations and their normalization.
+//! Edit proposals: wire-format change entries, validation, and conversion.
 
-use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use super::operation::{
+    decode_repo_path, deserialize_repo_path, strip_surrounding_markup,
+};
+pub use super::operation::{
+    normalize_repo_path, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
+    EditOperation, EditOverwrite, EditReplace,
+};
+use crate::command::LlmCommand;
 use crate::edit::EditFileOp;
-
-/// A single typed change operation.
-///
-/// A decoded operation can never address a location outside the repository: the
-/// serde boundary normalizes and validates every path it carries — the `path`
-/// of a file operation and both directories of a move — through
-/// [`normalize_repo_path`], and writes a decoded path back through the inverse
-/// escape of that rule, so serializing the operation and decoding it again
-/// reproduces the same target instead of retargeting it. An operation is a typed
-/// enum variant rather than a
-/// list entry, so a rejected path surfaces as a decode failure naming it
-/// instead of being dropped silently. The absolute-path and drive-root
-/// rejections are derived from the decoded segment structure rather than from
-/// enumerated spellings, so a spelling that reaches the file-system root
-/// through separator escapes or dot segments is refused as well. This is a
-/// first line of defence only:
-/// `core` still canonicalizes and confines every path against the repository
-/// root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum EditOperation {
-    Replace {
-        #[serde(with = "repo_path")]
-        path: String,
-        old_text: String,
-        new_text: String,
-    },
-    Create {
-        #[serde(with = "repo_path")]
-        path: String,
-        content: String,
-    },
-    Delete {
-        #[serde(with = "repo_path")]
-        path: String,
-    },
-    Move {
-        #[serde(with = "repo_path")]
-        from: String,
-        #[serde(with = "repo_path")]
-        to: String,
-    },
-    /// Moves a directory subtree, naming the source and the destination.
-    ///
-    /// A directory rename is one operation rather than one entry per file: the
-    /// staging engine expands it into the per-file moves of the subtree under
-    /// `from`. No replaced lines, range bounds, or payload belong to it.
-    MoveDir {
-        #[serde(with = "repo_path")]
-        from: String,
-        #[serde(with = "repo_path")]
-        to: String,
-    },
-    Overwrite {
-        #[serde(with = "repo_path")]
-        path: String,
-        content: String,
-    },
-    /// Replaces a range of lines that the proposal names by opaque anchors.
-    ///
-    /// `start` and `end` are inclusive bounds rendered beside the context lines
-    /// and decoded deterministically by the staging engine. `content` holds the
-    /// complete replacement of the addressed range, so the replaced text never
-    /// has to be echoed back.
-    LineAnchor {
-        #[serde(with = "repo_path")]
-        path: String,
-        start: String,
-        end: String,
-        content: String,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditProposal {
     pub summary: String,
@@ -87,139 +21,129 @@ pub struct EditProposal {
 
 /// One entry of a change set: its operation, its target, and its payload.
 ///
-/// The `op` property arrives as a plain spelling, because parsing it is fallible
-/// and an error raised inside the field deserializer would discard the whole
-/// `changes` array. A recognized spelling becomes [`Self::op`]; an unrecognized
-/// one leaves that field at the default replacement and is recorded verbatim in
-/// [`Self::unrecognized_op`], so the entry survives decoding while the
-/// diagnostic that finally rejects it still names the operation the response
-/// declared.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "ChangeProposalWire", into = "ChangeProposalWire")]
+/// Every field is a flat `String` with `#[serde(default)]` and
+/// `#[schemars(required)]`, so the derived JSON schema is strict
+/// (`additionalProperties: false`, every declared property in `required`, and
+/// descriptions from doc comments) while tolerant deserialization accepts
+/// partial or `null`-valued entries as empty strings.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredChangeProposal {
-    /// Operation the entry declares.
-    ///
-    /// An unrecognized spelling falls back to the default replacement instead of
-    /// failing the decode, and [`Self::unrecognized_op`] keeps that spelling, so
-    /// the fallback never hides what the response declared.
-    pub op: EditFileOp,
-    /// The `op` spelling the shared parser rejected, kept verbatim.
-    ///
-    /// `None` means [`Self::op`] is the spelling the response declared. When it
-    /// is set, [`Self::to_edit_operation_typed`] reports the rejection of
-    /// [`EditFileOp`]'s own parser, so the diagnostic names the operation that
-    /// was emitted instead of the replacement the tolerant decode substituted.
-    pub unrecognized_op: Option<String>,
+    /// Operation type: 'replace', 'create', 'delete', 'move', 'move_dir', or 'overwrite'.
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub op: String,
+    /// Repository-relative path to the target file (source path for 'move' and 'move_dir').
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
     pub path: String,
-    pub to: Option<String>,
-    pub old_text: Option<String>,
-    pub new_text: Option<String>,
-    pub content: Option<String>,
-    /// Inclusive anchor that opens the replaced line range.
-    ///
-    /// Both bounds are present only when the active patch strategy addresses a
-    /// range by its opaque anchors; a search/replace proposal leaves them
-    /// empty and keeps carrying the replaced text in `old_text`.
-    pub start: Option<String>,
-    /// Inclusive anchor that closes the replaced line range.
-    pub end: Option<String>,
+    /// Destination repository-relative path for 'move' and 'move_dir' (empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub to: String,
+    /// Exact text to replace in the file (required for 'replace' under search/replace, empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub old_text: String,
+    /// Replacement text (for 'replace' under search/replace, empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub new_text: String,
+    /// Opaque anchor of the first replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub start: String,
+    /// Opaque anchor of the last replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub end: String,
+    /// Replacement range text for 'replace' (line-anchor) or complete file content for 'create' and 'overwrite' (empty string otherwise).
+    #[serde(
+        default,
+        deserialize_with = "crate::discussion::deserialize_null_as_default"
+    )]
+    pub content: String,
 }
 
-/// Operation an entry declares when its `op` property is absent or `null`.
-fn default_change_op() -> EditFileOp {
-    EditFileOp::Replace
-}
+impl schemars::JsonSchema for StructuredChangeProposal {
+    fn schema_name() -> String {
+        "StructuredChangeProposal".to_string()
+    }
 
-/// Wire representation of one change entry.
-///
-/// The `op` property stays a plain spelling here, so the fallible parse happens
-/// once, in the conversion to [`StructuredChangeProposal`], where a rejected
-/// spelling is recorded instead of aborting the decode of the whole change set.
-#[derive(Debug, Serialize, Deserialize)]
-struct ChangeProposalWire {
-    /// Declared operation spelling; absent and `null` name the default.
-    #[serde(default)]
-    op: Option<String>,
-    path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    old_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    new_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    start: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    end: Option<String>,
-}
-
-impl From<ChangeProposalWire> for StructuredChangeProposal {
-    fn from(wire: ChangeProposalWire) -> Self {
-        let ChangeProposalWire {
-            op,
-            path,
-            to,
-            old_text,
-            new_text,
-            content,
-            start,
-            end,
-        } = wire;
-        // An absent or blank spelling names the default operation, a recognized
-        // spelling names itself, and only a spelling the shared parser rejects
-        // is recorded. It is recorded trimmed, because that is the form the
-        // parser and its diagnostic both address.
-        let (op, unrecognized_op) = match op.as_deref().map(str::trim) {
-            None | Some("") => (default_change_op(), None),
-            Some(declared) => match declared.parse::<EditFileOp>() {
-                Ok(operation) => (operation, None),
-                Err(_) => (default_change_op(), Some(declared.to_string())),
-            },
-        };
-        Self {
-            op,
-            unrecognized_op,
-            path,
-            to,
-            old_text,
-            new_text,
-            content,
-            start,
-            end,
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, ObjectValidation, Schema, SchemaObject};
+        let fields = [
+            (
+                "op",
+                "Operation type: 'replace', 'create', 'delete', 'move', 'move_dir', or 'overwrite'.",
+            ),
+            (
+                "path",
+                "Repository-relative path to the target file (source path for 'move' and 'move_dir').",
+            ),
+            (
+                "to",
+                "Destination repository-relative path for 'move' and 'move_dir' (empty string otherwise).",
+            ),
+            (
+                "old_text",
+                "Exact text to replace in the file (required for 'replace' under search/replace, empty string otherwise).",
+            ),
+            (
+                "new_text",
+                "Replacement text (for 'replace' under search/replace, empty string otherwise).",
+            ),
+            (
+                "start",
+                "Opaque anchor of the first replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).",
+            ),
+            (
+                "end",
+                "Opaque anchor of the last replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).",
+            ),
+            (
+                "content",
+                "Replacement range text for 'replace' (line-anchor) or complete file content for 'create' and 'overwrite' (empty string otherwise).",
+            ),
+        ];
+        let mut properties = schemars::Map::new();
+        let mut required = schemars::Set::new();
+        for (name, description) in fields {
+            let mut prop = <String as schemars::JsonSchema>::json_schema(gen).into_object();
+            prop.metadata = Some(Box::new(Metadata {
+                description: Some(description.to_string()),
+                ..Default::default()
+            }));
+            properties.insert(name.to_string(), Schema::Object(prop));
+            required.insert(name.to_string());
         }
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(ObjectValidation {
+                properties,
+                required,
+                additional_properties: Some(Box::new(Schema::Bool(false))),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
     }
 }
 
-impl From<StructuredChangeProposal> for ChangeProposalWire {
-    fn from(proposal: StructuredChangeProposal) -> Self {
-        let StructuredChangeProposal {
-            op,
-            unrecognized_op,
-            path,
-            to,
-            old_text,
-            new_text,
-            content,
-            start,
-            end,
-        } = proposal;
-        // The declared spelling wins over the substitute, so an unrecognized
-        // operation survives the round trip as the spelling it was instead of
-        // being rewritten into the replacement the decode picked for it.
-        Self {
-            op: Some(unrecognized_op.unwrap_or_else(|| op.as_str().to_string())),
-            path,
-            to,
-            old_text,
-            new_text,
-            content,
-            start,
-            end,
-        }
-    }
-}
 /// Why a structured change cannot become an edit operation.
 ///
 /// Only one rejection carries the vocabulary of a patch strategy: a `replace`
@@ -260,6 +184,18 @@ impl fmt::Display for ChangeConversionError {
 }
 
 impl StructuredChangeProposal {
+    /// Parses the declared `op` spelling into [`EditFileOp`].
+    ///
+    /// An empty or whitespace-only `op` defaults to [`EditFileOp::Replace`],
+    /// while an unrecognized spelling is rejected with the parser's own
+    /// diagnostic naming the declared spelling.
+    pub fn parsed_op(&self) -> Result<EditFileOp, String> {
+        match self.op.trim() {
+            "" => Ok(EditFileOp::Replace),
+            declared => declared.parse::<EditFileOp>(),
+        }
+    }
+
     /// Converts the proposal into a concrete edit operation.
     ///
     /// Malformed proposals are rejected with a diagnostic instead of being
@@ -297,370 +233,130 @@ impl StructuredChangeProposal {
     /// typed, so the strategy-dependent one can be reworded elsewhere.
     ///
     /// An entry that declared an operation the shared parser rejected is
-    /// rejected first, with that parser's own diagnostic: the entry names no
-    /// operation, so no path, range, or payload rule of the active strategy can
-    /// explain it, and the message must name what the response declared instead
-    /// of the replacement the tolerant decode substituted.
+    /// rejected first, with that parser's own diagnostic naming the declared
+    /// spelling.
     pub fn to_edit_operation_typed(&self) -> Result<EditOperation, ChangeConversionError> {
-        if let Some(declared) = self.unrecognized_op.as_deref() {
-            if let Err(message) = declared.parse::<EditFileOp>() {
-                return Err(ChangeConversionError::Other(message));
-            }
-        }
+        let op = self.parsed_op().map_err(ChangeConversionError::Other)?;
         let path = normalize_repo_path(&self.path).map_err(ChangeConversionError::Other)?;
-        if let (Some(start), Some(end)) = (self.start.as_deref(), self.end.as_deref()) {
-            let start = start.trim();
-            let end = end.trim();
-            // Anchors address the lines of a replaced range, so only a
-            // `replace` may take this fast path. A stray bound on any other
-            // operation falls through to its own branch instead of being
-            // coerced into a destructive range replacement.
-            if self.op == EditFileOp::Replace && !start.is_empty() && !end.is_empty() {
-                return Ok(EditOperation::LineAnchor {
-                    path,
-                    start: start.to_string(),
-                    end: end.to_string(),
-                    content: self
-                        .content
-                        .clone()
-                        .or_else(|| self.new_text.clone())
-                        .unwrap_or_default(),
-                });
-            }
+        let start = self.start.trim();
+        let end = self.end.trim();
+        // Anchors address the lines of a replaced range, so only a
+        // `replace` may take this fast path. A stray bound on any other
+        // operation falls through to its own branch instead of being
+        // coerced into a destructive range replacement.
+        if op == EditFileOp::Replace && !start.is_empty() && !end.is_empty() {
+            let content = if !self.content.is_empty() {
+                self.content.clone()
+            } else {
+                self.new_text.clone()
+            };
+            return Ok(EditOperation::LineAnchor(EditLineAnchor {
+                path,
+                start: start.to_string(),
+                end: end.to_string(),
+                content,
+            }));
         }
-        match self.op {
+        match op {
             EditFileOp::Create => {
-                let content = self
-                    .content
-                    .clone()
-                    .or_else(|| self.new_text.clone())
-                    .ok_or_else(|| {
-                        ChangeConversionError::Other(
-                            "Change 'create' requires a 'content' field".to_string(),
-                        )
-                    })?;
-                Ok(EditOperation::Create { path, content })
+                let content = if !self.content.is_empty() {
+                    self.content.clone()
+                } else if !self.new_text.is_empty() {
+                    self.new_text.clone()
+                } else {
+                    return Err(ChangeConversionError::Other(
+                        "Change 'create' requires a 'content' field".to_string(),
+                    ));
+                };
+                Ok(EditOperation::Create(EditCreate { path, content }))
             }
             EditFileOp::Overwrite => {
-                let content = self
-                    .content
-                    .clone()
-                    .or_else(|| self.new_text.clone())
-                    .ok_or_else(|| {
-                        ChangeConversionError::Other(
-                            "Change 'overwrite' requires a 'content' field".to_string(),
-                        )
-                    })?;
-                Ok(EditOperation::Overwrite { path, content })
+                let content = if !self.content.is_empty() {
+                    self.content.clone()
+                } else if !self.new_text.is_empty() {
+                    self.new_text.clone()
+                } else {
+                    return Err(ChangeConversionError::Other(
+                        "Change 'overwrite' requires a 'content' field".to_string(),
+                    ));
+                };
+                Ok(EditOperation::Overwrite(EditOverwrite { path, content }))
             }
-            EditFileOp::Delete => Ok(EditOperation::Delete { path }),
+            EditFileOp::Delete => Ok(EditOperation::Delete(EditDelete { path })),
             EditFileOp::Move => {
-                let to = self.to.as_deref().ok_or_else(|| {
-                    ChangeConversionError::Other("Change 'move' requires a 'to' field".to_string())
-                })?;
-                let to = normalize_repo_path(to).map_err(ChangeConversionError::Other)?;
-                Ok(EditOperation::Move { from: path, to })
-            }
-            EditFileOp::MoveDir => {
-                let to = self.to.as_deref().ok_or_else(|| {
-                    ChangeConversionError::Other(
-                        "Change 'move_dir' requires a 'to' field".to_string(),
-                    )
-                })?;
-                let to = normalize_repo_path(to).map_err(ChangeConversionError::Other)?;
-                Ok(EditOperation::MoveDir { from: path, to })
-            }
-            EditFileOp::Replace => {
-                let old_text = self
-                    .old_text
-                    .as_deref()
-                    .filter(|old| !old.is_empty())
-                    .ok_or_else(|| ChangeConversionError::ReplaceWithoutRange {
-                        path: path.clone(),
-                    })?;
-                // An explicit empty `new_text` is a deliberate deletion and
-                // must be preserved; only fall back to `content` when
-                // `new_text` is absent entirely.
-                let new_text = self
-                    .new_text
-                    .clone()
-                    .or_else(|| self.content.clone())
-                    .unwrap_or_default();
-                Ok(EditOperation::Replace {
-                    path,
-                    old_text: old_text.to_string(),
-                    new_text,
-                })
-            }
-        }
-    }
-}
-
-/// Strips the surrounding markup a producer may wrap a value in.
-///
-/// The value is trimmed, a backtick run wrapped around it is dropped, and the
-/// result is trimmed once more, so a markdown-wrapped spelling is cleaned
-/// before it is validated. Only the surrounding markup is removed: an interior
-/// backtick stays part of the value, while a value made of backticks alone
-/// becomes empty, exactly as a blank value does. This is the crate's single
-/// shared strip rule, so every wire boundary applies identical tolerance.
-pub(crate) fn strip_surrounding_markup(raw: &str) -> &str {
-    raw.trim().trim_matches('`').trim()
-}
-
-/// Decodes the separator escapes of one repository path.
-///
-/// Two readings of the same byte are in play, and the rules stay purely
-/// syntactic because this crate performs no I/O and therefore cannot ask the
-/// file system which of them a spelling means:
-///
-/// - a single backslash is a separator, so the spelling a Windows producer
-///   emits (`src\lib.rs`) addresses `src/lib.rs`;
-/// - a doubled backslash names one literal backslash byte, so a file whose own
-///   name carries a backslash stays addressable on a file system that permits
-///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
-///   the separator rule alone would silently retarget the identical spelling to
-///   the different path `src/new.rs`.
-///
-/// A value carrying no backslash is returned as it is, so the common path costs
-/// no allocation.
-fn decode_path_separators(raw: &str) -> Cow<'_, str> {
-    if !raw.contains('\\') {
-        return Cow::Borrowed(raw);
-    }
-    let mut decoded = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(index) = rest.find('\\') {
-        decoded.push_str(&rest[..index]);
-        rest = &rest[index + 1..];
-        match rest.strip_prefix('\\') {
-            Some(tail) => {
-                decoded.push('\\');
-                rest = tail;
-            }
-            None => decoded.push('/'),
-        }
-    }
-    decoded.push_str(rest);
-    Cow::Owned(decoded)
-}
-
-/// Encodes every literal backslash byte so the decoder restores it verbatim.
-///
-/// Normalization leaves exactly one byte that the separator rule would otherwise
-/// rewrite: the backslash of a file whose name carries one. Serializing such a
-/// path raw would make this crate's own wire form unre-decodable, because the
-/// reader would take that byte for a separator again. The encoder therefore
-/// applies the inverse of the doubling rule and leaves every other path
-/// untouched.
-fn encode_path_separators(path: &str) -> Cow<'_, str> {
-    if path.contains('\\') {
-        Cow::Owned(path.replace('\\', "\\\\"))
-    } else {
-        Cow::Borrowed(path)
-    }
-}
-
-/// Serde adapter of one repository-relative path field.
-///
-/// Both directions live here, so a field can never be normalized on the way in
-/// and echoed raw on the way out: a decoded path may carry the literal backslash
-/// of a file name, and the round trip must reproduce the value it started from
-/// instead of reading that byte as a separator.
-mod repo_path {
-    use serde::{Deserializer, Serializer};
-
-    use super::{deserialize_repo_path, encode_path_separators};
-
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_repo_path(deserializer)
-    }
-
-    pub(super) fn serialize<S>(path: &str, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&encode_path_separators(path))
-    }
-}
-
-/// Reports whether a decoded segment opens with a Windows drive root.
-///
-/// A drive root is an ASCII letter followed by a colon at the start of the
-/// first surviving segment, whether the colon closes the segment (`C:`) or
-/// continues a drive-relative spelling (`C:name`): both leave the repository.
-fn is_drive_root(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
-}
-
-/// Decodes a repository-path spelling into its normalized segment structure.
-///
-/// This is the crate's single shared decode-and-collapse core for repository
-/// paths, so a boundary decides acceptance from this structure instead of
-/// restating the rules. Surrounding whitespace and backtick markup are
-/// stripped first, then the separator escapes are decoded, and then the decoded
-/// spelling is split into the segments that survive the collapse of `.`
-/// components and repeated slashes.
-///
-/// Acceptance is derived from that structure instead of from enumerated
-/// spellings. A spelling that names no surviving segment yields an empty
-/// string, because it names the whole repository to a research request and no
-/// location at all to an edit operation, so each caller decides what it means.
-/// A spelling that can physically leave the repository is rejected here,
-/// because the repository confinement is never left to a caller:
-///
-/// - a NUL byte anywhere in the spelling;
-/// - an absolute spelling, decided from the decoded path rather than from a
-///   fixed prefix table: a leading forward slash is absolute, and so is a
-///   leading literal backslash byte, which the separator-doubling escape can
-///   place at position zero. The UNC spelling `\\server\share`, the doubled
-///   leading-separator traversal `\\etc\passwd`, the Windows extended-length
-///   prefix `\\?\C:\x`, and a lone doubled backslash all decode to such a
-///   string;
-/// - a `..` traversal component;
-/// - a Windows drive root, decided from the first segment that survives the
-///   collapse: a segment opening with an ASCII letter followed by a colon is a
-///   drive root, so `./C:/x` is refused exactly like `C:/x`, while the same
-///   bytes in a later segment stay part of a file name.
-pub(crate) fn decode_repo_path(raw: &str) -> Result<String, String> {
-    if raw.contains('\0') {
-        return Err("Change path must not contain NUL bytes".to_string());
-    }
-    let slashed = decode_path_separators(strip_surrounding_markup(raw));
-    let trimmed = slashed.trim();
-    // An absolute spelling leaves the repository whatever separator spells
-    // it: a leading forward slash names the file-system root, and a leading
-    // literal backslash byte names a Windows drive root or a UNC server root.
-    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
-        return Err(format!(
-            "Change path '{}' must be repository-relative",
-            trimmed
-        ));
-    }
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in trimmed.split('/') {
-        match segment {
-            "" | "." => continue,
-            ".." => {
-                return Err(format!(
-                    "Change path '{}' must not contain '..' components",
-                    trimmed
-                ));
-            }
-            other => {
-                // The drive root is decided from the first segment that
-                // survives the collapse, so a spelling that only reaches it
-                // through dot segments is refused exactly like the bare drive
-                // path, while a later segment stays an ordinary file name.
-                if segments.is_empty() && is_drive_root(other) {
-                    return Err(format!(
-                        "Change path '{}' must be repository-relative",
-                        trimmed
+                if self.to.is_empty() {
+                    return Err(ChangeConversionError::Other(
+                        "Change 'move' requires a 'to' field".to_string(),
                     ));
                 }
-                segments.push(other);
+                let to = normalize_repo_path(&self.to).map_err(ChangeConversionError::Other)?;
+                Ok(EditOperation::Move(EditMove { from: path, to }))
+            }
+            EditFileOp::MoveDir => {
+                if self.to.is_empty() {
+                    return Err(ChangeConversionError::Other(
+                        "Change 'move_dir' requires a 'to' field".to_string(),
+                    ));
+                }
+                let to = normalize_repo_path(&self.to).map_err(ChangeConversionError::Other)?;
+                Ok(EditOperation::MoveDir(EditMoveDir { from: path, to }))
+            }
+            EditFileOp::Replace => {
+                if self.old_text.is_empty() {
+                    return Err(ChangeConversionError::ReplaceWithoutRange { path });
+                }
+                let new_text = if !self.new_text.is_empty() {
+                    self.new_text.clone()
+                } else {
+                    self.content.clone()
+                };
+                Ok(EditOperation::Replace(EditReplace {
+                    path,
+                    old_text: self.old_text.clone(),
+                    new_text,
+                }))
             }
         }
     }
-    Ok(segments.join("/"))
-}
 
-/// Normalizes and validates a repository-relative path in a single place.
-///
-/// The shared decode-and-collapse core strips surrounding whitespace and
-/// backtick markup, decodes the separator escapes, collapses `.` segments and
-/// repeated slashes, and rejects every spelling that can leave the repository.
-/// A backslash is read two ways, because a producer and a file name spell the
-/// same byte in opposite directions:
-///
-/// - a single backslash is a separator, so the spelling a Windows producer
-///   emits (`src\lib.rs`) addresses `src/lib.rs`;
-/// - a doubled backslash names one literal backslash byte, so a file whose own
-///   name carries a backslash stays addressable on a file system that permits
-///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
-///   the separator rule alone would silently retarget the identical spelling to
-///   the different path `src/new.rs`.
-///
-/// The rejection follows the decoded structure. The path is rejected when it
-/// names no surviving segment, is absolute (a leading forward slash, or a
-/// leading literal backslash the separator-doubling escape places at position
-/// zero), carries a NUL byte, contains a `..` traversal component, or opens
-/// with a Windows drive root. Interior and trailing literal-backslash names
-/// keep decoding unchanged, so `src\\new.rs` addresses `src\new.rs` and
-/// `src\\` addresses `src\`. This is the crate's single shared path-cleaning
-/// routine, so every wire boundary applies identical rules. It is a first line
-/// of defence only: `core` must still canonicalize and confine paths against
-/// the repository root, because the protocol cannot guarantee that every path
-/// flows through this helper.
-pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
-    let normalized = decode_repo_path(raw)?;
-    if normalized.is_empty() {
-        return Err("Change path must not be empty".to_string());
+    /// Converts the proposal into a concrete [`LlmCommand`] edit variant,
+    /// keeping the rejection typed.
+    ///
+    /// Routes each operation per-op with the exact same validation and
+    /// anchor fast-path as [`Self::to_edit_operation_typed`].
+    pub fn to_edit_command(&self) -> Result<LlmCommand, ChangeConversionError> {
+        let op = self.to_edit_operation_typed()?;
+        Ok(match op {
+            EditOperation::Replace(op) => LlmCommand::EditReplace(op),
+            EditOperation::Create(op) => LlmCommand::EditCreate(op),
+            EditOperation::Delete(op) => LlmCommand::EditDelete(op),
+            EditOperation::Move(op) => LlmCommand::EditMove(op),
+            EditOperation::MoveDir(op) => LlmCommand::EditMoveDir(op),
+            EditOperation::Overwrite(op) => LlmCommand::EditOverwrite(op),
+            EditOperation::LineAnchor(op) => LlmCommand::EditLineAnchor(op),
+        })
     }
-    Ok(normalized)
-}
-
-/// Deserializes one repository-relative path at the wire boundary.
-///
-/// The decoded path is normalized and validated through
-/// [`normalize_repo_path`], so a field deserialized with this adapter can never
-/// address a location outside the repository. A malformed path is reported as a
-/// decode failure naming it, because a typed field has no representation for
-/// "absent" and must not be dropped silently. This is a first line of defence
-/// only: `core` still canonicalizes and confines every path against the
-/// repository root.
-pub(crate) fn deserialize_repo_path<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    normalize_repo_path(&raw).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_edit_operation_serde() {
-        let op = EditOperation::Replace {
-            path: "foo.rs".to_string(),
-            old_text: "let a = 1;".to_string(),
-            new_text: "let a = 2;".to_string(),
-        };
-
-        let json = serde_json::to_string(&op).unwrap();
-        assert!(json.contains("\"type\":\"replace\""));
-
-        let de: EditOperation = serde_json::from_str(&json).unwrap();
-        assert_eq!(de, op);
-    }
-
     fn proposal(op: EditFileOp, path: &str) -> StructuredChangeProposal {
         StructuredChangeProposal {
-            op,
-            unrecognized_op: None,
+            op: op.as_str().to_string(),
             path: path.to_string(),
-            to: None,
-            old_text: None,
-            new_text: None,
-            content: None,
-            start: None,
-            end: None,
+            ..StructuredChangeProposal::default()
         }
     }
 
     #[test]
     fn test_structured_proposal_conversion() {
         let mut change = proposal(EditFileOp::Create, "new.txt");
-        change.content = Some("hello".to_string());
+        change.content = "hello".to_string();
 
         match change.to_edit_operation().unwrap() {
-            EditOperation::Create { path, content } => {
+            EditOperation::Create(EditCreate { path, content }) => {
                 assert_eq!(path, "new.txt");
                 assert_eq!(content, "hello");
             }
@@ -690,26 +386,21 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_falls_back_to_content_only_when_new_text_is_absent() {
-        // An explicit empty `new_text` is a deletion, even when `content` is
-        // populated, and must not be silently coerced into a replacement.
-        let mut change = proposal(EditFileOp::Replace, "a.txt");
-        change.old_text = Some("remove me".to_string());
-        change.new_text = Some(String::new());
-        change.content = Some("unexpected".to_string());
-
-        match change.to_edit_operation().unwrap() {
-            EditOperation::Replace { new_text, .. } => assert!(new_text.is_empty()),
+    fn test_replace_falls_back_to_content_only_when_new_text_is_empty() {
+        let mut deletion = proposal(EditFileOp::Replace, "a.txt");
+        deletion.old_text = "remove me".to_string();
+        match deletion.to_edit_operation().unwrap() {
+            EditOperation::Replace(EditReplace { new_text, .. }) => assert!(new_text.is_empty()),
             other => panic!("Expected Replace operation, got {other:?}"),
         }
 
-        // When `new_text` is absent, the legacy `content` field still applies.
+        // When `new_text` is empty, the legacy `content` field still applies.
         let mut change = proposal(EditFileOp::Replace, "a.txt");
-        change.old_text = Some("old".to_string());
-        change.content = Some("new".to_string());
+        change.old_text = "old".to_string();
+        change.content = "new".to_string();
 
         match change.to_edit_operation().unwrap() {
-            EditOperation::Replace { new_text, .. } => assert_eq!(new_text, "new"),
+            EditOperation::Replace(EditReplace { new_text, .. }) => assert_eq!(new_text, "new"),
             other => panic!("Expected Replace operation, got {other:?}"),
         }
     }
@@ -717,189 +408,34 @@ mod tests {
     #[test]
     fn test_structured_change_op_deserializes_tolerantly() {
         // A known operation is parsed case-insensitively with whitespace
-        // ignored, and serializes back to the canonical snake_case wire form.
+        // ignored.
         let known: StructuredChangeProposal =
             serde_json::from_str(r#"{"op":"  CREATE ","path":"a.txt"}"#).unwrap();
-        assert_eq!(known.op, EditFileOp::Create);
-        assert_eq!(
-            serde_json::to_string(&EditFileOp::Create).unwrap(),
-            "\"create\""
-        );
+        assert_eq!(known.parsed_op(), Ok(EditFileOp::Create));
 
-        // An unrecognized operation falls back to the default `replace`
-        // instead of failing the whole proposal.
+        // An unrecognized operation is preserved verbatim and rejected on conversion.
         let unknown: StructuredChangeProposal =
             serde_json::from_str(r#"{"op":"frobnicate","path":"a.txt"}"#).unwrap();
-        assert_eq!(unknown.op, EditFileOp::Replace);
+        assert_eq!(unknown.op, "frobnicate");
+        assert!(unknown.parsed_op().is_err());
 
-        // An absent operation uses the same default.
+        // An absent operation defaults to replace.
         let absent: StructuredChangeProposal = serde_json::from_str(r#"{"path":"a.txt"}"#).unwrap();
-        assert_eq!(absent.op, EditFileOp::Replace);
+        assert_eq!(absent.parsed_op(), Ok(EditFileOp::Replace));
 
-        // An explicit `null` operation is tolerated exactly like an absent one,
-        // so a null-tolerant producer never fails the whole proposal.
+        // An explicit `null` operation is tolerated exactly like an absent one.
         let null_op: StructuredChangeProposal =
             serde_json::from_str(r#"{"op":null,"path":"a.txt"}"#).unwrap();
-        assert_eq!(null_op.op, EditFileOp::Replace);
-    }
-
-    #[test]
-    fn test_normalize_repo_path_collapses_and_rejects() {
-        // Dot segments, repeated slashes, and repeated `./` prefixes collapse.
-        assert_eq!(normalize_repo_path("./a/./b//c/").unwrap(), "a/b/c");
-        assert_eq!(normalize_repo_path(".//a").unwrap(), "a");
-        // Surrounding whitespace and backtick markup are stripped before the
-        // path is validated, so a markdown-wrapped spelling yields the same
-        // clean result as its bare form.
-        assert_eq!(normalize_repo_path(" `./src/a.rs` ").unwrap(), "src/a.rs");
-        assert_eq!(
-            normalize_repo_path("``crates/core``").unwrap(),
-            "crates/core"
-        );
-        assert_eq!(normalize_repo_path("`src/`").unwrap(), "src");
-
-        // Only the surrounding markup is stripped: an interior backtick stays
-        // part of the path, and a backticks-only spelling is the empty path it
-        // is rather than a literal backtick filename.
-        assert_eq!(
-            normalize_repo_path("src/`odd`/a.rs").unwrap(),
-            "src/`odd`/a.rs"
-        );
-        assert!(normalize_repo_path("``").is_err());
-        assert!(normalize_repo_path(" ` ` ").is_err());
-
-        // Traversal in both separators, absolute paths, drive paths, NUL
-        // bytes, and empty results are rejected. The surrounding markup never
-        // hides a rejection.
-        for raw in [
-            "a/../b",
-            "a\\..\\b",
-            "..",
-            ".",
-            "/abs",
-            "\\abs",
-            "C:\\abs",
-            "a\0b",
-            "`../escape.rs`",
-            "``/etc/passwd``",
-            "`C:\\Windows`",
-        ] {
-            assert!(
-                normalize_repo_path(raw).is_err(),
-                "path '{raw}' must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_repo_path_addresses_a_literal_backslash_name() {
-        // A single backslash keeps the documented Windows tolerance, so the
-        // spelling a Windows producer emits still addresses the nested path.
-        assert_eq!(normalize_repo_path(r"src\lib.rs").unwrap(), "src/lib.rs");
-
-        // A doubled backslash names one literal backslash byte, so a file whose
-        // own name carries one stays addressable instead of being silently
-        // retargeted to the nested path the rule above resolves.
-        assert_eq!(normalize_repo_path(r"src\\new.rs").unwrap(), "src\\new.rs");
-        assert_ne!(
-            normalize_repo_path(r"src\\new.rs").unwrap(),
-            normalize_repo_path(r"src\new.rs").unwrap()
-        );
-
-        // The escape composes with the shared strip rule and with the segment
-        // normalization: only the doubled byte survives, and it stays inside
-        // the one segment it was written in.
-        assert_eq!(
-            normalize_repo_path(r" `./src\\new.rs` ").unwrap(),
-            "src\\new.rs"
-        );
-        assert_eq!(normalize_repo_path(r"a\\b/c").unwrap(), "a\\b/c");
-        assert_eq!(normalize_repo_path(r"src\\").unwrap(), "src\\");
-
-        // The escape widens nothing: a traversal spelled with single separators
-        // is still refused, and a doubled separator cannot smuggle a `..`
-        // segment in, because the byte it produces stays part of one name.
-        assert!(normalize_repo_path(r"a\..\b").is_err());
-        assert_eq!(normalize_repo_path(r"a\\..\\b").unwrap(), "a\\..\\b");
-    }
-
-    #[test]
-    fn test_a_wire_path_addresses_a_literal_backslash_name() {
-        // Four backslashes in the payload decode to the two bytes the escape
-        // needs, so the wire form reaches the file literally called
-        // `src\new.rs` instead of the nested `src/new.rs`.
-        let literal: EditOperation =
-            serde_json::from_str(r#"{"type":"create","path":"src\\\\new.rs","content":"x"}"#)
-                .expect("an escaped literal-backslash path must decode");
-        assert_eq!(
-            literal,
-            EditOperation::Create {
-                path: "src\\new.rs".to_string(),
-                content: "x".to_string(),
-            }
-        );
-
-        // The undoubled spelling keeps the Windows tolerance and addresses the
-        // nested file, so the two spellings never collapse into one target.
-        let nested: EditOperation =
-            serde_json::from_str(r#"{"type":"create","path":"src\\new.rs","content":"x"}"#)
-                .expect("a Windows separator spelling must decode");
-        assert_eq!(
-            nested,
-            EditOperation::Create {
-                path: "src/new.rs".to_string(),
-                content: "x".to_string(),
-            }
-        );
-
-        // Serialization applies the inverse escape, so a decoded operation
-        // survives a round trip instead of being retargeted on the way back in.
-        let json = serde_json::to_string(&literal).unwrap();
-        assert!(json.contains(r#""path":"src\\\\new.rs""#), "{json}");
-        assert_eq!(
-            serde_json::from_str::<EditOperation>(&json).unwrap(),
-            literal
-        );
-    }
-
-    #[test]
-    fn test_edit_operation_paths_strip_surrounding_backticks_on_decode() {
-        // A markdown-wrapped path reaches the engine already clean, so a create
-        // never turns the wrapping markup into a phantom leading directory.
-        let decoded: EditOperation =
-            serde_json::from_str(r#"{"type":"create","path":" `./src/new.rs` ","content":"x"}"#)
-                .expect("a wrapped create path must decode");
-        assert_eq!(
-            decoded,
-            EditOperation::Create {
-                path: "src/new.rs".to_string(),
-                content: "x".to_string(),
-            }
-        );
-
-        // The surrounding markup never hides a rejection: an escaping or empty
-        // spelling outside the repository stays a decode failure naming it.
-        for payload in [
-            r#"{"type":"delete","path":"`../escape.rs`"}"#,
-            r#"{"type":"create","path":"``/etc/passwd``","content":""}"#,
-            r#"{"type":"delete","path":"``"}"#,
-        ] {
-            let error = serde_json::from_str::<EditOperation>(payload)
-                .expect_err("a wrapped escaping path must be rejected");
-            assert!(
-                error.to_string().contains("path"),
-                "diagnostic for {payload} must name the rejected path: {error}"
-            );
-        }
+        assert_eq!(null_op.parsed_op(), Ok(EditFileOp::Replace));
     }
 
     #[test]
     fn test_structured_proposal_normalizes_and_validates_paths() {
         // Surrounding whitespace and a leading `./` are stripped.
         let mut change = proposal(EditFileOp::Create, "  ./src/new.rs  ");
-        change.content = Some("fn x() {}\n".to_string());
+        change.content = "fn x() {}\n".to_string();
         match change.to_edit_operation().unwrap() {
-            EditOperation::Create { path, .. } => assert_eq!(path, "src/new.rs"),
+            EditOperation::Create(EditCreate { path, .. }) => assert_eq!(path, "src/new.rs"),
             other => panic!("Expected Create operation, got {other:?}"),
         }
 
@@ -925,9 +461,9 @@ mod tests {
 
         // The `move` destination follows the same normalization and validation.
         let mut change = proposal(EditFileOp::Move, "src/a.rs");
-        change.to = Some("  ./src/b.rs ".to_string());
+        change.to = "  ./src/b.rs ".to_string();
         match change.to_edit_operation().unwrap() {
-            EditOperation::Move { from, to } => {
+            EditOperation::Move(EditMove { from, to }) => {
                 assert_eq!(from, "src/a.rs");
                 assert_eq!(to, "src/b.rs");
             }
@@ -935,7 +471,7 @@ mod tests {
         }
 
         let mut change = proposal(EditFileOp::Move, "src/a.rs");
-        change.to = Some("../escape.rs".to_string());
+        change.to = "../escape.rs".to_string();
         assert!(change.to_edit_operation().is_err());
     }
 
@@ -944,16 +480,16 @@ mod tests {
         // A proposal naming both bounds addresses a line range, so it carries
         // the anchors and never echoes the replaced text.
         let mut change = proposal(EditFileOp::Replace, " ./src/a.rs ");
-        change.start = Some("Kf9Q".to_string());
-        change.end = Some(" Tq2W ".to_string());
-        change.content = Some("fn replacement() {}\n".to_string());
+        change.start = "Kf9Q".to_string();
+        change.end = " Tq2W ".to_string();
+        change.content = "fn replacement() {}\n".to_string();
         match change.to_edit_operation().unwrap() {
-            EditOperation::LineAnchor {
+            EditOperation::LineAnchor(EditLineAnchor {
                 path,
                 start,
                 end,
                 content,
-            } => {
+            }) => {
                 assert_eq!(path, "src/a.rs");
                 assert_eq!(start, "Kf9Q");
                 assert_eq!(end, "Tq2W");
@@ -965,26 +501,27 @@ mod tests {
         // A missing or blank bound leaves the proposal a search/replace edit,
         // so a strategy that renders no anchors decodes exactly as before.
         let mut change = proposal(EditFileOp::Replace, "src/a.rs");
-        change.start = Some("Kf9Q".to_string());
-        change.end = Some("   ".to_string());
-        change.old_text = Some("old();".to_string());
-        change.new_text = Some("new();".to_string());
+        change.start = "Kf9Q".to_string();
+        change.end = "   ".to_string();
+        change.old_text = "old();".to_string();
+        change.new_text = "new();".to_string();
         assert!(matches!(
             change.to_edit_operation().unwrap(),
-            EditOperation::Replace { .. }
+            EditOperation::Replace(_)
         ));
     }
+
     #[test]
     fn test_stray_bounds_never_coerce_other_ops_into_a_line_range() {
         // Anchors address replaced lines only, so a bound carried by any other
         // operation is ignored instead of turning that operation into a
         // destructive range replacement.
         let mut moved = proposal(EditFileOp::Move, "src/a.rs");
-        moved.to = Some("src/b.rs".to_string());
-        moved.start = Some("K1".to_string());
-        moved.end = Some("K2".to_string());
+        moved.to = "src/b.rs".to_string();
+        moved.start = "K1".to_string();
+        moved.end = "K2".to_string();
         match moved.to_edit_operation_typed() {
-            Ok(EditOperation::Move { from, to }) => {
+            Ok(EditOperation::Move(EditMove { from, to })) => {
                 assert_eq!(from, "src/a.rs");
                 assert_eq!(to, "src/b.rs");
             }
@@ -992,11 +529,11 @@ mod tests {
         }
 
         let mut created = proposal(EditFileOp::Create, "src/new.rs");
-        created.content = Some("fn new() {}\n".to_string());
-        created.start = Some("K1".to_string());
-        created.end = Some("K2".to_string());
+        created.content = "fn new() {}\n".to_string();
+        created.start = "K1".to_string();
+        created.end = "K2".to_string();
         match created.to_edit_operation_typed() {
-            Ok(EditOperation::Create { path, content }) => {
+            Ok(EditOperation::Create(EditCreate { path, content })) => {
                 assert_eq!(path, "src/new.rs");
                 assert_eq!(content, "fn new() {}\n");
             }
@@ -1004,19 +541,19 @@ mod tests {
         }
 
         let mut deleted = proposal(EditFileOp::Delete, "src/gone.rs");
-        deleted.start = Some("K1".to_string());
-        deleted.end = Some("K2".to_string());
+        deleted.start = "K1".to_string();
+        deleted.end = "K2".to_string();
         match deleted.to_edit_operation_typed() {
-            Ok(EditOperation::Delete { path }) => assert_eq!(path, "src/gone.rs"),
+            Ok(EditOperation::Delete(EditDelete { path })) => assert_eq!(path, "src/gone.rs"),
             other => panic!("Expected a delete that keeps its path, got {other:?}"),
         }
 
         let mut overwritten = proposal(EditFileOp::Overwrite, "src/a.rs");
-        overwritten.content = Some("whole file\n".to_string());
-        overwritten.start = Some("K1".to_string());
-        overwritten.end = Some("K2".to_string());
+        overwritten.content = "whole file\n".to_string();
+        overwritten.start = "K1".to_string();
+        overwritten.end = "K2".to_string();
         match overwritten.to_edit_operation_typed() {
-            Ok(EditOperation::Overwrite { path, content }) => {
+            Ok(EditOperation::Overwrite(EditOverwrite { path, content })) => {
                 assert_eq!(path, "src/a.rs");
                 assert_eq!(content, "whole file\n");
             }
@@ -1026,9 +563,6 @@ mod tests {
 
     #[test]
     fn test_replace_without_range_is_rejected_typed() {
-        // A replace that names neither anchors nor the replaced text is the one
-        // rejection whose wording depends on the active patch strategy, so it
-        // carries its own variant together with the rejected path.
         let change = proposal(EditFileOp::Replace, " ./src/a.rs ");
         let rejection = change
             .to_edit_operation_typed()
@@ -1041,18 +575,6 @@ mod tests {
         );
         assert_eq!(rejection.path(), Some("src/a.rs"));
 
-        // An explicit empty `old_text` is the very same rejection.
-        let mut empty_needle = proposal(EditFileOp::Replace, "src/a.rs");
-        empty_needle.old_text = Some(String::new());
-        assert_eq!(
-            empty_needle.to_edit_operation_typed(),
-            Err(ChangeConversionError::ReplaceWithoutRange {
-                path: "src/a.rs".to_string()
-            })
-        );
-
-        // The textual adapter renders exactly the message the conversion
-        // produced before the rejection became typed.
         assert_eq!(
             change.to_edit_operation(),
             Err("Change 'replace' requires a non-empty 'old_text' field".to_string())
@@ -1062,17 +584,17 @@ mod tests {
     #[test]
     fn test_anchored_change_keeps_the_fast_path() {
         let mut change = proposal(EditFileOp::Replace, "src/a.rs");
-        change.start = Some("Kf9Q".to_string());
-        change.end = Some("Tq2W".to_string());
-        change.content = Some("fn replacement() {}\n".to_string());
+        change.start = "Kf9Q".to_string();
+        change.end = "Tq2W".to_string();
+        change.content = "fn replacement() {}\n".to_string();
 
         match change.to_edit_operation_typed() {
-            Ok(EditOperation::LineAnchor {
+            Ok(EditOperation::LineAnchor(EditLineAnchor {
                 path,
                 start,
                 end,
                 content,
-            }) => {
+            })) => {
                 assert_eq!(path, "src/a.rs");
                 assert_eq!(start, "Kf9Q");
                 assert_eq!(end, "Tq2W");
@@ -1084,8 +606,6 @@ mod tests {
 
     #[test]
     fn test_other_conversion_rejections_keep_their_message() {
-        // A rejection that names no strategy vocabulary stays in the shared
-        // dictionary and renders verbatim through both entry points.
         let missing_payload = [
             (
                 EditFileOp::Create,
@@ -1107,7 +627,6 @@ mod tests {
             assert_eq!(change.to_edit_operation(), Err(message.to_string()), "{op}");
         }
 
-        // A blank path and a traversal destination are shared rejections too.
         let empty_path = proposal(EditFileOp::Delete, "   ");
         let rejection = empty_path
             .to_edit_operation_typed()
@@ -1119,7 +638,7 @@ mod tests {
         );
 
         let mut traversal = proposal(EditFileOp::Move, "src/a.rs");
-        traversal.to = Some("../escape.rs".to_string());
+        traversal.to = "../escape.rs".to_string();
         assert_eq!(
             traversal.to_edit_operation(),
             Err("Change path '../escape.rs' must not contain '..' components".to_string())
@@ -1129,28 +648,22 @@ mod tests {
     #[test]
     fn test_move_dir_proposal_names_two_directories_and_no_payload() {
         let mut change = proposal(EditFileOp::MoveDir, " ./src/old ");
-        change.to = Some("  ./src/new ".to_string());
-        // A directory move names two directories. A stray bound or payload
-        // must be ignored instead of turning the move into a range
-        // replacement, because a directory never addresses a line.
-        change.start = Some("Kf9Q".to_string());
-        change.end = Some("Tq2W".to_string());
-        change.content = Some("ignored".to_string());
+        change.to = "  ./src/new ".to_string();
+        change.start = "Kf9Q".to_string();
+        change.end = "Tq2W".to_string();
+        change.content = "ignored".to_string();
 
         match change.to_edit_operation_typed() {
-            Ok(EditOperation::MoveDir { from, to }) => {
+            Ok(EditOperation::MoveDir(EditMoveDir { from, to })) => {
                 assert_eq!(from, "src/old");
                 assert_eq!(to, "src/new");
             }
-            other => panic!("Expected a directory move, got {other:?}"),
+            other => panic!("Expected MoveDir operation, got {other:?}"),
         }
     }
 
     #[test]
     fn test_move_dir_requires_a_destination() {
-        // The source and the destination are the whole payload of a directory
-        // move, so an absent destination is rejected instead of degrading into
-        // a rename of the directory onto itself.
         let change = proposal(EditFileOp::MoveDir, "src/old");
         assert_eq!(
             change.to_edit_operation_typed(),
@@ -1163,17 +676,15 @@ mod tests {
             Err("Change 'move_dir' requires a 'to' field".to_string())
         );
 
-        // The destination obeys the same repository-relative rules as the
-        // source, and an empty destination is rejected as well.
         let mut traversal = proposal(EditFileOp::MoveDir, "src/old");
-        traversal.to = Some("../escape".to_string());
+        traversal.to = "../escape".to_string();
         assert_eq!(
             traversal.to_edit_operation(),
             Err("Change path '../escape' must not contain '..' components".to_string())
         );
 
         let mut empty = proposal(EditFileOp::MoveDir, "src/old");
-        empty.to = Some("   ".to_string());
+        empty.to = "   ".to_string();
         assert_eq!(
             empty.to_edit_operation(),
             Err("Change path must not be empty".to_string())
@@ -1181,110 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_move_dir_operation_serde() {
-        let op = EditOperation::MoveDir {
-            from: "src/old".to_string(),
-            to: "src/new".to_string(),
-        };
-        let json = serde_json::to_string(&op).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"move_dir","from":"src/old","to":"src/new"}"#
-        );
-
-        let decoded: EditOperation = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, op);
-    }
-    #[test]
-    fn test_edit_operation_paths_are_confined_at_the_wire_boundary() {
-        // A benign spelling is normalized on decode, so the engine never has to
-        // re-clean a path the boundary could have cleaned.
-        let decoded: EditOperation =
-            serde_json::from_str(r#"{"type":"move","from":"./src/a.rs","to":" ./src/b.rs "}"#)
-                .expect("a benign move must decode");
-        assert_eq!(
-            decoded,
-            EditOperation::Move {
-                from: "src/a.rs".to_string(),
-                to: "src/b.rs".to_string(),
-            }
-        );
-
-        // An escaping path is a decode failure naming it, because a typed enum
-        // variant cannot silently drop itself.
-        for payload in [
-            r#"{"type":"delete","path":"../escape.rs"}"#,
-            r#"{"type":"create","path":"/etc/passwd","content":""}"#,
-            r#"{"type":"replace","path":"a/../b.rs","old_text":"a","new_text":"b"}"#,
-            r#"{"type":"overwrite","path":"C:\\Windows","content":""}"#,
-            r#"{"type":"line_anchor","path":"../escape.rs","start":"K1","end":"K2","content":"x"}"#,
-            r#"{"type":"move_dir","from":"../escape","to":"src/new"}"#,
-        ] {
-            let error = serde_json::from_str::<EditOperation>(payload)
-                .expect_err("an escaping edit path must be rejected");
-            assert!(
-                error.to_string().contains("path"),
-                "diagnostic for {payload} must name the rejected path: {error}"
-            );
-        }
-    }
-    #[test]
-    fn test_absolute_rejection_is_derived_from_the_decoded_structure() {
-        // A doubled leading backslash decodes to a literal backslash byte at
-        // position zero, which names a Windows drive root or a UNC server
-        // root. Every spelling that produces it is absolute and leaves the
-        // repository, although none of them opens with a forward slash.
-        for raw in [
-            r"\\server\share",
-            r"\\etc\passwd",
-            r"\\?\C:\x",
-            r"\\",
-            r"\abs",
-            "/abs",
-        ] {
-            let rejection = normalize_repo_path(raw).expect_err("absolute path must be rejected");
-            assert!(
-                rejection.contains("repository-relative"),
-                "diagnostic for '{raw}' must name the absolute spelling: {rejection}"
-            );
-        }
-
-        // The drive root is decided from the first segment that survives the
-        // dot collapse, so a spelling that only reaches it through dot
-        // segments is refused exactly like the bare drive path.
-        for raw in ["C:/Windows", "./C:/Windows", "././C:name", r"C:\Windows"] {
-            assert!(normalize_repo_path(raw).is_err(), "drive path '{raw}'");
-        }
-
-        // The same bytes in a later segment stay part of a file name, and
-        // interior or trailing literal backslashes keep decoding unchanged.
-        assert_eq!(normalize_repo_path("src/C:/x").unwrap(), "src/C:/x");
-        assert_eq!(normalize_repo_path("src/C:name").unwrap(), "src/C:name");
-        assert_eq!(normalize_repo_path(r"src\\new.rs").unwrap(), "src\\new.rs");
-        assert_eq!(normalize_repo_path(r"src\\").unwrap(), "src\\");
-        assert_eq!(normalize_repo_path(r"a\\..\\b").unwrap(), "a\\..\\b");
-    }
-
-    #[test]
-    fn test_absolute_escape_spellings_fail_the_wire_and_conversion_boundaries() {
-        // The same absolute spellings are refused when they reach the edit
-        // boundary through serde, so no typed operation ever carries a target
-        // rooted outside the repository.
-        for payload in [
-            r#"{"type":"delete","path":"\\\\server\\share"}"#,
-            r#"{"type":"create","path":"\\\\etc\\passwd","content":""}"#,
-            r#"{"type":"overwrite","path":"\\\\?\\C:\\x","content":"x"}"#,
-            r#"{"type":"delete","path":"./C:/x"}"#,
-        ] {
-            let error = serde_json::from_str::<EditOperation>(payload)
-                .expect_err("an absolute edit path must be rejected");
-            assert!(
-                error.to_string().contains("repository-relative"),
-                "diagnostic for {payload} must name the absolute spelling: {error}"
-            );
-        }
-
-        // The proposal conversion applies the very same derived rules.
+    fn test_absolute_escape_spellings_fail_the_conversion_boundary() {
         for path in [r"\\server\share", r"\\etc\passwd", r"\\?\C:\x", "./C:/x"] {
             let rejection = proposal(EditFileOp::Delete, path)
                 .to_edit_operation_typed()
@@ -1298,47 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_repo_path_reports_the_root_and_refuses_absolute_spellings() {
-        // The shared core returns the collapsed segment structure, so a
-        // spelling that leaves no surviving segment yields the empty path.
-        // Every whole-repository caller derives its decision from that empty
-        // result instead of from an enumerated spelling list.
-        for raw in ["", ".", "./", "./.", "././", ".//", r".\."] {
-            assert_eq!(decode_repo_path(raw), Ok(String::new()));
-        }
-
-        // A leading separator is absolute whether a forward slash spells it or
-        // the separator-doubling escape places a literal backslash byte at
-        // position zero, so the core never reports such a spelling as a root.
-        for raw in ["/", "///", r"\\server\share", r"\\?\C:\x", r"\\"] {
-            assert!(decode_repo_path(raw).is_err());
-        }
-
-        // The traversal and drive-root rules keep their behaviour, so the
-        // derived root never widens acceptance beyond the decoded structure.
-        assert!(decode_repo_path("../escape.rs").is_err());
-        assert!(decode_repo_path("C:/Windows").is_err());
-    }
-
-    #[test]
     fn test_unrecognized_operation_is_reported_instead_of_the_fallback() {
-        // A malformed operation keeps its entry instead of failing the whole
-        // change set, and the spelling it declared is recorded beside the
-        // substitute the tolerant decode picked.
         let decoded: Vec<StructuredChangeProposal> = serde_json::from_str(
             r#"[{"op":"frobnicate","path":"src/a.rs"},
                 {"op":"create","path":"src/b.rs","content":"fn b() {}\n"}]"#,
         )
         .expect("a malformed operation must not discard the change set");
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].op, EditFileOp::Replace);
-        assert_eq!(decoded[0].unrecognized_op.as_deref(), Some("frobnicate"));
-        assert_eq!(decoded[1].op, EditFileOp::Create);
-        assert_eq!(decoded[1].unrecognized_op, None);
+        assert_eq!(decoded[0].op, "frobnicate");
+        assert_eq!(decoded[1].op, "create");
 
-        // The rejection names the operation the response declared, in the
-        // wording of the shared parser, instead of the replacement the fallback
-        // substituted.
         let rejection = decoded[0]
             .to_edit_operation_typed()
             .expect_err("an unrecognized operation must be rejected");
@@ -1351,46 +728,137 @@ mod tests {
         );
         assert_eq!(rejection.path(), None);
         assert_eq!(decoded[0].to_edit_operation(), Err(rejection.to_string()));
-
-        // A recorded spelling the shared parser accepts states no defect, so
-        // the typed operation stays authoritative.
-        let mut accepted = proposal(EditFileOp::Create, "src/c.rs");
-        accepted.content = Some("fn c() {}\n".to_string());
-        accepted.unrecognized_op = Some("create".to_string());
-        assert!(matches!(
-            accepted.to_edit_operation_typed(),
-            Ok(EditOperation::Create { .. })
-        ));
     }
 
     #[test]
     fn test_unrecognized_operation_survives_the_wire_round_trip() {
-        // The wire form declares the spelling the response emitted, so a stored
-        // transcript or a forwarded event keeps the diagnostic precise instead
-        // of degrading into the replacement the decode picked.
         let decoded: StructuredChangeProposal =
             serde_json::from_str(r#"{"op":" FROBNICATE ","path":"src/a.rs"}"#)
                 .expect("an unrecognized operation must decode");
-        assert_eq!(decoded.op, EditFileOp::Replace);
-        assert_eq!(decoded.unrecognized_op.as_deref(), Some("FROBNICATE"));
+        assert_eq!(decoded.op, " FROBNICATE ");
+        assert!(decoded.parsed_op().is_err());
 
         let json = serde_json::to_string(&decoded).unwrap();
-        assert!(json.contains(r#""op":"FROBNICATE""#), "{json}");
-        assert!(!json.contains("unrecognized_op"), "{json}");
+        assert!(json.contains(r#""op":" FROBNICATE ""#), "{json}");
         assert_eq!(
             serde_json::from_str::<StructuredChangeProposal>(&json).unwrap(),
             decoded
         );
+    }
 
-        // A recognized operation keeps serializing its canonical spelling and
-        // records no rejected spelling.
-        let mut created = proposal(EditFileOp::Create, "src/b.rs");
-        created.content = Some("fn b() {}\n".to_string());
-        let json = serde_json::to_string(&created).unwrap();
-        assert!(json.contains(r#""op":"create""#), "{json}");
+    #[test]
+    fn test_to_edit_command_emits_concrete_variants() {
+        let mut replace = proposal(EditFileOp::Replace, "src/a.rs");
+        replace.old_text = "old".to_string();
+        replace.new_text = "new".to_string();
+        assert!(matches!(
+            replace.to_edit_command(),
+            Ok(LlmCommand::EditReplace(EditReplace { path, old_text, new_text }))
+                if path == "src/a.rs" && old_text == "old" && new_text == "new"
+        ));
+
+        let mut anchor = proposal(EditFileOp::Replace, "src/a.rs");
+        anchor.start = "Kf9Q".to_string();
+        anchor.end = "Tq2W".to_string();
+        anchor.content = "body".to_string();
+        assert!(matches!(
+            anchor.to_edit_command(),
+            Ok(LlmCommand::EditLineAnchor(EditLineAnchor { path, start, end, content }))
+                if path == "src/a.rs" && start == "Kf9Q" && end == "Tq2W" && content == "body"
+        ));
+
+        let mut create = proposal(EditFileOp::Create, "src/b.rs");
+        create.content = "fn b() {}".to_string();
+        assert!(matches!(
+            create.to_edit_command(),
+            Ok(LlmCommand::EditCreate(EditCreate { path, content }))
+                if path == "src/b.rs" && content == "fn b() {}"
+        ));
+
+        let delete = proposal(EditFileOp::Delete, "src/c.rs");
+        assert!(matches!(
+            delete.to_edit_command(),
+            Ok(LlmCommand::EditDelete(EditDelete { path })) if path == "src/c.rs"
+        ));
+
+        let mut mv = proposal(EditFileOp::Move, "src/d.rs");
+        mv.to = "src/e.rs".to_string();
+        assert!(matches!(
+            mv.to_edit_command(),
+            Ok(LlmCommand::EditMove(EditMove { from, to }))
+                if from == "src/d.rs" && to == "src/e.rs"
+        ));
+
+        let mut mv_dir = proposal(EditFileOp::MoveDir, "src/old");
+        mv_dir.to = "src/new".to_string();
+        assert!(matches!(
+            mv_dir.to_edit_command(),
+            Ok(LlmCommand::EditMoveDir(EditMoveDir { from, to }))
+                if from == "src/old" && to == "src/new"
+        ));
+
+        let mut overwrite = proposal(EditFileOp::Overwrite, "src/f.rs");
+        overwrite.content = "all".to_string();
+        assert!(matches!(
+            overwrite.to_edit_command(),
+            Ok(LlmCommand::EditOverwrite(EditOverwrite { path, content }))
+                if path == "src/f.rs" && content == "all"
+        ));
+
+        let invalid = proposal(EditFileOp::Replace, "src/a.rs");
         assert_eq!(
-            serde_json::from_str::<StructuredChangeProposal>(&json).unwrap(),
-            created
+            invalid.to_edit_command(),
+            Err(ChangeConversionError::ReplaceWithoutRange {
+                path: "src/a.rs".to_string(),
+            })
         );
+    }
+
+    #[test]
+    fn test_structured_change_proposal_derives_strict_flat_schema() {
+        let root = schemars::schema_for!(StructuredChangeProposal);
+        let text = serde_json::to_string(&root).expect("schema must serialize");
+        for forbidden in [
+            "\"oneOf\"",
+            "\"allOf\"",
+            "\"anyOf\"",
+            "\"$ref\"",
+            "\"$defs\"",
+            "\"null\"",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "schema must not carry {forbidden}: {text}"
+            );
+        }
+        assert!(text.contains("\"additionalProperties\":false"), "{text}");
+
+        let schema = serde_json::to_value(&root.schema).expect("schema must convert");
+        let properties = schema["properties"].as_object().expect("properties object");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            required.len(),
+            properties.len(),
+            "every property must be required: {text}"
+        );
+        for (name, prop) in properties {
+            assert!(
+                required.contains(&name.as_str()),
+                "missing required '{name}'"
+            );
+            let desc = prop
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            assert!(
+                !desc.trim().is_empty(),
+                "property '{name}' must have a non-empty description"
+            );
+        }
     }
 }

@@ -1,16 +1,19 @@
 use super::*;
 use std::path::Path;
-use tauqe_protocol::{ContextAccess, ContextLayer, EditOperation, EditProposal};
+use tauqe_protocol::{
+    ContextAccess, ContextLayer, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
+    EditOperation, EditOverwrite, EditProposal, EditReplace,
+};
 use tempfile::tempdir;
 
 use crate::context::ContextManager;
 
 fn replace(path: &str, old_text: &str, new_text: &str) -> EditOperation {
-    EditOperation::Replace {
+    EditOperation::Replace(EditReplace {
         path: path.to_string(),
         old_text: old_text.to_string(),
         new_text: new_text.to_string(),
-    }
+    })
 }
 
 /// Returns the exact staged bytes of `path`.
@@ -103,13 +106,13 @@ async fn create_replace_delete_and_recreate_follow_operation_order() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     let mut cm = ContextManager::new(root.to_path_buf());
-    let create = EditOperation::Create {
+    let create = EditOperation::Create(EditCreate {
         path: "new.rs".into(),
         content: "one".into(),
-    };
-    let delete = EditOperation::Delete {
+    });
+    let delete = EditOperation::Delete(EditDelete {
         path: "new.rs".into(),
-    };
+    });
     let first = stage_and_validate_edits(root, &cm, std::slice::from_ref(&create), None);
     let second = stage_and_validate_edits(
         root,
@@ -154,9 +157,9 @@ async fn create_replace_delete_and_recreate_follow_operation_order() {
     assert_eq!(new_item.layer, ContextLayer::Auto);
     let deletion = EditProposal {
         summary: "delete".into(),
-        edits: vec![EditOperation::Delete {
+        edits: vec![EditOperation::Delete(EditDelete {
             path: "new.rs".into(),
-        }],
+        })],
     };
     apply_edit_proposal(root, &mut cm, &deletion).await.unwrap();
     assert!(!root.join("new.rs").exists());
@@ -177,13 +180,13 @@ fn permissions_paths_missing_files_and_ambiguous_matches_are_reported() {
     std::fs::remove_file(root.join("missing.rs")).unwrap();
     for edit in [
         replace("outside.rs", "one", "two"),
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "outside.rs".into(),
             content: "two".into(),
-        },
-        EditOperation::Delete {
+        }),
+        EditOperation::Delete(EditDelete {
             path: "outside.rs".into(),
-        },
+        }),
     ] {
         let result = stage_and_validate_edits(root, &cm, &[edit], None);
         assert!(matches!(
@@ -245,19 +248,19 @@ async fn overwrite_replaces_existing_file_and_requires_context() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("a.rs", ContextAccess::Editable).unwrap();
 
-    let op = EditOperation::Overwrite {
+    let op = EditOperation::Overwrite(EditOverwrite {
         path: "a.rs".into(),
         content: "all new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&op), None);
     assert!(result.is_success());
     assert_eq!(staged_bytes(&result, "a.rs"), &b"all new"[..]);
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
 
-    let missing = EditOperation::Overwrite {
+    let missing = EditOperation::Overwrite(EditOverwrite {
         path: "missing.rs".into(),
         content: "x".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, &[missing], None);
     assert!(matches!(
         &result.failed_files[0].error,
@@ -283,10 +286,10 @@ async fn test_move_file_stages_and_applies() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("old.rs", ContextAccess::Editable).unwrap();
 
-    let move_op = EditOperation::Move {
+    let move_op = EditOperation::Move(EditMove {
         from: "old.rs".into(),
         to: "new.rs".into(),
-    };
+    });
 
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&move_op), None);
     assert!(result.is_success());
@@ -318,14 +321,14 @@ async fn chained_moves_leave_only_the_final_destination_in_context() {
     let proposal = EditProposal {
         summary: "chained move".into(),
         edits: vec![
-            EditOperation::Move {
+            EditOperation::Move(EditMove {
                 from: "a.rs".into(),
                 to: "b.rs".into(),
-            },
-            EditOperation::Move {
+            }),
+            EditOperation::Move(EditMove {
                 from: "b.rs".into(),
                 to: "c.rs".into(),
-            },
+            }),
         ],
     };
     apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
@@ -352,14 +355,14 @@ async fn move_with_recreated_source_keeps_source_and_destination_in_context() {
     let proposal = EditProposal {
         summary: "move and recreate".into(),
         edits: vec![
-            EditOperation::Move {
+            EditOperation::Move(EditMove {
                 from: "a.rs".into(),
                 to: "b.rs".into(),
-            },
-            EditOperation::Create {
+            }),
+            EditOperation::Create(EditCreate {
                 path: "a.rs".into(),
                 content: "fn recreated() {}".into(),
-            },
+            }),
         ],
     };
     apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
@@ -388,10 +391,10 @@ fn a_failed_replace_after_a_move_keeps_the_moved_content_at_its_destination() {
     cm.add_file("a.rs", ContextAccess::Editable).unwrap();
 
     let edits = vec![
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "a.rs".into(),
             to: "b.rs".into(),
-        },
+        }),
         replace("b.rs", "missing text", "irrelevant"),
     ];
     let result = stage_and_validate_edits(root, &cm, &edits, None);
@@ -443,14 +446,14 @@ fn a_failed_move_keeps_the_source_content_a_previous_member_created() {
     let cm = ContextManager::new(root.to_path_buf());
 
     let edits = vec![
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "draft.rs".into(),
             content: "pub fn draft() {}\n".into(),
-        },
-        EditOperation::Move {
+        }),
+        EditOperation::Move(EditMove {
             from: "draft.rs".into(),
             to: "taken.rs".into(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(root, &cm, &edits, None);
 
@@ -480,10 +483,10 @@ fn a_failed_move_keeps_the_source_content_a_previous_member_created() {
     let retry = stage_and_validate_edits(
         root,
         &cm,
-        &[EditOperation::Move {
+        &[EditOperation::Move(EditMove {
             from: "draft.rs".into(),
             to: "renamed.rs".into(),
-        }],
+        })],
         Some(&result.staged_state),
     );
     assert!(retry.is_success(), "{:?}", retry.failed_files);
@@ -509,14 +512,14 @@ fn a_refused_second_hop_restores_the_state_the_first_hop_produced() {
     cm.add_file("a.rs", ContextAccess::Editable).unwrap();
 
     let edits = vec![
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "a.rs".into(),
             to: "b.rs".into(),
-        },
-        EditOperation::Move {
+        }),
+        EditOperation::Move(EditMove {
             from: "b.rs".into(),
             to: "c.rs".into(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(root, &cm, &edits, None);
 
@@ -564,10 +567,10 @@ async fn created_file_joins_the_auto_layer_not_the_user_layer() {
 
     let proposal = EditProposal {
         summary: "create".into(),
-        edits: vec![EditOperation::Create {
+        edits: vec![EditOperation::Create(EditCreate {
             path: "generated.rs".into(),
             content: "pub fn generated() {}\n".into(),
-        }],
+        })],
     };
     apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
     assert!(cm.contains("generated.rs").unwrap());
@@ -612,18 +615,18 @@ fn ignored_paths_are_rejected_for_create_overwrite_and_move() {
     cm.add_file("source.rs", ContextAccess::Editable).unwrap();
 
     let rejected = vec![
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "target/generated.rs".into(),
             content: "fn generated() {}".into(),
-        },
-        EditOperation::Overwrite {
+        }),
+        EditOperation::Overwrite(EditOverwrite {
             path: "scratch.log".into(),
             content: "new\n".into(),
-        },
-        EditOperation::Move {
+        }),
+        EditOperation::Move(EditMove {
             from: "source.rs".into(),
             to: "target/moved.rs".into(),
-        },
+        }),
     ];
     for operation in rejected {
         let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&operation), None);
@@ -640,10 +643,10 @@ fn ignored_paths_are_rejected_for_create_overwrite_and_move() {
     }
 
     // A path no ignore rule matches stages exactly as before.
-    let allowed = EditOperation::Create {
+    let allowed = EditOperation::Create(EditCreate {
         path: "src/generated.rs".into(),
         content: "fn generated() {}".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&allowed), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
@@ -673,10 +676,10 @@ fn the_sandbox_admits_creates_and_move_destinations_git_ignores() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("source.rs", ContextAccess::Editable).unwrap();
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: ".tauqe/mockups/prototype.rs".into(),
         content: "pub fn prototype() {}\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&created), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
@@ -684,10 +687,10 @@ fn the_sandbox_admits_creates_and_move_destinations_git_ignores() {
         &b"pub fn prototype() {}\n"[..]
     );
 
-    let moved = EditOperation::Move {
+    let moved = EditOperation::Move(EditMove {
         from: "source.rs".into(),
         to: ".tauqe/mockups/copied.rs".into(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &cm,
@@ -715,10 +718,10 @@ fn a_mockup_git_does_not_ignore_is_refused() {
     // and the commit of the change set would fail on it.
     let cm = ContextManager::new(root.to_path_buf());
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: ".tauqe/mockups/prototype.rs".into(),
         content: "pub fn prototype() {}\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&created), None);
     assert!(!result.is_success());
     assert_eq!(result.failed_files.len(), 1);
@@ -765,10 +768,10 @@ fn an_existing_mockup_is_edited_under_the_ordinary_context_rules() {
     let rewritten = stage_and_validate_edits(
         root,
         &cm,
-        &[EditOperation::Overwrite {
+        &[EditOperation::Overwrite(EditOverwrite {
             path: ".tauqe/mockups/prototype.rs".into(),
             content: "pub fn prototype() -> i32 { 7 }\n".into(),
-        }],
+        })],
         Some(&replaced.staged_state),
     );
     assert!(rewritten.is_success(), "{:?}", rewritten.failed_files);
@@ -793,10 +796,10 @@ async fn a_mockup_only_change_set_reaches_disk_without_joining_the_change_set() 
 
     let proposal = EditProposal {
         summary: "Draft a prototype".into(),
-        edits: vec![EditOperation::Create {
+        edits: vec![EditOperation::Create(EditCreate {
             path: ".tauqe/mockups/prototype.rs".into(),
             content: "pub fn prototype() -> i32 { 42 }\n".into(),
-        }],
+        })],
     };
     let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
@@ -833,10 +836,10 @@ async fn a_mixed_change_set_reports_only_the_tracked_paths() {
     let proposal = EditProposal {
         summary: "Prototype and edit".into(),
         edits: vec![
-            EditOperation::Create {
+            EditOperation::Create(EditCreate {
                 path: ".tauqe/mockups/prototype.rs".into(),
                 content: "pub fn prototype() {}\n".into(),
-            },
+            }),
             replace(
                 "a.rs",
                 "pub fn value() -> i32 { 0 }",
@@ -868,10 +871,10 @@ fn staged_project_config_syntax_error_is_rejected() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
 
-    let broken = EditOperation::Overwrite {
+    let broken = EditOperation::Overwrite(EditOverwrite {
         path: "tauqe.toml".into(),
         content: "[models\nprimary = ]\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
@@ -905,10 +908,10 @@ fn staged_project_config_without_verification_is_accepted() {
     // Verification is declarative, so dropping the command leaves a complete
     // declaration: the staged configuration is accepted and nothing reaches
     // disk before the change set is applied.
-    let dropped_verify = EditOperation::Overwrite {
+    let dropped_verify = EditOperation::Overwrite(EditOverwrite {
         path: "tauqe.toml".into(),
         content: "[models]\nrepl = [\"openrouter:a/b\"]\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
@@ -923,12 +926,12 @@ fn staged_project_config_without_verification_is_accepted() {
 
     // A declaration the harness could not run predictably is still rejected:
     // the file routes its verification through a command nobody declares.
-    let broken_chain = EditOperation::Overwrite {
+    let broken_chain = EditOperation::Overwrite(EditOverwrite {
         path: "tauqe.toml".into(),
         content:
             "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
                 .into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
@@ -952,10 +955,10 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file(".tauqe.toml", ContextAccess::Editable).unwrap();
 
-    let broken = EditOperation::Overwrite {
+    let broken = EditOperation::Overwrite(EditOverwrite {
         path: ".tauqe.toml".into(),
         content: "[models\nprimary = ]\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
@@ -975,12 +978,12 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
 
     // The semantic layer guards the second spelling as well: the file routes
     // its verification through a command nobody declares.
-    let broken_chain = EditOperation::Overwrite {
+    let broken_chain = EditOperation::Overwrite(EditOverwrite {
         path: ".tauqe.toml".into(),
         content:
             "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
                 .into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
@@ -995,10 +998,10 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
 
     // A rewrite that preserves the invariants stages normally, and the
     // check itself never writes the configuration to disk.
-    let extended = EditOperation::Overwrite {
+    let extended = EditOperation::Overwrite(EditOverwrite {
         path: ".tauqe.toml".into(),
         content: "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert!(result.staged_state.staged_files.contains_key(".tauqe.toml"));
@@ -1017,10 +1020,10 @@ fn staged_project_config_preserving_invariants_is_accepted() {
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
 
-    let extended = EditOperation::Overwrite {
+    let extended = EditOperation::Overwrite(EditOverwrite {
         path: "tauqe.toml".into(),
         content: "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
     assert!(result.is_success());
     assert!(result.staged_state.staged_files.contains_key("tauqe.toml"));
@@ -1138,12 +1141,12 @@ async fn prepare_keeps_the_authored_content_without_a_declared_filter() {
 
 /// Builds an anchored replacement of an inclusive line range.
 fn anchored_range(path: &str, start: u16, end: u16, content: &str) -> EditOperation {
-    EditOperation::LineAnchor {
+    EditOperation::LineAnchor(EditLineAnchor {
         path: path.to_string(),
         start: anchor::encode_anchor(path, start),
         end: anchor::encode_anchor(path, end),
         content: content.to_string(),
-    }
+    })
 }
 
 #[test]
@@ -1404,7 +1407,6 @@ fn rejected_change_set_reaches_the_model_in_the_active_strategy_dialect() {
         &HashSet::new(),
         &failed,
         &[],
-        None,
         PatchStrategy::LineAnchor,
     );
     assert!(
@@ -1422,7 +1424,6 @@ fn rejected_change_set_reaches_the_model_in_the_active_strategy_dialect() {
         &HashSet::new(),
         &failed,
         &[],
-        None,
         PatchStrategy::SearchReplace,
     );
     assert!(echoed_prompt.contains(&echoed_reason), "{echoed_prompt}");
@@ -1459,26 +1460,26 @@ fn every_operation_on_a_protected_path_is_rejected() {
 
     let rejected = vec![
         replace("Justfile", "cargo check", "cargo test"),
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "docs/specs/new.md".into(),
             content: "# New spec\n".into(),
-        },
-        EditOperation::Overwrite {
+        }),
+        EditOperation::Overwrite(EditOverwrite {
             path: "docs/specs/auth.md".into(),
             content: "# Rewritten spec\n".into(),
-        },
-        EditOperation::Delete {
+        }),
+        EditOperation::Delete(EditDelete {
             path: "Justfile".into(),
-        },
+        }),
         anchored_range("docs/specs/auth.md", 0, 0, "# Rewritten spec\n"),
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "Justfile".into(),
             to: "Justfile.bak".into(),
-        },
-        EditOperation::Move {
+        }),
+        EditOperation::Move(EditMove {
             from: "src.rs".into(),
             to: "docs/specs/src.rs".into(),
-        },
+        }),
     ];
 
     for operation in rejected {
@@ -1567,7 +1568,7 @@ fn a_repository_without_a_boundary_declaration_protects_nothing() {
 
 #[test]
 fn the_boundary_rejection_reaches_the_retry_request_verbatim() {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use tauqe_protocol::PatchStrategy;
 
     let error = EditError::ProtectedPath("docs/specs/auth.md".to_string());
@@ -1588,10 +1589,9 @@ fn the_boundary_rejection_reaches_the_retry_request_verbatim() {
         );
         assert_eq!(reason, message, "{strategy} reworded a boundary rejection");
         let prompt = crate::workflow::retry::build_patch_retry_prompt(
-            &HashSet::new(),
+            &std::collections::HashSet::new(),
             &failed,
             &[],
-            None,
             strategy,
         );
         assert!(prompt.contains(&message), "{strategy}: {prompt}");
@@ -1625,10 +1625,10 @@ fn a_directory_move_expands_into_the_moves_of_its_subtree() {
     let root = dir.path();
     let cm = ContextManager::new(root.to_path_buf());
 
-    let edit = EditOperation::MoveDir {
+    let edit = EditOperation::MoveDir(EditMoveDir {
         from: "src/old".into(),
         to: "src/new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
 
     assert!(result.is_success(), "{:?}", result.failed_files);
@@ -1672,10 +1672,10 @@ fn a_directory_move_into_its_own_subtree_is_rejected() {
     // both ask a rename to relocate the directory into a path it is moving away
     // from.
     for to in ["src/old", "src/old/inner"] {
-        let edit = EditOperation::MoveDir {
+        let edit = EditOperation::MoveDir(EditMoveDir {
             from: "src/old".into(),
             to: to.into(),
-        };
+        });
         let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
         assert!(
             !result.is_success(),
@@ -1697,10 +1697,10 @@ fn a_directory_move_without_a_source_directory_is_rejected() {
     let root = dir.path();
     let cm = ContextManager::new(root.to_path_buf());
 
-    let missing = EditOperation::MoveDir {
+    let missing = EditOperation::MoveDir(EditMoveDir {
         from: "src/missing".into(),
         to: "src/new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&missing), None);
     assert!(!result.is_success());
     assert!(matches!(
@@ -1711,10 +1711,10 @@ fn a_directory_move_without_a_source_directory_is_rejected() {
     // A directory that holds no file the change set could relocate has nothing
     // to expand into.
     std::fs::create_dir_all(root.join("src/empty")).unwrap();
-    let empty = EditOperation::MoveDir {
+    let empty = EditOperation::MoveDir(EditMoveDir {
         from: "src/empty".into(),
         to: "src/new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&empty), None);
     assert!(!result.is_success());
     assert!(matches!(
@@ -1738,10 +1738,10 @@ fn a_directory_move_that_would_overwrite_a_file_rolls_back_whole() {
     let root = dir.path();
     let cm = ContextManager::new(root.to_path_buf());
 
-    let edit = EditOperation::MoveDir {
+    let edit = EditOperation::MoveDir(EditMoveDir {
         from: "src/old".into(),
         to: "src/new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
 
     assert!(!result.is_success());
@@ -1771,10 +1771,10 @@ fn a_directory_move_across_a_declared_boundary_is_refused() {
     let cm = ContextManager::new(root.to_path_buf());
 
     // The guarded specification is the source of the move.
-    let away = EditOperation::MoveDir {
+    let away = EditOperation::MoveDir(EditMoveDir {
         from: "docs/specs".into(),
         to: "docs/archive".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&away), None);
     assert!(!result.is_success());
     assert!(matches!(
@@ -1786,10 +1786,10 @@ fn a_directory_move_across_a_declared_boundary_is_refused() {
 
     // The guarded path is the destination of the move, and the boundary is
     // asked before the collision with the file already there.
-    let into_guard = EditOperation::MoveDir {
+    let into_guard = EditOperation::MoveDir(EditMoveDir {
         from: "src/old".into(),
         to: "docs/specs".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&into_guard), None);
     assert!(!result.is_success());
     assert!(matches!(
@@ -1830,10 +1830,10 @@ fn a_directory_move_never_writes_through_a_symlink_that_leaves_the_repository() 
     .unwrap();
     let cm = ContextManager::new(root.to_path_buf());
 
-    let edit = EditOperation::MoveDir {
+    let edit = EditOperation::MoveDir(EditMoveDir {
         from: "src/old".into(),
         to: "src/new".into(),
-    };
+    });
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
 
     assert!(!result.is_success());
@@ -1859,10 +1859,10 @@ async fn a_directory_move_lands_on_disk_and_reconciles_the_context() {
 
     let proposal = EditProposal {
         summary: "Rename the module directory".into(),
-        edits: vec![EditOperation::MoveDir {
+        edits: vec![EditOperation::MoveDir(EditMoveDir {
             from: "src/old".into(),
             to: "src/new".into(),
-        }],
+        })],
     };
     let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
@@ -1926,10 +1926,10 @@ async fn a_binary_move_reaches_disk_and_reconciles_the_context() {
 
     let proposal = EditProposal {
         summary: "Relocate the logo".into(),
-        edits: vec![EditOperation::Move {
+        edits: vec![EditOperation::Move(EditMove {
             from: "assets/legacy/logo.png".into(),
             to: "assets/brand/logo.png".into(),
-        }],
+        })],
     };
     let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
@@ -1976,10 +1976,10 @@ async fn a_directory_move_carries_a_binary_member_to_disk() {
 
     let proposal = EditProposal {
         summary: "Rename the module directory".into(),
-        edits: vec![EditOperation::MoveDir {
+        edits: vec![EditOperation::MoveDir(EditMoveDir {
             from: "src/old".into(),
             to: "src/new".into(),
-        }],
+        })],
     };
     let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
@@ -2037,10 +2037,10 @@ async fn a_formatting_project_never_rewrites_a_moved_binary_payload() {
     let proposal = EditProposal {
         summary: "Relocate the payload and fix the value".into(),
         edits: vec![
-            EditOperation::Move {
+            EditOperation::Move(EditMove {
                 from: "logo.bin".into(),
                 to: "assets/logo.bin".into(),
-            },
+            }),
             replace(
                 "a.rs",
                 "pub fn value() -> i32 { 0 }",

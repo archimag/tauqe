@@ -6,12 +6,11 @@ use tauqe_core::config::{
     find_credentials_file, load_config_with_options, module_owners, AppConfig, ConfigLoadOptions,
     DEFAULT_CONFIG_TEMPLATE,
 };
-use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelCatalogEntry,
-    ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request,
-    Response, ReviewPresetSummary, SystemStatusResult,
+    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, Event,
+    ModelCatalogEntry, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
+    ModelSelection, Request, Response, ReviewPresetSummary, SystemStatusResult,
 };
 
 use crate::state::AppState;
@@ -90,13 +89,13 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
     let roles = effective_roles_summary(cfg);
     ConfigState {
         workflow: cfg.repl.workflow,
-        edit_protocol: cfg.repl.protocol,
+        edit_protocol: EditProtocolKind::Structured,
         model: effective,
         selection: Some(sel),
         roles: Some(roles),
         history_model: Some(cfg.history_model()),
         available_workflows: WorkflowFactory::available_workflows(),
-        available_edit_protocols: EditProtocolFactory::available_protocols(),
+        available_edit_protocols: Vec::new(),
         available_models: cfg.available_models(),
         review_presets: review_preset_summaries(cfg),
     }
@@ -322,9 +321,6 @@ fn written_config_keys(params: &ConfigSetParams) -> Vec<&'static str> {
     if params.workflow.is_some() {
         keys.push("repl.workflow");
     }
-    if params.edit_protocol.is_some() {
-        keys.push("repl.protocol");
-    }
     keys
 }
 
@@ -341,7 +337,7 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
     let _operation = match super::begin_exclusive_operation(
         &req.id,
         state,
-        "Cannot change workflow, edit protocol or model while a model operation is in progress",
+        "Cannot change workflow or model while a model operation is in progress",
     ) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
@@ -463,16 +459,10 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             new_workflow = wf;
         }
 
-        let mut new_protocol = guard.config.repl.protocol;
-        if let Some(proto) = params.edit_protocol {
-            new_protocol = proto;
-        }
-
         // Every requested field is valid: commit the whole change atomically.
         guard.selection = new_selection;
         guard.config.models.scribe = new_scribe;
         guard.config.repl.workflow = new_workflow;
-        guard.config.repl.protocol = new_protocol;
 
         (
             config_state(&guard.config, Some(&guard.selection)),
@@ -762,7 +752,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
 mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
-    use tauqe_protocol::{EditProtocolKind, ModelRef, WorkflowKind};
+    use tauqe_protocol::{ModelRef, WorkflowKind};
 
     #[tokio::test]
     async fn test_config_state_roles_and_scribe_history() {
@@ -916,7 +906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_config_set_workflow_and_protocol() {
+    async fn test_handle_config_set_workflow() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
         let root = scratch_root("config-set-workflow");
@@ -928,9 +918,9 @@ mod tests {
             params: Some(
                 serde_json::to_value(ConfigSetParams {
                     workflow: Some(WorkflowKind::Naive),
-                    edit_protocol: Some(EditProtocolKind::Structured),
                     model: None,
                     selection: None,
+                    edit_protocol: None,
                     history_model: None,
                 })
                 .unwrap(),
@@ -942,7 +932,6 @@ mod tests {
 
         let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(res_state.workflow, WorkflowKind::Naive);
-        assert_eq!(res_state.edit_protocol, EditProtocolKind::Structured);
         let _ = std::fs::remove_dir_all(&root);
     }
 

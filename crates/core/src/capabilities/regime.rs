@@ -23,10 +23,11 @@
 //! single source of truth: prompt rendering, the structured response schema,
 //! and command decoding all observe the same typed surface.
 
-use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability};
+use tauqe_protocol::{CapabilityExpr, LlmCapability};
 
-use super::registry::{ContractContext, ContractRule};
+use crate::prompt::ContourKind;
 
+use super::rules::{ContractContext, ContractRule, CODE_VERIFICATION_GUARANTEE};
 /// Returns the shared, intent-independent trunk of the `Core System Contract`.
 ///
 /// The list carries only the invariants that every turn states in exactly the
@@ -45,19 +46,13 @@ use super::registry::{ContractContext, ContractRule};
 /// prompt assembly hands each contour its concrete protocol, so every
 /// declaration other than `Xml` renders the structured spelling.
 pub fn shared_trunk_rules(
-    ctx: &ContractContext<'_>,
-    capabilities: &CapabilitySet,
+    _ctx: &ContractContext<'_>,
+    capabilities: &CapabilityExpr,
 ) -> Vec<ContractRule> {
-    let structured = ctx.protocol != EditProtocolKind::Xml;
-
     let mut rules = vec![
         ContractRule::new(
             "Authoritative Source",
             "The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.",
-        ),
-        ContractRule::new(
-            "No Arbitrary Shell",
-            "You do not have shell execution capabilities. Work strictly through the context and actions provided.",
         ),
     ];
 
@@ -65,31 +60,13 @@ pub fn shared_trunk_rules(
     // the only real fix is a terminal command the developer runs. The contract
     // therefore forbids every surrogate the model could reach for instead.
     if capabilities.contains(LlmCapability::Abort) {
-        let abort_command = if structured {
-            "report it immediately through the `abort` field with `is_aborted` set to true, its `reason` naming the concrete missing capability and its `recommendation` carrying the exact command or instruction".to_string()
-        } else {
-            format!(
-                "emit <{abort} reason=\"...\" recommendation=\"...\" /> immediately",
-                abort = ctx.tag_name("abort"),
-            )
-        };
+        let abort_command = "report it immediately through the `abort` field with `is_aborted` set to true, its `reason` naming the concrete missing capability and its `recommendation` carrying the exact command or instruction".to_string();
         let blocker = if capabilities.contains(LlmCapability::Blocked) {
-            if structured {
-                " Reporting the same failure through the `blocked` field is not a substitute either: a blocker states a failed precondition the harness replans around, and no amount of replanning installs a package, approves a build script, or starts a service.".to_string()
-            } else {
-                format!(
-                    " Reporting the same failure as a <{blocked}> outcome is not a substitute either: a blocker states a failed precondition the harness replans around, and no amount of replanning installs a package, approves a build script, or starts a service.",
-                    blocked = ctx.tag_name("blocked"),
-                )
-            }
+            " Reporting the same failure through the `blocked` field is not a substitute either: a blocker states a failed precondition the harness replans around, and no amount of replanning installs a package, approves a build script, or starts a service.".to_string()
         } else {
             String::new()
         };
-        let handling = if structured {
-            "Put the exact copy-pasteable command, or the exact step-by-step instruction, in `recommendation`, so the developer can complete it without further investigation."
-        } else {
-            "Name the concrete missing capability in `reason` and put the exact copy-pasteable command, or the exact step-by-step instruction, in `recommendation`, so the developer can complete it without further investigation."
-        };
+        let handling = "Put the exact copy-pasteable command, or the exact step-by-step instruction, in `recommendation`, so the developer can complete it without further investigation.";
         rules.push(ContractRule::new(
             "Host Environment Failures",
             format!(
@@ -103,36 +80,22 @@ pub fn shared_trunk_rules(
         "Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.",
     ));
 
-    // External project documentation is a harness channel rather than a regime
-    // decision: a dialogue, a step, and an architect turn all reason against the
-    // documents a project declares, so the rule renders into the byte-stable head
-    // for every regime that can request one and never reads the declared intent.
+    rules.push(ContractRule::new(
+        "Response Language",
+        "Always formulate all conversational explanations, answers, and user-facing messages in the same language as the user's request. Do not switch to English for user-facing responses unless requested.",
+    ));
     if capabilities.contains(LlmCapability::OuterDocRequest) {
-        let request = if structured {
-            "request it by that prefix through the `outer_doc_requests` field".to_string()
-        } else {
-            format!(
-                "request it by that prefix with <{request} id=\"...\" />",
-                request = ctx.tag_name("outer_doc_request"),
-            )
-        };
-        // The contrast clause renders only when the surface also carries the
-        // internal channel: a turn that cannot consult the harness documentation
-        // never reads about a command its decoder would reject.
+        let request =
+            "request it by that prefix through the `outer_doc_requests` field".to_string();
         let contrast = if !capabilities.contains(LlmCapability::DocRequest) {
             String::new()
-        } else if structured {
-            " The `tauqe_doc_requests` field requests the internal documentation of the harness itself; neither channel substitutes for the other.".to_string()
         } else {
-            format!(
-                " The <{doc} topic=\"...\" /> tag requests the internal documentation of the harness itself; neither channel substitutes for the other.",
-                doc = ctx.tag_name("tauqe_doc_request"),
-            )
+            " The `tauqe_doc_requests` field requests the internal documentation of the harness itself; neither channel substitutes for the other.".to_string()
         };
         rules.push(ContractRule::new(
             "External Project Documentation",
             format!(
-                "A project may declare external documentation in `[[outer_docs]]`, keyed by an identifier that names one root document, for material it reasons against but does not version: an upstream API note, a protocol summary, or a published book. When the task must be checked against such a document, {request}. The identifier is a prefix, not a file name: `id` answers the root document exactly as its original text, and `id/relative.md` answers a document below the directory that holds the root, so follow the relative links the root text carries instead of guessing the layout. The prefix is a jail: a request that climbs above the root with `..`, or that names an absolute path, is refused. The harness alone decides where the materialized copy lives, and the copy enters the context as `read_only` reference that a turn never rewrites. Request only identifiers the project declares and never invent one: a refusal names its cause and is not retried inside the same turn, while a delivery failure may be requested again in a later round.{contrast}"
+                "A project may declare external documentation in `[[outer_docs]]`, keyed by an identifier that names one root document, for material it reasons against but does not version: an upstream API note, a protocol summary, or a published book. When the task must be checked against such a document, {request}, and never invent an identifier the project does not declare: a refusal names its cause and is not retried inside the same turn.{contrast}"
             ),
         ));
     }
@@ -140,114 +103,48 @@ pub fn shared_trunk_rules(
     rules
 }
 
-/// Returns the intent-specific delta of the `Core System Contract`.
-///
-/// The list carries the rules that only one regime states: the scope and
-/// authorship of an editing turn, the action authorization and the plan-first
-/// proposal of a dialogue, and the decision immutability, verification, and
-/// scope rules of an isolated step. The registry renders it after the shared
-/// trunk, and the tail delta of a turn carries it once the head is emitted on
-/// its own.
-///
-/// Selection reads [`ContractContext::intent`] and the capability surface, never
-/// the text of a rule, so a rule cannot migrate between the two lists by
-/// accident. A rule that names the wire representation renders the variant of
-/// the declared protocol, exactly as in the shared trunk.
 pub fn intent_delta_rules(
     ctx: &ContractContext<'_>,
-    capabilities: &CapabilitySet,
+    capabilities: &CapabilityExpr,
 ) -> Vec<ContractRule> {
-    let structured = ctx.protocol != EditProtocolKind::Xml;
-    let mut rules: Vec<ContractRule> = Vec::new();
+    let mut rules = Vec::new();
+    // The contour is declared by the loop that owns the turn, so the rules of a
+    // step follow that declaration instead of a composition of leaves.
+    let is_step_contour = ctx.contour == ContourKind::Step;
 
-    // The context-scope rules describe what an edit may address, so they travel
-    // with the edit capability: a contour that cannot modify a file is never told
-    // which files it may modify, and therefore never advertises a command its
-    // decoder would reject.
-    if capabilities.contains(LlmCapability::FileEdits) {
+    if has_any_edit_capability(capabilities) {
         rules.push(ContractRule::new(
-            "Read-Only Scope",
-            "files inside <context> carry a declarative `access` attribute. Files marked `access=\"read_only\"` are provided for reference, context, and structural comprehension; prefer modifying files marked `access=\"editable\"`. If completing the task requires editing a read-only file, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.",
+            "File Access",
+            "files inside <context> carry a declarative `access` attribute. Files marked `access=\"read_only\"` are reference material provided for comprehension and are never modified; files marked `access=\"editable\"` may be modified. When the task requires changing a read-only file, propose the edit immediately without an extra discovery round: the environment promotes the file to editable when it applies the change.",
         ));
-        let editable_scope = if structured {
-            "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files by appending an entry to the `changes` array whose `op` is 'create', or move and rename files with an entry whose `op` is 'move', when required by the task.".to_string()
-        } else {
-            format!(
-                "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files using <{create} path=\"...\"> or move/rename files using <{moved} from=\"...\" to=\"...\" /> when required by the task.",
-                create = ctx.tag_name("create"),
-                moved = ctx.tag_name("move"),
-            )
-        };
-        rules.push(ContractRule::new("Editable Scope", editable_scope));
     }
 
-    // A file-editing turn is guarded by the authorization rule wherever it can
-    // actually write: an interactive dialogue, a review dialogue, and a plan
-    // discussion. An isolated step is itself the explicit instruction, so the
-    // rule is deliberately absent there.
-    if !ctx.intent.is_isolated_step() && capabilities.contains(LlmCapability::FileEdits) {
+    if !is_step_contour && has_any_edit_capability(capabilities) {
         rules.push(ContractRule::new(
             "Action Authorization",
-            "Default to discussion: conversational dialogue and technical analysis is the default mode of interaction. Whenever there is any ambiguity or doubt regarding the user's intent, or when the user asks an open, exploratory, analytical, or architectural question, engage strictly in conversational discussion without editing files or creating plans. Proceed directly with minimal coherent edits only when the required change is clear, specific, and unambiguous (e.g. direct instructions, straightforward bug fixes, or obvious adjustments) and that change is compact and indivisible. Propose, analyze, and seek confirmation first when there is architectural ambiguity, competing trade-offs, multiple viable designs, or when the work spans several independent subsystems. An analytical or exploratory request is never closed by silence: once the files, searches, or documentation you requested are available, the same turn must carry the written analysis the developer asked for, and an empty reply is never a valid conclusion. An answer is the deliverable of such a turn, so gathering material never substitutes for it.",
+            "Proactive engineering stance: when the developer asks to change code, fix a bug, or inspect a subsystem, that request is executed immediately with concrete action instead of passive commentary or manual instructions. If the relevant files are not yet in context, select the `research` branch (`repo_searches`, `context_requests`) to locate and load them in the same turn; if they are already in context, propose the minimal coherent change in the `edit` branch. Discussion is the mode for open, exploratory, analytical, and architectural questions, and for genuine ambiguity about the developer's intent: there you analyze, weigh competing trade-offs, and seek confirmation before editing files or creating a plan. An analytical or exploratory request is never closed by silence: once the files, searches, or documentation you requested are available, the same turn must carry the written analysis the developer asked for, and an empty reply is never a valid conclusion. An answer is the deliverable of such a turn, so gathering material never substitutes for it.",
         ));
 
-        // The proposal offers a fork between patching now and planning first. It
-        // belongs to every dialogue contour — the free REPL, the plan
-        // discussion, and the review discussion — and never to an isolated
-        // step, which implements an approved design instead of proposing one.
-        if (ctx.intent.is_interactive_repl()
-            || ctx.intent.is_plan_discussion()
-            || ctx.intent.is_review_discussion())
-            && capabilities.contains(LlmCapability::PlanCreation)
-        {
-            let proposal = if structured {
-                "A request is broad when it touches several independent subsystems or contracts, when its implementation has dependent stages that must land in order, or when those stages need separate verification. Purely mechanical or localized work — a cross-cutting rename, a signature update, one focused fix — is never broad, and you execute it immediately. When a broad request arrives, propose planning instead of patching: explain briefly in plain text why decomposition is warranted, then offer the developer the choice between drafting a plan and performing the whole change at once. A proposal is not a change: a non-empty `changes` array or a `plan_update` payload in the same answer is strictly prohibited, and no plan document may be created until the developer explicitly confirms or requests one. If the developer declines and asks for the whole task, execute it completely and never repeat the proposal. A proposal-only turn must still end with the `outcome` field carrying status 'success' and a concise summary of the offer.".to_string()
-            } else {
-                format!(
-                    "A request is broad when it touches several independent subsystems or contracts, when its implementation has dependent stages that must land in order, or when those stages need separate verification. Purely mechanical or localized work — a cross-cutting rename, a signature update, one focused fix — is never broad, and you execute it immediately. When a broad request arrives, propose planning instead of patching: explain briefly in plain text why decomposition is warranted, then offer the developer the choice between drafting a plan and performing the whole change at once. A proposal is not a change: emitting an <{edits} ...> tag or a <{plan} ...> tag in the same answer is strictly prohibited, and no plan document may be created until the developer explicitly confirms or requests one. If the developer declines and asks for the whole task, execute it completely and never repeat the proposal. A proposal-only turn must still end with an <{success} ...> tag carrying a concise summary of the offer.",
-                    edits = ctx.tag_name("edits"),
-                    plan = ctx.tag_name("plan"),
-                    success = ctx.tag_name("success"),
-                )
-            };
+        if capabilities.contains(LlmCapability::PlanCreation) {
+            let proposal = "A broad request — one that touches several independent subsystems or contracts, or whose dependent stages must land in order — is answered by proposing planning instead of patching: explain briefly in plain text why decomposition is warranted and offer the developer the choice between drafting a plan and performing the whole change at once. Purely mechanical or localized work, such as a cross-cutting rename or one focused fix, is never broad and is executed immediately. A proposal is not a change: a non-empty `changes` array or a plan payload (`plan_create` or `plan_update`) in the same answer is strictly prohibited, and no plan document may be created until the developer explicitly confirms or requests one. Once the developer confirms, execute the task completely and never repeat the proposal; a proposal-only turn closes in the answer branch and states the offer in its `message`.".to_string();
             rules.push(ContractRule::new("Plan-First Proposal", proposal));
         }
     }
 
-    // A dialogue that can consult the documentation is where the developer
-    // prepares a project and organizes the work, so it is also where the
-    // environment itself is stated once. The ontology therefore travels with
-    // that capability rather than with the declared intent: it lives in the
-    // delta, so every dialogue keeps the byte-stable head and pays one tail
-    // rule for it. An isolated step carries no documentation capability, so it
-    // states nothing about an environment it never asks about.
-    if capabilities.contains(LlmCapability::DocRequest) {
-        rules.push(ContractRule::new(
-            "Environment Ontology",
-            "TAUQE is a literal harness rather than an agent: the developer states the objective, the environment holds the work inside typed contracts, and the toolchain proves every change before it is committed. The roles divide the questions: the Architect owns what must be built and fixes the invariants, the Coder implements inside those invariants, the Reviewer inspects without editing, and the Scribe compacts history. Work arrives through one of three paths: the interactive dialogue for a focused change, a local plan when the work must land in dependent verified stages, and a code review for analytical inspection. The project declares its behavior in `tauqe.toml` at the repository root: `[project.verify]` names the deterministic checks, `[project.format]` the in-staging formatter, and `[models]` the model role ladders. Use this baseline to help the developer prepare a project, choose the workflow that fits the work, and organize it into steps; when a concrete parameter, default, budget, shortcut, or command must be exact, consult the authoritative documentation instead of recalling it.",
-        ));
-    }
-
-    if ctx.intent.is_isolated_step() {
-        let immutability = if structured {
-            "The architectural decision of this step is fixed by the Architect role and is immutable. You own the implementation only, never the requirement: revising the chosen architecture, substituting the components, libraries, or interfaces the decision selected, bypassing the contracts it designed, or relaxing its requirements is strictly prohibited. When the step cannot be implemented within the approved design, report the conflict through the `blocked` field with `is_blocked` set to true, its `reason` naming the violated decision and its `details` describing the exact conflict, so the harness starts a controlled replanning cycle instead of an improvised alternative design.".to_string()
-        } else {
-            format!(
-                "The architectural decision of this step is fixed by the Architect role and is immutable. You own the implementation only, never the requirement: revising the chosen architecture, substituting the components, libraries, or interfaces the decision selected, bypassing the contracts it designed, or relaxing its requirements is strictly prohibited. When the step cannot be implemented within the approved design, end the turn with a <{blocked} reason=\"...\" details=\"...\" /> outcome describing the exact conflict, so the harness starts a controlled replanning cycle instead of an improvised alternative design.",
-                blocked = ctx.tag_name("blocked"),
-            )
-        };
+    if is_step_contour {
+        let immutability = "The architectural decision of this step is fixed by the Architect role and is immutable. You own the implementation only, never the requirement: revising the chosen architecture, substituting the components, libraries, or interfaces the decision selected, bypassing the contracts it designed, or relaxing its requirements is strictly prohibited. When the step cannot be implemented within the approved design, report the conflict through the `blocked` field with `is_blocked` set to true, its `reason` naming the violated decision and its `details` describing the exact conflict, so the harness starts a controlled replanning cycle instead of an improvised alternative design.".to_string();
         rules.push(ContractRule::new(
             "Architectural Decision Immutability",
             immutability,
         ));
+        let mandatory_edits = "You are executing an implementation step. Every execution turn must produce concrete code changes in the `changes` array. Purely conversational responses, analysis, or explanations without code changes are strictly prohibited and will be rejected. If you need more information before editing, emit a discovery request through the research branch: `context_requests`, `repo_searches`, `repo_dirs`, `repo_maps`, or `dir_lists`. If the step cannot be implemented as specified, report a blocker via `blocked`.".to_string();
+        rules.push(ContractRule::new(
+            "Mandatory Code Implementation",
+            mandatory_edits,
+        ));
         rules.push(ContractRule::new(
             "Code Verification",
-            if structured {
-                "The response surface of a step carries no verification channel: verification of code modifications is handled automatically and deterministically by the harness, which runs toolchain verification and gating at the end of the step."
-            } else {
-                "Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit verification tags (the harness runs toolchain verification and gating automatically)."
-            },
+            CODE_VERIFICATION_GUARANTEE,
         ));
         rules.push(ContractRule::new(
             "Step Execution Scope",
@@ -258,55 +155,81 @@ pub fn intent_delta_rules(
     rules
 }
 
+fn has_any_edit_capability(capabilities: &CapabilityExpr) -> bool {
+    capabilities.contains(LlmCapability::EditReplace)
+        || capabilities.contains(LlmCapability::EditCreate)
+        || capabilities.contains(LlmCapability::EditDelete)
+        || capabilities.contains(LlmCapability::EditMove)
+        || capabilities.contains(LlmCapability::EditMoveDir)
+        || capabilities.contains(LlmCapability::EditOverwrite)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::registry::render_contract_rules;
-    use crate::capabilities::PromptRenderContext;
-    use tauqe_protocol::TurnIntent;
+    use crate::capabilities::{compose_contract_rules, render_contract_rules, PromptRenderContext};
+    use tauqe_protocol::DiscussionTarget;
 
-    /// Builds the shared trunk for one typed regime and wire contour.
-    fn shared(
-        intent: TurnIntent,
-        set: &CapabilitySet,
-        protocol: EditProtocolKind,
-        marker: Option<&str>,
-    ) -> Vec<ContractRule> {
-        let render = PromptRenderContext::new(&[], marker);
-        let ctx = ContractContext::new(intent, protocol, render);
-        shared_trunk_rules(&ctx, set)
+    /// Builds the capability surface of a free interactive dialogue.
+    fn repl_surface() -> CapabilityExpr {
+        crate::control::repl::repl_capability_expr(None)
     }
 
-    /// Builds the intent-specific delta for one typed regime and wire contour.
+    /// Builds the capability surface of a plan-anchored dialogue.
+    fn plan_discussion_surface() -> CapabilityExpr {
+        crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
+            id: "p-1".to_string(),
+        }))
+    }
+
+    /// Builds the capability surface of a review-anchored dialogue.
+    fn review_discussion_surface() -> CapabilityExpr {
+        crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Review {
+            id: "r-1".to_string(),
+        }))
+    }
+
+    /// Builds the capability surface of one isolated step.
+    fn step_surface() -> CapabilityExpr {
+        crate::control::turn::turn_capability_expr()
+    }
+
+    /// Builds the capability surface of an Architect horizon synthesis.
+    fn architect_surface() -> CapabilityExpr {
+        crate::control::refine::architect_synthesis_capability_expr()
+    }
+
+    /// Builds the shared trunk for one capability surface.
+    fn shared(expr: &CapabilityExpr, marker: Option<&str>) -> Vec<ContractRule> {
+        let render = PromptRenderContext::new(&[], marker);
+        let ctx = ContractContext::new(render);
+        shared_trunk_rules(&ctx, expr)
+    }
+
+    /// Builds the surface-specific delta of one contour and capability surface.
     fn delta(
-        intent: TurnIntent,
-        set: &CapabilitySet,
-        protocol: EditProtocolKind,
+        expr: &CapabilityExpr,
+        contour: ContourKind,
         marker: Option<&str>,
     ) -> Vec<ContractRule> {
         let render = PromptRenderContext::new(&[], marker);
-        let ctx = ContractContext::new(intent, protocol, render);
-        intent_delta_rules(&ctx, set)
+        let ctx = ContractContext::new(render).with_contour(contour);
+        intent_delta_rules(&ctx, expr)
     }
 
-    /// Builds the trunk rules for one typed regime and wire contour.
-    ///
-    /// The two lists are concatenated so a test can inspect the rules a regime
-    /// states as a whole; the split itself is asserted by the dedicated tests.
+    /// Builds the trunk rules of one contour and capability surface.
     fn trunk(
-        intent: TurnIntent,
-        set: &CapabilitySet,
-        protocol: EditProtocolKind,
+        expr: &CapabilityExpr,
+        contour: ContourKind,
         marker: Option<&str>,
     ) -> Vec<ContractRule> {
-        let mut rules = shared(intent, set, protocol, marker);
-        rules.extend(delta(intent, set, protocol, marker));
+        let mut rules = shared(expr, marker);
+        rules.extend(delta(expr, contour, marker));
         rules
     }
 
-    /// Collects the rule numbers rendered for one list of rules.
-    fn rule_numbers(rules: &[ContractRule]) -> Vec<usize> {
-        render_contract_rules(rules)
+    /// Collects the rule numbers rendered for one contract composition.
+    fn rule_numbers(rendered: &str) -> Vec<usize> {
+        rendered
             .lines()
             .filter_map(|line| {
                 let (prefix, _) = line.split_once(". ")?;
@@ -315,24 +238,29 @@ mod tests {
             .collect()
     }
 
-    /// Returns the regimes the trunk renders for.
-    fn regimes() -> Vec<(TurnIntent, CapabilitySet)> {
-        vec![
+    /// Returns the capability surfaces the trunk renders for.
+    fn regimes() -> Vec<(&'static str, CapabilityExpr, ContourKind)> {
+        [
+            ("interactive_repl", repl_surface(), ContourKind::Dialogue),
             (
-                TurnIntent::InteractiveRepl,
-                CapabilitySet::interactive_repl(),
+                "plan_discussion",
+                plan_discussion_surface(),
+                ContourKind::Dialogue,
             ),
-            (TurnIntent::PlanDiscussion, CapabilitySet::discussion()),
             (
-                TurnIntent::ReviewDiscussion,
-                CapabilitySet::review_discussion(),
+                "review_discussion",
+                review_discussion_surface(),
+                ContourKind::Dialogue,
             ),
-            (TurnIntent::IsolatedStep, CapabilitySet::isolated_step()),
+            ("isolated_step", step_surface(), ContourKind::Step),
             (
-                TurnIntent::ArchitectSynthesis,
-                CapabilitySet::architect_research(),
+                "architect_synthesis",
+                architect_surface(),
+                ContourKind::Architect,
             ),
         ]
+        .into_iter()
+        .collect()
     }
 
     /// Collects the titles of the given rules.
@@ -349,6 +277,16 @@ mod tests {
             .unwrap_or_default()
     }
 
+    const REGIME_SPECIFIC_TITLES: &[&str] = &[
+        "File Access",
+        "Action Authorization",
+        "Plan-First Proposal",
+        "Environment Ontology",
+        "Architectural Decision Immutability",
+        "Mandatory Code Implementation",
+        "Code Verification",
+        "Step Execution Scope",
+    ];
     /// Operational tag prefixes that belong to the XML contour only.
     const XML_TAG_PREFIXES: &[&str] = &[
         "<abort",
@@ -373,35 +311,9 @@ mod tests {
         "<custom_tool",
     ];
 
-    /// Top-level properties of the composed structured response schema.
-    const SCHEMA_FIELDS: &[&str] = &[
-        "changes",
-        "plan_update",
-        "message",
-        "context_requests",
-        "repo_searches",
-        "repo_dirs",
-        "repo_maps",
-        "dir_lists",
-        "tauqe_doc_requests",
-        "outer_doc_requests",
-        "verify",
-        "scratchpad",
-        "outcome",
-        "blocked",
-        "abort",
-        "user_language",
-        "custom_tools",
-    ];
-
     #[test]
     fn host_environment_failures_forbid_stubs_and_blockers() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let rule = body(&rules, "Host Environment Failures");
 
         // The rule states the repair the developer performs and forbids every
@@ -420,13 +332,9 @@ mod tests {
         assert!(rule.contains("blocked"));
         assert!(rule.contains("not a substitute"));
 
-        // The rule sits beside the shell rule it complements, ahead of the
-        // authorization rule that governs edits.
+        // The rule follows the authoritative-source rule it complements, ahead
+        // of the authorization rule that governs edits.
         let names = titles(&rules);
-        let shell = names
-            .iter()
-            .position(|title| *title == "No Arbitrary Shell")
-            .expect("shell rule");
         let host = names
             .iter()
             .position(|title| *title == "Host Environment Failures")
@@ -435,164 +343,88 @@ mod tests {
             .iter()
             .position(|title| *title == "Action Authorization")
             .expect("authorization rule");
-        assert_eq!(host, shell + 1);
+        assert_eq!(host, 1);
         assert!(host < authorization);
     }
 
     #[test]
     fn host_environment_failures_require_the_abort_capability() {
         // A surface without the abort capability never states the rule.
-        let narrowed_discussion = CapabilitySet::from_slice(&[
+        let narrowed_discussion = CapabilityExpr::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
-            LlmCapability::Research,
-            LlmCapability::UserLanguage,
+            LlmCapability::ContextRequest,
         ]);
-        let discussion = trunk(
-            TurnIntent::PlanDiscussion,
-            &narrowed_discussion,
-            EditProtocolKind::Xml,
-            None,
-        );
+        let discussion = trunk(&narrowed_discussion, ContourKind::Dialogue, None);
         assert!(!titles(&discussion).contains(&"Host Environment Failures"));
 
         // A narrowed surface without the abort capability keeps the dense
         // numbering of its own rules and never advertises the rule.
-        let narrowed = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let narrowed_surface =
+            CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
+        let narrowed = trunk(&narrowed_surface, ContourKind::Dialogue, None);
         assert!(!titles(&narrowed).contains(&"Host Environment Failures"));
 
         // An unattended step is exactly where an unverified stub would ship
         // unseen, so the rule is rendered there as well.
-        let step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let step = trunk(&step_surface(), ContourKind::Step, None);
         assert!(titles(&step).contains(&"Host Environment Failures"));
     }
 
     #[test]
     fn host_environment_failures_render_both_tags_through_the_marker() {
-        let rules = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+        let rules = trunk(&step_surface(), ContourKind::Step, None);
         let rule = body(&rules, "Host Environment Failures");
 
-        assert!(rule.contains("abort_M12345"));
-        assert!(rule.contains("blocked_M12345"));
-        assert!(!rule.contains("abort reason"));
+        assert!(rule.contains("`abort`"));
+        assert!(rule.contains("`blocked`"));
     }
 
     #[test]
     fn trunk_opens_with_the_authoritative_source() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         assert_eq!(
             rules.first().map(|rule| rule.title.as_str()),
             Some("Authoritative Source")
         );
         let names = titles(&rules);
-        assert!(names.contains(&"Read-Only Scope"));
-        assert!(names.contains(&"Editable Scope"));
-        assert!(names.contains(&"No Arbitrary Shell"));
+        assert!(names.contains(&"File Access"));
         assert!(names.contains(&"Reasoning in English"));
         assert!(names.contains(&"Action Authorization"));
     }
 
     #[test]
     fn discussion_trunk_carries_the_dialogue_surface() {
-        let rules = trunk(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&plan_discussion_surface(), ContourKind::Dialogue, None);
         let names = titles(&rules);
-        // The rule that restricted a plan discussion to prose is gone: the
-        // regime renders the interactive trunk instead of a discussion-only one.
         assert!(!names.contains(&"Discussion Mode Scope"));
-        // A plan discussion carries the full dialogue surface, so it states the
-        // same scope and authorization rules as any other editing dialogue.
-        assert!(names.contains(&"Read-Only Scope"));
-        assert!(names.contains(&"Editable Scope"));
+        assert!(names.contains(&"File Access"));
         assert!(names.contains(&"Action Authorization"));
         assert!(!names.contains(&"Read-Only Context Exploration"));
-        // A discussion may also author a new plan, so it offers the same fork
-        // between patching now and planning first.
         assert!(names.contains(&"Plan-First Proposal"));
     }
 
     #[test]
     fn discussion_trunk_renders_the_interactive_dialogue_surface() {
-        let rules = trunk(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&plan_discussion_surface(), ContourKind::Dialogue, None);
 
-        // No discussion-only scope rule survives: an edit travels the ordinary
-        // transactional path once the developer states the request directly.
         assert!(!titles(&rules).contains(&"Discussion Mode Scope"));
-        assert!(body(&rules, "Action Authorization").contains("Default to discussion"));
+        assert!(body(&rules, "Action Authorization").contains("executed immediately"));
 
-        // The shared scope pair travels with the discussion, so the XML contour
-        // renders its own edit spellings there instead of the JSON fields.
-        let editable = body(&rules, "Editable Scope");
-        assert!(editable.contains("access=\"editable\""));
-        assert!(editable.contains("<create"));
-        assert!(!editable.contains("`changes`"));
+        let access = body(&rules, "File Access");
+        assert!(access.contains("access=\"read_only\""));
+        assert!(access.contains("access=\"editable\""));
 
-        // The environment ontology travels with the documentation capability
-        // rather than with the declared intent, so every dialogue states it;
-        // removing that capability removes the rule and nothing else, which
-        // keeps a dialogue that changes its focus on one shared trunk.
-        let repl = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(titles(&repl).contains(&"Environment Ontology"));
-        assert!(titles(&rules).contains(&"Environment Ontology"));
-
-        let without_docs = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl().without(LlmCapability::DocRequest),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(!titles(&without_docs).contains(&"Environment Ontology"));
-
-        // A plan discussion carries the documentation capability the ontology
-        // travels with, so its trunk renders the dialogue trunk of the REPL
-        // byte for byte: a dialogue that changes its focus moves no shared byte.
+        let repl = trunk(&repl_surface(), ContourKind::Dialogue, None);
         assert_eq!(render_contract_rules(&rules), render_contract_rules(&repl));
     }
 
     #[test]
     fn isolated_step_trunk_delegates_verification_and_scopes_the_step() {
-        let rules = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&step_surface(), ContourKind::Step, None);
         let names = titles(&rules);
+        assert!(names.contains(&"Mandatory Code Implementation"));
         assert!(names.contains(&"Code Verification"));
         assert!(names.contains(&"Step Execution Scope"));
         assert!(!names.contains(&"Action Authorization"));
@@ -601,84 +433,46 @@ mod tests {
 
     #[test]
     fn action_authorization_requires_the_file_edit_capability() {
-        let with_edits = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let with_edits = trunk(&repl_surface(), ContourKind::Dialogue, None);
         assert!(titles(&with_edits).contains(&"Action Authorization"));
 
-        let without_edits = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::from_slice(&[LlmCapability::TextMessage]),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let without_edits_surface = CapabilityExpr::from_leaves([LlmCapability::TextMessage]);
+        let without_edits = trunk(&without_edits_surface, ContourKind::Dialogue, None);
         assert!(!titles(&without_edits).contains(&"Action Authorization"));
     }
 
     #[test]
-    fn editable_scope_applies_the_turn_marker() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
-        let scope = body(&rules, "Editable Scope");
-        assert!(scope.contains("<create_M12345 path=\"...\">"));
-        assert!(scope.contains("<move_M12345 from=\"...\" to=\"...\" />"));
-        assert!(!scope.contains("<create path"));
+    fn file_access_rule_states_the_read_only_promotion() {
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
+        let access = body(&rules, "File Access");
+        assert!(access.contains("read_only"));
+        assert!(access.contains("promotes the file to editable"));
     }
 
     #[test]
-    fn action_authorization_is_bounded_by_change_scale() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+    fn action_authorization_states_a_proactive_stance() {
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let authorization = body(&rules, "Action Authorization");
         assert!(!authorization.contains("ONLY when"));
-        assert!(authorization.contains("Default to discussion"));
-        assert!(authorization.contains("doubt"));
-        assert!(authorization.contains("compact and indivisible"));
-        assert!(authorization.contains("several independent subsystems"));
+        assert!(!authorization.contains("Default to discussion"));
+        assert!(authorization.contains("executed immediately"));
+        assert!(authorization.contains("Discussion is the mode"));
+        assert!(authorization.contains("genuine ambiguity"));
     }
 
     #[test]
     fn action_authorization_demands_the_written_analysis_after_discovery() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let authorization = body(&rules, "Action Authorization");
 
-        // The investigation a discovery round performs never concludes the
-        // turn on its own: the same turn owes the developer the analysis.
         assert!(authorization.contains("never closed by silence"));
         assert!(authorization.contains("same turn must carry the written analysis"));
         assert!(authorization.contains("an empty reply is never a valid conclusion"));
-
-        // The obligation is a general invariant, so the rule names no concrete
-        // control tag that a narrowed capability set could disable.
-        assert!(!authorization.contains("<success"));
-        assert!(!authorization.contains("<error"));
-        assert!(!authorization.contains("<blocked"));
     }
 
     #[test]
     fn plan_first_proposal_is_gated_by_intent_and_capabilities() {
-        let repl = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let repl = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let names = titles(&repl);
         let authorization = names
             .iter()
@@ -690,23 +484,7 @@ mod tests {
             .expect("plan-first proposal");
         assert_eq!(proposal, authorization + 1);
 
-        // A surface that cannot author plans never proposes one.
-        let without_plans = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(!titles(&without_plans).contains(&"Plan-First Proposal"));
-
-        // A plan discussion carries the whole dialogue surface, so it offers the
-        // same fork between patching now and planning first.
-        let discussion = trunk(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let discussion = trunk(&plan_discussion_surface(), ContourKind::Dialogue, None);
         let names = titles(&discussion);
         let authorization = names
             .iter()
@@ -717,35 +495,20 @@ mod tests {
             .position(|title| *title == "Plan-First Proposal")
             .expect("plan-first proposal");
         assert_eq!(proposal, authorization + 1);
-        // An isolated step cannot author plans either.
-        let step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
+
+        let step = trunk(&step_surface(), ContourKind::Step, None);
         assert!(!titles(&step).contains(&"Plan-First Proposal"));
     }
 
     #[test]
     fn plan_first_proposal_forbids_edits_and_requires_explicit_confirmation() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let proposal = body(&rules, "Plan-First Proposal");
 
-        // The categorical prohibition names every control tag through the
-        // active turn marker, so the rule stays a command rather than prose.
-        assert!(proposal.contains("<edits_M12345 ...>"));
-        assert!(proposal.contains("<plan_M12345 ...>"));
-        assert!(proposal.contains("<success_M12345 ...>"));
-        assert!(!proposal.contains("<edits ...>"));
-
-        // The rule carries the scale criteria, the explicit-confirmation
-        // boundary, and the ban on repeating a declined offer.
+        assert!(proposal.contains("`changes`"));
+        assert!(proposal.contains("`plan_create`"));
+        assert!(proposal.contains("`plan_update`"));
+        assert!(proposal.contains("`message`"));
         assert!(proposal.contains("independent subsystems"));
         assert!(proposal.contains("explicitly confirms"));
         assert!(proposal.contains("never repeat the proposal"));
@@ -754,16 +517,11 @@ mod tests {
 
     #[test]
     fn repl_trunk_carries_action_authorization_and_plan_first_proposal() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
 
         let authorization = body(&rules, "Action Authorization");
-        assert!(authorization.contains("compact and indivisible"));
-        assert!(authorization.contains("several independent subsystems"));
+        assert!(authorization.contains("executed immediately"));
+        assert!(authorization.contains("genuine ambiguity"));
 
         let proposal = body(&rules, "Plan-First Proposal");
         assert!(proposal.contains("planning instead of patching"));
@@ -773,168 +531,54 @@ mod tests {
 
     #[test]
     fn plan_first_proposal_requires_the_plan_creation_capability() {
-        // A surface that edits files but cannot author plans has no fork
-        // between patching now and planning first, whichever transport carries
-        // it.
-        let planless = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl().without(LlmCapability::PlanCreation),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let planless_surface = repl_surface()
+            .filter(&|capability| capability != LlmCapability::PlanCreation)
+            .expect("the shared head survives the narrowing");
+        let planless = trunk(&planless_surface, ContourKind::Dialogue, None);
         assert!(titles(&planless).contains(&"Action Authorization"));
         assert!(!titles(&planless).contains(&"Plan-First Proposal"));
-
-        // A bare file-edit surface is the same case: without plan creation
-        // there is no proposal channel to offer.
-        let edits_only = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(titles(&edits_only).contains(&"Action Authorization"));
-        assert!(!titles(&edits_only).contains(&"Plan-First Proposal"));
-    }
-
-    #[test]
-    fn plan_first_proposal_renders_every_tag_through_the_turn_marker() {
-        let marked = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
-        let proposal = body(&marked, "Plan-First Proposal");
-        assert!(proposal.contains("<edits_M12345 ...>"));
-        assert!(proposal.contains("<plan_M12345 ...>"));
-        assert!(proposal.contains("<success_M12345 ...>"));
-        assert!(!proposal.contains("<edits ...>"));
-        assert!(!proposal.contains("<plan ...>"));
-        assert!(!proposal.contains("<success ...>"));
-
-        // Without a marker the same rule renders bare tag names, so the rule
-        // never hardcodes one spelling of the control tags.
-        let bare = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        let bare_proposal = body(&bare, "Plan-First Proposal");
-        assert!(bare_proposal.contains("<edits ...>"));
-        assert!(bare_proposal.contains("<plan ...>"));
-        assert!(bare_proposal.contains("<success ...>"));
-        assert!(!bare_proposal.contains("_M12345"));
     }
 
     #[test]
     fn only_the_isolated_step_never_renders_the_proposal_rule() {
-        let discussion = trunk(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+        let discussion = trunk(&plan_discussion_surface(), ContourKind::Dialogue, None);
         assert!(titles(&discussion).contains(&"Plan-First Proposal"));
 
-        let step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+        let step = trunk(&step_surface(), ContourKind::Step, None);
         assert!(!titles(&step).contains(&"Plan-First Proposal"));
         assert!(!body(&step, "Action Authorization").contains("planning instead of patching"));
     }
 
     #[test]
     fn isolated_step_trunk_pins_the_architectural_decision() {
-        let rules = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = trunk(&step_surface(), ContourKind::Step, None);
         let immutability = body(&rules, "Architectural Decision Immutability");
         assert!(immutability.contains("immutable"));
         assert!(immutability.contains("never the requirement"));
-        assert!(immutability.contains("<blocked reason=\"...\" details=\"...\" />"));
-
-        // The rule belongs to the isolated-step regime: an interactive turn may
-        // still revise a decision with the developer, and a read-only
-        // discussion never implements anything in the first place.
-        for (intent, set) in [
-            (
-                TurnIntent::InteractiveRepl,
-                CapabilitySet::interactive_repl(),
-            ),
-            (TurnIntent::PlanDiscussion, CapabilitySet::discussion()),
-        ] {
-            let rules = trunk(intent, &set, EditProtocolKind::Xml, None);
-            assert!(!titles(&rules).contains(&"Architectural Decision Immutability"));
-        }
+        assert!(immutability.contains("`blocked`"));
     }
 
     #[test]
-    fn architectural_decision_immutability_renders_the_blocked_tag_through_the_marker() {
-        let rules = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+    fn architectural_decision_immutability_mentions_blocked_field() {
+        let rules = trunk(&step_surface(), ContourKind::Step, None);
         let immutability = body(&rules, "Architectural Decision Immutability");
-        assert!(immutability.contains("<blocked_M12345 reason=\"...\" details=\"...\" />"));
-        assert!(!immutability.contains("<blocked reason"));
-    }
-
-    #[test]
-    fn both_contours_render_the_same_rule_sequence() {
-        // The wire format changes how a rule spells its command, never which
-        // invariants the regime states or in which order.
-        for (intent, set) in regimes() {
-            let xml = trunk(intent, &set, EditProtocolKind::Xml, None);
-            let structured = trunk(intent, &set, EditProtocolKind::Structured, None);
-            assert_eq!(
-                titles(&xml),
-                titles(&structured),
-                "the two contours render identical rule titles"
-            );
-        }
+        assert!(immutability.contains("`blocked`"));
     }
 
     #[test]
     fn structured_trunk_never_renders_an_operational_tag() {
-        for (intent, set) in regimes() {
-            let rules = trunk(intent, &set, EditProtocolKind::Structured, Some("M12345"));
+        for (label, surface, contour) in regimes() {
+            let rules = trunk(&surface, contour, None);
             for rule in &rules {
                 for prefix in XML_TAG_PREFIXES {
                     assert!(
                         !rule.title.contains(prefix),
-                        "rule title '{}' advertises {prefix} in the structured contour",
+                        "rule title '{}' advertises {prefix} in the structured contour ({label})",
                         rule.title
                     );
                     assert!(
                         !rule.body.contains(prefix),
-                        "rule '{}' advertises {prefix} in the structured contour",
-                        rule.title
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn xml_trunk_never_names_a_structured_schema_field() {
-        for (intent, set) in regimes() {
-            let rules = trunk(intent, &set, EditProtocolKind::Xml, Some("M12345"));
-            for rule in &rules {
-                for field in SCHEMA_FIELDS {
-                    let quoted = format!("`{field}`");
-                    assert!(
-                        !rule.body.contains(&quoted),
-                        "rule '{}' names the schema field {quoted} in the XML contour",
+                        "rule '{}' advertises {prefix} in the structured contour ({label})",
                         rule.title
                     );
                 }
@@ -944,21 +588,13 @@ mod tests {
 
     #[test]
     fn structured_twins_name_the_fields_they_govern() {
-        let develop = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Structured,
-            None,
-        );
+        let develop = trunk(&repl_surface(), ContourKind::Dialogue, None);
 
-        // Creating and moving files addresses the change set, never a tag.
-        let scope = body(&develop, "Editable Scope");
-        assert!(scope.contains("`changes`"));
-        assert!(scope.contains("'create'"));
-        assert!(scope.contains("'move'"));
+        let scope = body(&develop, "File Access");
+        assert!(scope.contains("access=\"read_only\""));
+        assert!(scope.contains("access=\"editable\""));
+        assert!(scope.contains("promotes the file to editable"));
 
-        // A host failure is reported through the abort field, and the blocker
-        // clause is ruled out through the blocked field.
         let host = body(&develop, "Host Environment Failures");
         assert!(host.contains("`abort`"));
         assert!(host.contains("`is_aborted`"));
@@ -968,24 +604,16 @@ mod tests {
         assert!(host.contains("not a substitute"));
         assert!(host.contains("stub"));
 
-        // A proposal keeps both the change set and the plan payload empty and
-        // terminates through the outcome field.
         let proposal = body(&develop, "Plan-First Proposal");
         assert!(proposal.contains("`changes`"));
+        assert!(proposal.contains("`plan_create`"));
         assert!(proposal.contains("`plan_update`"));
-        assert!(proposal.contains("`outcome`"));
-        assert!(proposal.contains("'success'"));
+        assert!(proposal.contains("`message`"));
         assert!(proposal.contains("planning instead of patching"));
         assert!(proposal.contains("explicitly confirms"));
 
-        let step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Structured,
-            None,
-        );
+        let step = trunk(&step_surface(), ContourKind::Step, None);
 
-        // The immutability rule reports the conflict through the blocked field.
         let immutability = body(&step, "Architectural Decision Immutability");
         assert!(immutability.contains("immutable"));
         assert!(immutability.contains("never the requirement"));
@@ -993,95 +621,27 @@ mod tests {
         assert!(immutability.contains("`is_blocked`"));
         assert!(immutability.contains("`details`"));
 
-        // The response surface of a step carries no verification channel, so the
-        // rule states the harness obligation instead of naming a field the
-        // strict step schema never declares.
         let verification = body(&step, "Code Verification");
-        assert!(verification.contains("no verification channel"));
-        assert!(verification.contains("toolchain verification"));
+        assert!(verification.contains("automatically and deterministically"));
+        assert!(verification.contains("checks the project declares"));
+        assert!(verification.contains("rejected"));
+        assert!(verification.contains("never reaches the repository"));
         assert!(!verification.contains("`verify`"));
-        assert!(!verification.contains("verification tags"));
-        assert!(!verification.contains("<verify"));
-    }
-
-    #[test]
-    fn structured_twins_keep_the_shared_invariant_text() {
-        let xml = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        let structured = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Structured,
-            None,
-        );
-
-        // Both variants keep the shared invariant wording; only the spelling
-        // of the command differs. The authorization rule bounds edits by the
-        // scale of the change, and the proposal rule states that criterion
-        // before adding the confirmation boundary.
-        for authorization in [
-            body(&xml, "Action Authorization"),
-            body(&structured, "Action Authorization"),
-        ] {
-            assert!(authorization.contains("compact and indivisible"));
-            assert!(authorization.contains("several independent subsystems"));
-        }
-
-        for proposal in [
-            body(&xml, "Plan-First Proposal"),
-            body(&structured, "Plan-First Proposal"),
-        ] {
-            assert!(proposal.contains("independent subsystems"));
-            assert!(proposal.contains("explicitly confirms"));
-            assert!(proposal.contains("never repeat the proposal"));
-            assert!(proposal.contains("cross-cutting rename"));
-        }
     }
 
     #[test]
     fn step_execution_scope_is_wire_neutral() {
-        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-            let rules = trunk(
-                TurnIntent::IsolatedStep,
-                &CapabilitySet::isolated_step(),
-                protocol,
-                None,
-            );
-            let scope = body(&rules, "Step Execution Scope");
-            assert!(scope.contains("single isolated plan step"));
-            assert!(scope.contains("Plan creation, modification, and status updates"));
-            assert!(!scope.contains("plan tags"));
-            assert!(!scope.contains("plan_tags"));
-        }
+        let rules = trunk(&step_surface(), ContourKind::Step, None);
+        let scope = body(&rules, "Step Execution Scope");
+        assert!(scope.contains("single isolated plan step"));
+        assert!(scope.contains("Plan creation, modification, and status updates"));
     }
-
-    /// Regime-specific rule titles that the shared trunk must never carry.
-    const REGIME_SPECIFIC_TITLES: &[&str] = &[
-        "Read-Only Scope",
-        "Editable Scope",
-        "Action Authorization",
-        "Plan-First Proposal",
-        "Environment Ontology",
-        "Architectural Decision Immutability",
-        "Code Verification",
-        "Step Execution Scope",
-    ];
 
     #[test]
     fn shared_trunk_states_the_universal_invariants_only() {
-        let rules = shared(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let rules = shared(&repl_surface(), None);
         let names = titles(&rules);
         assert_eq!(names.first(), Some(&"Authoritative Source"));
-        assert!(names.contains(&"No Arbitrary Shell"));
         assert!(names.contains(&"Host Environment Failures"));
         assert!(names.contains(&"Reasoning in English"));
         for specific in REGIME_SPECIFIC_TITLES {
@@ -1094,86 +654,43 @@ mod tests {
 
     #[test]
     fn shared_trunk_is_identical_for_every_dialog_regime() {
-        // The head is byte-stable only when the shared trunk renders the same
-        // bytes for every dialogue. The review discussion runs as an
-        // interactive turn, so its share of the trunk is the interactive one by
-        // construction; comparing the remaining intents states that the shared
-        // list never reads the declared intent either.
-        let surface = CapabilitySet::interactive_repl();
-        let reference = render_contract_rules(&shared(
-            TurnIntent::InteractiveRepl,
-            &surface,
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        ));
+        let reference = render_contract_rules(&shared(&repl_surface(), None));
         assert!(!reference.is_empty());
 
-        for intent in [
-            TurnIntent::PlanDiscussion,
-            TurnIntent::ReviewDiscussion,
-            TurnIntent::IsolatedStep,
-        ] {
-            let other = render_contract_rules(&shared(
-                intent,
-                &surface,
-                EditProtocolKind::Xml,
-                Some("M12345"),
-            ));
-            assert_eq!(other, reference, "the shared trunk diverged for {intent:?}");
+        for surface in [plan_discussion_surface(), review_discussion_surface()] {
+            let other = render_contract_rules(&shared(&surface, None));
+            assert_eq!(
+                other, reference,
+                "the shared trunk diverged for another dialogue"
+            );
         }
     }
 
     #[test]
     fn intent_delta_carries_only_the_specifics_of_its_regime() {
-        let repl = delta(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let repl = delta(&repl_surface(), ContourKind::Dialogue, None);
         let names = titles(&repl);
-        assert!(names.contains(&"Read-Only Scope"));
-        assert!(names.contains(&"Editable Scope"));
+        assert!(names.contains(&"File Access"));
         assert!(names.contains(&"Action Authorization"));
         assert!(names.contains(&"Plan-First Proposal"));
-        assert!(names.contains(&"Environment Ontology"));
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert!(!names.contains(&"Architectural Decision Immutability"));
         assert!(!names.contains(&"Step Execution Scope"));
 
-        let discussion = delta(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let discussion = delta(&plan_discussion_surface(), ContourKind::Dialogue, None);
         let names = titles(&discussion);
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert!(!names.contains(&"Read-Only Context Exploration"));
-        assert!(names.contains(&"Environment Ontology"));
-        // A plan discussion states the same dialogue pair as the REPL, because
-        // its surface is the dialogue head plus the plan mutation.
-        assert!(names.contains(&"Read-Only Scope"));
-        assert!(names.contains(&"Editable Scope"));
+        assert!(names.contains(&"File Access"));
         assert!(names.contains(&"Action Authorization"));
         assert!(names.contains(&"Plan-First Proposal"));
         assert!(!names.contains(&"Step Execution Scope"));
 
-        let review = delta(
-            TurnIntent::ReviewDiscussion,
-            &CapabilitySet::review_discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let review = delta(&review_discussion_surface(), ContourKind::Dialogue, None);
         let names = titles(&review);
-        // The review discussion states the very same delta as the REPL: the
-        // decision it records lives in the surface and renders no tail rule,
-        // so switching focus to a review session moves no tail byte either.
-        assert!(names.contains(&"Read-Only Scope"));
-        assert!(names.contains(&"Editable Scope"));
+        assert!(names.contains(&"File Access"));
         assert!(names.contains(&"Action Authorization"));
         assert!(names.contains(&"Plan-First Proposal"));
-        assert!(names.contains(&"Environment Ontology"));
         assert!(!names.contains(&"Architectural Decision Immutability"));
         assert!(!names.contains(&"Step Execution Scope"));
         assert_eq!(
@@ -1182,311 +699,173 @@ mod tests {
             "the review delta diverged from the REPL delta"
         );
 
-        let step = delta(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
+        let step = delta(&step_surface(), ContourKind::Step, None);
         let names = titles(&step);
         assert!(names.contains(&"Architectural Decision Immutability"));
+        assert!(names.contains(&"Mandatory Code Implementation"));
         assert!(names.contains(&"Code Verification"));
         assert!(names.contains(&"Step Execution Scope"));
         assert!(!names.contains(&"Action Authorization"));
         assert!(!names.contains(&"Plan-First Proposal"));
-        assert!(!names.contains(&"Environment Ontology"));
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert_eq!(names.last(), Some(&"Step Execution Scope"));
     }
+
+    /// The contour decides the regime: the same leaves declared as a step render the
+    /// step rules, and the step surface declared as a dialogue renders the dialogue
+    /// rules, so no composition of leaves selects a regime.
     #[test]
-    fn the_interactive_repl_states_the_environment_ontology() {
-        let rules = delta(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        let ontology = body(&rules, "Environment Ontology");
+    fn the_step_rules_follow_the_declared_contour_not_the_leaf_composition() {
+        let as_step = trunk(&repl_surface(), ContourKind::Step, None);
+        let names = titles(&as_step);
+        assert!(names.contains(&"Architectural Decision Immutability"));
+        assert!(names.contains(&"Mandatory Code Implementation"));
+        assert!(names.contains(&"Step Execution Scope"));
+        assert!(!names.contains(&"Action Authorization"));
+        assert!(!names.contains(&"Plan-First Proposal"));
 
-        // The ontology names the paradigm, the role split, the paths work
-        // travels, and the configuration surface a consultation starts from.
-        assert!(ontology.contains("literal harness"));
-        assert!(ontology.contains("Architect"));
-        assert!(ontology.contains("what must be built"));
-        assert!(ontology.contains("Coder"));
-        assert!(ontology.contains("local plan"));
-        assert!(ontology.contains("code review"));
-        assert!(ontology.contains("`tauqe.toml`"));
-        assert!(ontology.contains("`[project.verify]`"));
-        assert!(ontology.contains("`[project.format]`"));
-        assert!(ontology.contains("`[models]`"));
-
-        // The ontology is a consultation baseline, so it routes every exact
-        // detail to the authoritative documentation instead of asserting it.
-        assert!(ontology.contains("consult the authoritative documentation"));
-
-        // A plan discussion carries the documentation capability the ontology
-        // travels with, so it states the environment exactly as the REPL does.
-        let discussion = delta(
-            TurnIntent::PlanDiscussion,
-            &CapabilitySet::discussion(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(titles(&discussion).contains(&"Environment Ontology"));
-
-        // An isolated step carries no documentation capability, so the coder
-        // never reads about an environment it never asks about.
-        let step = delta(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(
-            !titles(&step).contains(&"Environment Ontology"),
-            "the isolated step regime states the environment ontology"
-        );
+        let as_dialogue = trunk(&step_surface(), ContourKind::Dialogue, None);
+        let names = titles(&as_dialogue);
+        assert!(names.contains(&"Action Authorization"));
+        assert!(!names.contains(&"Step Execution Scope"));
+        assert!(!names.contains(&"Architectural Decision Immutability"));
     }
-
     #[test]
-    fn the_environment_ontology_is_wire_neutral() {
-        // The rule states a conceptual surface and names no command channel, so
-        // both contours render it byte for byte and no control tag leaks into a
-        // structured prompt.
-        let xml = delta(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        let structured = delta(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Structured,
-            None,
-        );
-        let ontology = body(&xml, "Environment Ontology");
-        assert_eq!(ontology, body(&structured, "Environment Ontology"));
-        for prefix in XML_TAG_PREFIXES {
-            assert!(
-                !ontology.contains(prefix),
-                "the environment ontology advertises {prefix}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_environment_ontology_requires_the_documentation_capability() {
-        let rules = delta(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl().without(LlmCapability::DocRequest),
-            EditProtocolKind::Xml,
-            None,
-        );
+    fn the_intent_delta_carries_no_documentation_ontology() {
+        // A question about the harness is answered by the self-knowledge rule
+        // and the authoritative documentation, so the intent delta states no
+        // second lecture about the environment.
+        let rules = delta(&repl_surface(), ContourKind::Dialogue, None);
         assert!(!titles(&rules).contains(&"Environment Ontology"));
+
+        // Nothing of the delta depends on the documentation capability, so a
+        // dialogue that cannot request a document states the very same rules.
+        let narrowed = delta(
+            &repl_surface()
+                .filter(&|capability| capability != LlmCapability::DocRequest)
+                .expect("the shared head survives the narrowing"),
+            ContourKind::Dialogue,
+            None,
+        );
+        assert_eq!(
+            render_contract_rules(&narrowed),
+            render_contract_rules(&rules),
+            "narrowing the documentation capability changed the intent delta"
+        );
     }
 
     #[test]
     fn the_architect_synthesis_delta_states_no_edit_scope() {
-        let rules = delta(
-            TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_research(),
-            EditProtocolKind::Structured,
-            None,
-        );
-        let names = titles(&rules);
-
-        // The Architect produces a typed horizon, so it is never told which files
-        // it may modify: the scope rules travel with the edit capability.
-        assert!(!names.contains(&"Read-Only Scope"));
-        assert!(!names.contains(&"Editable Scope"));
-        assert!(!names.contains(&"Action Authorization"));
-        assert!(!names.contains(&"Plan-First Proposal"));
-        assert!(names.contains(&"Environment Ontology"));
+        // The synthesis contour owns no edit scope, no plan authorship, and no
+        // step scope, so its intent delta is legitimately empty.
+        let rules = delta(&architect_surface(), ContourKind::Architect, None);
+        assert!(rules.is_empty());
     }
+
     #[test]
     fn architect_synthesis_trunk_keeps_the_abort_escape_hatch() {
-        // A synthesis runs unattended exactly as an isolated step does, so its
-        // trunk states the same host-failure rule: a condition that only the
-        // developer can repair on the host is reported through the escape hatch
-        // instead of an improvised surrogate or a misreported blocker.
-        let rules = shared(
-            TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_research(),
-            EditProtocolKind::Structured,
-            None,
-        );
+        let rules = shared(&architect_surface(), None);
         assert!(titles(&rules).contains(&"Host Environment Failures"));
         let host = body(&rules, "Host Environment Failures");
         assert!(host.contains("`abort`"));
         assert!(host.contains("`is_aborted`"));
         assert!(host.contains("`recommendation`"));
-        assert!(!host.contains("<abort"));
-
-        // The rule belongs to the shared trunk and never to the regime delta, so
-        // the synthesis states it in the byte-stable head beside the invariants
-        // every turn shares.
-        let regime = delta(
-            TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_research(),
-            EditProtocolKind::Structured,
-            None,
-        );
-        assert!(!titles(&regime).contains(&"Host Environment Failures"));
-
-        // The rule is rendered from the declared capability, so a surface
-        // without the escape hatch never advertises a command it cannot decode.
-        let without = shared(
-            TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_research().without(LlmCapability::Abort),
-            EditProtocolKind::Structured,
-            None,
-        );
-        assert!(!titles(&without).contains(&"Host Environment Failures"));
-
-        // The XML contour of the same regime spells the command as a control
-        // tag through the active turn marker.
-        let xml = shared(
-            TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_research(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
-        assert!(body(&xml, "Host Environment Failures").contains("<abort_M12345"));
     }
 
     #[test]
-    fn every_regime_states_a_non_empty_delta_beside_the_shared_trunk() {
-        for (intent, set) in regimes() {
-            for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-                assert!(!shared(intent, &set, protocol, None).is_empty());
+    fn every_regime_states_the_shared_trunk_and_only_authorized_delta_rules() {
+        for (label, surface, _) in regimes() {
+            assert!(
+                !shared(&surface, None).is_empty(),
+                "the {label} regime states no shared trunk"
+            );
+        }
+
+        // Every contour that owns an edit scope, a plan authorship, or a step
+        // scope states the rules of that scope in its delta.
+        for (label, surface, contour) in [
+            ("interactive_repl", repl_surface(), ContourKind::Dialogue),
+            (
+                "plan_discussion",
+                plan_discussion_surface(),
+                ContourKind::Dialogue,
+            ),
+            (
+                "review_discussion",
+                review_discussion_surface(),
+                ContourKind::Dialogue,
+            ),
+            ("isolated_step", step_surface(), ContourKind::Step),
+        ] {
+            assert!(
+                !delta(&surface, contour, None).is_empty(),
+                "the {label} regime states no surface-specific rule"
+            );
+        }
+
+        // The Architect synthesis contour authorizes none of them, so its delta
+        // is legitimately empty and the shared trunk carries it alone.
+        assert!(delta(&architect_surface(), ContourKind::Architect, None).is_empty());
+    }
+    #[test]
+    fn the_unified_composition_is_numbered_densely() {
+        for (label, surface, contour) in regimes() {
+            let ctx =
+                ContractContext::new(PromptRenderContext::new(&[], None)).with_contour(contour);
+            let rendered = compose_contract_rules(&surface, &ctx);
+            let numbers = rule_numbers(&rendered);
+            assert!(!numbers.is_empty());
+            assert_eq!(
+                numbers,
+                (1..=numbers.len()).collect::<Vec<_>>(),
+                "the {label} regime renders non-dense numbering"
+            );
+
+            // The unified composition states every rule of the shared trunk
+            // beside every rule the declared regime alone authorizes, so no
+            // rule of the two former lists may disappear from the sequence.
+            for rule in trunk(&surface, contour, None) {
                 assert!(
-                    !delta(intent, &set, protocol, None).is_empty(),
-                    "the {intent:?} regime states no intent-specific rule"
+                    rendered.contains(&rule.title),
+                    "the unified composition dropped '{}'",
+                    rule.title
                 );
             }
         }
     }
 
     #[test]
-    fn both_lists_are_numbered_densely_and_independently() {
-        for (intent, set) in regimes() {
-            for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-                for rules in [
-                    shared(intent, &set, protocol, None),
-                    delta(intent, &set, protocol, None),
-                ] {
-                    let numbers = rule_numbers(&rules);
-                    assert!(!numbers.is_empty());
-                    assert_eq!(
-                        numbers,
-                        (1..=numbers.len()).collect::<Vec<_>>(),
-                        "the {intent:?} regime renders non-dense numbering"
-                    );
-                }
-            }
-        }
-    }
-    #[test]
     fn the_external_documentation_rule_states_the_channel_in_both_contours() {
-        // A dialogue reaches both channels: the material a project declares and
-        // the internal documentation of the harness.
-        let repl = |protocol| {
-            trunk(
-                TurnIntent::InteractiveRepl,
-                &CapabilitySet::interactive_repl(),
-                protocol,
-                None,
-            )
-        };
+        let repl = |contour: ContourKind| trunk(&repl_surface(), contour, None);
 
-        let xml_rules = repl(EditProtocolKind::Xml);
-        let xml = body(&xml_rules, "External Project Documentation");
-        assert!(xml.contains("<outer_doc_request id=\"...\" />"));
-        assert!(xml.contains("<tauqe_doc_request topic=\"...\" />"));
-        // The rule states the prefix surface and the jail around it in the
-        // vocabulary of the XML contour.
-        assert!(xml.contains("`id/relative.md`"));
-        assert!(xml.contains("climbs above the root"));
-        assert!(xml.contains("absolute path"));
-        assert!(!xml.contains("`outer_doc_requests`"));
-        assert!(xml.contains("`[[outer_docs]]`"));
-
-        let structured_rules = repl(EditProtocolKind::Structured);
+        let structured_rules = repl(ContourKind::Dialogue);
         let structured = body(&structured_rules, "External Project Documentation");
         assert!(structured.contains("`outer_doc_requests`"));
         assert!(structured.contains("`tauqe_doc_requests`"));
-        assert!(structured.contains("`id/relative.md`"));
-        assert!(structured.contains("climbs above the root"));
+        assert!(structured.contains("never invent"));
+        // The prefix and jail semantics live in the catalog heading, so the
+        // trunk paragraph states only the essence of the declaration.
+        assert!(!structured.contains("`id/relative.md`"));
+        assert!(!structured.contains("climbs above the root"));
         assert!(structured.contains("`[[outer_docs]]`"));
-        for prefix in XML_TAG_PREFIXES {
+    }
+
+    #[test]
+    fn the_external_documentation_rule_follows_the_capability_surface() {
+        for (label, surface, contour) in regimes() {
+            let rules = trunk(&surface, contour, None);
             assert!(
-                !structured.contains(prefix),
-                "the structured rule advertises {prefix}"
+                titles(&rules).contains(&"External Project Documentation"),
+                "the {label} regime cannot request the documents it declares"
             );
         }
     }
 
     #[test]
-    fn the_external_documentation_rule_follows_the_capability_surface() {
-        for (intent, set) in regimes() {
-            for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-                let rules = trunk(intent, &set, protocol, None);
-                assert!(
-                    titles(&rules).contains(&"External Project Documentation"),
-                    "the {intent:?} regime cannot request the documents it declares"
-                );
-            }
-        }
-
-        // An isolated step reads the contracts its plan pointed at, so the
-        // external channel travels with it …
-        let step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Xml,
-            None,
-        );
-        let channel = body(&step, "External Project Documentation");
-        assert!(channel.contains("<outer_doc_request"));
-        // … while the internal documentation of the harness stays closed to it,
-        // in both spellings the two contours use.
-        let structured_step = trunk(
-            TurnIntent::IsolatedStep,
-            &CapabilitySet::isolated_step(),
-            EditProtocolKind::Structured,
-            None,
-        );
-        for rule in &step {
-            assert!(!rule.body.contains("<tauqe_doc_request"));
-            assert!(!rule.body.contains("<doc_request"));
-        }
-        for rule in &structured_step {
-            assert!(!rule.body.contains("`tauqe_doc_requests`"));
-        }
-
-        // A surface without the external channel states no rule at all.
-        let without = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl().without(LlmCapability::OuterDocRequest),
-            EditProtocolKind::Xml,
-            None,
-        );
-        assert!(!titles(&without).contains(&"External Project Documentation"));
-    }
-
-    #[test]
     fn the_external_documentation_rule_folds_the_turn_marker() {
-        let rules = trunk(
-            TurnIntent::InteractiveRepl,
-            &CapabilitySet::interactive_repl(),
-            EditProtocolKind::Xml,
-            Some("M12345"),
-        );
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
         let rule = body(&rules, "External Project Documentation");
-        assert!(rule.contains("<outer_doc_request_M12345 id=\"...\" />"));
-        assert!(rule.contains("<tauqe_doc_request_M12345 topic=\"...\" />"));
+        assert!(rule.contains("`outer_doc_requests`"));
         assert!(!rule.contains("<outer_doc_request id"));
     }
 }

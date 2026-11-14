@@ -46,7 +46,7 @@ mod tests {
         let prompt = format_review_step_retry_prompt(
             "I inspected the file and it looks correct.",
             Some("No edits were applied"),
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
         );
         assert!(prompt.contains("# Correction Required: Review Finding Turn Incomplete"));
@@ -54,11 +54,11 @@ mod tests {
         assert!(prompt.contains("I inspected the file and it looks correct."));
         assert!(prompt.contains("## Diagnostic Feedback:"));
         assert!(prompt.contains("No edits were applied"));
-        assert!(prompt.contains("emit a valid edit block"));
-        assert!(prompt.contains("terminal success tag"));
+        assert!(prompt.contains("`changes`"));
+        assert!(prompt.contains("`outcome`"));
 
-        let empty = format_review_step_retry_prompt("   ", None, EditProtocolKind::Xml, None);
-        assert!(empty.contains("(empty response)"));
+        let empty =
+            format_review_step_retry_prompt("   ", None, EditProtocolKind::Structured, None);
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));
     }
@@ -95,13 +95,17 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt =
-            format_review_step_execution_prompt(&session, 3, EditProtocolKind::Xml, Some("TAG"))
-                .unwrap();
+        let prompt = format_review_step_execution_prompt(
+            &session,
+            3,
+            EditProtocolKind::Structured,
+            Some("TAG"),
+        )
+        .unwrap();
         assert!(prompt
             .contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
-        assert!(prompt.contains("<success_TAG commit_message=\"...\" />"));
-        assert!(prompt.contains("<error_TAG message=\"...\" />"));
+        assert!(prompt.contains("`outcome`"));
+        assert!(prompt.contains("commit_message"));
     }
 
     #[test]

@@ -480,49 +480,6 @@ impl ResearchRoundOutcome {
             .join("\n\n")
     }
 
-    /// One-line round summary for the FSM research banner.
-    pub fn fsm_banner_summary(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.added_files.is_empty() {
-            parts.push(format!("{} file(s) added", self.added_files.len()));
-        }
-        if !self.searches_executed.is_empty() {
-            parts.push(format!(
-                "{} search(es) executed",
-                self.searches_executed.len()
-            ));
-        }
-        if self.dir_trees_loaded > 0 {
-            parts.push(format!(
-                "{} directory tree(s) rendered",
-                self.dir_trees_loaded
-            ));
-        }
-        if self.dir_lists_loaded > 0 {
-            parts.push(format!(
-                "{} directory listing(s) rendered",
-                self.dir_lists_loaded
-            ));
-        }
-        if self.repo_maps_loaded > 0 {
-            parts.push(format!(
-                "{} targeted map(s) rendered",
-                self.repo_maps_loaded
-            ));
-        }
-        if !self.doc_topics_loaded.is_empty() {
-            parts.push(format!(
-                "{} doc topic(s) loaded",
-                self.doc_topics_loaded.len()
-            ));
-        }
-        if parts.is_empty() {
-            format!("{} file(s) added.", self.added_files.len())
-        } else {
-            format!("{}.", parts.join(", "))
-        }
-    }
-
     /// Detailed round summary for the architect research banner.
     pub fn architect_banner_summary(&self) -> String {
         let mut notes = Vec::new();
@@ -600,11 +557,11 @@ struct ContextRequestHandler;
 
 impl ResearchCapabilityHandler for ContextRequestHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Research
+        LlmCapability::ContextRequest
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::ContextRequest { .. })
+        matches!(command, LlmCommand::ContextRequest(_))
     }
 
     fn execute(
@@ -617,9 +574,9 @@ impl ResearchCapabilityHandler for ContextRequestHandler {
         let requests: Vec<ContextRequest> = commands
             .iter()
             .filter_map(|command| match command {
-                LlmCommand::ContextRequest { path, access } => Some(ContextRequest {
-                    path: path.clone(),
-                    access: *access,
+                LlmCommand::ContextRequest(command) => Some(ContextRequest {
+                    path: command.path.clone(),
+                    access: command.access,
                 }),
                 _ => None,
             })
@@ -672,11 +629,11 @@ struct RepoSearchHandler;
 
 impl ResearchCapabilityHandler for RepoSearchHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Research
+        LlmCapability::RepoSearch
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::RepoSearch { .. })
+        matches!(command, LlmCommand::RepoSearch(_))
     }
 
     fn execute(
@@ -689,9 +646,10 @@ impl ResearchCapabilityHandler for RepoSearchHandler {
         let queries: Vec<RepoSearchRequest> = commands
             .iter()
             .filter_map(|command| match command {
-                LlmCommand::RepoSearch { path, regex } => {
-                    Some(RepoSearchRequest::new(path.clone(), regex.clone()))
-                }
+                LlmCommand::RepoSearch(command) => Some(RepoSearchRequest::new(
+                    command.path.as_str(),
+                    command.regex.as_str(),
+                )),
                 _ => None,
             })
             .collect();
@@ -719,11 +677,11 @@ struct RepoDirsHandler;
 
 impl ResearchCapabilityHandler for RepoDirsHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Research
+        LlmCapability::RepoDirs
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::RepoDirs)
+        matches!(command, LlmCommand::RepoDirs(_))
     }
 
     fn execute(
@@ -735,7 +693,7 @@ impl ResearchCapabilityHandler for RepoDirsHandler {
     ) {
         if !commands
             .iter()
-            .any(|command| matches!(command, LlmCommand::RepoDirs))
+            .any(|command| matches!(command, LlmCommand::RepoDirs(_)))
         {
             return;
         }
@@ -766,11 +724,11 @@ struct RepoMapRequestHandler;
 
 impl ResearchCapabilityHandler for RepoMapRequestHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Research
+        LlmCapability::RepoMap
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::RepoMap { .. })
+        matches!(command, LlmCommand::RepoMap(_))
     }
 
     fn execute(
@@ -783,10 +741,10 @@ impl ResearchCapabilityHandler for RepoMapRequestHandler {
         let max_requests = round.limits.max_repo_map_requests_per_round;
         let mut requested: Vec<String> = Vec::new();
         for command in commands {
-            let LlmCommand::RepoMap { path } = command else {
+            let LlmCommand::RepoMap(command) = command else {
                 continue;
             };
-            let target = path.trim().to_string();
+            let target = command.path.trim().to_string();
             if requested.contains(&target) {
                 continue;
             }
@@ -847,11 +805,11 @@ struct DirListHandler;
 
 impl ResearchCapabilityHandler for DirListHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Research
+        LlmCapability::DirList
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::DirList { .. })
+        matches!(command, LlmCommand::DirList(_))
     }
 
     fn execute(
@@ -864,12 +822,13 @@ impl ResearchCapabilityHandler for DirListHandler {
         let max_entries = round.limits.max_dir_list_entries;
         let mut requested: Vec<DirListRequest> = Vec::new();
         for command in commands {
-            let LlmCommand::DirList { path, recursive } = command else {
+            let LlmCommand::DirList(command) = command else {
                 continue;
             };
-            let Some(request) = DirListRequest::new(path.clone(), *recursive).normalized() else {
+            let request = DirListRequest::new(command.path.clone(), command.recursive);
+            let Some(request) = request.normalized() else {
                 tracing::warn!(
-                    path = path.as_str(),
+                    path = command.path.as_str(),
                     "invalid directory listing request ignored"
                 );
                 continue;
@@ -966,7 +925,7 @@ impl ResearchCapabilityHandler for DocRequestHandler {
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
-        matches!(command, LlmCommand::DocRequest { .. })
+        matches!(command, LlmCommand::DocRequest(_))
     }
 
     fn execute(
@@ -979,7 +938,7 @@ impl ResearchCapabilityHandler for DocRequestHandler {
         let topics: Vec<DocTopic> = commands
             .iter()
             .filter_map(|command| match command {
-                LlmCommand::DocRequest { topic } => Some(*topic),
+                LlmCommand::DocRequest(command) => Some(command.topic),
                 _ => None,
             })
             .collect();
@@ -1149,11 +1108,11 @@ pub async fn execute_research_commands(
     let needs_file_list = commands.iter().any(|command| {
         matches!(
             command,
-            LlmCommand::ContextRequest { .. }
-                | LlmCommand::RepoSearch { .. }
-                | LlmCommand::RepoDirs
-                | LlmCommand::RepoMap { .. }
-                | LlmCommand::DirList { .. }
+            LlmCommand::ContextRequest(_)
+                | LlmCommand::RepoSearch(_)
+                | LlmCommand::RepoDirs(_)
+                | LlmCommand::RepoMap(_)
+                | LlmCommand::DirList(_)
         )
     });
     let available_files = if needs_file_list {
@@ -1381,7 +1340,6 @@ mod tests {
     #[test]
     fn test_round_outcome_banner_summaries() {
         let mut outcome = ResearchRoundOutcome::default();
-        assert_eq!(outcome.fsm_banner_summary(), "0 file(s) added.");
         assert_eq!(outcome.architect_banner_summary(), "");
 
         outcome.added_files.push("a.rs".to_string());
@@ -1389,11 +1347,6 @@ mod tests {
         outcome.missing_files.push("c.rs".to_string());
         outcome.searches_executed.push(sample_search_result());
         outcome.doc_topics_loaded.push(DocTopic::Workflow);
-
-        assert_eq!(
-            outcome.fsm_banner_summary(),
-            "2 file(s) added, 1 search(es) executed, 1 doc topic(s) loaded."
-        );
         assert_eq!(
             outcome.architect_banner_summary(),
             "Added 2 file(s) to context: a.rs, b.rs; Executed 1 repository search(es); \
@@ -1423,21 +1376,21 @@ mod tests {
         let available = vec!["a.rs".to_string(), "b.rs".to_string()];
 
         let commands = vec![
-            LlmCommand::ContextRequest {
+            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
                 path: "a.rs".to_string(),
                 access: ContextAccess::ReadOnly,
-            },
-            LlmCommand::ContextRequest {
+            }),
+            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
                 path: "missing.rs".to_string(),
                 access: ContextAccess::ReadOnly,
-            },
-            LlmCommand::RepoSearch {
+            }),
+            LlmCommand::RepoSearch(tauqe_protocol::RepoSearchCommand {
                 path: String::new(),
                 regex: "pub fn".to_string(),
-            },
-            LlmCommand::DocRequest {
+            }),
+            LlmCommand::DocRequest(tauqe_protocol::DocRequestCommand {
                 topic: DocTopic::Workflow,
-            },
+            }),
         ];
 
         let outcome = execute_research_commands_sync(
@@ -1477,13 +1430,13 @@ mod tests {
         let available = vec!["big.rs".to_string()];
 
         let commands = vec![
-            LlmCommand::ContextRequest {
+            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
                 path: "big.rs".to_string(),
                 access: ContextAccess::ReadOnly,
-            },
-            LlmCommand::DocRequest {
+            }),
+            LlmCommand::DocRequest(tauqe_protocol::DocRequestCommand {
                 topic: DocTopic::Workflow,
-            },
+            }),
         ];
 
         let outcome = execute_research_commands_sync(
@@ -1515,10 +1468,12 @@ mod tests {
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
         let available = vec!["a.rs".to_string()];
-        let commands = vec![LlmCommand::ContextRequest {
-            path: "a.rs".to_string(),
-            access: ContextAccess::ReadOnly,
-        }];
+        let commands = vec![LlmCommand::ContextRequest(
+            tauqe_protocol::ContextRequestCommand {
+                path: "a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+        )];
 
         let outcome = execute_research_commands_sync(
             &mut cm,
@@ -1560,7 +1515,7 @@ mod tests {
             "src/nested/module.rs".to_string(),
         ];
 
-        let commands = vec![LlmCommand::RepoDirs];
+        let commands = vec![LlmCommand::RepoDirs(tauqe_protocol::RepoDirsCommand {})];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1574,10 +1529,6 @@ mod tests {
 
         assert_eq!(outcome.dir_trees_loaded, 1);
         assert!(outcome.has_progress(false));
-        assert_eq!(
-            outcome.fsm_banner_summary(),
-            "1 directory tree(s) rendered."
-        );
         let feedback = outcome.combined_feedback();
         assert!(feedback.contains("<repo_dirs_feedback>"));
         assert!(feedback.contains("src\n  nested"));
@@ -1595,10 +1546,10 @@ mod tests {
         ];
 
         // A shallow listing reports the direct children of the directory.
-        let commands = vec![LlmCommand::DirList {
+        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
             path: "src".to_string(),
             recursive: false,
-        }];
+        })];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1611,10 +1562,6 @@ mod tests {
         );
         assert_eq!(outcome.dir_lists_loaded, 1);
         assert!(outcome.has_progress(false));
-        assert_eq!(
-            outcome.fsm_banner_summary(),
-            "1 directory listing(s) rendered."
-        );
         let feedback = outcome.combined_feedback();
         assert!(feedback.contains("<dir_list_feedback path=\"src\" recursive=\"false\">"));
         assert!(feedback.contains("main.rs"));
@@ -1622,10 +1569,10 @@ mod tests {
         assert!(!feedback.contains("README.md"));
 
         // A recursive listing reports every tracked file underneath.
-        let commands = vec![LlmCommand::DirList {
+        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
             path: "src".to_string(),
             recursive: true,
-        }];
+        })];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1655,10 +1602,10 @@ mod tests {
             max_dir_list_entries: 2,
             ..default_limits()
         };
-        let commands = vec![LlmCommand::DirList {
+        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
             path: "src".to_string(),
             recursive: true,
-        }];
+        })];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1683,9 +1630,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
 
-        let commands = vec![LlmCommand::Text {
+        let commands = vec![LlmCommand::Text(tauqe_protocol::TextCommand {
             content: "no research work".to_string(),
-        }];
+        })];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1718,12 +1665,12 @@ mod tests {
 
         // The same target requested twice renders exactly one block.
         let commands = vec![
-            LlmCommand::RepoMap {
+            LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
                 path: "src".to_string(),
-            },
-            LlmCommand::RepoMap {
+            }),
+            LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
                 path: "src".to_string(),
-            },
+            }),
         ];
         let outcome = execute_research_commands_sync(
             &mut cm,
@@ -1738,7 +1685,6 @@ mod tests {
 
         assert_eq!(outcome.repo_maps_loaded, 1);
         assert!(outcome.has_progress(false));
-        assert_eq!(outcome.fsm_banner_summary(), "1 targeted map(s) rendered.");
 
         let feedback = outcome.combined_feedback();
         assert_eq!(
@@ -1759,9 +1705,9 @@ mod tests {
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let available = vec!["src/alpha.rs".to_string()];
 
-        let commands = vec![LlmCommand::RepoMap {
+        let commands = vec![LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
             path: "docs".to_string(),
-        }];
+        })];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1797,8 +1743,10 @@ mod tests {
         let mut cm = ContextManager::new(dir.path().to_path_buf());
 
         let commands: Vec<LlmCommand> = (0..5)
-            .map(|index| LlmCommand::RepoMap {
-                path: format!("module{index}"),
+            .map(|index| {
+                LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
+                    path: format!("module{index}"),
+                })
             })
             .collect();
 
@@ -1837,10 +1785,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing_root = dir.path().join("no-such-repository");
         let mut cm = ContextManager::new(dir.path().to_path_buf());
-        let commands = vec![LlmCommand::ContextRequest {
-            path: "a.rs".to_string(),
-            access: ContextAccess::ReadOnly,
-        }];
+        let commands = vec![LlmCommand::ContextRequest(
+            tauqe_protocol::ContextRequestCommand {
+                path: "a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+        )];
 
         let (buffer, _guard) = crate::blocking::log_capture::install();
         let outcome = execute_research_commands(

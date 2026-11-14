@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
-use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation, StructuredChangeProposal};
+use tauqe_protocol::{
+    EditCreate, EditDelete, EditFileOp, EditFileStatus, EditLineAnchor, EditMove, EditMoveDir,
+    EditOperation, EditOverwrite, EditReplace, StructuredChangeProposal,
+};
 
 use super::{
     hunk_event, normalize_hunk, resolve_path, EditStreamFilter, HunkCoordinates, OwnedAnchor,
@@ -336,12 +339,13 @@ impl JsonStreamFilter {
             self.has_emitted_edit_started = true;
         }
 
+        let op = change.parsed_op().unwrap_or(EditFileOp::Replace);
         let operation = match change.to_edit_operation() {
             Ok(operation) => operation,
             Err(message) => {
-                let is_create = change.op == EditFileOp::Create;
+                let is_create = op == EditFileOp::Create;
                 let resolved = resolve_path(&change.path, &self.editable_paths, is_create);
-                self.open_file(&resolved, change.op, events);
+                self.open_file(&resolved, op, events);
                 let hunks_count = self.next_hunk_index(&resolved);
                 self.fail_open_file(resolved, message, hunks_count, events);
                 return;
@@ -349,7 +353,7 @@ impl JsonStreamFilter {
         };
 
         match operation {
-            EditOperation::Create { path, content } => {
+            EditOperation::Create(EditCreate { path, content }) => {
                 let resolved = resolve_path(&path, &self.editable_paths, true);
                 self.open_file(&resolved, EditFileOp::Create, events);
                 let hunk_index = self.next_hunk_index(&resolved);
@@ -366,7 +370,7 @@ impl JsonStreamFilter {
                 self.staging.overwrite(&resolved, content);
                 self.file_hunk_counts.insert(resolved, hunk_index + 1);
             }
-            EditOperation::Overwrite { path, content } => {
+            EditOperation::Overwrite(EditOverwrite { path, content }) => {
                 let resolved = resolve_path(&path, &self.editable_paths, false);
                 self.open_file(&resolved, EditFileOp::Overwrite, events);
                 let hunk_index = self.next_hunk_index(&resolved);
@@ -389,13 +393,13 @@ impl JsonStreamFilter {
                     Err(message) => self.fail_open_file(resolved, message, hunk_index, events),
                 }
             }
-            EditOperation::Delete { path } => {
+            EditOperation::Delete(EditDelete { path }) => {
                 let resolved = resolve_path(&path, &self.editable_paths, false);
                 self.open_file(&resolved, EditFileOp::Delete, events);
                 // No hunk content; the pending EditFileDone reports zero hunks.
                 self.file_hunk_counts.entry(resolved).or_insert(0);
             }
-            EditOperation::Move { from, to } => {
+            EditOperation::Move(EditMove { from, to }) => {
                 let resolved_from = resolve_path(&from, &self.editable_paths, false);
                 let resolved_to = resolve_path(&to, &self.editable_paths, true);
                 self.open_file(&resolved_from, EditFileOp::Move, events);
@@ -403,7 +407,7 @@ impl JsonStreamFilter {
                 self.open_file_display = format!("{} -> {}", resolved_from, resolved_to);
                 self.file_hunk_counts.entry(resolved_from).or_insert(0);
             }
-            EditOperation::MoveDir { from, to } => {
+            EditOperation::MoveDir(EditMoveDir { from, to }) => {
                 let resolved_from = resolve_path(&from, &self.editable_paths, false);
                 let resolved_to = resolve_path(&to, &self.editable_paths, true);
                 self.open_file(&resolved_from, EditFileOp::MoveDir, events);
@@ -414,11 +418,11 @@ impl JsonStreamFilter {
                 self.open_file_display = format!("{} -> {}", resolved_from, resolved_to);
                 self.file_hunk_counts.entry(resolved_from).or_insert(0);
             }
-            EditOperation::Replace {
+            EditOperation::Replace(EditReplace {
                 path,
                 old_text,
                 new_text,
-            } => {
+            }) => {
                 let resolved = resolve_path(&path, &self.editable_paths, false);
                 self.open_file(&resolved, EditFileOp::Replace, events);
                 let hunk_index = self.next_hunk_index(&resolved);
@@ -438,12 +442,12 @@ impl JsonStreamFilter {
                     Err(message) => self.fail_open_file(resolved, message, hunk_index + 1, events),
                 }
             }
-            EditOperation::LineAnchor {
+            EditOperation::LineAnchor(EditLineAnchor {
                 path,
                 start,
                 end,
                 content,
-            } => {
+            }) => {
                 let resolved = resolve_path(&path, &self.editable_paths, false);
                 self.open_file(&resolved, EditFileOp::Replace, events);
                 let hunk_index = self.next_hunk_index(&resolved);
@@ -1732,5 +1736,148 @@ mod tests {
                 "split {split}: the diagnostic must name the payload defect: {error}"
             );
         }
+    }
+    #[test]
+    fn test_nested_branch_changes_stream_the_hunk_events() {
+        let path = "a.rs";
+        let root = scratch_dir("json-nested-changes");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root).with_staged_contents(
+            HashMap::from([(path.to_string(), "alpha\nbeta\n".to_string())]),
+        );
+        // The change set and the conversational text both live inside the
+        // operational branch, so the filter must resolve them at the depth the
+        // envelope gives them instead of only at the root of the payload.
+        let input = serde_json::json!({
+            "action": {
+                "kind": "edit",
+                "changes": [{
+                    "op": "replace",
+                    "path": path,
+                    "old_text": "beta\n",
+                    "new_text": "BETA\n",
+                }],
+                "message": "Nested edit",
+            },
+        })
+        .to_string();
+
+        let mut events = Vec::new();
+        for c in input.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Nested edit");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::EditHunk {
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 1,
+                    ..
+                }
+            )),
+            "the nested change must stream its coordinates: {events:?}"
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+    }
+
+    #[test]
+    fn test_error_message_never_becomes_the_response_channel() {
+        let path = "a.rs";
+        let root = scratch_dir("json-error-message-channel");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root);
+        // The error channel is its own property: a failing edit round reports
+        // `error_message`, and the filter must never stream it as the answer.
+        let input = serde_json::json!({
+            "action": {
+                "kind": "edit",
+                "changes": [],
+                "commit_message": "",
+                "error_message": "Missing dependency",
+                "reason": ""
+            },
+        })
+        .to_string();
+
+        let mut events = Vec::new();
+        for c in input.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.is_empty(),
+            "the error channel must never reach the answer stream: {text}"
+        );
+    }
+
+    #[test]
+    fn test_the_single_branch_message_is_streamed_once() {
+        let path = "a.rs";
+        let root = scratch_dir("json-nested-single-message");
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], root);
+        // The created content spells the field name, and the only real `message`
+        // key sits inside the branch: the stream must carry the branch text once
+        // and never the content of the change set.
+        let input = serde_json::json!({
+            "action": {
+                "kind": "edit",
+                "changes": [{
+                    "op": "create",
+                    "path": path,
+                    "content": "let message = \"message\";\n",
+                }],
+                "message": "Created the module",
+            },
+        })
+        .to_string();
+
+        let mut events = Vec::new();
+        for c in input.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Created the module");
+        assert!(!text.contains("let message"), "{text}");
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
     }
 }

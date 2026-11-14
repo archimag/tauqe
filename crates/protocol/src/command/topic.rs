@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// missing, or explicitly `null` topic resolves to the full documentation set
 /// instead of failing, while a value of any other shape keeps reporting the
 /// precise type error it produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DocTopic {
     /// Project introduction and philosophy.
@@ -168,7 +168,7 @@ impl<'de> Deserialize<'de> for DocTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::LlmCommand;
+    use crate::command::{DocRequestCommand, LlmCommand};
 
     #[test]
     fn test_doc_topic_serde_aliases_default_and_parsing() {
@@ -210,9 +210,9 @@ mod tests {
         let command: LlmCommand = serde_json::from_str(raw).unwrap();
         assert_eq!(
             command,
-            LlmCommand::DocRequest {
+            LlmCommand::DocRequest(DocRequestCommand {
                 topic: DocTopic::All
-            }
+            })
         );
     }
     #[test]
@@ -221,9 +221,9 @@ mod tests {
         let command: LlmCommand = serde_json::from_str(r#"{"type":"doc_request"}"#).unwrap();
         assert_eq!(
             command,
-            LlmCommand::DocRequest {
+            LlmCommand::DocRequest(DocRequestCommand {
                 topic: DocTopic::All
-            }
+            })
         );
     }
 
@@ -238,9 +238,9 @@ mod tests {
                 .expect("a null topic must decode instead of rejecting the command");
             assert_eq!(
                 command,
-                LlmCommand::DocRequest {
+                LlmCommand::DocRequest(DocRequestCommand {
                     topic: DocTopic::All
-                },
+                }),
                 "{spelling}"
             );
         }

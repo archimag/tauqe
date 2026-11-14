@@ -29,10 +29,10 @@ use crate::usage::UsageGuard;
 use async_trait::async_trait;
 use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::context::ContextManager;
-use tauqe_core::providers::{LlmProvider, StreamEvent};
-use tauqe_core::workflow::fsm::structured::{
+use tauqe_core::control::refine::{
     run_structured_refine, ProviderResolver, StructuredRefineConfig, StructuredRefineOutcome,
 };
+use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::{
     events, ArchitectTier, ModelConnectionRetryingEvent, ModelDeltaEvent, ModelErrorEvent,
@@ -444,8 +444,8 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use tauqe_core::control::refine::StructuredRefineStatus;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_core::workflow::fsm::structured::StructuredRefineStatus;
     use tauqe_protocol::{
         ContextAccess, ModelRef, ModelRole, ModelUsageInfo, ReasoningEffort, TurnPhase,
     };

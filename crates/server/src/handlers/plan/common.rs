@@ -12,7 +12,7 @@ use crate::state::AppState;
 /// Event emission and transient-context cleanup are shared with every other
 /// handler subsystem, so they are re-exported here instead of being duplicated
 /// per subsystem.
-pub(super) use crate::handlers::common::{cleanup_transient_context, emit};
+pub(super) use crate::handlers::common::emit;
 
 /// Runs a blocking plan-storage operation on the Tokio blocking pool.
 ///

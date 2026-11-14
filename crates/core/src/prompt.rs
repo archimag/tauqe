@@ -2,12 +2,11 @@ pub mod json;
 pub mod layout;
 pub mod protocol;
 pub mod refine;
-pub mod xml;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::capabilities::{CapabilityRegistry, ContractContext, PromptRenderContext};
+use crate::capabilities::{compose_contract_rules, ContractContext, PromptRenderContext};
 use crate::context::ContextFileContent;
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
@@ -16,9 +15,94 @@ use crate::prompt::layout::layout_for;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
 use tauqe_protocol::{
-    CapabilitySet, ContextAccess, EditProtocolKind, ModelRole, PatchStrategy, Plan,
-    PromptLayoutKind, RepositoryState, TurnIntent,
+    CapabilityExpr, ContextAccess, EditProtocolKind, ModelRole, PatchStrategy, Plan,
+    PromptLayoutKind, RepositoryState,
 };
+
+/// Typed kind of the contour that drives a turn.
+///
+/// The contour is declared by the loop that owns the turn rather than inferred from
+/// the capability surface: a dialogue, an isolated step, and an Architect synthesis
+/// share leaves but never share the rules of their regime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContourKind {
+    /// An interactive dialogue: the REPL, a plan discussion, or a review discussion.
+    #[default]
+    Dialogue,
+    /// One isolated plan or review step executed inside the working tree.
+    Step,
+    /// An Architect horizon synthesis that projects a plan instead of patching code.
+    Architect,
+}
+
+/// Introductory brief of a turn: the contour that drives it and the text it opens with.
+///
+/// The brief belongs to the loop that drives the turn, so the assembly renders the
+/// introduction of the contour instead of selecting one by a flag, and the rules of the
+/// regime follow the same typed value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnBrief {
+    /// Contour that drives the turn and gates the rules of its regime.
+    pub contour: ContourKind,
+    /// Opening text the turn renders ahead of the Core System Contract.
+    pub intro: String,
+}
+
+impl TurnBrief {
+    /// Builds the brief of an interactive dialogue.
+    pub fn dialogue() -> Self {
+        Self {
+            contour: ContourKind::Dialogue,
+            intro: DIALOGUE_INTRO.to_string(),
+        }
+    }
+
+    /// Builds the brief of one isolated step.
+    pub fn step() -> Self {
+        Self {
+            contour: ContourKind::Step,
+            intro: STEP_INTRO.to_string(),
+        }
+    }
+
+    /// Builds the brief of an Architect horizon synthesis.
+    ///
+    /// A synthesis reasons about the project rather than about the working tree, so it
+    /// opens with the introduction of its own planning role.
+    pub fn architect() -> Self {
+        Self {
+            contour: ContourKind::Architect,
+            intro: ARCHITECT_INTRO.to_string(),
+        }
+    }
+}
+
+impl Default for TurnBrief {
+    fn default() -> Self {
+        Self::dialogue()
+    }
+}
+
+/// Opening text of an interactive dialogue.
+const DIALOGUE_INTRO: &str = concat!(
+    "You are Tauqe AI, a proactive engineering assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n",
+    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role in this dialogue is to act on direct requests, answer open questions in writing, and keep the developer in control of the objective.\n",
+    "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
+);
+
+/// Opening text of one isolated step.
+const STEP_INTRO: &str = concat!(
+    "You are Tauqe Coder, the execution engine of one isolated plan step inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n",
+    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role is to implement the assigned step exactly as designed, without re-architecting it, and to close with a concise summary of what changed and why.\n",
+    "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
+);
+
+/// Opening text of an Architect horizon synthesis.
+const ARCHITECT_INTRO: &str = concat!(
+    "You are Tauqe Architect, the planning role inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n",
+    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role is to synthesize the concept tree and the architectural invariants that the implementation steps must satisfy.\n",
+    "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
+);
 
 /// Default model role used for squash commit message synthesis.
 pub const SQUASH_COMMIT_ROLE: ModelRole = ModelRole::Scribe;
@@ -378,10 +462,13 @@ pub struct PromptAssembly {
     /// Rendered only when the eager global symbol map is disabled, so the model
     /// still learns where subsystems live without a full outline pass.
     pub repo_dirs: Option<String>,
-    pub target_language: Option<String>,
     pub active_plan: Option<Plan>,
-    /// Declared intent of this turn, which decides the advertised capability set.
-    pub intent: TurnIntent,
+    /// Introductory brief of the turn, owned by the loop that drives it.
+    ///
+    /// The brief carries both the text the turn opens with and the typed contour that
+    /// gates the rules of its regime, so the assembly never infers either from the
+    /// capability surface.
+    pub turn_brief: Option<TurnBrief>,
     pub turn_scratchpad: Option<String>,
     /// Maximum characters of a turn scratchpad block kept before truncation.
     ///
@@ -429,9 +516,8 @@ impl PromptAssembly {
             history,
             repo_map,
             repo_dirs: None,
-            target_language: None,
             active_plan: None,
-            intent: TurnIntent::InteractiveRepl,
+            turn_brief: None,
             turn_scratchpad: None,
             max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             patch_strategy: PatchStrategy::default(),
@@ -465,9 +551,9 @@ impl PromptAssembly {
         self
     }
 
-    /// Declares the intent that decides which capabilities this turn advertises.
-    pub fn with_intent(mut self, intent: TurnIntent) -> Self {
-        self.intent = intent;
+    /// Declares the introductory brief the turn renders.
+    pub fn with_turn_brief(mut self, turn_brief: TurnBrief) -> Self {
+        self.turn_brief = Some(turn_brief);
         self
     }
 
@@ -483,24 +569,23 @@ impl PromptAssembly {
     }
 
     pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
-        let capabilities = self.effective_capabilities(protocol);
-        let effective_protocol = protocol.with_capability_set(capabilities.clone());
+        let capabilities = self.effective_capability_expr(protocol);
+        let effective_protocol = protocol.with_capability_expr(capabilities.clone());
         let mut prompt = String::new();
-        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n");
-        prompt.push_str("TAUQE is the environment you operate within. Whenever the developer mentions TAUQE, they refer to this same control environment—its harness, workflows, context model, plans, and Git transactions—not to an external tool or framework.\n");
-        prompt.push_str("Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n");
+        // The introduction belongs to the contour that drives the turn: the loop
+        // hands its brief to the assembly, so no flag selects the opening text.
+        let turn_brief = self.turn_brief.clone().unwrap_or_default();
+        prompt.push_str(&turn_brief.intro);
         let has_eager_repo_map = self.has_eager_repo_map();
-        let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker())
+        let render_ctx = PromptRenderContext::new(&[], None)
             .with_eager_repo_map(has_eager_repo_map)
             .with_project(self.project.as_ref())
             .with_patch_strategy(self.patch_strategy);
-        let contract_ctx = ContractContext::new(self.intent, protocol.kind(), render_ctx)
-            .with_target_language(self.target_language.as_deref())
-            .with_prompt_layout(self.prompt_layout);
+        let contract_ctx = ContractContext::new(render_ctx)
+            .with_prompt_layout(self.prompt_layout)
+            .with_contour(turn_brief.contour);
         prompt.push_str("## Core System Contract\n");
-        prompt.push_str(
-            &CapabilityRegistry::global().compose_core_contract_rules(&capabilities, &contract_ctx),
-        );
+        prompt.push_str(&compose_contract_rules(&capabilities, &contract_ctx));
         prompt.push('\n');
 
         // The capability set narrowed by the declared `TurnIntent` decides which
@@ -519,28 +604,17 @@ impl PromptAssembly {
             self.patch_strategy,
         ));
 
-        prompt.push_str("## Project Metadata\n");
-        if let Some(repo) = &self.repo_state {
-            prompt.push_str(&format!("- Root: {}\n", repo.root));
-            prompt.push_str(&format!("- Branch: {}\n", repo.branch));
-            prompt.push_str(&format!("- HEAD: {}\n", repo.head));
-            let dirty_str = if repo.dirty {
-                "dirty (uncommitted changes present)"
-            } else {
-                "clean"
-            };
-            prompt.push_str(&format!("- Status: {}\n", dirty_str));
-        }
-        prompt.push_str(&format!("- Workflow: {}\n", self.workflow));
-        prompt.push_str(&format!("- Edit Protocol: {}\n\n", self.edit_protocol));
+        // The head carries no repository metadata: the working-tree state reaches
+        // the model through the context block and through the Git transactions the
+        // harness performs, so no host path, branch, or revision is rendered here.
 
-        // The catalog of the declared external documentation travels in the
-        // byte-stable head beside the project metadata it belongs to: the
-        // declaration changes between turns, never between the rounds of one
-        // turn. It is gated by the capability that can act on it, so a narrowed
-        // surface never lists a document it cannot request.
+        // The catalog of the declared external documentation closes the
+        // byte-stable head: the declaration changes between turns, never between
+        // the rounds of one turn. It is gated by the capability that can act on
+        // it, so a narrowed surface never lists a document it cannot request.
         if capabilities.contains(tauqe_protocol::LlmCapability::OuterDocRequest) {
             if let Some(catalog) = self.format_outer_docs_catalog_block() {
+                prompt.push('\n');
                 prompt.push_str(&catalog);
             }
         }
@@ -548,72 +622,25 @@ impl PromptAssembly {
         prompt
     }
 
-    /// Renders the contour delta of the declared regime as the leading block of
-    /// the trailing user message.
+    /// Returns the capability tree this turn both advertises and accepts.
     ///
-    /// The system prompt head carries only the invariants every dialogue shares,
-    /// so whatever the declared regime alone authorizes is rendered here instead:
-    /// the delta rules of its profile list, followed by the delta protocol
-    /// instructions of its contour. The block numbers its own rules densely from
-    /// one and carries no runtime-varying content, so an unchanged regime renders
-    /// identical bytes from one round of a turn to the next.
-    ///
-    /// An empty delta renders no block at all, so a regime that adds nothing to
-    /// the shared head never widens the trailing message with an empty heading.
-    pub fn format_regime_delta_section(&self, protocol: &dyn PromptProtocol) -> Option<String> {
-        let capabilities = self.effective_capabilities(protocol);
-        let effective_protocol = protocol.with_capability_set(capabilities.clone());
-        let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker())
-            .with_eager_repo_map(self.has_eager_repo_map())
-            .with_project(self.project.as_ref())
-            .with_patch_strategy(self.patch_strategy);
-        let contract_ctx = ContractContext::new(self.intent, protocol.kind(), render_ctx)
-            .with_target_language(self.target_language.as_deref())
-            .with_prompt_layout(self.prompt_layout);
-        let registry = CapabilityRegistry::global();
-        let rules = registry.compose_delta_contract_rules(&capabilities, &contract_ctx);
-        let instructions = if protocol.kind() == EditProtocolKind::Xml {
-            registry.compose_delta_xml_instructions(
-                &capabilities,
-                &contract_ctx.render,
-                self.intent,
-            )
-        } else {
-            registry.compose_delta_structured_protocol_instructions(
-                &capabilities,
-                &contract_ctx.render,
-                self.intent,
-            )
-        };
-        let instructions = instructions.trim_end();
-        if rules.trim().is_empty() && instructions.is_empty() {
-            return None;
-        }
-        let mut section = String::from("## Regime Delta\n");
-        section.push_str(&rules);
-        if !instructions.is_empty() {
-            section.push_str(instructions);
-            section.push('\n');
-        }
-        section.push('\n');
-        Some(section)
-    }
-
-    /// Computes the capability set this turn both advertises and accepts.
-    ///
-    /// The protocol's own set is narrowed by the declared turn intent, so the
-    /// rendered instructions, the structured response schema, the stream filter,
-    /// and the decoder all observe one surface: a capability can neither be
-    /// advertised without being decodable nor accepted without being advertised.
-    pub(crate) fn effective_capabilities(&self, protocol: &dyn PromptProtocol) -> CapabilitySet {
-        self.intent.narrow_capabilities(&protocol.capability_set())
+    /// The tree belongs to the contour that started the turn: the control loop
+    /// hands its declared surface to the protocol, so the rendered instructions,
+    /// the structured response schema, the stream filter, and the decoder all
+    /// observe that one surface. The assembly therefore projects the protocol and
+    /// never narrows it against a second declaration.
+    pub(crate) fn effective_capability_expr(
+        &self,
+        protocol: &dyn PromptProtocol,
+    ) -> CapabilityExpr {
+        protocol.capability_expr()
     }
     /// Resolves the access a layout renders for `file`.
     ///
     /// Every dialogue renders the access layer the file resolves to, and both
     /// layouts read this single predicate, so an element can never disagree with
-    /// the layer behind it. No turn intent relabels the layers: a plan discussion
-    /// is a dialogue like any other and renders exactly what the REPL renders,
+    /// the layer behind it. No contour relabels the layers: a plan discussion is
+    /// a dialogue like any other and renders exactly what the REPL renders,
     /// because the developer may request a concrete change there. A file the plan
     /// loaded as editable therefore stays editable instead of being flattened into
     /// a read-only view.
@@ -718,27 +745,23 @@ impl PromptAssembly {
         self.format_repo_dirs_block()
             .map(|dirs| format!("## Repository Directories\n{dirs}\n\n"))
     }
-
-    /// Renders the language directive section of a prompt.
+    /// Whether the brief the loop declared drives this turn as an isolated step.
     ///
-    /// The directive pins the natural language of every user-facing answer and
-    /// keeps the reasoning in English. It is a stable block: the language of a
-    /// dialogue changes between turns, not between the rounds of one turn.
-    pub(crate) fn format_language_directive_block(&self) -> Option<String> {
-        self.target_language.as_ref().map(|target| {
-            format!(
-                "## Language Directive\n- Target Response Language: {} (all conversational explanations, answers, messages, and plan items/titles/details MUST be in {})\n- Reasoning / Thoughts: Strictly in English.\n\n",
-                target, target
-            )
-        })
+    /// The predicate reads the typed contour of the [`TurnBrief`] and nothing else:
+    /// the regime of a turn is declared by the loop that owns it, so no caller
+    /// infers one from the shape of the capability surface.
+    pub(crate) fn is_step_contour(&self) -> bool {
+        self.turn_brief
+            .as_ref()
+            .is_some_and(|brief| brief.contour == ContourKind::Step)
     }
 
     /// Renders the active plan section of a prompt, if the turn may read it.
     ///
-    /// An isolated step receives its own instructions and the scope of a single
+    /// A step contour receives its own instructions and the scope of a single
     /// plan item, so the whole active plan is deliberately withheld from it.
     pub(crate) fn format_active_plan_block(&self) -> Option<String> {
-        if self.intent.is_isolated_step() {
+        if self.is_step_contour() {
             return None;
         }
         let plan = self.active_plan.as_ref()?;
@@ -780,13 +803,18 @@ impl PromptAssembly {
 
     /// Renders the compact catalog of the external documentation a project declares.
     ///
-    /// The catalog publishes what a request may name — the mount point, the title,
-    /// and the optional description of one entry — and nothing about where the
-    /// material comes from: an address, a host path, and a cache path stay harness
-    /// details. Entries keep their declaration order, and one that cannot be
-    /// resolved contributes no line, so an unusable declaration is reported by
-    /// configuration validation instead of a line nobody can request. A declaration
-    /// that resolves to nothing renders no block at all.
+    /// The heading states how a declared document is invoked — one request through
+    /// the `outer_doc_requests` field names a declared identifier, and that
+    /// identifier is a prefix: `id` addresses the root document exactly as its
+    /// original text, and `id/relative.md` addresses a document below the
+    /// directory that holds the root and never climbs above it. The list itself
+    /// publishes what a request may name — the title and the optional description
+    /// of one entry — and nothing about where the material comes from: an address,
+    /// a host path, and a cache path stay harness details. Entries keep their
+    /// declaration order, and one that cannot be resolved contributes no line, so
+    /// an unusable declaration is reported by configuration validation instead of
+    /// a line nobody can request. A declaration that resolves to nothing renders
+    /// no block at all.
     pub(crate) fn format_outer_docs_catalog_block(&self) -> Option<String> {
         let mut catalog = String::new();
         for entry in &self.outer_docs {
@@ -802,7 +830,9 @@ impl PromptAssembly {
         if catalog.is_empty() {
             return None;
         }
-        Some(format!("## External Documentation Catalog\n{catalog}\n"))
+        Some(format!(
+            "## External Documentation Catalog\nRequest a declared document by its identifier through the `outer_doc_requests` field: `id` addresses the root document exactly as its original text, and `id/relative.md` addresses a document below the directory that holds the root, and never climbs above it.\n{catalog}\n"
+        ))
     }
 
     pub fn format_scratchpad_block(&self) -> Option<String> {
@@ -857,8 +887,19 @@ impl PromptAssembly {
 mod tests {
     use super::*;
     use crate::history::HistoryEntry;
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::prompt::json::JsonPromptProtocol;
 
+    /// Structured protocol carrying the shared dialogue surface.
+    fn dialogue_protocol() -> Box<dyn PromptProtocol> {
+        JsonPromptProtocol::edits()
+            .with_capability_expr(crate::control::repl::repl_capability_expr(None))
+    }
+
+    /// Structured protocol carrying the capability surface of one isolated step.
+    fn step_protocol() -> Box<dyn PromptProtocol> {
+        JsonPromptProtocol::edits()
+            .with_capability_expr(crate::control::turn::turn_capability_expr())
+    }
     /// Lifts the operational branch envelope of a composed schema into one surface.
     ///
     /// The wire keeps the operational branches mutually exclusive, so a field of
@@ -945,19 +986,21 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_assembly_with_target_language() {
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        assembly.target_language = Some("Russian".to_string());
-        let proto = XmlPromptProtocol;
+    fn test_prompt_assembly_carries_static_language_and_reasoning_rules() {
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        let proto = JsonPromptProtocol::default();
         let messages = assembly.assemble_chat_messages("Привет", &proto);
-        assert!(messages[0].content.contains("## Language Directive"));
-        assert!(messages[0]
-            .content
-            .contains("Target Response Language: Russian"));
-        assert!(messages[0]
-            .content
-            .contains("Reasoning / Thoughts: Strictly in English."));
+        assert!(!messages[0].content.contains("## Language Directive"));
+        assert!(messages[0].content.contains("Response Language"));
+        assert!(messages[0].content.contains("Reasoning in English"));
     }
 
     #[test]
@@ -980,11 +1023,11 @@ mod tests {
             1,
             files,
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             history,
             repo_map,
         );
-        let proto = XmlPromptProtocol;
+        let proto = JsonPromptProtocol::default();
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
         assert_eq!(messages.len(), 2);
@@ -1000,14 +1043,11 @@ mod tests {
         assert!(messages[0]
             .content
             .contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
-        // The regime delta opens the developer message while the task closes
-        // it, so every byte of the stable head survives the change.
-        let delta = assembly
-            .format_regime_delta_section(&proto)
-            .expect("the interactive regime states a delta");
+        // The regime rules travel beside the shared ones in the byte-stable
+        // head, so the developer message carries the task alone.
+        assert!(messages[0].content.contains("Action Authorization"));
         assert_eq!(messages[1].role, "user");
-        assert!(messages[1].content.starts_with(&delta));
-        assert!(messages[1].content.ends_with("Explain this code"));
+        assert_eq!(messages[1].content, "Explain this code");
     }
 
     #[test]
@@ -1026,10 +1066,16 @@ mod tests {
                 insertion_seq: 0,
             },
         ];
-        let mut assembly =
-            PromptAssembly::new(None, 1, files, "git", EditProtocolKind::Xml, None, None);
-        assembly.intent = TurnIntent::PlanDiscussion;
-        let proto = XmlPromptProtocol;
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            files,
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        let proto = JsonPromptProtocol::default();
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
 
@@ -1038,13 +1084,9 @@ mod tests {
         // the very same Action Authorization rule the REPL states.
         assert!(!sys.contains("Discussion Mode Scope"));
         assert!(!sys.contains("architectural discussion"));
-        // The authorization rule is regime-specific, so it travels in the
-        // contour delta instead of the byte-stable head.
-        assert!(!sys.contains("Action Authorization"));
-        let delta = assembly
-            .format_regime_delta_section(&proto)
-            .expect("a dialogue regime states a delta");
-        assert!(delta.contains("Action Authorization"));
+        // The authorization rule is regime-specific, and the unified
+        // composition states it in the same head as the shared rules.
+        assert!(sys.contains("Action Authorization"));
         assert!(sys.contains("<context>"));
         // A plan discussion is a dialogue like any other: every element carries
         // the layer the file actually resolves to, so an editable file stays
@@ -1062,16 +1104,14 @@ mod tests {
         // The answer obligation is owned by the enabled capability modules: a
         // discussion that gathered its material answers in prose instead of
         // closing the turn silently.
-        assert!(sys.contains("Never close a turn silently"));
-
-        // The XML protocol renders its own discovery, plan, and language surface
-        // for a discussion turn narrowed to the discussion capability profile.
-        assert!(sys.contains("<context_request"));
-        assert!(sys.contains("<plan action"));
-        assert!(sys.contains("<user_language>"));
-        // The code-modification channel travels with the discussion, so the XML
-        // contour advertises its edit container as well.
-        assert!(sys.contains("<file_edits"));
+        // The response structure belongs to the schema alone: the contract
+        // states the answer obligation and the prompt names no response field
+        // as a reference.
+        assert!(sys.contains("never closed by silence"));
+        assert!(!sys.contains("- `message`:"));
+        assert!(!sys.contains("- `context_requests`:"));
+        assert!(sys.contains("plan_update"));
+        assert!(sys.contains("context_requests"));
 
         // The assembly contributes no wire-format knowledge of its own.
         assert!(!sys.contains("Mode: Structured Discussion"));
@@ -1085,7 +1125,9 @@ mod tests {
     #[test]
     fn test_discussion_renders_stub_protocol_instructions_without_json_schema() {
         use crate::prompt::protocol::PromptProtocol;
-        use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand, PatchStrategy};
+        use tauqe_protocol::{
+            CapabilityExpr, LlmCapability, LlmCommand, PatchStrategy, TextCommand,
+        };
 
         /// Protocol stub whose only mode text is its own heading.
         struct StubWireProtocol;
@@ -1099,14 +1141,14 @@ mod tests {
                 EditProtocolKind::Structured
             }
 
-            fn capabilities(&self) -> &[LlmCapability] {
-                &[LlmCapability::TextMessage, LlmCapability::UserLanguage]
+            fn capability_expr(&self) -> CapabilityExpr {
+                CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)])
             }
 
             fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
-                vec![LlmCommand::Text {
+                vec![LlmCommand::Text(TextCommand {
                     content: raw_text.to_string(),
-                }]
+                })]
             }
 
             fn system_instructions(
@@ -1118,7 +1160,7 @@ mod tests {
                 "## Mode: Stub Wire\nAnswer in the stub wire format.\n".to_string()
             }
 
-            fn with_capability_set(&self, _capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
+            fn with_capability_expr(&self, _expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
                 Box::new(StubWireProtocol)
             }
 
@@ -1129,15 +1171,21 @@ mod tests {
                 staged_contents: std::collections::HashMap<String, String>,
             ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
                 Box::new(
-                    crate::edits::stream::XmlStreamFilter::new(editable_paths, repo_root)
+                    crate::edits::stream::JsonStreamFilter::new(editable_paths, repo_root)
                         .with_staged_contents(staged_contents),
                 )
             }
         }
 
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        assembly.intent = TurnIntent::PlanDiscussion;
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         let prompt = assembly.build_system_prompt(&StubWireProtocol);
 
         assert!(prompt.contains("## Mode: Stub Wire"));
@@ -1152,12 +1200,15 @@ mod tests {
 
     #[test]
     fn test_discussion_instructions_compose_the_edit_surface_once() {
-        let assembly = {
-            let mut assembly =
-                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-            assembly.intent = TurnIntent::PlanDiscussion;
-            assembly
-        };
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         // A plan discussion carries the whole dialogue surface, so the structured
         // transport derives the edit mode and composes the registry schema, where
         // the plan payload is already declared. The conversation-specific mode
@@ -1189,7 +1240,7 @@ mod tests {
             7,
             vec![file("src/a.rs", ContextAccess::ReadOnly)],
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
             None,
         );
@@ -1265,9 +1316,16 @@ mod tests {
             ]
         };
 
-        let anchored =
-            PromptAssembly::new(None, 1, files(), "git", EditProtocolKind::Xml, None, None)
-                .with_patch_strategy(PatchStrategy::LineAnchor);
+        let anchored = PromptAssembly::new(
+            None,
+            1,
+            files(),
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        )
+        .with_patch_strategy(PatchStrategy::LineAnchor);
         let block = anchored.format_context_block().unwrap();
 
         // Both access layers carry anchors, so a read-only file is addressable
@@ -1284,8 +1342,16 @@ mod tests {
         assert!(!block.contains(&format!("{} | beta\n\n", encode_anchor("src/a.rs", 1))));
 
         // The search/replace strategy keeps the raw lines untouched.
-        let plain = PromptAssembly::new(None, 1, files(), "git", EditProtocolKind::Xml, None, None)
-            .with_patch_strategy(PatchStrategy::SearchReplace);
+        let plain = PromptAssembly::new(
+            None,
+            1,
+            files(),
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        )
+        .with_patch_strategy(PatchStrategy::SearchReplace);
         let raw = plain.format_context_block().unwrap();
         assert!(raw.contains("\nalpha\nbeta\n"));
         assert!(!raw.contains(&format!("{} | ", encode_anchor("src/a.rs", 0))));
@@ -1313,7 +1379,7 @@ mod tests {
                 },
             ],
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
             None,
         )
@@ -1363,7 +1429,7 @@ mod tests {
                     insertion_seq: 0,
                 }],
                 "git",
-                EditProtocolKind::Xml,
+                EditProtocolKind::Structured,
                 None,
                 None,
             )
@@ -1394,7 +1460,7 @@ mod tests {
             1,
             files,
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             Some(std::sync::Arc::new(HistorySnapshot::new(vec![
                 HistoryEntry::Summary {
                     id: Some(1),
@@ -1418,7 +1484,8 @@ mod tests {
             }],
         ));
 
-        let messages = assembly.assemble_chat_messages("Do work", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = assembly.assemble_chat_messages("Do work", &proto);
         let sys = &messages[0].content;
 
         let repo_map = sys.find("## Repository Map").expect("repo map block");
@@ -1439,17 +1506,23 @@ mod tests {
         assert!(plan < history);
         assert!(history < scratchpad);
         assert!(sys.trim_end().ends_with("</scratchpad>"));
-        let delta = assembly
-            .format_regime_delta_section(&XmlPromptProtocol)
-            .expect("the interactive regime states a delta");
-        assert!(messages[1].content.starts_with(&delta));
-        assert!(messages[1].content.ends_with("Do work"));
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "Do work");
     }
 
     #[test]
     fn test_repository_outline_is_map_or_directories_never_both() {
-        let base =
-            || PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let base = || {
+            PromptAssembly::new(
+                None,
+                1,
+                vec![],
+                "git",
+                EditProtocolKind::Structured,
+                None,
+                None,
+            )
+        };
 
         // The rendered outline block, as opposed to the bare `<repo_dirs>` tag
         // name that the protocol instructions advertise in every turn.
@@ -1460,7 +1533,8 @@ mod tests {
         let mut with_map = base().with_repo_dirs(Some("crate\n  src".to_string()));
         with_map.repo_map = Some("crate\n  pub fn main".to_string());
         assert!(with_map.format_repo_dirs_block().is_some());
-        let messages = with_map.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = with_map.assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(sys.contains("## Repository Map"));
         assert!(!sys.contains("## Repository Directories"));
@@ -1468,7 +1542,8 @@ mod tests {
 
         // Without a map the compact outline answers where subsystems live.
         let with_dirs = base().with_repo_dirs(Some("crate\n  src".to_string()));
-        let messages = with_dirs.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = with_dirs.assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(!sys.contains("## Repository Map"));
         assert!(sys.contains("## Repository Directories"));
@@ -1479,7 +1554,8 @@ mod tests {
         assert!(blank.format_repo_dirs_block().is_none());
 
         // With neither input the prefix carries no repository outline.
-        let messages = base().assemble_chat_messages("Go", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = base().assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(!sys.contains("## Repository Map"));
         assert!(!sys.contains("## Repository Directories"));
@@ -1487,8 +1563,15 @@ mod tests {
 
     #[test]
     fn test_eager_repo_map_flag_tracks_the_rendered_block() {
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         assert!(!assembly.has_eager_repo_map());
         assert!(assembly.format_repo_map_block().is_none());
 
@@ -1509,13 +1592,14 @@ mod tests {
             1,
             vec![],
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
             Some("crates/core/src/prompt.rs\n  pub fn estimate_tokens".to_string()),
         );
         assert!(assembly.has_eager_repo_map());
 
-        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
 
         // The static symbol contours already answer where symbols live, so no
@@ -1526,25 +1610,31 @@ mod tests {
 
         // Discovery still routes through targeted search, directory listings,
         // and full-file loading.
-        assert!(system.contains("<repo_search"));
-        assert!(system.contains("<dir_list"));
-        assert!(system.contains("<context_request"));
+        assert!(system.contains("context_requests"));
+        assert!(system.contains("repo_searches"));
+        assert!(system.contains("dir_lists"));
+        assert!(system.contains("repo_dirs"));
     }
 
     #[test]
     fn test_on_demand_repo_map_instructions_carry_an_explicit_example() {
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         assert!(!assembly.has_eager_repo_map());
 
-        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let proto = JsonPromptProtocol::default();
+        let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
 
-        // Without the rendered outline the model needs an unambiguous tag
-        // invocation example, so it requests symbol contours instead of loading
-        // whole files.
         assert!(!system.contains("## Repository Map"));
-        assert!(system.contains("<repo_map path=\"path/to/file.rs\" />"));
+        assert!(system.contains("repo_maps"));
     }
 
     #[test]
@@ -1561,10 +1651,17 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_isolated_step() {
-        let proto = XmlPromptProtocol;
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        assembly.intent = TurnIntent::IsolatedStep;
+        let proto = step_protocol();
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        assembly.turn_brief = Some(TurnBrief::step());
         assembly.active_plan = Some(Plan::from_parts(
             "plan-test".to_string(),
             "Test Plan".to_string(),
@@ -1575,15 +1672,15 @@ mod tests {
             vec![],
         ));
 
-        let sys_prompt = assembly.build_system_prompt(&proto);
+        let sys_prompt = assembly.build_system_prompt(proto.as_ref());
         assert!(!sys_prompt.contains("Local Engineering Plans"));
-        assert!(!sys_prompt.contains("Step Execution Scope"));
-        let delta = assembly
-            .format_regime_delta_section(&proto)
-            .expect("the step regime states a delta");
-        assert!(delta.contains("Step Execution Scope"));
+        assert!(sys_prompt.contains("Step Execution Scope"));
         assert!(!sys_prompt.contains("<plan"));
         assert!(!sys_prompt.contains("<verify"));
+        // The introduction belongs to the contour, so a step opens with its own
+        // brief instead of the dialogue introduction.
+        assert!(sys_prompt.contains("Tauqe Coder"));
+        assert!(!sys_prompt.contains("proactive engineering assistant"));
 
         // An isolated step carries no documentation surface: the capability is
         // absent from its profile, so neither the self-knowledge rule nor the
@@ -1593,65 +1690,97 @@ mod tests {
         assert!(!sys_prompt.contains("<tauqe_doc_request"));
         assert!(!sys_prompt.contains("<doc_request"));
         assert!(!sys_prompt.contains("Environment Ontology"));
-        assert!(!delta.contains("<tauqe_doc_request"));
-        assert!(!delta.contains("<doc_request"));
-        assert!(!delta.contains("Environment Ontology"));
-        assert!(!delta.contains("<doc_request"));
-
-        let messages = assembly.assemble_chat_messages("Execute step", &proto);
+        let messages = assembly.assemble_chat_messages("Execute step", proto.as_ref());
         assert!(!messages[0].content.contains("## Active Task Plan Context"));
     }
 
+    /// The introduction belongs to the contour: the assembly renders the brief the
+    /// loop declared, and a turn without one opens with the dialogue introduction.
     #[test]
-    fn test_interactive_repl_delta_states_the_environment_ontology() {
-        let proto = XmlPromptProtocol;
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+    fn the_turn_brief_renders_the_introduction_of_its_contour() {
+        let proto = JsonPromptProtocol::default();
+        let render = |turn_brief: Option<TurnBrief>| {
+            let mut assembly = PromptAssembly::new(
+                None,
+                1,
+                vec![],
+                "git",
+                EditProtocolKind::Structured,
+                None,
+                None,
+            );
+            assembly.turn_brief = turn_brief;
+            assembly.build_system_prompt(&proto)
+        };
 
-        // The head states the self-knowledge invariant every dialogue shares, so
-        // switching the focus never rewrites it; the ontology that invariant
-        // enables is stated once in the tail delta instead of widening the
-        // byte-stable head.
+        assert!(render(None).starts_with(DIALOGUE_INTRO));
+
+        let step = render(Some(TurnBrief::step()));
+        assert!(step.starts_with(STEP_INTRO));
+        assert!(!step.starts_with(DIALOGUE_INTRO));
+
+        // The brief also selects the regime the contract renders, so one
+        // assembly states the dialogue authorization rule under the dialogue
+        // contour and the scope of an isolated step under the step contour.
+        let dialogue = render(Some(TurnBrief::dialogue()));
+        assert!(dialogue.contains("Action Authorization"));
+        assert!(!dialogue.contains("Step Execution Scope"));
+        assert!(step.contains("Step Execution Scope"));
+        assert!(step.contains("Architectural Decision Immutability"));
+        assert!(!step.contains("Action Authorization"));
+
+        // A synthesis opens with the introduction of its own planning role and
+        // differs in the contour that gates its regime.
+        let architect = render(Some(TurnBrief::architect()));
+        assert!(architect.starts_with(ARCHITECT_INTRO));
+        assert!(!architect.contains("Step Execution Scope"));
+    }
+
+    #[test]
+    fn test_interactive_repl_routes_harness_questions_to_the_documentation() {
+        let proto = JsonPromptProtocol::default();
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+
+        // The self-knowledge rule routes a question about the harness to the
+        // authoritative documentation, so the intent delta carries no second
+        // lecture about the environment beside it.
         let sys_prompt = assembly.build_system_prompt(&proto);
         assert!(sys_prompt.contains("Self-Knowledge"));
-        assert!(sys_prompt.contains("<tauqe_doc_request"));
+        assert!(sys_prompt.contains("tauqe_doc_requests"));
         assert!(!sys_prompt.contains("<doc_request"));
-        assert!(sys_prompt.contains("<system_documentation>"));
         assert!(!sys_prompt.contains("Environment Ontology"));
-        assert!(!sys_prompt.contains("literal harness rather than an agent"));
-
-        let delta = assembly
-            .format_regime_delta_section(&proto)
-            .expect("the interactive regime states a delta");
-        assert!(delta.contains("Environment Ontology"));
-        assert!(delta.contains("literal harness rather than an agent"));
-        assert!(delta.contains("`tauqe.toml`"));
-        assert!(delta.contains("consult the authoritative documentation"));
+        assert!(sys_prompt.contains("`tauqe.toml`"));
     }
 
     #[test]
     fn test_documentation_surface_is_absent_from_the_isolated_step_schema() {
-        use crate::capabilities::CapabilityRegistry;
-
-        let registry = CapabilityRegistry::global();
         let render =
             PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::SearchReplace);
-        let interactive = flattened_surface(
-            &registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render),
-        );
+        let interactive = flattened_surface(&crate::capabilities::capability_expr_schema(
+            &crate::control::repl::repl_capability_expr(None),
+            &render,
+        ));
+        assert!(interactive["properties"].get("context_requests").is_some());
         assert!(interactive["properties"]
             .get("tauqe_doc_requests")
             .is_some());
-        // The strict schema advertises one spelling per command: the
-        // pre-canonical alias stays decodable but is never published.
         assert!(interactive["properties"].get("doc_requests").is_none());
 
         // The composed schema is a projection of the capability set, so a turn
         // that cannot consult the documentation never advertises a field its
         // decoder would reject.
-        let step = flattened_surface(
-            &registry.compose_structured_schema(&CapabilitySet::isolated_step(), &render),
-        );
+        let step = flattened_surface(&crate::capabilities::capability_expr_schema(
+            &crate::control::turn::turn_capability_expr(),
+            &render,
+        ));
         assert!(step["properties"].get("tauqe_doc_requests").is_none());
         assert!(step["properties"].get("doc_requests").is_none());
         assert!(step["properties"].get("changes").is_some());
@@ -1662,103 +1791,125 @@ mod tests {
 
     #[test]
     fn test_planning_prompt_instructions() {
-        let proto = XmlPromptProtocol;
+        let proto = JsonPromptProtocol::default();
 
         // Develop mode
-        let dev_assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let dev_assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         let dev_prompt = dev_assembly.build_system_prompt(&proto);
         assert!(dev_prompt.contains("Conceptual Foundation Invariant"));
-        assert!(dev_prompt.contains("<concept_item"));
-        assert!(dev_prompt.contains("Structured Plan XML Format"));
+        assert!(dev_prompt.contains("concept"));
         assert!(dev_prompt.contains("Leaf-Only Files Invariant"));
-        // The planning objective belongs to the declared regime, so it travels
-        // in the delta instead of conditioning the shared head.
-        assert!(!dev_prompt.contains("Planning Objective: "));
-        assert!(dev_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
-        assert!(dev_prompt.contains("File Attributes Contract"));
-        assert!(dev_prompt.contains("readonly"));
-        let dev_delta = dev_assembly
-            .format_regime_delta_section(&proto)
-            .expect("the develop regime states a delta");
-        assert!(dev_delta.contains(
-            "Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What')"
-        ));
-        assert!(!dev_delta.contains("Step Formulation Contract: "));
+        // The plan rules state the invariants the model must satisfy; the
+        // execution-time checks that follow from them are enforced by the
+        // harness itself and are never restated here.
+        assert!(dev_prompt.contains("Plan Creation Invariant"));
+        assert!(dev_prompt.contains("only create a plan when explicitly instructed"));
 
         // Discussion mode
-        let mut disc_assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        disc_assembly.intent = TurnIntent::PlanDiscussion;
-        let disc_prompt = disc_assembly.build_system_prompt(&proto);
+        // Discussion mode
+        let disc_assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        // The plan-action semantics follow the surface the round actually
+        // advertises, so the plan-anchored surface of the discussion protocol
+        // is what authorizes in-place plan mutation.
+        let disc_prompt = disc_assembly.build_system_prompt(&JsonPromptProtocol::discussion());
         assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
         assert!(disc_prompt.contains("Leaf-Only Files Invariant"));
-        assert!(!disc_prompt.contains("Planning Objective: "));
-        let disc_delta = disc_assembly
-            .format_regime_delta_section(&proto)
-            .expect("the plan discussion states a delta");
-        assert!(disc_delta.contains(
-            "Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What')"
-        ));
-        assert!(disc_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
+        assert!(disc_prompt.contains("Plan Action Semantics"));
+        assert!(disc_prompt.contains("action: \"update\""));
     }
 
     #[test]
     fn test_prompt_assembly_research_instructions() {
-        let proto = XmlPromptProtocol;
+        let proto = JsonPromptProtocol::default();
 
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         let prompt = assembly.build_system_prompt(&proto);
         assert!(!prompt.contains("<context_drop"));
         assert!(!prompt.contains("Incremental Strategy"));
         assert!(!prompt.contains("Snapshot Strategy"));
-        assert!(prompt.contains("<context_request"));
-        assert!(prompt.contains("<repo_search"));
-        // A tag runs a request only when it is emitted verbatim at the very end
-        // of the response, outside markdown code; prose that merely describes
-        // an intent performs nothing.
-        assert!(prompt.contains("describing the intent in prose performs nothing"));
+        assert!(prompt.contains("context_requests"));
+        assert!(prompt.contains("empty answer is never a valid conclusion"));
     }
-
     #[test]
     fn test_system_prompt_anchors_project_configuration() {
         use tauqe_protocol::LlmCapability;
 
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        let full = assembly.build_system_prompt(&XmlPromptProtocol);
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        let proto = JsonPromptProtocol::default();
+        let full = assembly.build_system_prompt(&proto);
 
         // The configuration anchor belongs to the static introduction, and the
         // self-knowledge rule routes configuration questions to that topic.
         assert!(full.contains("tauqe.toml"));
         assert!(full.contains("Self-Knowledge"));
-        assert!(full.contains("topic=\"config\""));
 
-        // With documentation requests disabled the anchor survives as prose,
-        // because it advertises no control tag the decoder would reject.
-        let text_only = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
+        // With documentation requests disabled the anchor survives as prose.
+        let text_only = JsonPromptProtocol::with_capabilities(CapabilityExpr::from_leaves([
             LlmCapability::TextMessage,
         ]));
-        let narrowed = assembly.build_system_prompt(&*text_only);
+        let narrowed = assembly.build_system_prompt(&text_only);
         assert!(narrowed.contains("tauqe.toml"));
         assert!(!narrowed.contains("Self-Knowledge"));
-        assert!(!narrowed.contains("<tauqe_doc_request"));
-        assert!(!narrowed.contains("<doc_request"));
 
         // Discussion mode renders the same authoritative anchor.
-        let mut discussion =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        discussion.intent = TurnIntent::PlanDiscussion;
-        let prompt = discussion.build_system_prompt(&XmlPromptProtocol);
+        let discussion = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        let proto = JsonPromptProtocol::discussion();
+        let prompt = discussion.build_system_prompt(&proto);
         assert!(prompt.contains("tauqe.toml"));
     }
 
     #[test]
     fn test_prompt_assembly_with_turn_scratchpad() {
-        let proto = XmlPromptProtocol;
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let proto = JsonPromptProtocol::default();
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         assert!(assembly.format_scratchpad_block().is_none());
 
         assembly.turn_scratchpad = Some("   ".to_string());
@@ -1783,153 +1934,101 @@ mod tests {
         let multi_byte_text = "Рабочая гипотеза и детали проверки UTF-8 символов. ".repeat(200);
         assert!(multi_byte_text.len() > crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS);
 
-        let mut assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         assembly.turn_scratchpad = Some(multi_byte_text);
         let block = assembly.format_scratchpad_block().unwrap();
         assert!(block.contains("... [scratchpad truncated for length] ..."));
     }
 
     #[test]
-    fn test_narrowed_capabilities_hide_disabled_instructions() {
-        use crate::prompt::protocol::PromptProtocol;
-        use tauqe_protocol::{LlmCapability, LlmCommand};
-
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-        ]));
-        let prompt = assembly.build_system_prompt(&*narrowed);
-
-        assert!(prompt.contains("<file_edits"));
-        assert!(!prompt.contains("<context_request>"));
-        assert!(!prompt.contains("<verify"));
-        assert!(!prompt.contains("<scratchpad"));
-        assert!(!prompt.contains("<success"));
-        assert!(!prompt.contains("Self-Knowledge"));
-        assert!(!prompt.contains("<tauqe_doc_request"));
-        assert!(!prompt.contains("<doc_request"));
-        assert!(!prompt.contains("Turn Scratchpad"));
-
-        // The same set narrows decoding, so a disabled capability never reaches
-        // the execution pipeline.
-        let raw = concat!(
-            "Working.\n<context_request path=\"src/a.rs\" />\n",
-            "<doc_request topic=\"config\" />\n<scratchpad>notes</scratchpad>\n"
-        );
-        let full = XmlPromptProtocol.decode(raw, &[]);
-        assert!(full
-            .iter()
-            .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
-        assert!(full
-            .iter()
-            .any(|command| matches!(command, LlmCommand::DocRequest { .. })));
-        let filtered = narrowed.decode(raw, &[]);
-        assert!(!filtered
-            .iter()
-            .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
-        assert!(!filtered
-            .iter()
-            .any(|command| matches!(command, LlmCommand::DocRequest { .. })));
-        assert!(!filtered
-            .iter()
-            .any(|command| matches!(command, LlmCommand::Scratchpad { .. })));
-    }
-
-    #[test]
     fn test_prompt_assembly_renders_protocol_instructions() {
-        use crate::prompt::json::JsonPromptProtocol;
-
         let files = vec![ContextFileContent {
             path: "src/main.rs".to_string(),
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
             insertion_seq: 0,
         }];
-        let assembly =
-            PromptAssembly::new(None, 1, files, "git", EditProtocolKind::Xml, None, None);
-
-        // Each protocol renders its own edit reference directly instead of being
-        // reconstructed from its name.
-        let xml = XmlPromptProtocol;
-        let xml_prompt = assembly.build_system_prompt(&xml);
-        assert!(xml_prompt.contains("Code Modification Protocol (XML Edits)"));
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            files,
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
 
         let json = JsonPromptProtocol::default();
         let json_prompt = assembly.build_system_prompt(&json);
         assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 
-        // Chat assembly yields system + user messages.
-        let messages = assembly.assemble_chat_messages("Explain this code", &xml);
+        let messages = assembly.assemble_chat_messages("Explain this code", &json);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert!(messages[1].content.ends_with("Explain this code"));
     }
 
     #[test]
-    fn test_prompt_assembly_preserves_turn_marker() {
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        let marked = XmlPromptProtocol
-            .with_turn_marker("M12345")
-            .expect("marker-bound protocol");
+    fn test_prompt_assembly_states_the_proactive_engineering_stance() {
+        let proto = JsonPromptProtocol::default();
 
-        let prompt = assembly.build_system_prompt(&*marked);
-        assert!(prompt.contains("<scratchpad_M12345>"));
-        assert!(prompt.contains("</scratchpad_M12345>"));
-        assert!(prompt.contains("<plan_M12345"));
-        assert!(prompt.contains("<concept_M12345>"));
-        assert!(prompt.contains("<concept_item_M12345"));
-        assert!(prompt.contains("<context_request_M12345>"));
-
-        let messages = assembly.assemble_chat_messages("Go", &*marked);
-        assert!(messages[0].content.contains("<scratchpad_M12345>"));
-    }
-
-    #[test]
-    fn test_prompt_assembly_requires_an_explicit_request_for_code_changes() {
-        let proto = XmlPromptProtocol;
-
-        // Interactive REPL turn: changes require an explicit user request or clear unambiguous task.
-        let assembly =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        // Interactive REPL turn: a direct request is executed immediately,
+        // while an open or architectural question is answered in prose.
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         let prompt = assembly.build_system_prompt(&proto);
-        // The head carries the intent-independent trunk only, so the rule that
-        // authorizes an edit travels in the contour delta.
-        assert!(!prompt.contains("Action Authorization"));
-        let delta = assembly
-            .format_regime_delta_section(&proto)
-            .expect("the interactive regime states a delta");
-        assert!(delta.contains("Action Authorization"));
-        assert!(delta.contains("Default to discussion"));
-        assert!(delta.contains("when the required change is clear"));
+        // The unified composition states the proactive engineering stance
+        // beside the intent-independent trunk it refines.
+        assert!(prompt.contains("Action Authorization"));
+        assert!(prompt.contains("executed immediately"));
+        assert!(prompt.contains("Discussion is the mode"));
+        assert!(!prompt.contains("Default to discussion"));
 
         // An isolated step turn is itself the explicit instruction, so the rule
         // is deliberately omitted there instead of contradicting the step scope.
-        let mut isolated =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        isolated.intent = TurnIntent::IsolatedStep;
-        let isolated_prompt = isolated.build_system_prompt(&proto);
+        let mut isolated = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
+        isolated.turn_brief = Some(TurnBrief::step());
+        let isolated_protocol = step_protocol();
+        let isolated_prompt = isolated.build_system_prompt(isolated_protocol.as_ref());
         assert!(!isolated_prompt.contains("Action Authorization"));
-        let isolated_delta = isolated
-            .format_regime_delta_section(&proto)
-            .expect("the step regime states its own delta");
-        assert!(!isolated_delta.contains("Action Authorization"));
 
         // A plan discussion carries the whole dialogue surface, so the very same
         // authorization rule guards it: a change there is permitted only when
         // the developer states the request directly, exactly as in the REPL.
-        let mut discussion =
-            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-        discussion.intent = TurnIntent::PlanDiscussion;
+        let discussion = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         let discussion_prompt = discussion.build_system_prompt(&proto);
-        assert!(!discussion_prompt.contains("Action Authorization"));
-        let discussion_delta = discussion
-            .format_regime_delta_section(&proto)
-            .expect("the plan discussion states a delta");
-        assert!(discussion_delta.contains("Action Authorization"));
+        assert!(discussion_prompt.contains("Action Authorization"));
         assert!(!discussion_prompt.contains("Discussion Mode Scope"));
     }
 
@@ -2003,74 +2102,79 @@ mod tests {
 
     #[test]
     fn test_core_system_contract_is_numbered_monotonically() {
-        let proto = XmlPromptProtocol;
-        for intent in [
-            TurnIntent::InteractiveRepl,
-            TurnIntent::PlanDiscussion,
-            TurnIntent::IsolatedStep,
-        ] {
-            let mut assembly =
-                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-            assembly.intent = intent;
-            let prompt = assembly.build_system_prompt(&proto);
+        for isolated in [false, true] {
+            let proto = if isolated {
+                step_protocol()
+            } else {
+                dialogue_protocol()
+            };
+            let mut assembly = PromptAssembly::new(
+                None,
+                1,
+                vec![],
+                "git",
+                EditProtocolKind::Structured,
+                None,
+                None,
+            );
+            assembly.turn_brief = Some(if isolated {
+                TurnBrief::step()
+            } else {
+                TurnBrief::dialogue()
+            });
+            let prompt = assembly.build_system_prompt(proto.as_ref());
             let section = contract_section(&prompt);
-            assert!(!section.is_empty(), "missing contract for {intent:?}");
+            assert!(
+                !section.is_empty(),
+                "missing contract for isolated = {isolated}"
+            );
 
             let numbers = contract_rule_numbers(section);
-            assert!(!numbers.is_empty(), "no rules rendered for {intent:?}");
+            assert!(
+                !numbers.is_empty(),
+                "no rules rendered for isolated = {isolated}"
+            );
             let expected: Vec<usize> = (1..=numbers.len()).collect();
-            assert_eq!(numbers, expected, "non-monotonic numbering for {intent:?}");
+            assert_eq!(
+                numbers, expected,
+                "non-monotonic numbering for isolated = {isolated}"
+            );
         }
     }
 
     #[test]
     fn test_core_system_contract_has_no_lettered_surrogates() {
-        let proto = XmlPromptProtocol;
-        for intent in [
-            TurnIntent::InteractiveRepl,
-            TurnIntent::PlanDiscussion,
-            TurnIntent::IsolatedStep,
-        ] {
-            let mut assembly =
-                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
-            assembly.intent = intent;
-            let prompt = assembly.build_system_prompt(&proto);
+        for isolated in [false, true] {
+            let proto = if isolated {
+                step_protocol()
+            } else {
+                dialogue_protocol()
+            };
+            let mut assembly = PromptAssembly::new(
+                None,
+                1,
+                vec![],
+                "git",
+                EditProtocolKind::Structured,
+                None,
+                None,
+            );
+            assembly.turn_brief = Some(if isolated {
+                TurnBrief::step()
+            } else {
+                TurnBrief::dialogue()
+            });
+            let prompt = assembly.build_system_prompt(proto.as_ref());
             let section = contract_section(&prompt);
             for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
                 assert!(
                     !section.contains(surrogate),
-                    "surrogate {surrogate} present for {intent:?}"
+                    "surrogate {surrogate} present for isolated = {isolated}"
                 );
             }
         }
     }
 
-    #[test]
-    fn test_transport_never_changes_the_capability_surface_of_a_turn() {
-        use crate::prompt::json::JsonPromptProtocol;
-
-        // Both transports advertise one intent-oriented surface, so switching
-        // the wire format changes the encoding only.
-        assert_eq!(
-            XmlPromptProtocol.capability_set(),
-            JsonPromptProtocol::edits().capability_set()
-        );
-
-        // Whatever the declared intent, the narrowed surface a turn renders and
-        // decodes is identical for both transports.
-        for intent in [
-            TurnIntent::InteractiveRepl,
-            TurnIntent::PlanDiscussion,
-            TurnIntent::IsolatedStep,
-        ] {
-            let assembly =
-                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
-                    .with_intent(intent);
-            let xml = assembly.effective_capabilities(&XmlPromptProtocol);
-            let structured = assembly.effective_capabilities(&JsonPromptProtocol::edits());
-            assert_eq!(xml, structured, "surface diverged for {intent:?}");
-        }
-    }
     /// Builds one declared external document for the catalog tests.
     fn outer_doc(id: &str, title: &str, description: Option<&str>) -> crate::config::OuterDocEntry {
         crate::config::OuterDocEntry {
@@ -2091,13 +2195,25 @@ mod tests {
             ),
             outer_doc("mylib", "MyLib Book", None),
         ];
-        let built = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
-            .with_outer_docs(declared);
-
+        let built = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        )
+        .with_outer_docs(declared);
         let catalog = built
             .format_outer_docs_catalog_block()
             .expect("the declarations render a catalog");
         assert!(catalog.starts_with("## External Documentation Catalog\n"));
+        // The heading carries the invocation of a declared document, so the
+        // trunk rule states only the essence of the declaration.
+        assert!(catalog.contains("`outer_doc_requests`"));
+        assert!(catalog.contains("`id/relative.md`"));
+        assert!(catalog.contains("never climbs above it"));
         assert!(catalog.contains("- vendor/api.md — Upstream API notes: Endpoint contracts.\n"));
         assert!(catalog.contains("- mylib — MyLib Book\n"));
         // Entries keep their declaration order.
@@ -2112,7 +2228,15 @@ mod tests {
 
     #[test]
     fn test_outer_docs_catalog_renders_nothing_without_a_resolvable_entry() {
-        let empty = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        let empty = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        );
         assert!(empty.format_outer_docs_catalog_block().is_none());
 
         // An entry configuration validation rejects contributes no line, so a
@@ -2132,18 +2256,33 @@ mod tests {
         use tauqe_protocol::LlmCapability;
 
         let declared = vec![outer_doc("vendor/api.md", "Upstream API notes", None)];
-        let built = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
-            .with_outer_docs(declared);
+        let built = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            EditProtocolKind::Structured,
+            None,
+            None,
+        )
+        .with_outer_docs(declared);
 
         // A turn that can request an external document publishes the catalog in
-        // the byte-stable head, right after the project metadata it belongs to.
-        let messages = built.assemble_chat_messages("Go", &XmlPromptProtocol);
+        // the byte-stable head, and the head carries no repository metadata: the
+        // working-tree state reaches the model through the context block alone.
+        let messages = built.assemble_chat_messages("Go", &JsonPromptProtocol::default());
         let system = &messages[0].content;
-        let metadata = system.find("## Project Metadata").expect("metadata block");
+        assert!(!system.contains("## Project Metadata"));
         let catalog = system
             .find("## External Documentation Catalog")
             .expect("catalog block");
-        assert!(metadata < catalog);
+        // The catalog closes the head after the protocol instructions, and a
+        // turn without context files renders no context block at all.
+        assert!(!system.contains("## Project Context"));
+        let instructions = system
+            .find("## Code Modification Protocol")
+            .expect("protocol instructions");
+        assert!(instructions < catalog);
         assert!(system.contains("- vendor/api.md — Upstream API notes\n"));
         // The catalog is a head block: the task message never repeats it.
         assert!(!messages[1]
@@ -2156,11 +2295,14 @@ mod tests {
         );
 
         // A narrowed surface that cannot request a document advertises none.
-        let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
+        let narrowed = JsonPromptProtocol::with_capabilities(CapabilityExpr::from_leaves([
             LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
+            LlmCapability::EditReplace,
         ]));
-        let prompt = built.build_system_prompt(&*narrowed);
+        let prompt = built.build_system_prompt(&narrowed);
         assert!(!prompt.contains("## External Documentation Catalog"));
+        // The invocation disappears with the capability that performs it, so a
+        // narrowed turn never states a channel it cannot use.
+        assert!(!prompt.contains("`outer_doc_requests`"));
     }
 }

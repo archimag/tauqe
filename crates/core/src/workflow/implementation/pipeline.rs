@@ -42,7 +42,8 @@
 use std::path::Path;
 
 use tauqe_protocol::{
-    ArchitectTier, IssueStatus, ModelSelection, PlanItem, PlanItemStatus, PlanScopeEvaluation,
+    ArchitectTier, EditProtocolKind, IssueStatus, ModelSelection, PlanItem, PlanItemStatus,
+    PlanScopeEvaluation,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -319,7 +320,7 @@ impl<'a> PlanImplementationPipeline<'a> {
 
             let run_config = ImplementationRunConfig {
                 models: self.config.models.clone(),
-                protocol: self.config.repl.protocol,
+                protocol: EditProtocolKind::Structured,
                 marker: self.options.marker.clone(),
                 selection: self.options.selection.clone(),
                 instructions: self.options.instructions.clone(),

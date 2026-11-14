@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauqe_core::config::{AppConfig, ModelsConfig};
+use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::plan::prompt::{
     build_plan_critique_prompt, build_plan_critique_system_prompt,
     build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
@@ -44,7 +45,6 @@ use tauqe_core::providers::{
     format_session_id, ChatMessage, JsonSchemaDefinition, LlmProvider, ResponseFormat, StreamEvent,
     SESSION_PREFIX_ARCHITECT,
 };
-use tauqe_core::workflow::fsm::structured::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::{
     errors, events, ArchitectTier, ModelErrorEvent, ModelFinishedEvent, ModelRole, ModelSelection,

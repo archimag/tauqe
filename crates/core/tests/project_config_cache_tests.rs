@@ -11,17 +11,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use tauqe_core::context::ContextManager;
-use tauqe_core::history::HistoryManager;
-use tauqe_core::prompt::protocol::PromptProtocol;
+use tauqe_core::control::cache::TurnInputCache;
+use tauqe_core::control::context::{CancellationToken, EventSink, LoopContext};
+use tauqe_core::control::prompt::PromptBuilder;
+use tauqe_core::control::turn::{run_turn_loop, TurnLoopConfig};
+use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-use tauqe_core::providers::StreamEvent;
+use tauqe_core::workflow::git_policy::GitTransactionPolicy;
 use tauqe_core::workflow::policy::DirectApplyPolicy;
-use tauqe_core::workflow::{GitTransactionPolicy, WorkflowOptions};
-use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, TurnIntent};
-use tokio::sync::{mpsc, watch};
-
-/// Turn marker attached to every scripted protocol exchange.
-const MARKER: &str = "CACHE";
+use tauqe_core::workflow::research::journal::TurnResearchJournal;
+use tauqe_protocol::{CapabilityExpr, ContextAccess, LlmCapability, ModelRef};
 
 /// Writes an instrumented `just` stub into `bin_dir` and returns its counter.
 ///
@@ -69,10 +68,29 @@ fn commit_fixture(repo_root: &Path, files: &[&str]) {
 }
 
 /// Builds a single-edit XML response carrying one search/replace hunk.
-fn edit_block(summary: &str, path: &str, search: &str, replace: &str) -> String {
-    format!(
-        "<tauqe_edits_{MARKER} summary=\"{summary}\">\n<edit_{MARKER} path=\"{path}\">\n<search_{MARKER}>\n{search}\n</search_{MARKER}>\n<replace_{MARKER}>\n{replace}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
-    )
+fn edit_payload(summary: &str, path: &str, search: &str, replace: &str) -> String {
+    serde_json::json!({
+        "message": summary,
+        "action": {
+            "kind": "edit",
+            "changes": [
+                {
+                    "op": "replace",
+                    "path": path,
+                    "old_text": search,
+                    "new_text": replace,
+                    "to": "",
+                    "start": "",
+                    "end": "",
+                    "content": ""
+                }
+            ],
+            "commit_message": summary,
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string()
 }
 
 /// Serializes the tests that install an instrumented task runner on `PATH`.
@@ -89,15 +107,11 @@ async fn path_lock() -> tokio::sync::MutexGuard<'static, ()> {
 
 #[tokio::test]
 async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() {
-    // The runner is resolved through `PATH`, so the stub this test installs
-    // owns a process-wide resource the lock keeps exclusive.
     let _guard = path_lock().await;
     let (_repo_dir, repo_root) = init_repo();
     let stub_dir = tempfile::tempdir().expect("create the stub directory");
     let counter = write_runner_stub(stub_dir.path());
 
-    // A declared runner is executed as an ordinary project process, so the stub
-    // must be reachable by name for the duration of the test.
     let mut paths = vec![stub_dir.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -131,34 +145,24 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
     context
         .add_file("src/lib.rs", ContextAccess::Editable)
         .expect("add the library to context");
-    let mut history = HistoryManager::new(repo_root.clone());
 
-    // The first proposal rejects its own change set, so staging spends a patch
-    // retry; the repair it proposes then leaves beta broken, so verification
-    // spends a healing round.
-    let broken = edit_block(
+    let broken = edit_payload(
         "Broken attempt",
         "src/lib.rs",
         "this text does not exist in the file",
         "irrelevant replacement",
     );
-    let repair_alpha = format!(
-        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
-        edits = edit_block(
-            "Repair alpha return type",
-            "src/lib.rs",
-            "pub fn alpha() -> i32 { \"alpha\" }",
-            "pub fn alpha() -> i32 { 1 }",
-        ),
+    let repair_alpha = edit_payload(
+        "Repair alpha return type",
+        "src/lib.rs",
+        "pub fn alpha() -> i32 { \"alpha\" }",
+        "pub fn alpha() -> i32 { 1 }",
     );
-    let repair_beta = format!(
-        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
-        edits = edit_block(
-            "Repair beta return type",
-            "src/lib.rs",
-            "pub fn beta() -> i32 { \"beta\" }",
-            "pub fn beta() -> i32 { 2 }",
-        ),
+    let repair_beta = edit_payload(
+        "Repair beta return type",
+        "src/lib.rs",
+        "pub fn beta() -> i32 { \"beta\" }",
+        "pub fn beta() -> i32 { 2 }",
     );
     let provider = MockLlmProvider::scripted([
         MockResponse::text(broken),
@@ -166,42 +170,40 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
         MockResponse::text(repair_beta),
     ]);
     let model = ModelRef::openrouter("mock/model");
-    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
-        .with_turn_marker(MARKER)
-        .expect("marker-bound protocol");
+    let protocol = JsonPromptProtocol::edits();
+
+    let cancel = CancellationToken::new();
+    let events = EventSink::noop();
+    let mut cache = TurnInputCache::default();
+    let mut journal = TurnResearchJournal::default();
     let mut policy = GitTransactionPolicy::new();
-    let (stream_tx, rx) = mpsc::channel::<StreamEvent>(512);
-    drop(rx);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-
-    let outcome = tauqe_core::workflow::run_fsm_turn(
-        "Fix the mismatched return types in src/lib.rs",
-        TurnIntent::InteractiveRepl,
-        &provider,
-        &model,
+    let caps = tauqe_core::control::turn::turn_capability_expr();
+    let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
+    let mut ctx = LoopContext::new(
+        &cancel,
+        &events,
+        &repo_root,
         &mut context,
-        &mut history,
-        protocol.as_ref(),
+        &mut journal,
         &mut policy,
-        "git",
-        stream_tx,
-        cancel_rx,
-        &WorkflowOptions::default(),
-    )
-    .await
-    .expect("the bounded turn executes");
+        caps,
+        prompt_builder,
+    );
 
-    match outcome.result {
-        ModelResult::Edit { outcome, .. } => {
-            assert!(
-                outcome.error.is_none(),
-                "unexpected error: {:?}",
-                outcome.error
-            );
-            assert!(outcome.applied, "the healed change set must be committed");
-        }
-        other => panic!("expected applied edits, got {other:?}"),
-    }
+    let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
+        .await
+        .expect("the bounded turn executes");
+
+    assert!(outcome.is_success());
+    let success = outcome.into_success().expect("success");
+    assert_eq!(success.value.modified_paths, vec!["src/lib.rs"]);
+    assert!(success.value.commit_hash.is_some());
+    assert!(
+        success.value.commit_error.is_none(),
+        "unexpected commit error: {:?}",
+        success.value.commit_error
+    );
+
     assert_eq!(
         provider.requests().len(),
         3,
@@ -218,13 +220,6 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
     assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
 }
 
-/// An answer-only turn must verify against the configuration it froze.
-///
-/// The turn proposes no edit, so it closes through the answer-with-verification
-/// corridor instead of staging and healing. That corridor obeys the same freeze
-/// as every other phase: the declared task runner is dumped once for the whole
-/// turn, and the verification lifecycle runs against the snapshot the turn
-/// already holds instead of a freshly resolved configuration.
 #[tokio::test]
 async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     let _guard = path_lock().await;
@@ -232,8 +227,6 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     let stub_dir = tempfile::tempdir().expect("create the stub directory");
     let counter = write_runner_stub(stub_dir.path());
 
-    // The declared runner is resolved by name, so the stub must be reachable
-    // through `PATH` for the duration of the turn.
     let mut paths = vec![stub_dir.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -266,46 +259,47 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     context
         .add_file("src/lib.rs", ContextAccess::Editable)
         .expect("add the library to context");
-    let mut history = HistoryManager::new(repo_root.clone());
 
-    // The round answers in prose and asks for one verification run, so the turn
-    // leaves through the answer-with-verification exit: nothing is staged and
-    // no healing round is spent.
-    let answer = format!(
-        "Nothing to change here.\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />"
-    );
+    let answer = "Nothing to change here.";
     let provider = MockLlmProvider::scripted([MockResponse::text(answer)]);
     let model = ModelRef::openrouter("mock/model");
-    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
-        .with_turn_marker(MARKER)
-        .expect("marker-bound protocol");
-    // The apply path of the policy is never reached: the turn proposes no edit.
+    let protocol = JsonPromptProtocol::edits();
+
+    let cancel = CancellationToken::new();
+    let events = EventSink::noop();
+    let mut cache = TurnInputCache::default();
+    let mut journal = TurnResearchJournal::default();
     let mut policy = DirectApplyPolicy::new();
-    let (stream_tx, rx) = mpsc::channel::<StreamEvent>(512);
-    drop(rx);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-
-    let outcome = tauqe_core::workflow::run_fsm_turn(
-        "Explain why the helper needs no change",
-        TurnIntent::InteractiveRepl,
-        &provider,
-        &model,
+    let caps = CapabilityExpr::set([
+        CapabilityExpr::leaf(LlmCapability::TextMessage),
+        CapabilityExpr::leaf(LlmCapability::EditReplace),
+        CapabilityExpr::leaf(LlmCapability::ContextRequest),
+    ]);
+    let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
+    let mut ctx = LoopContext::new(
+        &cancel,
+        &events,
+        &repo_root,
         &mut context,
-        &mut history,
-        protocol.as_ref(),
+        &mut journal,
         &mut policy,
-        "git",
-        stream_tx,
-        cancel_rx,
-        &WorkflowOptions::default(),
-    )
-    .await
-    .expect("the bounded turn executes");
+        caps,
+        prompt_builder,
+    );
 
+    let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
+        .await
+        .expect("the bounded turn executes");
+
+    assert!(outcome.is_success());
+    let success = outcome.into_success().expect("success");
     assert!(
-        matches!(outcome.result, ModelResult::Answer { .. }),
-        "an answer-only turn must stay an answer: {:?}",
-        outcome.result
+        success.value.modified_paths.is_empty(),
+        "an answer-only turn touches no paths"
+    );
+    assert!(
+        success.response.has(LlmCapability::TextMessage),
+        "an answer-only turn retains text response"
     );
     assert_eq!(
         provider.requests().len(),
@@ -315,6 +309,6 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     assert_eq!(
         dump_count(&counter),
         1,
-        "the answer-with-verification round must reuse the frozen configuration"
+        "the answer round must reuse the frozen configuration"
     );
 }

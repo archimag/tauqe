@@ -1,31 +1,44 @@
 //! Discussion prompt construction for model turns.
 //!
 //! A structured discussion turn and a focused interactive turn are both built
-//! here: the typed discussion target decides the prompt text and the turn
-//! intent, so neither is ever inferred from the prompt body.
+//! here: the typed discussion target decides the prompt text and the dialogue
+//! branch the turn advertises, so neither is ever inferred from the prompt body.
 
 use std::sync::Arc;
 
 use tauqe_protocol::{
-    DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams, ResponseError, TurnIntent,
+    DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams, ResponseError,
 };
 
 use crate::handlers::offload;
 use crate::state::AppState;
 
-/// Resolves the turn prompt and its declared intent for a model ask request.
+/// Prompt and anchored dialogue branch resolved for a model ask request.
+///
+/// The branch is the typed value the turn's capability surface is derived from:
+/// a plan anchor declares plan mutation, and a review anchor — a finding dialogue
+/// and a group dialogue alike — declares the recorded decision. Nothing here is
+/// inferred from the prompt body, so text that merely resembles a discussion
+/// heading can never widen the surface of a turn.
+#[derive(Debug)]
+pub(super) struct ModelAskTurn {
+    /// Prompt text the turn sends.
+    pub(super) prompt: String,
+    /// Dialogue branch the request anchored on, if any.
+    pub(super) focus: Option<DiscussionTarget>,
+}
+
+/// Resolves the turn prompt and its anchored dialogue branch for a model ask.
 ///
 /// A structured discussion turn carries its target explicitly, so the server
 /// generates the discussion prompt from those typed fields and replaces the
 /// focus anchor. A plain ask continues the anchored discussion instead: while a
 /// focus is active, the current state of the focused plan or review session is
-/// injected into the prompt on every turn. The intent is derived from the
-/// resolved target rather than from the prompt text, so text that merely
-/// resembles a discussion heading can never switch the turn mode.
+/// injected into the prompt on every turn.
 pub(super) async fn build_model_ask_prompt(
     state: &Arc<AppState>,
     params: ModelAskParams,
-) -> Result<(String, TurnIntent), ResponseError> {
+) -> Result<ModelAskTurn, ResponseError> {
     match params {
         ModelAskParams::Discussion(discussion) => {
             let prompt = build_discussion_prompt(
@@ -40,7 +53,10 @@ pub(super) async fn build_model_ask_prompt(
             state
                 .set_discussion_focus(focus_from_target(&discussion))
                 .await;
-            Ok((prompt, intent_for_target(&discussion.target)))
+            Ok(ModelAskTurn {
+                prompt,
+                focus: Some(discussion.target),
+            })
         }
         ModelAskParams::Prompt { text } => {
             if text.trim().is_empty() {
@@ -54,7 +70,10 @@ pub(super) async fn build_model_ask_prompt(
             match focus_to_target(&state.discussion_focus().await) {
                 Some((target, focused_items)) => {
                     match build_discussion_prompt(state, &target, &focused_items, &text).await {
-                        Ok(prompt) => Ok((prompt, intent_for_target(&target))),
+                        Ok(prompt) => Ok(ModelAskTurn {
+                            prompt,
+                            focus: Some(target),
+                        }),
                         Err(err) => {
                             // The focused entity is gone (for example the plan
                             // was deleted elsewhere): drop the stale anchor and
@@ -64,31 +83,18 @@ pub(super) async fn build_model_ask_prompt(
                                 err.message
                             );
                             state.clear_discussion_focus().await;
-                            Ok((text, TurnIntent::InteractiveRepl))
+                            Ok(ModelAskTurn {
+                                prompt: text,
+                                focus: None,
+                            })
                         }
                     }
                 }
-                None => Ok((text, TurnIntent::InteractiveRepl)),
+                None => Ok(ModelAskTurn {
+                    prompt: text,
+                    focus: None,
+                }),
             }
-        }
-    }
-}
-
-/// Maps a discussion target onto the turn intent it establishes.
-///
-/// A plan anchor establishes the plan-discussion regime. A review anchor — a
-/// finding dialogue and a group dialogue alike — establishes the
-/// review-discussion regime: it carries the whole dialogue surface, so the
-/// developer may still ask for the fix directly, and it authorizes the decision
-/// the dialogue records for the anchored session.
-pub(super) fn intent_for_target(target: &DiscussionTarget) -> TurnIntent {
-    match target {
-        DiscussionTarget::Plan { .. } => TurnIntent::PlanDiscussion,
-        // A review finding dialogue and a group dialogue share one regime: the
-        // decision recorded in either travels with the dialogue payload, and a
-        // group identifier is unique only inside the session that declares it.
-        DiscussionTarget::Review { .. } | DiscussionTarget::ReviewGroup { .. } => {
-            TurnIntent::ReviewDiscussion
         }
     }
 }

@@ -1,14 +1,10 @@
 pub mod batch;
 pub mod common;
-pub mod execution;
-pub mod fsm;
 pub mod git_policy;
 pub mod implementation;
-pub mod loops;
 pub mod policy;
 pub mod research;
 pub(crate) mod retry;
-pub mod task;
 pub(crate) mod verification;
 
 #[cfg(test)]
@@ -18,14 +14,130 @@ pub use batch::{
     BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepReport,
     BatchStepStatus, BatchStop, BatchUsage,
 };
-pub use execution::{ExecutionMode, SingleExecution, WorkflowOptions};
-pub use fsm::{run_fsm_turn, FsmTurnOutcome};
 pub use git_policy::GitTransactionPolicy;
-pub use loops::{AnswerEditLoop, EditLoop};
 pub use policy::{ApplyPolicy, DirectApplyPolicy};
-pub use task::{Task, TaskEnv};
 
-use tauqe_protocol::{ModelResult, PlanRejection, WorkflowKind};
+use crate::workflow::research::ResearchLimits;
+use tauqe_protocol::{
+    ModelRef, ModelResult, PatchStrategy, PlanRejection, PromptLayoutKind, ReasoningEffort,
+    WorkflowKind,
+};
+
+/// Execution options and token budgets for edit workflows.
+#[derive(Debug, Clone)]
+pub struct WorkflowOptions {
+    pub max_retries: usize,
+    pub max_research_rounds: usize,
+    pub token_budget: usize,
+    pub history_budget_tokens: u64,
+    pub history_tail_turns: usize,
+    pub repomap_token_budget: usize,
+    /// Whether the eager global symbol map is injected into every proposal.
+    ///
+    /// When disabled, the prompt carries the compact directory outline instead,
+    /// so the model still knows where subsystems live without a full map.
+    pub include_repo_map: bool,
+    /// Operational caps the Research phase applies to one round.
+    pub research_limits: ResearchLimits,
+    /// Maximum characters of one project command stream reported back to the model.
+    pub max_feedback_chars: usize,
+    /// Maximum characters of a turn scratchpad block before safe truncation.
+    pub max_scratchpad_chars: usize,
+    pub history_model: ModelRef,
+    pub app_config: Option<crate::config::AppConfig>,
+    /// Reasoning effort applied to the current turn, resolved from the active
+    /// semantic role. Updated on `auto_level_up` escalation so a
+    /// Coder→Architect switch inherits the deeper Architect effort.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Provider session identifier that binds this turn to a warm prompt-prefix
+    /// cache on the provider side.
+    ///
+    /// The caller owns the affinity scope: an interactive dialogue, a plan
+    /// execution, or a review audit each pass their own identifier. `None`
+    /// disables affinity and the provider serves every round statelessly.
+    pub session_id: Option<String>,
+    /// Review session the dialogue is anchored on, if any.
+    ///
+    /// A dialogue anchored on a review session may record a decision for one of
+    /// its findings. The identity travels with the turn so a decoded decision is
+    /// persisted against the session the dialogue discusses, never against an
+    /// ambient one.
+    pub review_session_id: Option<String>,
+}
+
+impl Default for WorkflowOptions {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            max_research_rounds: crate::config::DEFAULT_MAX_RESEARCH_ROUNDS,
+            token_budget: crate::config::DEFAULT_TOKEN_BUDGET,
+            history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
+            history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
+            repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
+            include_repo_map: true,
+            research_limits: ResearchLimits::default(),
+            max_feedback_chars: crate::config::DEFAULT_MAX_FEEDBACK_CHARS,
+            max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
+            history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
+            app_config: None,
+            reasoning_effort: None,
+            session_id: None,
+            review_session_id: None,
+        }
+    }
+}
+
+impl WorkflowOptions {
+    /// Constructs workflow options from the unified application configuration.
+    pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
+        let max_retries = config.repl.max_retries;
+        Self {
+            max_retries,
+            max_research_rounds: config.context.max_research_rounds,
+            token_budget: config.context.token_budget,
+            history_budget_tokens: config.history.budget_tokens,
+            history_tail_turns: config.history.tail_turns,
+            repomap_token_budget: config.context.repomap_token_budget,
+            include_repo_map: config.context.include_repo_map,
+            research_limits: ResearchLimits::from_context_config(&config.context),
+            max_feedback_chars: config.context.max_feedback_chars,
+            max_scratchpad_chars: config.context.max_scratchpad_chars,
+            history_model: config.history_model(),
+            app_config: Some(config.clone()),
+            reasoning_effort: None,
+            session_id: None,
+            review_session_id: None,
+        }
+    }
+
+    /// Returns the patch strategy declared by the governing project configuration.
+    ///
+    /// The strategy decides how a change set addresses the lines it replaces, so
+    /// every phase that describes a change set — prompt rendering and
+    /// patch-retry diagnostics alike — reads it from this single accessor
+    /// instead of deriving its own copy from the configuration.
+    pub fn patch_strategy(&self) -> PatchStrategy {
+        self.app_config
+            .as_ref()
+            .map(|config| config.repl.patch_strategy)
+            .unwrap_or_default()
+    }
+
+    /// Returns the prompt layout policy that composes this turn's messages.
+    ///
+    /// The declared `[repl]` key of the governing project configuration wins
+    /// for every turn; without one the caller's typed argument decides: a turn
+    /// that carries a growing session history builds the chronological
+    /// transcript, while a turn that carries none keeps the semantic block
+    /// order. Options that carry no governing configuration keep the semantic
+    /// policy, which every contour renders correctly.
+    pub fn prompt_layout(&self, carries_session_history: bool) -> PromptLayoutKind {
+        self.app_config
+            .as_ref()
+            .map(|config| config.resolve_prompt_layout(carries_session_history))
+            .unwrap_or(PromptLayoutKind::Semantic)
+    }
+}
 
 /// Result of a completed workflow turn.
 #[derive(Debug, Clone)]
@@ -62,10 +174,6 @@ pub struct WorkflowExecutionResult {
     /// signal. Preserved so a review supervisor can mark the finding as
     /// skipped instead of treating the empty turn as an unverified reply.
     pub skip_reason: Option<String>,
-    /// Coder's abort report when the turn ended with a semantic `<abort>`
-    /// signal. Preserved so a supervisor can stop its queue without architect
-    /// escalation while the developer receives the exact action to perform.
-    pub abort: Option<fsm::AbortReport>,
     /// Whether the turn applied a plan `save` action that created or fully
     /// replaced a plan. Propagated to the `plan/updated` event so clients can
     /// focus a freshly created plan instead of an incremental update.

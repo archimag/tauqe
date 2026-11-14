@@ -20,41 +20,47 @@
 //! explicit selection that names one is refused, and the implicit queues
 //! subsume the findings a group collects into a single group member.
 //!
-//! The member runner implements nothing of the execution itself. Every step
-//! turn, every Architect wave, every ladder rung, and every durable status
-//! transition belongs to the engine's unified implementation pipeline
-//! (`tauqe_core::workflow::implementation`), which this module drives through
-//! `ServerImplementationHost`. The server contributes the batch framing only:
-//! it decodes the addressing contract, resolves the scope, and maps the
-//! terminal report onto the supervisor's step outcome, so a review run and a
-//! plan run cannot drift apart in how they reach a provider, how they escalate
-//! a ladder, or when they settle an entity.
+//! The member runner implements nothing of the step execution itself. Every
+//! bounded turn, every coder rung, and every durable step transition belongs to
+//! the control loops (`tauqe_core::control::plan` and
+//! `tauqe_core::control::turn`), which this module drives through the step
+//! endpoint of the daemon: a group horizon runs as an ordered sequence through
+//! `run_plan_sequence_loop_with`, a single finding runs through the same
+//! sequence loop over its degenerate horizon, and every step turn reaches the
+//! provider through `run_turn_loop`. The persistence adapter of each member
+//! writes the step lifecycles back to the review storage, and the verdict of
+//! the run is stated once, when the member settles. The server contributes the
+//! batch framing only: it decodes the addressing contract, resolves the scope,
+//! and maps the terminal outcome onto the supervisor's step outcome, so a
+//! review run and a plan run cannot drift apart in how they reach a provider,
+//! how they escalate a ladder, or when they settle an entity.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tauqe_core::config::AppConfig;
-use tauqe_core::providers::StreamEvent;
+use tauqe_core::control::outcome::LoopResult;
+use tauqe_core::control::plan::sequence::ReviewMemberPersistence;
+use tauqe_core::control::plan::step::StepPersistence;
+use tauqe_core::providers::{format_session_id, StreamEvent, SESSION_PREFIX_REVIEW};
 use tauqe_core::review::prompt::refine::has_recorded_decision;
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::batch::{
     BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepStatus,
     BatchStop,
 };
-use tauqe_core::workflow::implementation::{
-    ExecutionScope, PlanImplementationOptions, PlanImplementationPipeline,
-    PlanImplementationReport, PlanImplementationStop,
-};
+use tauqe_core::workflow::implementation::{classify_scope_stall, ExecutionScope};
+use tauqe_protocol::model::{TurnWorkContext, TurnWorkItem, TurnWorkQueue};
 use tauqe_protocol::{
     errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, IssueType, ModelSelection,
-    Request, Response, ResponseError, ReviewBatchFinishedEvent, ReviewExecuteParams,
-    ReviewExecuteTarget, ReviewItem, ReviewSession,
+    PlanItemStatus, PlanScopeEvaluation, Request, Response, ResponseError,
+    ReviewBatchFinishedEvent, ReviewExecuteParams, ReviewExecuteTarget, ReviewItem, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::handlers::common::spawn_escalation_relay;
-use crate::handlers::host::ServerImplementationHost;
+use crate::handlers::model::turn::{run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport};
+use crate::handlers::offload;
 use crate::handlers::PreflightVerdict;
 use crate::state::{AppState, OperationGuard};
 
@@ -649,9 +655,7 @@ struct ReviewBatchExecutor<'a> {
     state: &'a Arc<AppState>,
     repo_root: &'a Path,
     operation: &'a Arc<OperationGuard>,
-    config: AppConfig,
     model: Option<ModelSelection>,
-    instructions: Option<String>,
     /// Findings the completed members repaired.
     fixed_items: usize,
 }
@@ -683,33 +687,385 @@ impl ReviewBatchExecutor<'_> {
             .unwrap_or(0)
     }
 
-    /// Maps the terminal report of one member onto the supervisor's step outcome.
+    /// Takes the step the member is about to execute over, before its turn starts.
     ///
-    /// The engine settles the entity of every member it ends, so a member that
-    /// could not be implemented as stated is a local skip of the queue instead
-    /// of a fatal stop: the remaining findings are independent of it. A
-    /// cancellation and a failure the engine could not repair stop the queue,
-    /// because the next member must never build on a state nobody verified.
-    async fn map_report(
-        &mut self,
-        member_id: &str,
-        report: &PlanImplementationReport,
-    ) -> BatchStepOutcome {
-        match &report.stop {
-            PlanImplementationStop::Completed => {
-                self.fixed_items += self.repaired_findings(member_id).await;
-                BatchStepOutcome::succeeded()
+    /// The lifecycle of the entity belongs to the control loops, which write the
+    /// very same transition when they start the step. Writing it ahead of the run
+    /// lets the client observe the work that is actually executing: the caller
+    /// publishes the session right after this call and before `model/started`, so a
+    /// session that still reports `TODO` never covers the turn that already owns it.
+    async fn mark_taken(&self, persistence: &ReviewMemberPersistence, step_id: Option<String>) {
+        let Some(step_id) = step_id else {
+            return;
+        };
+        let tracked = step_id.clone();
+        let persistence = persistence.clone();
+        let root = self.repo_root.to_path_buf();
+        let outcome = offload(move || {
+            let mut plan = persistence.load(&root).map_err(|err| err.to_string())?;
+            if !mark_leaf_in_progress(&mut plan.implementation.items, &step_id) {
+                return Ok(());
             }
-            PlanImplementationStop::Cancelled | PlanImplementationStop::Stopped => {
-                BatchStepOutcome::cancelled()
-            }
-            PlanImplementationStop::Blocked { reason, .. } => {
-                BatchStepOutcome::skipped(reason.clone())
-            }
-            PlanImplementationStop::Failed { reason, .. } => {
-                BatchStepOutcome::failed(reason.clone())
+            plan.implementation.refresh_parent_statuses();
+            persistence
+                .persist(&root, &plan)
+                .map_err(|err| err.to_string())
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) | Err(err) => tracing::warn!(
+                step_id = tracked.as_str(),
+                error = %err,
+                "the taken review step was not persisted"
+            ),
+        }
+    }
+
+    /// States the verdict of a settled member on the entity it addressed.
+    ///
+    /// The verdict is written exactly once, when the run of the member reached its
+    /// terminal outcome, and it describes the review entity rather than the step
+    /// graph: a completed horizon closes the findings a group collects as `Fixed`,
+    /// and a member the run could not implement states `Skipped` with the
+    /// diagnostic. A plan scope owns no review entity, so it settles nothing, and
+    /// a finding keeps the note the developer already stated.
+    async fn settle(&self, scope: &ExecutionScope, verdict: MemberVerdict<'_>) {
+        let status_code = match &verdict {
+            MemberVerdict::Fixed => "fixed",
+            MemberVerdict::Skipped(_) => "skipped",
+        };
+        match scope {
+            ExecutionScope::Plan { .. } => {}
+            ExecutionScope::ReviewGroup {
+                review_id,
+                group_id,
+            } => match verdict {
+                MemberVerdict::Fixed => {
+                    let root = self.repo_root.to_path_buf();
+                    let review = review_id.clone();
+                    let group = group_id.clone();
+                    let settled = offload(move || {
+                        ReviewStorage::close_group_implementation(
+                            &root,
+                            &review,
+                            &group,
+                            GROUP_COMPLETION_NOTE,
+                        )
+                    })
+                    .await;
+                    match settled {
+                        Ok(Ok(persisted)) => tracing::info!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            persisted = ?persisted,
+                            "review group implementation closed"
+                        ),
+                        Ok(Err(err)) => tracing::warn!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            error = %err,
+                            "the review group completion was not persisted"
+                        ),
+                        Err(err) => tracing::warn!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            error = %err,
+                            "the review group completion was not persisted"
+                        ),
+                    }
+                }
+                MemberVerdict::Skipped(reason) => {
+                    let root = self.repo_root.to_path_buf();
+                    let review = review_id.clone();
+                    let group = group_id.clone();
+                    let reason = reason.to_string();
+                    let settled = offload(move || {
+                        ReviewStorage::set_group_blocked_reason(
+                            &root,
+                            &review,
+                            &group,
+                            Some(reason.as_str()),
+                        )
+                    })
+                    .await;
+                    match settled {
+                        Ok(Ok(persisted)) => tracing::warn!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            persisted = ?persisted,
+                            status = status_code,
+                            "the review group horizon was not completed"
+                        ),
+                        Ok(Err(err)) => tracing::warn!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            status = status_code,
+                            error = %err,
+                            "the review group blocker was not persisted"
+                        ),
+                        Err(err) => tracing::warn!(
+                            review_id = review_id.as_str(),
+                            group_id = group_id.as_str(),
+                            status = status_code,
+                            error = %err,
+                            "the review group blocker was not persisted"
+                        ),
+                    }
+                }
+            },
+            ExecutionScope::ReviewFinding { review_id, item_id } => {
+                let (status, note) = match verdict {
+                    MemberVerdict::Fixed => {
+                        (IssueStatus::Fixed, FINDING_COMPLETION_NOTE.to_string())
+                    }
+                    MemberVerdict::Skipped(reason) => (
+                        IssueStatus::Skipped,
+                        format!("The implementation run could not address this finding: {reason}"),
+                    ),
+                };
+                let root = self.repo_root.to_path_buf();
+                let review = review_id.clone();
+                let id = *item_id;
+                let settled = offload(move || {
+                    ReviewStorage::update_session_item(&root, &review, id, |issue| {
+                        issue.status = status;
+                        // A note the developer already stated is never rewritten by
+                        // a settlement: the note of the run is recorded only on a
+                        // finding that carries none.
+                        if !carries_note(issue.note.as_deref()) {
+                            issue.note = Some(note);
+                        }
+                    })
+                })
+                .await;
+                match settled {
+                    Ok(Ok(Some(_))) => tracing::info!(
+                        review_id = review_id.as_str(),
+                        item_id = *item_id,
+                        status = status_code,
+                        "review finding settled"
+                    ),
+                    Ok(Ok(None)) => tracing::warn!(
+                        review_id = review_id.as_str(),
+                        item_id = *item_id,
+                        status = status_code,
+                        "the review finding verdict was not persisted: the finding was not found"
+                    ),
+                    Ok(Err(err)) => tracing::warn!(
+                        review_id = review_id.as_str(),
+                        item_id = *item_id,
+                        status = status_code,
+                        error = %err,
+                        "the review finding verdict was not persisted"
+                    ),
+                    Err(err) => tracing::warn!(
+                        review_id = review_id.as_str(),
+                        item_id = *item_id,
+                        status = status_code,
+                        error = %err,
+                        "the review finding verdict was not persisted"
+                    ),
+                }
             }
         }
+    }
+
+    /// Settles the terminal report of one member run on the entity it addressed.
+    ///
+    /// The engine ends every run it starts, so a member that could not be
+    /// implemented as stated is a local skip of the queue instead of a fatal
+    /// stop: the remaining findings are independent of it. A cancellation and an
+    /// infrastructure failure stop the queue, because the next member must never
+    /// build on a state nobody verified.
+    async fn settle_run(&self, scope: &ExecutionScope, report: StepLoopReport) -> BatchStepOutcome {
+        match report {
+            StepLoopReport::Cancelled => BatchStepOutcome::cancelled(),
+            StepLoopReport::Failed(reason) => {
+                self.settle(scope, MemberVerdict::Skipped(reason.as_str()))
+                    .await;
+                BatchStepOutcome::failed(reason)
+            }
+            StepLoopReport::Turn(_) => BatchStepOutcome::failed(
+                "A review member reported a single-turn outcome instead of a step sequence"
+                    .to_string(),
+            ),
+            StepLoopReport::Sequence(result) => match result {
+                LoopResult::Success(_) => {
+                    if self.horizon_complete(scope).await {
+                        self.settle(scope, MemberVerdict::Fixed).await;
+                        BatchStepOutcome::succeeded()
+                    } else {
+                        let reason = "The run stopped before the horizon became complete; execute the run again to continue from the remaining steps".to_string();
+                        self.settle(scope, MemberVerdict::Skipped(reason.as_str()))
+                            .await;
+                        BatchStepOutcome::skipped(reason)
+                    }
+                }
+                LoopResult::Diverged(_) => {
+                    let reason = "The run diverged without a completed horizon".to_string();
+                    self.settle(scope, MemberVerdict::Skipped(reason.as_str()))
+                        .await;
+                    BatchStepOutcome::skipped(reason)
+                }
+                LoopResult::Exhausted(report) => {
+                    self.settle(scope, MemberVerdict::Skipped(report.reason.as_str()))
+                        .await;
+                    BatchStepOutcome::skipped(report.reason)
+                }
+            },
+        }
+    }
+
+    /// Whether the horizon the member executes reached its aggregate `Done`.
+    ///
+    /// A degenerate single-finding horizon owns no persisted step graph, so a run
+    /// that completed it is the whole verdict of that member.
+    async fn horizon_complete(&self, scope: &ExecutionScope) -> bool {
+        if matches!(scope, ExecutionScope::ReviewFinding { .. }) {
+            return true;
+        }
+        let resolve_scope = scope.clone();
+        let root = self.repo_root.to_path_buf();
+        matches!(
+            offload(move || resolve_scope.resolve(&root)).await,
+            Ok(Ok(frame)) if frame.plan.implementation.status() == PlanItemStatus::Done
+        )
+    }
+
+    /// Resolves the work one review member executes.
+    ///
+    /// The horizon is read from the storage that owns it, so the sequence loop
+    /// drives exactly the steps the entity declares. A scope that cannot be
+    /// resolved, or whose horizon is not synthesized yet, yields the diagnostic
+    /// the member reports instead of a model turn.
+    async fn member_run(&self, scope: &ExecutionScope) -> Result<MemberRun, String> {
+        let resolve_scope = scope.clone();
+        let root = self.repo_root.to_path_buf();
+        let frame = match offload(move || resolve_scope.resolve(&root)).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(failure)) => return Err(failure.into_reason()),
+            Err(err) => return Err(err),
+        };
+        let title = frame.plan.title.clone();
+        match scope {
+            ExecutionScope::Plan { .. } => {
+                Err("A review batch member addresses no plan horizon".to_string())
+            }
+            ExecutionScope::ReviewFinding { review_id, item_id } => Ok(MemberRun {
+                work: TurnWorkContext::ReviewStep {
+                    review_id: review_id.clone(),
+                    review_title: review_id.clone(),
+                    queue: TurnWorkQueue {
+                        items: vec![TurnWorkItem {
+                            id: item_id.to_string(),
+                            title,
+                        }],
+                        active_index: 0,
+                    },
+                },
+                steps: vec![item_id.to_string()],
+            }),
+            ExecutionScope::ReviewGroup {
+                review_id,
+                group_id,
+            } => {
+                if frame.plan.implementation.items.is_empty() {
+                    return Err(format!(
+                        "Review group '{}' of session '{}' owns no implementation horizon yet; synthesize its horizon before the group is executed",
+                        group_id, review_id
+                    ));
+                }
+                let items = match frame.plan.implementation.evaluate_scope(None) {
+                    PlanScopeEvaluation::Ready(leaves) => leaves
+                        .into_iter()
+                        .map(|item| TurnWorkItem {
+                            id: item.id.clone(),
+                            title: item.title.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                    PlanScopeEvaluation::AllCompleted => Vec::new(),
+                    stall => {
+                        let failure = classify_scope_stall(&frame.plan, None, &stall);
+                        return Err(failure.into_reason());
+                    }
+                };
+                let steps = items.iter().map(|item| item.id.clone()).collect();
+                Ok(MemberRun {
+                    work: TurnWorkContext::ReviewGroupStep {
+                        review_id: review_id.clone(),
+                        review_title: review_id.clone(),
+                        group_id: group_id.clone(),
+                        group_title: title,
+                        queue: TurnWorkQueue {
+                            items,
+                            active_index: 0,
+                        },
+                    },
+                    steps,
+                })
+            }
+        }
+    }
+}
+
+/// Work one review batch member executes through the control loops.
+struct MemberRun {
+    /// Work the turns of the run execute, published with `model/started`.
+    work: TurnWorkContext,
+    /// Ordered steps the sequence loop drives.
+    steps: Vec<String>,
+}
+
+/// Verdict a settled batch member states on the review entity it addressed.
+enum MemberVerdict<'a> {
+    /// The run completed the work the member addressed.
+    Fixed,
+    /// The run could not address the work of the member, with its diagnostic.
+    Skipped(&'a str),
+}
+
+/// Note recorded on the findings a completed group horizon closes.
+///
+/// It states why the findings became `Fixed`: the horizon the group owns
+/// finished. A finding that already carries a note keeps it.
+const GROUP_COMPLETION_NOTE: &str =
+    "Resolved by the completed implementation horizon of the review group";
+
+/// Note recorded on a finding the run addressed through its own step.
+const FINDING_COMPLETION_NOTE: &str = "Addressed by the implementation run";
+
+/// Whether a finding already carries a resolution note.
+fn carries_note(note: Option<&str>) -> bool {
+    note.map(str::trim).is_some_and(|text| !text.is_empty())
+}
+
+/// Marks the addressed leaf of a stored horizon as taken by the run.
+///
+/// Only a ready leaf that still waits for its turn is taken over, so a step the
+/// control loops already advanced keeps the lifecycle they recorded.
+fn mark_leaf_in_progress(items: &mut [tauqe_protocol::PlanItem], step_id: &str) -> bool {
+    for item in items {
+        if item.id.trim().eq_ignore_ascii_case(step_id.trim()) {
+            if !item.is_leaf() || item.status != PlanItemStatus::Todo {
+                return false;
+            }
+            item.status = PlanItemStatus::InProgress;
+            return true;
+        }
+        if mark_leaf_in_progress(&mut item.children, step_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves the review session a batch member addresses.
+fn scope_review_id(scope: &ExecutionScope) -> Option<String> {
+    match scope {
+        ExecutionScope::ReviewGroup { review_id, .. }
+        | ExecutionScope::ReviewFinding { review_id, .. } => Some(review_id.clone()),
+        ExecutionScope::Plan { .. } => None,
     }
 }
 
@@ -718,7 +1074,7 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
     async fn execute_step(
         &mut self,
         step: &BatchStep,
-        stream_tx: mpsc::Sender<StreamEvent>,
+        _stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
         let Some(scope) = member_scope(&step.id) else {
@@ -727,49 +1083,83 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
                 step.id
             )));
         };
-        // The member addresses exactly one review session, and that session is the
-        // state the client is told about once the member settles.
-        let review_id = match &scope {
-            ExecutionScope::ReviewGroup { review_id, .. }
-            | ExecutionScope::ReviewFinding { review_id, .. } => Some(review_id.clone()),
-            ExecutionScope::Plan { .. } => None,
+        let Some(review_id) = scope_review_id(&scope) else {
+            return Ok(BatchStepOutcome::failed(format!(
+                "Review step '{}' addresses no review session",
+                step.id
+            )));
         };
-        // Every member is a whole bounded turn of its own, so it mints its own
-        // marker before the pipeline resolves the horizon it executes.
-        let marker = self.state.next_turn_marker().await;
-        let host = ServerImplementationHost::new(
-            Arc::clone(self.state),
-            Arc::clone(self.operation),
-            self.config.clone(),
-            self.repo_root.to_path_buf(),
-        );
-        let options = PlanImplementationOptions {
-            selection: self.model.clone(),
-            instructions: self.instructions.clone(),
-            marker,
+        let Some(persistence) = ReviewMemberPersistence::of(&scope) else {
+            return Ok(BatchStepOutcome::failed(format!(
+                "Review step '{}' addresses no executable review entity",
+                step.id
+            )));
         };
-        // The queue itself owns the graceful drain between members, so the
-        // member pipeline runs without a soft-stop of its own while the sender
-        // stays alive for the whole call.
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
-        let pipeline = PlanImplementationPipeline::new(
-            self.repo_root,
-            scope,
-            &host,
-            self.config.clone(),
-            options,
-        );
-        let report = pipeline.run(&stream_tx, &cancel_rx, &soft_stop_rx).await;
-        // The pipeline settles the entity of the member before it returns, so the
-        // refreshed session is published with the verdict already on disk: a
-        // completed member reports its findings `Fixed`, and a member the engine
-        // could not implement reports them `Skipped`. A publication at member start
-        // is deliberately not performed here: it would observe a run that has not
-        // begun and report the `TODO` it still is.
-        if let Some(review_id) = review_id.as_deref() {
-            publish_review(self.state, self.repo_root, review_id).await;
+
+        // A cancel observed before the member is launched ends it before any model
+        // turn is requested and before the addressed entity is touched.
+        if *cancel_rx.borrow() {
+            return Ok(BatchStepOutcome::cancelled());
         }
-        Ok(self.map_report(&step.id, &report).await)
+
+        // The horizon is resolved before the run starts, because the sequence loop
+        // drives exactly the steps the entity declares: a scope that cannot be
+        // resolved, or whose horizon is not synthesized yet, reports its diagnostic
+        // instead of spending a model turn.
+        let run = match self.member_run(&scope).await {
+            Ok(run) => run,
+            Err(reason) => {
+                self.settle(&scope, MemberVerdict::Skipped(reason.as_str()))
+                    .await;
+                publish_review(self.state, self.repo_root, &review_id).await;
+                return Ok(BatchStepOutcome::skipped(reason));
+            }
+        };
+
+        let outcome = if run.steps.is_empty() {
+            // Nothing is left to schedule: the horizon already reached its
+            // aggregate completion, so the member settles the findings it collects.
+            self.settle(&scope, MemberVerdict::Fixed).await;
+            BatchStepOutcome::succeeded()
+        } else {
+            // The member is taken over and published before its first turn starts,
+            // so the client observes the entity the run executes instead of the
+            // `TODO` it held when the batch was launched.
+            self.mark_taken(&persistence, run.steps.first().cloned())
+                .await;
+            publish_review(self.state, self.repo_root, &review_id).await;
+            let report = run_step_loop(
+                self.state,
+                StepLoopOptions {
+                    selection: self.model.clone(),
+                    reasoning_effort: None,
+                    // Every member is a whole bounded run of its own, so it mints
+                    // its own marker before the sequence drives its steps.
+                    marker: None,
+                    // The run extends one long-lived review session, so consecutive
+                    // turns of the horizon reuse the prefix cache they warm.
+                    session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &review_id)),
+                    operation: Arc::clone(self.operation),
+                    plan_context: None,
+                    work_context: Some(run.work),
+                    body: StepLoopBody::Sequence {
+                        persistence,
+                        steps: run.steps,
+                    },
+                },
+            )
+            .await;
+            self.settle_run(&scope, report).await
+        };
+
+        if outcome.status == BatchStepStatus::Succeeded {
+            self.fixed_items += self.repaired_findings(&step.id).await;
+        }
+        // The member is settled before it is published, so the client observes the
+        // verdict already on disk instead of the state it held when the batch was
+        // launched.
+        publish_review(self.state, self.repo_root, &review_id).await;
+        Ok(outcome)
     }
 }
 
@@ -789,11 +1179,10 @@ pub(super) async fn run_review_batch_with_options(
     _step_id: Option<String>,
     deferred: usize,
     model: Option<ModelSelection>,
-    instructions: Option<String>,
+    _instructions: Option<String>,
     operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let config = state.config.lock().await.config.clone();
     if owner_id != "all" {
         let save_root = repo_root.clone();
         let owner_owned = owner_id.to_string();
@@ -832,9 +1221,7 @@ pub(super) async fn run_review_batch_with_options(
         state,
         repo_root: &repo_root,
         operation: &operation,
-        config,
         model,
-        instructions,
         fixed_items: 0,
     };
 

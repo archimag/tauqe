@@ -97,13 +97,16 @@ Two further terms are used precisely throughout this book:
   mandate, repeat failed actions, or redefine the task it was given.
 - **Bounded turn** — one finite-state cycle of discovery, proposal, staging,
   verification, and healing that terminates in a declared outcome.
-### 1.2.1 Knowledge about the environment
+### 1.2.1 The brief of a contour
 
-The environment describes itself, and that description is not equally relevant
-everywhere.
+Every turn opens with a typed brief that the loop function running the turn
+declares: the kind of the contour, the role the model fills, a short statement
+of the paradigm, and the task itself. The brief is a value the governing loop
+hands to the assembly, never a text selected by a flag that merely resembles a
+regime.
 
 The **interactive dialogue** is where the developer prepares a project, chooses
-a workflow, and organizes the work, so it carries a compact ontology: the
+a workflow, and organizes the work, so its brief carries a compact ontology:
 literal-harness paradigm, the split between the Architect who fixes *what* and
 the Coder who implements *how*, the three paths work travels (the interactive
 change, a local plan, a code review), and the configuration surfaces a

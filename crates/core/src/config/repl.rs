@@ -1,22 +1,20 @@
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{EditProtocolKind, PatchStrategy, PromptLayoutKind, WorkflowKind};
+use tauqe_protocol::{PatchStrategy, PromptLayoutKind, WorkflowKind};
 
-/// Turn profile of a project: workflow engine, edit protocol, patch strategy,
+/// Turn profile of a project: workflow engine, patch strategy,
 /// and the retry and replanning budgets of a turn.
 ///
 /// The profile is declared under the canonical `[repl]` section and governs
 /// every bounded turn of the project: an isolated step and a discussion run
-/// under the same workflow, transport, patch strategy, and budgets as an
+/// under the same workflow, patch strategy, and budgets as an
 /// interactive REPL turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplConfig {
     #[serde(default)]
     pub workflow: WorkflowKind,
-    #[serde(default)]
-    pub protocol: EditProtocolKind,
     /// Strategy that decides how a change set addresses the lines it replaces.
     ///
-    /// It is orthogonal to `protocol`: the transport decides how an edit is
+    /// It is orthogonal to protocol: the transport decides how an edit is
     /// encoded, while the strategy decides whether it addresses a line range
     /// through the text it echoes or through the opaque anchors rendered in
     /// context.
@@ -39,9 +37,6 @@ pub struct ReplConfig {
     pub max_retries: usize,
     #[serde(default = "default_max_replans")]
     pub max_replans: usize,
-    /// Temporary flag to enable functional control loops migration
-    #[serde(default)]
-    pub use_control_loops: bool,
 }
 
 /// Backwards-compatible alias for the legacy `[edit]` configuration section.
@@ -59,12 +54,10 @@ impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             workflow: WorkflowKind::default(),
-            protocol: EditProtocolKind::default(),
             patch_strategy: PatchStrategy::default(),
             prompt_layout: None,
             max_retries: default_max_retries(),
             max_replans: default_max_replans(),
-            use_control_loops: false,
         }
     }
 }
@@ -79,28 +72,22 @@ mod tests {
         let toml_str = r#"
 [repl]
 workflow = "git"
-protocol = "structured"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
-        assert_eq!(config.repl.protocol, EditProtocolKind::Structured);
         assert_eq!(config.repl.max_retries, 3);
     }
-
     #[test]
     fn test_edit_alias_compatibility() {
         let toml_str = r#"
 [edit]
 workflow = "naive"
-protocol = "xml"
 max_retries = 1
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.repl.workflow, WorkflowKind::Naive);
-        assert_eq!(config.repl.protocol, EditProtocolKind::Xml);
         assert_eq!(config.repl.max_retries, 1);
     }
-
     #[test]
     fn test_repl_max_retries_override() {
         let config: AppConfig = toml::from_str("[repl]\nmax_retries = 0\n").unwrap();

@@ -276,7 +276,7 @@ async fn format_staged_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
+    use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, EditReplace};
 
     /// The repository configuration file the filters rewrite.
     const CONFIG_PATH: &str = "tauqe.toml";
@@ -351,11 +351,11 @@ mod tests {
         project: &ProjectConfig,
         validator: StagedConfigValidator,
     ) -> StageEditsResult {
-        let edits = [EditOperation::Replace {
+        let edits = [EditOperation::Replace(EditReplace {
             path: CONFIG_PATH.to_string(),
             old_text: ORIGINAL_CONFIG.to_string(),
             new_text: AUTHORED_CONFIG.to_string(),
-        }];
+        })];
         prepare_staged_edits_with_config_and_validator(
             repo_root,
             project,
@@ -475,16 +475,16 @@ mod tests {
             total_estimated_tokens: 2,
         };
         let edits = [
-            EditOperation::Replace {
+            EditOperation::Replace(EditReplace {
                 path: CONFIG_PATH.to_string(),
                 old_text: ORIGINAL_CONFIG.to_string(),
                 new_text: AUTHORED_CONFIG.to_string(),
-            },
-            EditOperation::Replace {
+            }),
+            EditOperation::Replace(EditReplace {
                 path: HELPER_PATH.to_string(),
                 old_text: ORIGINAL_HELPER.to_string(),
                 new_text: AUTHORED_HELPER.to_string(),
-            },
+            }),
         ];
 
         let result = prepare_staged_edits_with_config_and_validator(
@@ -592,18 +592,17 @@ mod tests {
             total_estimated_tokens: 2,
         };
         let edits = [
-            EditOperation::Replace {
+            EditOperation::Replace(EditReplace {
                 path: CONFIG_PATH.to_string(),
                 old_text: ORIGINAL_CONFIG.to_string(),
                 new_text: AUTHORED_CONFIG.to_string(),
-            },
-            EditOperation::Replace {
+            }),
+            EditOperation::Replace(EditReplace {
                 path: HELPER_PATH.to_string(),
                 old_text: ORIGINAL_HELPER.to_string(),
                 new_text: AUTHORED_HELPER.to_string(),
-            },
+            }),
         ];
-
         let result = prepare_staged_edits_with_config_and_validator(
             dir.path(),
             &project,

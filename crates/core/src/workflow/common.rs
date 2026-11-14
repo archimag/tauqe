@@ -1,4 +1,7 @@
-use tauqe_protocol::{EditFileOp, EditOperation, HistoryFileChange, ModelResult};
+use tauqe_protocol::{
+    EditCreate, EditDelete, EditFileOp, EditLineAnchor, EditMove, EditMoveDir, EditOperation,
+    EditOverwrite, EditReplace, HistoryFileChange, ModelResult,
+};
 use tokio::sync::{mpsc, watch};
 
 use tauqe_protocol::ModelRef;
@@ -194,25 +197,25 @@ pub fn record_workflow_response(
             let mut files = Vec::new();
             for edit in edits {
                 let entry = match edit {
-                    EditOperation::Create { path, .. } => {
+                    EditOperation::Create(EditCreate { path, .. }) => {
                         HistoryFileChange::operated(EditFileOp::Create, path.clone())
                     }
-                    EditOperation::Delete { path } => {
+                    EditOperation::Delete(EditDelete { path }) => {
                         HistoryFileChange::operated(EditFileOp::Delete, path.clone())
                     }
-                    EditOperation::Replace { path, .. } => {
+                    EditOperation::Replace(EditReplace { path, .. }) => {
                         HistoryFileChange::operated(EditFileOp::Replace, path.clone())
                     }
-                    EditOperation::LineAnchor { path, .. } => {
+                    EditOperation::LineAnchor(EditLineAnchor { path, .. }) => {
                         HistoryFileChange::operated(EditFileOp::Replace, path.clone())
                     }
-                    EditOperation::Overwrite { path, .. } => {
+                    EditOperation::Overwrite(EditOverwrite { path, .. }) => {
                         HistoryFileChange::operated(EditFileOp::Overwrite, path.clone())
                     }
-                    EditOperation::Move { from, to } => {
+                    EditOperation::Move(EditMove { from, to }) => {
                         HistoryFileChange::moved(from.clone(), to.clone())
                     }
-                    EditOperation::MoveDir { from, to } => {
+                    EditOperation::MoveDir(EditMoveDir { from, to }) => {
                         HistoryFileChange::moved_dir(from.clone(), to.clone())
                     }
                 };
@@ -333,11 +336,11 @@ mod tests {
 
         let edit_res = ModelResult::Edit {
             summary: "Refactored module A".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "src/a.rs".to_string(),
                 old_text: "fn old() {}".to_string(),
                 new_text: "fn new() {}".to_string(),
-            }],
+            })],
             proposal: None,
             outcome: tauqe_protocol::EditOutcome {
                 applied: true,
@@ -380,11 +383,11 @@ mod tests {
 
         let edit_res = ModelResult::Edit {
             summary: "Update file a.rs".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "old".to_string(),
                 new_text: "new".to_string(),
-            }],
+            })],
             proposal: None,
             outcome: tauqe_protocol::EditOutcome {
                 applied: true,
@@ -414,19 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_request_preserved_before_clean() {
-        let proto = crate::edits::XmlEditProtocol;
-        let raw = "I need files.\n<context_request path=\"crates/tui/src/markdown.rs\" access=\"read_only\" />\n";
-        let reqs = proto.parse_context_requests(raw);
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].path, "crates/tui/src/markdown.rs");
-
-        let cleaned = proto.clean_assistant_text(raw);
-        assert!(!cleaned.contains("<context_request"));
-        assert!(proto.parse_context_requests(&cleaned).is_empty());
-    }
-
-    #[test]
     fn test_record_workflow_response_scratchpad_isolated_from_history() {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
@@ -434,11 +424,11 @@ mod tests {
         let raw_assistant = "I found the issue and fixed it.\n<scratchpad>\nWorking hypothesis: broken parser.\nVerified: parser fixed.\n</scratchpad>";
         let edit_res = ModelResult::Edit {
             summary: "Fix parser bug".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "src/parser.rs".to_string(),
                 old_text: "bad()".to_string(),
                 new_text: "good()".to_string(),
-            }],
+            })],
             proposal: Some(tauqe_protocol::ModelResultProposal {
                 message: "I found the issue and fixed it.".to_string(),
                 ..Default::default()
@@ -470,11 +460,29 @@ mod tests {
     fn test_scratchpad_round_accumulation_and_turn_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
-        let proto = crate::edits::XmlEditProtocol;
+        let proto = crate::edits::StructuredEditProtocol;
 
         // Round 1: Model emits research request and scratchpad note
-        let round1_output = "Need to inspect config.\n<context_request path=\"src/config.rs\" access=\"read_only\" />\n<scratchpad>\n- Hypothesis: missing timeout field\n- Goal: inspect config struct\n</scratchpad>";
-        let pad1 = proto.parse_scratchpad(round1_output);
+        let round1_output = serde_json::json!({
+            "message": "Need to inspect config.",
+            "scratchpad": "- Hypothesis: missing timeout field\n- Goal: inspect config struct",
+            "action": {
+                "kind": "research",
+                "research_requests": [{
+                    "kind": "file",
+                    "path": "src/config.rs",
+                    "access": "read_only",
+                    "regex": "",
+                    "recursive": false,
+                    "topic": "",
+                    "id": ""
+                }],
+                "custom_tools": [],
+                "scratchpad": "- Hypothesis: missing timeout field\n- Goal: inspect config struct"
+            },
+        })
+        .to_string();
+        let pad1 = proto.parse_scratchpad(&round1_output);
         assert_eq!(
             pad1.as_deref(),
             Some("- Hypothesis: missing timeout field\n- Goal: inspect config struct")
@@ -486,38 +494,64 @@ mod tests {
             1,
             vec![],
             "git",
-            tauqe_protocol::EditProtocolKind::Xml,
+            tauqe_protocol::EditProtocolKind::Structured,
             None,
             None,
         );
         assembly.turn_scratchpad = pad1;
-        let messages =
-            assembly.assemble_chat_messages("Continue", &crate::prompt::xml::XmlPromptProtocol);
+        let messages = assembly.assemble_chat_messages(
+            "Continue",
+            &crate::prompt::json::JsonPromptProtocol::default(),
+        );
         let prompt_text = &messages[0].content;
         assert!(prompt_text.contains("<scratchpad>"));
         assert!(prompt_text.contains("- Hypothesis: missing timeout field"));
 
         // Round 2 response: Model updates scratchpad with verified conclusion
-        let round2_output = "I have updated the config.\n<tauqe_edits summary=\"Add timeout field\">\n<edit path=\"src/config.rs\">\n<search>\nstruct Config {}\n</search>\n<replace>\nstruct Config {\n    timeout: u64,\n}\n</replace>\n</edit>\n</tauqe_edits>\n<scratchpad>\n- Verified: timeout field added\n- Status: ready for test\n</scratchpad>";
-        let pad2 = proto.parse_scratchpad(round2_output);
+        let round2_output = serde_json::json!({
+            "message": "I have updated the config.",
+            "scratchpad": "- Verified: timeout field added\n- Status: ready for test",
+            "action": {
+                "kind": "edit",
+                "changes": [{
+                    "op": "replace",
+                    "path": "src/config.rs",
+                    "to": "",
+                    "start": "AAAA",
+                    "end": "BBBB",
+                    "content": "struct Config {\n    timeout: u64,\n}\n"
+                }],
+                "outcome": {
+                    "status": "success",
+                    "commit_message": "feat: add timeout",
+                    "message": "",
+                    "reason": ""
+                }
+            },
+        })
+        .to_string();
+        let pad2 = proto.parse_scratchpad(&round2_output);
         assert_eq!(
             pad2.as_deref(),
             Some("- Verified: timeout field added\n- Status: ready for test")
         );
 
         // Turn completion: assistant text is cleaned and recorded in history
-        let cleaned = proto.clean_assistant_text(round2_output);
-        assert!(!cleaned.contains("<scratchpad"));
-        assert!(!cleaned.contains("Verified: timeout field added"));
-        assert!(cleaned.contains("I have updated the config."));
+        let cleaned = crate::edits::protocol::structured::clean_raw_json_or_text(&round2_output);
+        assert_eq!(cleaned, "I have updated the config.");
 
-        let edit_res = proto.parse_output(round2_output, &["src/config.rs".to_string()]);
+        let edit_res = proto.parse_output(
+            &crate::control::repl::dialogue_capability_expr(false, false),
+            &round2_output,
+            &["src/config.rs".to_string()],
+        );
         record_workflow_response(&mut hm, &edit_res, &cleaned, vec![]);
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
             crate::history::entry::HistoryEntry::Response { message, files, .. } => {
+                assert_eq!(message, "I have updated the config.");
                 assert!(!message.contains("scratchpad"));
                 assert!(!message.contains("Verified: timeout field"));
                 assert_eq!(

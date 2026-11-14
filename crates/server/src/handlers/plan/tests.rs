@@ -1232,12 +1232,28 @@ async fn test_plan_step_binds_the_plan_session() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let response = "<tauqe_edits summary=\"Set value\">\n<edit path=\"src.rs\">\n<search>\npub fn value() -> i32 { 0 }\n</search>\n<replace>\npub fn value() -> i32 { 1 }\n</replace>\n</edit>\n<success commit_message=\"done\" />\n</tauqe_edits>";
+    let response = serde_json::json!({
+        "message": "Set value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 1 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
     let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
@@ -1454,84 +1470,7 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
     );
 }
 
-#[tokio::test]
-async fn test_plan_step_execution_uses_turn_marker() {
-    let dir = TestDir::new();
-    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
-    std::fs::write(dir.path().join("src.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
-    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
-    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
-
-    let mut item = test_item("1", PlanItemStatus::Todo);
-    item.title = "Implement compute".to_string();
-    item.files = vec!["src.rs".to_string()];
-    let plan = Plan::from_parts(
-        "marker-plan".to_string(),
-        "Marker Plan".to_string(),
-        None,
-        1,
-        1,
-        Vec::new(),
-        vec![item],
-    );
-    PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "TESTMARKER1";
-    let response = format!(
-        "<tauqe_edits_{m} summary=\"Implement compute\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn compute() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
-    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
-
-    let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.models.auto_level_up = false;
-
-    let state = test_state_with_provider(&dir, config, provider.clone()).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
-
-    let operation = Arc::new(
-        state
-            .try_begin_operation()
-            .expect("register batch operation"),
-    );
-    let outcome = run_plan_batch(
-        &state,
-        "marker-plan",
-        vec!["1".to_string()],
-        operation,
-        PlanBatchOptions::default(),
-    )
-    .await;
-    assert!(
-        matches!(outcome, BatchOutcome::Completed { steps: 1 }),
-        "expected a completed batch, got {:?}",
-        outcome
-    );
-
-    // Both the system prompt and the step prompt must carry the marker suffix.
-    let request = &provider.requests()[0];
-    assert!(request.messages[0]
-        .content
-        .contains(&format!("scratchpad_{}", marker)));
-    assert!(request.messages[0]
-        .content
-        .contains(&format!("success_{}", marker)));
-
-    // The marker-bound edits were applied and the step reached DONE.
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
-        "pub fn compute() -> i32 { 42 }\n"
-    );
-    let reloaded = PlanStorage::load_plan(dir.path(), "marker-plan")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        reloaded.implementation.find_item("1").unwrap().status,
-        PlanItemStatus::Done
-    );
-}
+// Retired XML marker test.
 
 #[tokio::test]
 async fn test_plan_batch_automated_replanning_on_blocked_step() {
@@ -1555,13 +1494,18 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let marker = "AUTOREPLANM1";
-    // 1. Coder turn returns a semantic blocked outcome:
-    let blocked_response = format!(
-        "<blocked_{m} reason=\"Precondition missing: value signature invalid\" />",
-        m = marker
-    );
-    // 2. Architect replanning turn returns a new horizon with replacement step "1.1":
+    let blocked_response = serde_json::json!({
+        "message": "Blocked",
+        "action": {
+            "kind": "blocked",
+            "blocked": {
+                "is_blocked": true,
+                "reason": "Precondition missing: value signature invalid",
+                "details": ""
+            }
+        }
+    })
+    .to_string();
     let replan_output = serde_json::json!({
         "status": "success",
         "explanation": "Replanned step 1 into replacement 1.1",
@@ -1578,11 +1522,24 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
             }
         ]
     });
-    // 3. Coder turn for step "1.1" succeeds:
-    let success_response = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 100 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let success_response = serde_json::json!({
+        "message": "Fix value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 100 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
 
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(blocked_response),
@@ -1592,12 +1549,10 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -1651,13 +1606,18 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let marker = "LAZYUP1";
-    let blocked = format!(
-        "<blocked_{m} reason=\"Precondition missing\" />",
-        m = marker
-    );
-    // Both replanning waves restate the same step identifier, so the second
-    // failure of step 1 is a repeated failure and must escalate the Architect.
+    let blocked = serde_json::json!({
+        "message": "Blocked",
+        "action": {
+            "kind": "blocked",
+            "blocked": {
+                "is_blocked": true,
+                "reason": "Precondition missing",
+                "details": ""
+            }
+        }
+    })
+    .to_string();
     let replan_output = serde_json::json!({
         "status": "success",
         "explanation": "Restated the same step",
@@ -1672,10 +1632,24 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
             "children": []
         }]
     });
-    let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 7 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let success = serde_json::json!({
+        "message": "Fix value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 7 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
 
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(blocked.clone()),
@@ -1687,7 +1661,6 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
@@ -1697,7 +1670,6 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -1755,11 +1727,18 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
         vec![item],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "LIMITREPLANM1";
-    // 1. First coder turn blocks:
-    let blocked_1 = format!("<blocked_{m} reason=\"First blocker\" />", m = marker);
-    // 2. Architect replanning replaces step 1 with 1.1:
+    let blocked_1 = serde_json::json!({
+        "message": "Blocked",
+        "action": {
+            "kind": "blocked",
+            "blocked": {
+                "is_blocked": true,
+                "reason": "First blocker",
+                "details": ""
+            }
+        }
+    })
+    .to_string();
     let replan_output = serde_json::json!({
         "status": "success",
         "explanation": "Replanned into 1.1",
@@ -1776,8 +1755,18 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
             }
         ]
     });
-    // 3. Second coder turn on step 1.1 also blocks:
-    let blocked_2 = format!("<blocked_{m} reason=\"Second blocker\" />", m = marker);
+    let blocked_2 = serde_json::json!({
+        "message": "Blocked",
+        "action": {
+            "kind": "blocked",
+            "blocked": {
+                "is_blocked": true,
+                "reason": "Second blocker",
+                "details": ""
+            }
+        }
+    })
+    .to_string();
 
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(blocked_1),
@@ -1787,13 +1776,10 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    // Limit max_replans to 1:
     config.repl.max_replans = 1;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -1867,23 +1853,25 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
         vec![first, second],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "ABORTBATCHM1";
-    // The coder cannot proceed without a host action and reports an
-    // unconditional abort together with the command the developer must run.
-    let abort_response = format!(
-        "<abort_{m} reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />",
-        m = marker
-    );
-    // Only one round is scripted: an architect replanning cycle would need a
-    // second generation, so an exhausted script proves it never ran.
+    let abort_response = serde_json::json!({
+        "message": "Aborted",
+        "action": {
+            "kind": "abort",
+            "abort": {
+                "is_aborted": true,
+                "reason": "Native build approval required",
+                "recommendation": "pnpm approve-builds"
+            }
+        }
+    })
+    .to_string();
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
         abort_response,
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    // protocol is always structured
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
@@ -1893,7 +1881,6 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
     )]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -2107,8 +2094,6 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let marker = "JITHORIZONM1";
-    // 1. The Architect projects the first horizon just-in-time:
     let refine_output = serde_json::json!({
         "status": "success",
         "explanation": "Projected the first horizon",
@@ -2125,11 +2110,24 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
             }
         ]
     });
-    // 2. The projected step is then executed by the coder:
-    let success_response = format!(
-        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 5 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let success_response = serde_json::json!({
+        "message": "Set value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 5 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
 
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(refine_output.to_string()),
@@ -2138,11 +2136,10 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    // protocol is always structured
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -2952,24 +2949,29 @@ async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
         vec![item],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "BLOCKEDREASONM1";
     let reason = "Missing capability: native compiler";
-    let blocked_response = format!("<blocked_{m} reason=\"{r}\" />", m = marker, r = reason);
-    // Only the blocking round is scripted: with `max_replans = 0` the batch ends
-    // immediately, so an exhausted script proves no replanning was engaged.
+    let blocked_response = serde_json::json!({
+        "message": "Blocked",
+        "action": {
+            "kind": "blocked",
+            "blocked": {
+                "is_blocked": true,
+                "reason": reason,
+                "details": ""
+            }
+        }
+    })
+    .to_string();
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
         blocked_response,
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_replans = 0;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -3043,20 +3045,19 @@ async fn test_plan_step_structured_protocol_execution() {
 
     let response = serde_json::json!({
         "message": "Set value to 42",
-        "changes": [
-            {
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 42 }",
-                "content": ""
-            }
-        ],
-        "context_requests": [],
-        "outcome": {
-            "status": "success",
-            "summary": "Value set to 42",
+        "action": {
+            "kind": "edit",
+            "changes": [
+                {
+                    "op": "replace",
+                    "path": "src.rs",
+                    "to": "",
+                    "old_text": "pub fn value() -> i32 { 0 }",
+                    "new_text": "pub fn value() -> i32 { 42 }",
+                    "content": ""
+                }
+            ],
+            "commit_message": "done",
             "message": "",
             "reason": ""
         }
@@ -3066,7 +3067,6 @@ async fn test_plan_step_structured_protocol_execution() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Structured;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
@@ -3096,7 +3096,7 @@ async fn test_plan_step_structured_protocol_execution() {
             "a Structured step prompt must not mention {tag}: {user_prompt}"
         );
     }
-    assert!(user_prompt.contains("outcome"));
+    assert!(user_prompt.contains("commit_message"));
     assert!(user_prompt.contains("context_requests"));
 
     assert_eq!(
@@ -3135,15 +3135,24 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
         vec![item],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "STARTTIERM1";
-    // Round 1 answers without a change set, so the single-attempt tier budget is
-    // spent at once and the step escalates one rung above the selected tier.
-    // Round 2 applies the edit and completes.
-    let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 9 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let success = serde_json::json!({
+        "message": "Fix value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 9 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text("The step looks complete."),
         MockResponse::text(success),
@@ -3151,7 +3160,6 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3161,7 +3169,6 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -3228,19 +3235,28 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
         vec![item],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "MIDTIERPLAN1";
-    // A verified first attempt: the edit lands and the step carries a terminal
-    // success, so the ladder never has to advance.
-    let response = format!(
-        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 3 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let response = serde_json::json!({
+        "message": "Set value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 3 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.repl.max_retries = 2;
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
@@ -3251,7 +3267,6 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -3324,10 +3339,8 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         MockResponse::text("The step looks complete."),
         MockResponse::text("The step looks complete."),
     ]));
-
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
@@ -3439,14 +3452,24 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
         vec![item],
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-
-    let marker = "SAMETIERM1";
-    // Round 1 answers without a change set, so the step spends one attempt and
-    // retries the same tier. Round 2 applies the edit and completes.
-    let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 11 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker
-    );
+    let success = serde_json::json!({
+        "message": "Fix value",
+        "action": {
+            "kind": "edit",
+            "changes": [{
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 11 }",
+                "content": ""
+            }],
+            "commit_message": "done",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
     let mock_provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text("The step looks complete."),
         MockResponse::text(success),
@@ -3454,7 +3477,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    // protocol is always structured
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3467,7 +3490,6 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
     *state.provider_override.lock().await = Some(provider);
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -3547,7 +3569,6 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3690,7 +3711,6 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     // A hard cancel is classified in the turn-classification branch, before the
     // tier budget is consulted: the raised cancel signal ends the step as
     // cancelled instead of spending an attempt on the aborted turn.
@@ -3775,7 +3795,7 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
     crate::handlers::model::start_model_turn(
         &state,
         "Probe the session lock".to_string(),
-        tauqe_protocol::TurnIntent::InteractiveRepl,
+        None,
         None,
         None,
     )

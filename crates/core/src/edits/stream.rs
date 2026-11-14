@@ -9,11 +9,8 @@ use crate::providers::StreamEvent;
 
 pub mod discussion;
 pub mod json;
-pub mod xml;
-
 pub use discussion::DiscussionStreamFilter;
 pub use json::{JsonFieldStreamFilter, JsonStreamFilter};
-pub use xml::XmlStreamFilter;
 
 /// Common interface for streaming parsers that intercept code edits in real time.
 pub trait EditStreamFilter: Send {

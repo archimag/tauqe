@@ -15,7 +15,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tauqe_protocol::{ContextState, EditOperation, GlobPattern, ProjectConfig};
+use tauqe_protocol::{
+    ContextState, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation,
+    EditOverwrite, EditReplace, GlobPattern, ProjectConfig,
+};
 
 use super::admission::{admit_move_destination, admit_write, ignored_target_paths, IgnoreAnswer};
 use super::error::EditError;
@@ -499,7 +502,7 @@ impl StagingUnit<'_> {
                 let writes = operations.iter().copied().any(|operation| {
                     matches!(
                         operation,
-                        EditOperation::Create { .. } | EditOperation::Overwrite { .. }
+                        EditOperation::Create(_) | EditOperation::Overwrite(_)
                     )
                 });
                 if writes {
@@ -604,7 +607,7 @@ fn build_staging_units<'a>(
 
     for edit in edits {
         match edit {
-            EditOperation::Move { from, to } => {
+            EditOperation::Move(EditMove { from, to }) => {
                 open = None;
                 match (
                     normalize_edit_path(repo_root, from),
@@ -630,7 +633,7 @@ fn build_staging_units<'a>(
                     }
                 }
             }
-            EditOperation::MoveDir { from, to } => {
+            EditOperation::MoveDir(EditMoveDir { from, to }) => {
                 // A directory move names a whole subtree, so it is expanded
                 // into the per-file moves it consists of before the attempt
                 // starts. A member left carrying the directory operation would
@@ -695,12 +698,13 @@ fn build_staging_units<'a>(
 /// Names the path an operation writes, regardless of its kind.
 fn operation_path(operation: &EditOperation) -> &str {
     match operation {
-        EditOperation::Replace { path, .. }
-        | EditOperation::Create { path, .. }
-        | EditOperation::Overwrite { path, .. }
-        | EditOperation::Delete { path, .. }
-        | EditOperation::LineAnchor { path, .. } => path,
-        EditOperation::Move { from, .. } | EditOperation::MoveDir { from, .. } => from,
+        EditOperation::Replace(EditReplace { path, .. })
+        | EditOperation::Create(EditCreate { path, .. })
+        | EditOperation::Overwrite(EditOverwrite { path, .. })
+        | EditOperation::Delete(EditDelete { path })
+        | EditOperation::LineAnchor(EditLineAnchor { path, .. }) => path,
+        EditOperation::Move(EditMove { from, .. })
+        | EditOperation::MoveDir(EditMoveDir { from, .. }) => from,
     }
 }
 
@@ -1008,18 +1012,18 @@ fn stage_file_edits(
         };
         if !in_context && !newly_created {
             match edit {
-                EditOperation::Create { .. } if !full_path.exists() => {}
+                EditOperation::Create(_) if !full_path.exists() => {}
                 _ => return Err(EditError::NotInContext(path.to_string())),
             }
         }
 
         match edit {
-            EditOperation::LineAnchor {
+            EditOperation::LineAnchor(EditLineAnchor {
                 start,
                 end,
                 content: replacement,
                 ..
-            } => {
+            }) => {
                 // Anchored ranges address the lines the context block rendered,
                 // so a run of them is resolved against one snapshot and applied
                 // from the bottom of the file upwards. Replacing a lower range
@@ -1032,12 +1036,12 @@ fn stage_file_edits(
                     content: replacement.as_str(),
                 }];
                 index += 1;
-                while let Some(EditOperation::LineAnchor {
+                while let Some(EditOperation::LineAnchor(EditLineAnchor {
                     start,
                     end,
                     content: replacement,
                     ..
-                }) = edits.get(index)
+                })) = edits.get(index)
                 {
                     batch.push(staging::AnchorEdit {
                         start: start.as_str(),
@@ -1065,9 +1069,9 @@ fn stage_file_edits(
                 content = Some(updated);
                 continue;
             }
-            EditOperation::Replace {
+            EditOperation::Replace(EditReplace {
                 old_text, new_text, ..
-            } => {
+            }) => {
                 // A replacement that echoes no text addresses no line of the
                 // file, so this is the staging end of the rejection the
                 // structured converter reports: the failure is carried as the
@@ -1094,18 +1098,18 @@ fn stage_file_edits(
                 let updated = apply_replace(current, old_text, new_text, path)?;
                 content = Some(updated);
             }
-            EditOperation::Create {
+            EditOperation::Create(EditCreate {
                 content: new_content,
                 ..
-            } => {
+            }) => {
                 content = Some(new_content.clone());
                 loaded = true;
                 newly_created = !full_path.exists();
             }
-            EditOperation::Overwrite {
+            EditOperation::Overwrite(EditOverwrite {
                 content: new_content,
                 ..
-            } => {
+            }) => {
                 // Full replacement requires an existing (on disk or staged) file.
                 if content.is_none() && (loaded || !full_path.is_file()) {
                     return Err(EditError::FileNotFound(path.to_string()));
@@ -1113,17 +1117,17 @@ fn stage_file_edits(
                 content = Some(new_content.clone());
                 loaded = true;
             }
-            EditOperation::Delete { .. } => {
+            EditOperation::Delete(_) => {
                 content = None;
                 loaded = true;
             }
-            EditOperation::Move { .. } => {
+            EditOperation::Move(_) => {
                 return Err(EditError::InvalidPath(
                     path.to_string(),
                     "Move operations cannot be staged as per-file edits".to_string(),
                 ));
             }
-            EditOperation::MoveDir { .. } => {
+            EditOperation::MoveDir(_) => {
                 return Err(EditError::InvalidPath(
                     path.to_string(),
                     "Directory moves cannot be staged as per-file edits".to_string(),

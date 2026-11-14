@@ -16,54 +16,74 @@ use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEven
 use tauqe_protocol::discussion::DiscussionPlanAction;
 use tauqe_protocol::{
     DiscussionFocus, DiscussionRequest, DiscussionTarget, EditProtocolKind, LlmCapability,
-    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, ProviderKind, Request, TurnIntent,
+    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, ProviderKind, Request,
 };
 use tokio::sync::{mpsc, watch};
 
-use super::prompt::{build_model_ask_prompt, intent_for_target};
-use super::turn::{execute_model_turn, resolve_session_id, resolve_turn_protocol, StepTurnOptions};
+use super::prompt::build_model_ask_prompt;
+use super::turn::{
+    execute_model_turn, forward_step_event, resolve_session_id, resolve_turn_protocol,
+    StepTurnOptions,
+};
 use super::{
     handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
 };
 use crate::handlers::common::test_support::scratch_root;
+use crate::handlers::edit_cycle::EditCycle;
 use crate::handlers::history::handle_history_get;
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
-/// A plan discussion is strictly read-only: the model reasons about the plan
-/// and never touches files.
-#[test]
-fn plan_discussion_is_readonly() {
-    let intent = intent_for_target(&DiscussionTarget::Plan {
+/// Capability surface of a free interactive dialogue.
+fn dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+    tauqe_core::control::repl_capabilities(None)
+}
+
+/// Capability surface of a plan-anchored dialogue.
+fn plan_dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+    tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Plan {
         id: "plan-1".to_string(),
-    });
-    assert!(intent.is_plan_discussion());
-    assert!(!intent.is_interactive_repl());
+    }))
+}
+
+/// Capability surface of a review-anchored dialogue.
+fn review_dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+    tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Review {
+        id: "review-1".to_string(),
+    }))
+}
+
+/// A plan-anchored dialogue declares plan mutation beside the dialogue surface,
+/// so the turn may record plan changes without leaving the discussion.
+#[test]
+fn plan_discussion_declares_plan_mutation() {
+    let capabilities = plan_dialogue_capabilities();
+    assert!(capabilities.contains(LlmCapability::PlanUpdate));
+    assert!(capabilities.contains(LlmCapability::TextMessage));
 }
 
 /// A review finding dialogue establishes its own regime, because the decision
 /// the dialogue records is authorized by that regime alone. The developer still
 /// holds the full finding context and may ask for the fix directly.
 #[test]
-fn review_discussion_is_authorized_by_its_regime() {
-    let finding = intent_for_target(&DiscussionTarget::Review {
-        id: "review-1".to_string(),
-    });
-    assert!(finding.is_review_discussion());
-    assert!(!finding.is_interactive_repl());
-    assert!(!finding.is_plan_discussion());
+fn review_discussion_is_authorized_by_its_surface() {
+    let capabilities = review_dialogue_capabilities();
+    assert!(capabilities.contains(LlmCapability::ReviewUpdate));
+    assert!(!capabilities.contains(LlmCapability::PlanUpdate));
 
-    // A group dialogue shares the regime: the plan of the group is the unit of
+    // A group dialogue shares the surface: the plan of the group is the unit of
     // remediation, and the decision it records belongs to the same anchored
     // session.
-    let group = intent_for_target(&DiscussionTarget::ReviewGroup {
+    let group = DiscussionTarget::ReviewGroup {
         session_id: "review-1".to_string(),
         group_id: "arch-1".to_string(),
-    });
-    assert!(group.is_review_discussion());
+    };
+    assert!(
+        tauqe_core::control::repl_capabilities(Some(&group)).contains(LlmCapability::ReviewUpdate)
+    );
 }
 
 /// A decision recorded for one finding through the Structured Output transport.
-const REVIEW_DECISION_JSON: &str = r#"{"message":"Recording the decision.","review_update":{"item_id":7,"status":"rejected","note":"The race cannot happen"}}"#;
+const REVIEW_DECISION_JSON: &str = r#"{"message":"Recording the decision.","action":{"kind":"review","review_update":{"item_id":7,"status":"rejected","note":"The race cannot happen"}}}"#;
 
 /// Decodes `raw` and returns the review decisions that survived decoding.
 ///
@@ -89,12 +109,8 @@ fn decoded_review_updates(
 /// persists against the anchored session.
 #[test]
 fn review_discussion_decodes_the_recorded_decision() {
-    let structured = resolve_turn_protocol(
-        TurnIntent::ReviewDiscussion,
-        EditProtocolKind::Structured,
-        None,
-    );
-    let surface = structured.capability_set();
+    let structured = resolve_turn_protocol(review_dialogue_capabilities());
+    let surface = structured.capability_expr();
     assert!(surface.contains(LlmCapability::ReviewUpdate));
 
     let decisions = decoded_review_updates(structured.as_ref(), REVIEW_DECISION_JSON);
@@ -112,43 +128,39 @@ fn review_discussion_decodes_the_recorded_decision() {
 /// through Structured Output.
 #[test]
 fn the_recorded_decision_never_leaves_the_review_regime() {
-    for intent in [
-        TurnIntent::InteractiveRepl,
-        TurnIntent::PlanDiscussion,
-        TurnIntent::IsolatedStep,
+    for capabilities in [
+        dialogue_capabilities(),
+        plan_dialogue_capabilities(),
+        tauqe_core::control::turn::turn_capability_expr(),
     ] {
-        let protocol = resolve_turn_protocol(intent, EditProtocolKind::Structured, None);
-        let surface = protocol.capability_set();
+        let protocol = resolve_turn_protocol(capabilities);
+        let surface = protocol.capability_expr();
         assert!(!surface.contains(LlmCapability::ReviewUpdate));
         let decisions = decoded_review_updates(protocol.as_ref(), REVIEW_DECISION_JSON);
         assert!(decisions.is_empty());
     }
 
-    // The grant is orthogonal to the transport, but the decision owns no control
-    // tag: an XML dialogue advertises the capability and decodes nothing from it.
-    let xml = resolve_turn_protocol(TurnIntent::ReviewDiscussion, EditProtocolKind::Xml, None);
-    let xml_surface = xml.capability_set();
-    assert!(xml_surface.contains(LlmCapability::ReviewUpdate));
-    let decisions = decoded_review_updates(xml.as_ref(), REVIEW_DECISION_JSON);
-    assert!(decisions.is_empty());
+    let review = resolve_turn_protocol(review_dialogue_capabilities());
+    assert!(review
+        .capability_expr()
+        .contains(LlmCapability::ReviewUpdate));
+    let decisions = decoded_review_updates(review.as_ref(), REVIEW_DECISION_JSON);
+    assert_eq!(decisions.len(), 1);
 }
-
 /// An isolated step never inherits the interactive session, so it cannot reuse
 /// a prompt-prefix cache built from the dialogue transcript.
 #[test]
 fn isolated_step_carries_no_dialogue_session() {
-    assert_eq!(
-        resolve_session_id(TurnIntent::IsolatedStep, "session-1".to_string()),
-        None
-    );
+    assert_eq!(resolve_session_id(true, "session-1".to_string()), None);
 }
 
 /// A dialogue turn binds the interactive session, so successive rounds reuse the
 /// backend's cached prompt prefix.
+/// A dialogue turn binds the interactive session, so successive rounds reuse the
+/// backend's cached prompt prefix.
 #[test]
 fn interactive_turn_binds_the_dialogue_session() {
-    assert!(resolve_session_id(TurnIntent::InteractiveRepl, "session-1".to_string()).is_some());
-    assert!(resolve_session_id(TurnIntent::PlanDiscussion, "session-1".to_string()).is_some());
+    assert!(resolve_session_id(false, "session-1".to_string()).is_some());
 }
 
 /// Builds a `model/select` request for the given selection.
@@ -206,20 +218,15 @@ async fn model_select_rotates_the_session_confirmed_by_the_effective_model() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Plan mutation emitted through the XML transport: an update of an existing
-/// plan and the save of a new one.
-const PLAN_UPDATE_XML: &str =
-    "<plan action=\"update\" id=\"p-1\"><item id=\"1\" status=\"done\" /></plan>";
-const PLAN_SAVE_XML: &str = concat!(
-    "<plan action=\"save\" id=\"p-2\" title=\"P2\">",
-    "<concept><concept_item id=\"c-1\" title=\"Invariant\" /></concept></plan>"
-);
+/// Plan mutations emitted through Structured Output by a dialogue that
+/// advertises plan authorship alone, so the payload stays at the branch level.
+const PLAN_UPDATE_JSON: &str = r#"{"message":"Updating","action":{"kind":"plan","plan_update":{"action":"update","id":"p-1"}}}"#;
+const PLAN_SAVE_JSON: &str = r#"{"message":"Saving","action":{"kind":"plan","plan_create":{"action":"save","id":"p-2","title":"P2"}}}"#;
 
-/// The same two mutations emitted through the Structured Output transport.
-const PLAN_UPDATE_JSON: &str =
-    r#"{"message":"Updating","plan_update":{"action":"update","id":"p-1"}}"#;
-const PLAN_SAVE_JSON: &str =
-    r#"{"message":"Saving","plan_update":{"action":"save","id":"p-2","title":"P2"}}"#;
+/// Plan mutations of a dialogue that advertises both plan capabilities, so the
+/// payload travels inside the `plan_action` variant the round selects.
+const PLAN_ACTION_UPDATE_JSON: &str = r#"{"message":"Updating","action":{"kind":"plan","plan_action":{"kind":"modify","plan_update":{"action":"update","id":"p-1"}}}}"#;
+const PLAN_ACTION_SAVE_JSON: &str = r#"{"message":"Saving","action":{"kind":"plan","plan_action":{"kind":"create","plan_create":{"action":"save","id":"p-2","title":"P2"}}}}"#;
 
 /// Decodes `raw` and returns the plan actions that survived decoding.
 ///
@@ -241,32 +248,26 @@ fn decoded_plan_actions(protocol: &dyn PromptProtocol, raw: &str) -> Vec<Discuss
 /// encodes it, and the transport never shrinks its surface. Both encodings
 /// therefore advertise the edit capability and decode the very same plan
 /// mutation, which the discussion authorizes by its regime.
+/// A plan discussion is a dialogue like any other: the transport never shrinks
+/// its surface, so the anchored dialogue advertises the edit capability and
+/// decodes the very same plan mutation the discussion authorizes.
 #[test]
 fn plan_discussion_follows_the_configured_transport() {
-    let xml = resolve_turn_protocol(TurnIntent::PlanDiscussion, EditProtocolKind::Xml, None);
-    assert_eq!(xml.kind(), EditProtocolKind::Xml);
-    assert!(xml.capability_set().contains(LlmCapability::FileEdits));
-    assert!(xml.capability_set().contains(LlmCapability::PlanUpdate));
-    assert_eq!(
-        decoded_plan_actions(xml.as_ref(), PLAN_UPDATE_XML),
-        vec![DiscussionPlanAction::Update]
-    );
-
-    let structured = resolve_turn_protocol(
-        TurnIntent::PlanDiscussion,
-        EditProtocolKind::Structured,
-        None,
-    );
-    assert_eq!(structured.kind(), EditProtocolKind::Structured);
-    assert!(structured
-        .capability_set()
-        .contains(LlmCapability::FileEdits));
-    assert!(structured
-        .capability_set()
+    let protocol = resolve_turn_protocol(plan_dialogue_capabilities());
+    assert_eq!(protocol.kind(), EditProtocolKind::Structured);
+    assert!(protocol
+        .capability_expr()
+        .contains(LlmCapability::EditReplace));
+    assert!(protocol
+        .capability_expr()
         .contains(LlmCapability::PlanUpdate));
     assert_eq!(
-        decoded_plan_actions(structured.as_ref(), PLAN_UPDATE_JSON),
+        decoded_plan_actions(protocol.as_ref(), PLAN_ACTION_UPDATE_JSON),
         vec![DiscussionPlanAction::Update]
+    );
+    assert_eq!(
+        decoded_plan_actions(protocol.as_ref(), PLAN_ACTION_SAVE_JSON),
+        vec![DiscussionPlanAction::Save]
     );
 }
 
@@ -276,26 +277,16 @@ fn plan_discussion_follows_the_configured_transport() {
 /// because a user may ask for a plan at any moment of a dialogue.
 #[test]
 fn interactive_turn_never_carries_plan_mutation() {
-    let xml = resolve_turn_protocol(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, None);
-    assert!(!xml.capability_set().contains(LlmCapability::PlanUpdate));
-    assert!(xml.capability_set().contains(LlmCapability::PlanCreation));
-    assert!(decoded_plan_actions(xml.as_ref(), PLAN_UPDATE_XML).is_empty());
-    assert_eq!(
-        decoded_plan_actions(xml.as_ref(), PLAN_SAVE_XML),
-        vec![DiscussionPlanAction::Save]
-    );
-
-    let structured = resolve_turn_protocol(
-        TurnIntent::InteractiveRepl,
-        EditProtocolKind::Structured,
-        None,
-    );
-    assert!(!structured
-        .capability_set()
+    let protocol = resolve_turn_protocol(dialogue_capabilities());
+    assert!(protocol
+        .capability_expr()
+        .contains(LlmCapability::PlanCreation));
+    assert!(!protocol
+        .capability_expr()
         .contains(LlmCapability::PlanUpdate));
-    assert!(decoded_plan_actions(structured.as_ref(), PLAN_UPDATE_JSON).is_empty());
+    assert!(decoded_plan_actions(protocol.as_ref(), PLAN_UPDATE_JSON).is_empty());
     assert_eq!(
-        decoded_plan_actions(structured.as_ref(), PLAN_SAVE_JSON),
+        decoded_plan_actions(protocol.as_ref(), PLAN_SAVE_JSON),
         vec![DiscussionPlanAction::Save]
     );
 }
@@ -305,29 +296,17 @@ fn interactive_turn_never_carries_plan_mutation() {
 /// The turn-intent narrowing runs after protocol resolution, exactly as the
 /// bounded-turn FSM narrows the decoder, so the assertion covers the
 /// end-to-end surface of the step.
-fn assert_step_has_no_plan_permission(transport: EditProtocolKind) {
-    let protocol = resolve_turn_protocol(TurnIntent::IsolatedStep, transport, None);
+fn assert_step_has_no_plan_permission() {
+    let protocol = resolve_turn_protocol(tauqe_core::control::turn::turn_capability_expr());
     assert!(!protocol
-        .capability_set()
-        .contains(LlmCapability::PlanUpdate));
-
-    let narrowed = protocol.with_capability_set(
-        TurnIntent::IsolatedStep.narrow_capabilities(&protocol.capability_set()),
-    );
-    assert!(!narrowed
-        .capability_set()
+        .capability_expr()
         .contains(LlmCapability::PlanCreation));
-    assert!(!narrowed
-        .capability_set()
+    assert!(!protocol
+        .capability_expr()
         .contains(LlmCapability::PlanUpdate));
-    for raw in [
-        PLAN_UPDATE_XML,
-        PLAN_SAVE_XML,
-        PLAN_UPDATE_JSON,
-        PLAN_SAVE_JSON,
-    ] {
+    for raw in [PLAN_UPDATE_JSON, PLAN_SAVE_JSON] {
         assert!(
-            decoded_plan_actions(narrowed.as_ref(), raw).is_empty(),
+            decoded_plan_actions(protocol.as_ref(), raw).is_empty(),
             "an isolated step must decode no plan command"
         );
     }
@@ -336,9 +315,8 @@ fn assert_step_has_no_plan_permission(transport: EditProtocolKind) {
 /// An isolated step keeps the plan immutable: neither the mutation a discussion
 /// anchor grants nor plan authorship survives, whatever the transport.
 #[test]
-fn isolated_step_carries_no_plan_permission() {
-    assert_step_has_no_plan_permission(EditProtocolKind::Xml);
-    assert_step_has_no_plan_permission(EditProtocolKind::Structured);
+fn test_isolated_step_has_no_plan_permission() {
+    assert_step_has_no_plan_permission();
 }
 /// Constructs an [`AppState`] over a scratch repository root, isolating each
 /// focus test's stored plans and history from every other test.
@@ -366,7 +344,7 @@ async fn plain_prompt_with_active_focus_continues_the_discussion() {
         .set_discussion_focus(DiscussionFocus::plan("plan-1", vec!["1".to_string()]))
         .await;
 
-    let (prompt, intent) = build_model_ask_prompt(
+    let turn = build_model_ask_prompt(
         &state,
         ModelAskParams::Prompt {
             text: "keep refining".to_string(),
@@ -376,11 +354,11 @@ async fn plain_prompt_with_active_focus_continues_the_discussion() {
     .expect("the focused plan must load");
 
     assert!(
-        intent.is_plan_discussion(),
-        "a plain prompt under plan focus must follow the anchored intent"
+        matches!(turn.focus, Some(DiscussionTarget::Plan { .. })),
+        "a plain prompt under plan focus must follow the anchored branch"
     );
     assert!(
-        prompt.contains("keep refining"),
+        turn.prompt.contains("keep refining"),
         "the plain prompt must reach the discussion prompt"
     );
     assert!(
@@ -409,7 +387,7 @@ async fn discussion_target_replaces_the_focus_anchor() {
         .set_discussion_focus(DiscussionFocus::plan("other-plan", Vec::new()))
         .await;
 
-    let (prompt, intent) = build_model_ask_prompt(
+    let turn = build_model_ask_prompt(
         &state,
         ModelAskParams::Discussion(DiscussionRequest {
             target: DiscussionTarget::Plan {
@@ -422,9 +400,9 @@ async fn discussion_target_replaces_the_focus_anchor() {
     .await
     .expect("the stored plan must load");
 
-    assert!(intent.is_plan_discussion());
+    assert!(matches!(turn.focus, Some(DiscussionTarget::Plan { .. })));
     assert!(
-        prompt.contains("refine the authentication flow"),
+        turn.prompt.contains("refine the authentication flow"),
         "the developer comment must reach the discussion prompt"
     );
 
@@ -452,7 +430,7 @@ async fn plain_prompt_with_stale_focus_clears_the_anchor() {
         .set_discussion_focus(DiscussionFocus::plan("gone-plan", Vec::new()))
         .await;
 
-    let (prompt, intent) = build_model_ask_prompt(
+    let turn = build_model_ask_prompt(
         &state,
         ModelAskParams::Prompt {
             text: "just answer here".to_string(),
@@ -461,8 +439,8 @@ async fn plain_prompt_with_stale_focus_clears_the_anchor() {
     .await
     .expect("a stale focus must not fail the plain prompt");
 
-    assert_eq!(prompt, "just answer here");
-    assert!(intent.is_interactive_repl());
+    assert_eq!(turn.prompt, "just answer here");
+    assert!(turn.focus.is_none());
     assert!(
         state.discussion_focus().await.is_none(),
         "the stale anchor must be cleared instead of kept"
@@ -829,7 +807,7 @@ async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
     start_model_turn(
         &state,
         "Explain the repository".to_string(),
-        TurnIntent::InteractiveRepl,
+        None,
         None,
         None,
     )
@@ -1064,8 +1042,7 @@ async fn a_recorded_review_decision_is_published_as_review_updated() {
     tauqe_core::review::ReviewStorage::save_session(&root, &session)
         .expect("save the review session");
 
-    let mut cfg = AppConfig::default();
-    cfg.repl.protocol = EditProtocolKind::Structured;
+    let cfg = AppConfig::default();
     let (out, mut rx) = crate::transport::OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(cfg, root.clone(), history_sender, out.clone());
@@ -1082,7 +1059,8 @@ async fn a_recorded_review_decision_is_published_as_review_updated() {
         "Record the decision we reached".to_string(),
         Box::new(DirectApplyPolicy::new()),
         StepTurnOptions {
-            intent: TurnIntent::ReviewDiscussion,
+            capabilities: review_dialogue_capabilities(),
+            is_isolated_step: false,
             custom_selection: None,
             plan_context: None,
             work_context: None,
@@ -1273,7 +1251,8 @@ async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
                 "Explain the repository".to_string(),
                 Box::new(DirectApplyPolicy::new()),
                 StepTurnOptions {
-                    intent: TurnIntent::InteractiveRepl,
+                    capabilities: dialogue_capabilities(),
+                    is_isolated_step: false,
                     custom_selection: None,
                     plan_context: None,
                     work_context: None,
@@ -1420,7 +1399,8 @@ async fn a_force_aborted_turn_is_reported_as_cancelled() {
             "Explain the repository".to_string(),
             Box::new(DirectApplyPolicy::new()),
             StepTurnOptions {
-                intent: TurnIntent::InteractiveRepl,
+                capabilities: dialogue_capabilities(),
+                is_isolated_step: false,
                 custom_selection: None,
                 plan_context: None,
                 work_context: None,
@@ -1486,6 +1466,83 @@ async fn a_force_aborted_turn_is_reported_as_cancelled() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn step_event_forwarding_streams_edit_lifecycle_events() {
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let edit_cycle = EditCycle::new(out.clone(), "op-step-edit");
+    let root = scratch_root("step-forward-edits");
+    let state = state_over_root(root.clone());
+    let mut usage_guard = state.begin_usage("op-step-edit").await;
+
+    forward_step_event(
+        &out,
+        "op-step-edit",
+        StreamEvent::EditStarted,
+        &mut usage_guard,
+        &edit_cycle,
+    )
+    .await;
+    forward_step_event(
+        &out,
+        "op-step-edit",
+        StreamEvent::EditFileStarted {
+            path: "src/main.rs".to_string(),
+            op_type: tauqe_protocol::EditFileOp::Replace,
+        },
+        &mut usage_guard,
+        &edit_cycle,
+    )
+    .await;
+    forward_step_event(
+        &out,
+        "op-step-edit",
+        StreamEvent::EditHunk {
+            path: "src/main.rs".to_string(),
+            hunk_index: 0,
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 2,
+            context_hint: None,
+            old_text: "fn main() {}".to_string(),
+            new_text: "fn main() {\n    println!();\n}".to_string(),
+        },
+        &mut usage_guard,
+        &edit_cycle,
+    )
+    .await;
+    forward_step_event(
+        &out,
+        "op-step-edit",
+        StreamEvent::EditFileDone {
+            path: "src/main.rs".to_string(),
+            status: tauqe_protocol::EditFileStatus::Ok,
+            error: None,
+            hunks_count: 1,
+        },
+        &mut usage_guard,
+        &edit_cycle,
+    )
+    .await;
+
+    let events = published_events(&mut rx);
+    let methods: Vec<&str> = events.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        methods,
+        vec![
+            tauqe_protocol::events::EDIT_STARTED,
+            tauqe_protocol::events::EDIT_FILE_STARTED,
+            tauqe_protocol::events::EDIT_HUNK,
+            tauqe_protocol::events::EDIT_FILE_DONE,
+        ]
+    );
+    assert_eq!(events[1].1["path"], "src/main.rs");
+    assert_eq!(events[2].1["hunk_index"], 0);
+    assert_eq!(events[3].1["hunks_count"], 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A committed turn applies the change set it proposed and releases the
 /// transient context that served the decision.
 ///
@@ -1501,22 +1558,6 @@ async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_cont
     use tauqe_core::workflow::DirectApplyPolicy;
     use tauqe_protocol::ContextAccess;
 
-    // The change set travels through the XML transport as the canonical
-    // unmarked search/replace grammar the decoder accepts.
-    const CHANGE_SET: &str = concat!(
-        "Rewriting the value.\n",
-        "<edits summary=\"Bump the value\">\n",
-        "  <edit path=\"target.rs\">\n",
-        "    <search>\n",
-        "pub fn value() -> i32 { 0 }\n",
-        "    </search>\n",
-        "    <replace>\n",
-        "pub fn value() -> i32 { 42 }\n",
-        "    </replace>\n",
-        "  </edit>\n",
-        "</edits>\n",
-    );
-
     let root = scratch_root("turn-committed-release");
     tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
     std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
@@ -1528,8 +1569,7 @@ async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_cont
     tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixtures", false)
         .expect("commit the fixtures");
 
-    let mut cfg = AppConfig::default();
-    cfg.repl.protocol = EditProtocolKind::Xml;
+    let cfg = AppConfig::default();
     let (out, _rx) = crate::transport::OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(cfg, root.clone(), history_sender, out);
@@ -1545,10 +1585,30 @@ async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_cont
         .await
         .add_auto_file("discovered.rs", ContextAccess::ReadOnly)
         .expect("the discovered file joins the transient context");
-    let script = [
-        MockResponse::text(CHANGE_SET),
-        MockResponse::text("<success commit_message=\"Bump the value\" />"),
-    ];
+    let script = [MockResponse::text(
+        serde_json::json!({
+            "message": "Rewriting the value.",
+            "action": {
+                "kind": "edit",
+                "changes": [
+                    {
+                        "op": "replace",
+                        "path": "target.rs",
+                        "to": "",
+                        "start": "",
+                        "end": "",
+                        "old_text": "pub fn value() -> i32 { 0 }\n",
+                        "new_text": "pub fn value() -> i32 { 42 }\n",
+                        "content": ""
+                    }
+                ],
+                "commit_message": "Bump the value",
+                "message": "",
+                "reason": ""
+            }
+        })
+        .to_string(),
+    )];
     let provider = Arc::new(MockLlmProvider::scripted(script));
     let injected: Arc<dyn LlmProvider> = provider.clone();
     *state.provider_override.lock().await = Some(injected);
@@ -1559,7 +1619,8 @@ async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_cont
         "Bump the value to 42".to_string(),
         Box::new(DirectApplyPolicy::new()),
         StepTurnOptions {
-            intent: TurnIntent::InteractiveRepl,
+            capabilities: dialogue_capabilities(),
+            is_isolated_step: false,
             custom_selection: None,
             plan_context: None,
             work_context: None,
@@ -1756,20 +1817,6 @@ async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::workflow::DirectApplyPolicy;
 
-    const CHANGE_SET: &str = concat!(
-        "Rewriting the value.\n",
-        "<edits summary=\"Bump the value\">\n",
-        "  <edit path=\"target.rs\">\n",
-        "    <search>\n",
-        "pub fn value() -> i32 { 0 }\n",
-        "    </search>\n",
-        "    <replace>\n",
-        "pub fn value() -> i32 { 42 }\n",
-        "    </replace>\n",
-        "  </edit>\n",
-        "</edits>\n",
-    );
-
     let root = scratch_root("turn-cycle-success");
     tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
     std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
@@ -1779,8 +1826,7 @@ async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
     tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
         .expect("commit the fixture");
 
-    let mut cfg = AppConfig::default();
-    cfg.repl.protocol = EditProtocolKind::Xml;
+    let cfg = AppConfig::default();
     let (out, mut rx) = crate::transport::OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(cfg, root.clone(), history_sender, out);
@@ -1790,10 +1836,30 @@ async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
         .await
         .add_file("target.rs", tauqe_protocol::ContextAccess::Editable)
         .expect("the edit target is editable");
-    let script = [
-        MockResponse::text(CHANGE_SET),
-        MockResponse::text("<success commit_message=\"Bump the value\" />"),
-    ];
+    let script = [MockResponse::text(
+        serde_json::json!({
+            "message": "Rewriting the value.",
+            "action": {
+                "kind": "edit",
+                "changes": [
+                    {
+                        "op": "replace",
+                        "path": "target.rs",
+                        "to": "",
+                        "start": "",
+                        "end": "",
+                        "old_text": "pub fn value() -> i32 { 0 }\n",
+                        "new_text": "pub fn value() -> i32 { 42 }\n",
+                        "content": ""
+                    }
+                ],
+                "commit_message": "Bump the value",
+                "message": "",
+                "reason": ""
+            }
+        })
+        .to_string(),
+    )];
     let injected: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted(script));
     *state.provider_override.lock().await = Some(injected);
 
@@ -1802,7 +1868,8 @@ async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
         "Bump the value to 42".to_string(),
         Box::new(DirectApplyPolicy::new()),
         StepTurnOptions {
-            intent: TurnIntent::InteractiveRepl,
+            capabilities: dialogue_capabilities(),
+            is_isolated_step: false,
             custom_selection: None,
             plan_context: None,
             work_context: None,
@@ -1894,8 +1961,7 @@ async fn a_withdrawn_attempt_closes_its_cycle_before_the_next_one_opens() {
     tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
         .expect("commit the fixture");
 
-    let mut cfg = AppConfig::default();
-    cfg.repl.protocol = EditProtocolKind::Xml;
+    let cfg = AppConfig::default();
     let (out, mut rx) = crate::transport::OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(cfg, root.clone(), history_sender, out);
@@ -1909,7 +1975,8 @@ async fn a_withdrawn_attempt_closes_its_cycle_before_the_next_one_opens() {
         "Explain the repository".to_string(),
         Box::new(DirectApplyPolicy::new()),
         StepTurnOptions {
-            intent: TurnIntent::InteractiveRepl,
+            capabilities: dialogue_capabilities(),
+            is_isolated_step: false,
             custom_selection: None,
             plan_context: None,
             work_context: None,
@@ -2027,7 +2094,8 @@ async fn a_cancelled_turn_closes_its_open_cycle_exactly_once() {
             "Explain the repository".to_string(),
             Box::new(DirectApplyPolicy::new()),
             StepTurnOptions {
-                intent: TurnIntent::InteractiveRepl,
+                capabilities: dialogue_capabilities(),
+                is_isolated_step: false,
                 custom_selection: None,
                 plan_context: None,
                 work_context: None,

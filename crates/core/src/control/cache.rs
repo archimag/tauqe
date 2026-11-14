@@ -9,7 +9,6 @@
 //! provider's prefix cache keeps matching its tokens across rounds.
 
 use std::path::{Path, PathBuf};
-use tauqe_protocol::TurnIntent;
 
 use crate::history::{HistoryManager, HistorySnapshot};
 use crate::prompt::ContextBlockCache;
@@ -28,6 +27,7 @@ pub struct TurnInputCache {
     /// frozen as well instead of re-reading history.jsonl on each round. The
     /// snapshot keeps the records rather than the rendered block, so every
     /// layout reads the same structural material.
+    #[allow(dead_code)]
     history: Option<std::sync::Arc<HistorySnapshot>>,
     /// Body of every context file this turn has already read.
     ///
@@ -199,22 +199,22 @@ impl TurnInputCache {
 
     /// Returns the interaction records frozen at the start of the turn.
     ///
-    /// A regime that suppresses session history never injects it and freezes an
-    /// empty snapshot: an isolated step and an Architect synthesis both qualify.
-    /// For regular turns the first call reads the session records off the
-    /// executor thread and freezes them; every later round reuses that exact
+    /// A contour that carries no growing dialogue history never calls this method
+    /// and therefore freezes nothing: an isolated step and an Architect synthesis
+    /// both qualify. For a dialogue the first call reads the session records off
+    /// the executor thread and freezes them; every later round reuses that exact
     /// vector without hitting disk or re-parsing JSONL records. The freeze is
     /// structural: the semantic layout renders the `<history>` block from it
     /// byte for byte, and the chronological layout reads the recorded context
     /// watermarks from the same material. Records appended while the turn runs
     /// never reach the snapshot, so the prompt prefix stays byte-identical.
+    #[allow(dead_code)]
     pub(crate) async fn history_snapshot(
         &mut self,
         history_manager: &HistoryManager,
-        intent: TurnIntent,
     ) -> Option<std::sync::Arc<HistorySnapshot>> {
         if self.history.is_none() {
-            let snapshot = Self::resolve_history(history_manager, intent).await;
+            let snapshot = Self::resolve_history(history_manager).await;
             self.history = Some(std::sync::Arc::new(snapshot));
         }
         self.history
@@ -223,15 +223,9 @@ impl TurnInputCache {
             .cloned()
     }
 
-    /// Reads the session records a turn freezes for its whole duration.
-    async fn resolve_history(
-        history_manager: &HistoryManager,
-        intent: TurnIntent,
-    ) -> HistorySnapshot {
-        if intent.suppresses_session_history() {
-            return HistorySnapshot::default();
-        }
-
+    /// Reads the session records a dialogue turn freezes for its whole duration.
+    #[allow(dead_code)]
+    async fn resolve_history(history_manager: &HistoryManager) -> HistorySnapshot {
         let hm = history_manager.clone();
         match crate::blocking::run_blocking_async(move || hm.snapshot()).await {
             Ok(Ok(snapshot)) => snapshot,
@@ -514,7 +508,7 @@ mod tests {
             1,
             vec![file("a.rs", "alpha\n")],
             "git",
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
             None,
         )
@@ -625,7 +619,7 @@ mod tests {
 
         let mut cache = TurnInputCache::default();
         let first = cache
-            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager)
             .await
             .expect("first round resolves history");
         // The frozen records render exactly the block the live history would
@@ -640,7 +634,7 @@ mod tests {
             .unwrap();
 
         let second = cache
-            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager)
             .await
             .expect("second round reuses frozen history");
         assert_eq!(second, first);
@@ -679,37 +673,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn isolated_step_freezes_none_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let mut history_manager = HistoryManager::new(root);
-        history_manager.record_turn("Prompt", vec![]).unwrap();
-
-        let mut cache = TurnInputCache::default();
-        assert!(cache
-            .history_snapshot(&history_manager, TurnIntent::IsolatedStep)
-            .await
-            .is_none());
-        assert!(cache
-            .history_snapshot(&history_manager, TurnIntent::IsolatedStep)
-            .await
-            .is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn architect_synthesis_freezes_none_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let mut history_manager = HistoryManager::new(root);
-        history_manager.record_turn("Prompt", vec![]).unwrap();
-
-        let mut cache = TurnInputCache::default();
-        assert!(cache
-            .history_snapshot(&history_manager, TurnIntent::ArchitectSynthesis)
-            .await
-            .is_none());
-    }
     /// The freeze is structural: the context watermarks the frozen turn
     /// records observed stay readable for the whole turn, even after the live
     /// history moved on.
@@ -730,7 +693,7 @@ mod tests {
 
         let mut cache = TurnInputCache::default();
         let frozen = cache
-            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager)
             .await
             .expect("the turn freezes its history");
         assert_eq!(frozen.watermark(), Some(12));
@@ -750,7 +713,7 @@ mod tests {
             })
             .unwrap();
         let again = cache
-            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager)
             .await
             .expect("the frozen snapshot is reused");
         assert_eq!(again.watermark(), Some(12));

@@ -2560,7 +2560,7 @@ pub(crate) fn test_state() -> AppState {
         repo_state: None,
         all_repo_files: Vec::new(),
         workflow: tauqe_protocol::WorkflowKind::Git,
-        edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
+        edit_protocol: tauqe_protocol::EditProtocolKind::Structured,
         active_model: ModelRef::openrouter("test-model"),
         available_workflows: Vec::new(),
         available_edit_protocols: Vec::new(),

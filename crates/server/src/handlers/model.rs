@@ -6,7 +6,7 @@
 //! turn primitives shared by the plan, review, architect, and locale handlers.
 
 mod prompt;
-mod turn;
+pub(crate) mod turn;
 
 #[cfg(test)]
 mod tests;
@@ -21,8 +21,8 @@ use tauqe_protocol::{
 
 use crate::state::AppState;
 
-pub(crate) use turn::{build_apply_policy, emit_legacy_usage_event, unwind_grace};
-pub use turn::{execute_model_turn, start_model_turn, ModelTurnResult, StepTurnOptions};
+pub(crate) use turn::{emit_legacy_usage_event, unwind_grace};
+pub use turn::{start_model_turn, ModelTurnResult};
 
 pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
     let params: ModelAskParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -36,7 +36,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    let (prompt, intent) = match prompt::build_model_ask_prompt(state, params).await {
+    let resolved = match prompt::build_model_ask_prompt(state, params).await {
         Ok(resolved) => resolved,
         Err(err) => {
             return Response {
@@ -47,7 +47,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    match start_model_turn(state, prompt, intent, None, None).await {
+    match start_model_turn(state, resolved.prompt, resolved.focus, None, None).await {
         Ok(op_id) => Response {
             id: req.id,
             result: Some(serde_json::json!({ "operation_id": op_id })),

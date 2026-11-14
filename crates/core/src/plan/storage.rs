@@ -154,23 +154,6 @@ impl PlanBatchSnapshot {
         }
     }
 
-    /// Removes `id` from the snapshot and returns the document and file it held.
-    fn remove(&mut self, id: &str) -> Option<(Plan, PathBuf)> {
-        let position = self.index.remove(&id.to_ascii_lowercase())?;
-        if position >= self.plans.len() {
-            return None;
-        }
-        let plan = self.plans.remove(position);
-        let file = self.files.remove(position);
-        // Every plan behind the removed position shifts down by one entry.
-        for index in self.index.values_mut() {
-            if *index > position {
-                *index -= 1;
-            }
-        }
-        Some((plan, file))
-    }
-
     /// Appends one stored plan and its file to the snapshot.
     fn insert(&mut self, plan: Plan, file: PathBuf) {
         self.index
@@ -373,34 +356,6 @@ impl PlanStorage {
         snapshot.remember(prepared.plan.clone(), prepared.target_file);
         Ok(prepared.plan)
     }
-
-    /// Deletes one plan of a batch through the snapshot of that batch.
-    ///
-    /// The snapshot already resolved the file that stores the plan, so the removal
-    /// unlinks it directly instead of scanning the storage directory again. An id
-    /// the snapshot does not carry deletes nothing, which keeps a removal unable to
-    /// drop a file it never inspected.
-    fn delete_plan_in_snapshot_unlocked(
-        repo_root: &Path,
-        snapshot: &mut PlanBatchSnapshot,
-        id: &str,
-    ) -> Result<bool> {
-        let (plan, file) = match snapshot.remove(id) {
-            Some(removed) => removed,
-            None => return Ok(false),
-        };
-        std::fs::remove_file(&file)
-            .with_context(|| format!("Failed to remove plan file at {}", file.display()))?;
-
-        let safe_id = Self::sanitize_id(&plan.id);
-        if let Ok(Some(active)) = Self::load_active_id_unlocked(repo_root) {
-            if active.eq_ignore_ascii_case(&plan.id) || active.eq_ignore_ascii_case(&safe_id) {
-                let _ = Self::save_active_id_unlocked(repo_root, None);
-            }
-        }
-        Ok(true)
-    }
-
     /// Creates the plan storage directory.
     fn ensure_plans_dir(repo_root: &Path) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
@@ -1017,40 +972,56 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan1_text = r#"
-<plan action="save" id="plan-1" title="Plan One">
-  <concept>
-    <concept_item id="c-1" title="Invariant 1" />
-  </concept>
-  <item id="1" title="Step 1" status="done" files="src/step.rs" />
-</plan>
-"#;
-        let outcome1 = PlanStorage::apply_plan_tags(root, plan1_text);
-        assert!(outcome1.errors.is_empty());
-        assert_eq!(outcome1.applied.len(), 1);
+        let plan1 = Plan::from_parts(
+            "plan-1".to_string(),
+            "Plan One".to_string(),
+            None,
+            100,
+            100,
+            vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant 1".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Done,
+                files: vec!["src/step.rs".to_string()],
+                ..Default::default()
+            }],
+        );
+        PlanStorage::save_plan(root, &plan1).unwrap();
 
         // Saving "plan-2" (Levenshtein distance 1 from "plan-1") must NOT overwrite "plan-1"
-        let plan2_text = r#"
-<plan action="save" id="plan-2" title="Plan Two">
-  <concept>
-    <concept_item id="c-2" title="Invariant 2" />
-  </concept>
-  <item id="1" title="Step 1 in plan 2" status="todo" files="src/step.rs" />
-</plan>
-"#;
-        let outcome2 = PlanStorage::apply_plan_tags(root, plan2_text);
-        assert!(outcome2.errors.is_empty(), "Errors: {:?}", outcome2.errors);
-        assert_eq!(outcome2.applied.len(), 1);
-        assert_eq!(outcome2.applied[0].id, "plan-2");
+        let plan2 = Plan::from_parts(
+            "plan-2".to_string(),
+            "Plan Two".to_string(),
+            None,
+            100,
+            100,
+            vec![tauqe_protocol::ConceptItem {
+                id: "c-2".to_string(),
+                title: "Invariant 2".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1 in plan 2".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/step.rs".to_string()],
+                ..Default::default()
+            }],
+        );
+        PlanStorage::save_plan(root, &plan2).unwrap();
 
-        let p1 = PlanStorage::load_plan(root, "plan-1").unwrap().unwrap();
-        let p2 = PlanStorage::load_plan(root, "plan-2").unwrap().unwrap();
-        assert_eq!(p1.id, "plan-1");
-        assert_eq!(p1.title, "Plan One");
-        assert_eq!(p2.id, "plan-2");
-        assert_eq!(p2.title, "Plan Two");
+        let loaded1 = PlanStorage::load_plan(root, "plan-1").unwrap().unwrap();
+        assert_eq!(loaded1.title, "Plan One");
+        let loaded2 = PlanStorage::load_plan(root, "plan-2").unwrap().unwrap();
+        assert_eq!(loaded2.title, "Plan Two");
     }
-
     #[test]
     fn test_save_plan_detects_sanitized_id_collision() {
         let dir = tempdir().unwrap();
@@ -1616,33 +1587,7 @@ mod tests {
             "{direct_err}"
         );
 
-        // 2. The text-tag contour a model emits during a discussion.
-        let tags = concat!(
-            "<plan action=\"save\" id=\"barrier-tags\" title=\"Barrier Tags\">\n",
-            "  <concept>\n",
-            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
-            "  </concept>\n",
-            "  <item id=\"1\" title=\"First\" status=\"todo\" files=\"src/first.rs\" />\n",
-            "  <item id=\"1\" title=\"Second\" status=\"todo\" files=\"src/second.rs\" />\n",
-            "</plan>\n",
-        );
-        let tag_outcome = PlanStorage::apply_plan_tags(root, tags);
-        let tag_errors = rejection_messages(&tag_outcome.errors);
-        assert!(
-            tag_outcome
-                .errors
-                .iter()
-                .all(|rejection| rejection.kind == PlanRejectionKind::PayloadDefect),
-            "a structural defect is a payload defect: {:?}",
-            tag_outcome.errors
-        );
-        assert!(tag_outcome.applied.is_empty());
-        assert!(
-            tag_errors.contains("Cannot save plan 'barrier-tags'"),
-            "{tag_errors}"
-        );
-
-        // 3. The structured discussion contour.
+        // 2. The structured discussion contour.
         let update = DiscussionPlanUpdate {
             action: DiscussionPlanAction::Save,
             id: Some("barrier-structured".to_string()),
@@ -1673,7 +1618,7 @@ mod tests {
         );
 
         // No path persisted anything.
-        for id in ["barrier-direct", "barrier-tags", "barrier-structured"] {
+        for id in ["barrier-direct", "barrier-structured"] {
             assert!(
                 PlanStorage::load_plan(root, id).unwrap().is_none(),
                 "the rejected plan '{id}' must never reach disk"

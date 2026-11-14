@@ -161,6 +161,34 @@ impl FailureReport {
     }
 }
 
+/// Developer-facing report of a semantic `<abort>` outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortReport {
+    /// What blocked the work in the host environment.
+    pub reason: String,
+    /// The exact command or instruction the developer must run.
+    pub recommendation: String,
+}
+
+impl AbortReport {
+    /// Creates a new abort report.
+    pub fn new(reason: impl Into<String>, recommendation: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recommendation: recommendation.into(),
+        }
+    }
+
+    /// Renders the report as a developer-facing message.
+    pub fn to_message(&self) -> String {
+        format!(
+            "Execution aborted: {}\n\nRecommended action:\n{}",
+            self.reason.trim(),
+            self.recommendation.trim()
+        )
+    }
+}
+
 /// Domain-level outcome of a control loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopResult<T> {
@@ -200,23 +228,20 @@ impl<T> LoopResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::LlmOutcome;
-
+    use tauqe_protocol::{BlockedCommand, CommitMessageCommand, TextCommand};
     #[test]
     fn test_drainable_envelope() {
         let commands = vec![
-            LlmCommand::Text {
+            LlmCommand::Text(TextCommand {
                 content: "Fixed the bug.".to_string(),
-            },
-            LlmCommand::Outcome {
-                outcome: LlmOutcome::Success {
-                    commit_message: Some("fix(core): resolve null pointer".to_string()),
-                },
-            },
-            LlmCommand::Blocked {
+            }),
+            LlmCommand::CommitMessage(CommitMessageCommand {
+                commit_message: "fix(core): resolve null pointer".to_string(),
+            }),
+            LlmCommand::Blocked(BlockedCommand {
                 reason: "Database unavailable".to_string(),
-                details: Some("connection refused on port 5432".to_string()),
-            },
+                details: "connection refused on port 5432".to_string(),
+            }),
         ];
 
         let mut resp = ResponseEnvelope::from_commands(&commands);
@@ -225,20 +250,19 @@ mod tests {
 
         let caps = resp.remaining_capabilities();
         assert!(caps.contains(&LlmCapability::TextMessage));
-        assert!(caps.contains(&LlmCapability::Outcome));
-        assert!(caps.contains(&LlmCapability::Blocked));
+        assert!(caps.contains(&LlmCapability::CommitMessage));
 
         // Drain TextMessage
         let text_cmds = resp.take(LlmCapability::TextMessage);
         assert_eq!(text_cmds.len(), 1);
         match &text_cmds[0] {
-            LlmCommand::Text { content } => assert_eq!(content, "Fixed the bug."),
+            LlmCommand::Text(command) => assert_eq!(command.content, "Fixed the bug."),
             _ => panic!("expected text command"),
         }
         assert!(!resp.has(LlmCapability::TextMessage));
         assert_eq!(resp.len(), 2);
         // Drain Outcome and Blocked together
-        let drained = resp.take_any(&[LlmCapability::Outcome, LlmCapability::Blocked]);
+        let drained = resp.take_any(&[LlmCapability::CommitMessage, LlmCapability::Blocked]);
         assert_eq!(drained.len(), 2);
         assert!(resp.is_empty());
         assert!(resp.remaining_capabilities().is_empty());
@@ -246,9 +270,9 @@ mod tests {
 
     #[test]
     fn test_loop_success_envelope() {
-        let commands = vec![LlmCommand::Text {
+        let commands = vec![LlmCommand::Text(TextCommand {
             content: "Explanation text".to_string(),
-        }];
+        })];
         let resp = ResponseEnvelope::from_commands(&commands);
         let success = LoopSuccess::new(42, resp);
         assert_eq!(success.value, 42);

@@ -1,20 +1,19 @@
 //! Prompt assembly and model round execution for control loops.
 
-use tauqe_protocol::{
-    ContextAccess, ModelRef, PatchStrategy, PromptLayoutKind, ReasoningEffort, TurnIntent,
-};
+use tauqe_protocol::{ContextAccess, ModelRef, PatchStrategy, PromptLayoutKind, ReasoningEffort};
 use tokio::sync::mpsc;
 
 use super::context::LoopContext;
 use super::outcome::{ResponseEnvelope, SystemError};
 use crate::config::OuterDocEntry;
 use crate::context::ContextFileContent;
+use crate::control::cache::TurnInputCache;
 use crate::edits::StagedEditsState;
 use crate::history::HistorySnapshot;
 use crate::prompt::protocol::PromptProtocol;
 use crate::prompt::PromptAssembly;
+use crate::prompt::TurnBrief;
 use crate::providers::{LlmProvider, StreamEvent};
-use crate::workflow::fsm::cache::TurnInputCache;
 
 /// Dedicated builder and executor for model prompt rounds.
 ///
@@ -35,7 +34,8 @@ pub struct PromptBuilder<'a> {
     pub(crate) workflow: String,
     pub(crate) outer_docs: Vec<OuterDocEntry>,
     pub(crate) project_config: Option<tauqe_protocol::ProjectConfig>,
-    pub(crate) intent: TurnIntent,
+    /// Introductory brief of the turn, owned by the loop that drives it.
+    pub(crate) turn_brief: Option<TurnBrief>,
     pub(crate) scratchpad: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
@@ -63,7 +63,7 @@ impl<'a> PromptBuilder<'a> {
             workflow: "git".to_string(),
             outer_docs: Vec::new(),
             project_config: None,
-            intent: TurnIntent::InteractiveRepl,
+            turn_brief: None,
             scratchpad: None,
             reasoning_effort: None,
         }
@@ -86,7 +86,7 @@ impl<'a> PromptBuilder<'a> {
             workflow: self.workflow.clone(),
             outer_docs: self.outer_docs.clone(),
             project_config: self.project_config.clone(),
-            intent: self.intent,
+            turn_brief: self.turn_brief.clone(),
             scratchpad: self.scratchpad.clone(),
             reasoning_effort: self.reasoning_effort,
         }
@@ -141,8 +141,8 @@ impl<'a> PromptBuilder<'a> {
         self
     }
 
-    pub fn with_intent(mut self, intent: TurnIntent) -> Self {
-        self.intent = intent;
+    pub fn with_turn_brief(mut self, turn_brief: Option<TurnBrief>) -> Self {
+        self.turn_brief = turn_brief;
         self
     }
 
@@ -161,6 +161,11 @@ impl<'a> PromptBuilder<'a> {
         self
     }
 
+    pub fn set_turn_brief(&mut self, turn_brief: Option<TurnBrief>) -> &mut Self {
+        self.turn_brief = turn_brief;
+        self
+    }
+
     pub fn set_history(&mut self, history: Option<&'a HistorySnapshot>) -> &mut Self {
         self.history = history;
         self
@@ -176,6 +181,17 @@ impl<'a> PromptBuilder<'a> {
         self
     }
 }
+
+/// Corrective rounds granted to a contour that answered with nothing actionable.
+const MAX_EMPTY_STEP_RETRIES: usize = 2;
+
+/// Corrective suffix appended to the request after an empty round.
+///
+/// Silence is a transport-level non-answer rather than a conclusion, so a round
+/// that carries nothing actionable is asked again with an explicit result
+/// contract. The suffix extends the previous request, so the provider keeps
+/// matching the prompt prefix it has already cached and the task stays in view.
+const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edit, no research command, and no terminal signal, so nothing could be acted upon. Respond again with a concrete result: state the analysis or conclusion in the 'answer' branch, emit code changes in the 'edit' branch (with commit_message), or declare a blocker in the 'blocked' branch.";
 
 pub(crate) async fn execute_round(
     ctx: &mut LoopContext<'_>,
@@ -279,104 +295,198 @@ pub(crate) async fn execute_round(
     .with_patch_strategy(ctx.prompt_builder.patch_strategy)
     .with_outer_docs(ctx.prompt_builder.outer_docs.clone());
 
-    assembly.target_language = ctx.target_language.clone();
-    assembly.intent = ctx.prompt_builder.intent;
     assembly.turn_scratchpad = ctx.prompt_builder.scratchpad.clone();
+    assembly.turn_brief = ctx.prompt_builder.turn_brief.clone();
     if let Some(layout) = ctx.prompt_builder.prompt_layout {
         assembly.prompt_layout = layout;
     }
 
-    let base_protocol = ctx
+    // The contour owns the capability tree of the round, so the protocol the
+    // round renders and decodes with is exactly the surface the loop declared.
+    let scoped_protocol = ctx
         .prompt_builder
         .protocol
-        .with_capability_set(ctx.capabilities.clone());
-    let effective_caps = assembly.effective_capabilities(base_protocol.as_ref());
-    let scoped_protocol = base_protocol.with_capability_set(effective_caps);
+        .with_capability_expr(ctx.capabilities.clone());
     let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
+    // The user message is composed once, so a corrective round appends its
+    // reminder to this exact text instead of reshaping the request: the task the
+    // developer wrote keeps its position and the provider keeps matching the
+    // prefix it has already cached.
     let base_prompt = ctx.prompt_builder.prompt.as_deref().unwrap_or("");
-    let user_prompt = ctx.journal.compose_user_prompt(base_prompt, repair_prompt);
-
-    let messages = assembly.assemble_chat_messages_with_context_cache(
-        &user_prompt,
-        protocol,
-        ctx.prompt_builder.input_cache.context_cache(),
-    );
-
-    let response_format = protocol.response_format(
-        &context_paths,
-        ctx.prompt_builder.patch_strategy,
-        Some(&project),
-    );
-
-    let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(64);
-    let event_sink = ctx.events.clone();
+    let base_user_prompt = ctx.journal.compose_user_prompt(base_prompt, repair_prompt);
     let staged_contents: std::collections::HashMap<String, String> = context_files
         .iter()
-        .map(|f| (f.path.clone(), f.content.clone()))
+        .map(|file| (file.path.clone(), file.content.clone()))
         .collect();
-    let mut stream_filter =
-        protocol.create_stream_filter(context_paths.clone(), root_buf, staged_contents);
 
-    let forward = tokio::spawn(async move {
-        let mut text = String::new();
-        let mut stream_error: Option<String> = None;
-        let mut cancelled = false;
-        while let Some(event) = llm_rx.recv().await {
-            match event {
-                StreamEvent::TextDelta(delta) => {
-                    text.push_str(&delta);
-                    for filtered in stream_filter.push_chunk(&delta) {
-                        event_sink.emit(filtered);
-                    }
-                }
-                StreamEvent::Error(message) => {
-                    event_sink.emit(StreamEvent::Error(message.clone()));
-                    stream_error = Some(message);
-                }
-                StreamEvent::Cancelled => {
-                    event_sink.emit(StreamEvent::Cancelled);
-                    cancelled = true;
-                }
-                other => event_sink.emit(other),
+    let mut empty_attempts = 0usize;
+    loop {
+        let mut user_prompt = base_user_prompt.clone();
+        if empty_attempts > 0 {
+            user_prompt.push_str(&EMPTY_STEP_REMINDER.repeat(empty_attempts));
+        }
+
+        // The round is assembled per attempt, because the corrective reminder
+        // changes the trailing user message while the head of the request stays
+        // byte-identical.
+        let messages = assembly.assemble_chat_messages_with_context_cache(
+            &user_prompt,
+            protocol,
+            ctx.prompt_builder.input_cache.context_cache(),
+        );
+        let response_format = protocol.response_format(
+            &context_paths,
+            ctx.prompt_builder.patch_strategy,
+            Some(&project),
+        );
+        let schema_str = match &response_format {
+            Some(crate::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+                serde_json::to_string_pretty(&json_schema.schema)
+                    .unwrap_or_else(|_| json_schema.schema.to_string())
             }
+            _ => String::new(),
+        };
+
+        let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(64);
+        let event_sink = ctx.events.clone();
+        let mut stream_filter = protocol.create_stream_filter(
+            context_paths.clone(),
+            root_buf.clone(),
+            staged_contents.clone(),
+        );
+
+        let forward = tokio::spawn(async move {
+            let mut text = String::new();
+            let mut stream_error: Option<String> = None;
+            let mut cancelled = false;
+            let mut completed = false;
+            while let Some(event) = llm_rx.recv().await {
+                match event {
+                    StreamEvent::TextDelta(delta) => {
+                        text.push_str(&delta);
+                        for filtered in stream_filter.push_chunk(&delta) {
+                            event_sink.emit(filtered);
+                        }
+                    }
+                    // The transport voided the interrupted attempt and re-issued
+                    // the request, so the payload accumulated for decoding and the
+                    // streamed preview restart together with the new attempt.
+                    StreamEvent::ResetStream => {
+                        text.clear();
+                        stream_filter.reset();
+                        event_sink.emit(StreamEvent::ResetStream);
+                    }
+                    StreamEvent::Error(message) => {
+                        event_sink.emit(StreamEvent::Error(message.clone()));
+                        stream_error = Some(message);
+                    }
+                    StreamEvent::Cancelled => {
+                        event_sink.emit(StreamEvent::Cancelled);
+                        cancelled = true;
+                    }
+                    StreamEvent::Done => {
+                        completed = true;
+                        event_sink.emit(StreamEvent::Done);
+                    }
+                    other => event_sink.emit(other),
+                }
+            }
+            for filtered in stream_filter.finish() {
+                event_sink.emit(filtered);
+            }
+            (text, stream_error, cancelled, completed)
+        });
+
+        let client_result = ctx
+            .prompt_builder
+            .provider
+            .stream_chat_with_session(
+                &ctx.prompt_builder.model.name,
+                messages,
+                response_format,
+                ctx.prompt_builder.reasoning_effort,
+                ctx.prompt_builder.session_id.as_deref(),
+                llm_tx,
+                ctx.cancel.receiver(),
+            )
+            .await;
+
+        client_result.map_err(|error| SystemError::Provider(error.to_string()))?;
+
+        let (assistant_text, stream_error, cancelled, completed) = forward
+            .await
+            .map_err(|error| SystemError::Other(format!("control stream task failed: {error}")))?;
+
+        if cancelled || ctx.cancel.is_cancelled() {
+            return Err(SystemError::Cancelled);
         }
-        for filtered in stream_filter.finish() {
-            event_sink.emit(filtered);
+        if let Some(message) = stream_error {
+            return Err(SystemError::Provider(message));
         }
-        (text, stream_error, cancelled)
-    });
+        // A body that ended without its terminal event was interrupted, so the
+        // bytes it accumulated are a fragment of an answer rather than an answer.
+        if !completed {
+            return Err(SystemError::Provider(
+                "the provider stream closed without completing".to_string(),
+            ));
+        }
 
-    let client_result = ctx
-        .prompt_builder
-        .provider
-        .stream_chat_with_session(
-            &ctx.prompt_builder.model.name,
-            messages,
-            response_format,
-            ctx.prompt_builder.reasoning_effort,
-            ctx.prompt_builder.session_id.as_deref(),
-            llm_tx,
-            ctx.cancel.receiver(),
-        )
-        .await;
+        let commands = if assistant_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            protocol.decode(&assistant_text, &context_paths)
+        };
 
-    client_result.map_err(|error| SystemError::Provider(error.to_string()))?;
+        let protocol_errors: Vec<_> = commands
+            .iter()
+            .filter_map(|c| match c {
+                tauqe_protocol::LlmCommand::ProtocolError { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !protocol_errors.is_empty() {
+            tracing::warn!(
+                repo_root = %ctx.repo_root.display(),
+                errors = ?protocol_errors,
+                schema = %schema_str,
+                raw_response = %assistant_text,
+                "protocol violation detected in model response"
+            );
+        }
 
-    let (assistant_text, stream_error, cancelled) = forward
-        .await
-        .map_err(|error| SystemError::Other(format!("control stream task failed: {error}")))?;
+        if !commands.is_empty() {
+            return Ok(ResponseEnvelope::from_commands(&commands).with_raw_text(assistant_text));
+        }
 
-    if cancelled || ctx.cancel.is_cancelled() {
-        return Err(SystemError::Cancelled);
+        tracing::warn!(
+            repo_root = %ctx.repo_root.display(),
+            attempt = empty_attempts + 1,
+            schema = %schema_str,
+            raw_response = %assistant_text,
+            "model round produced zero actionable commands"
+        );
+
+        // Silence is a transport-level non-answer: asking again with an explicit
+        // result contract keeps a structurally empty reply from being recorded as
+        // a conclusion, and the corrective budget bounds the asking.
+        if empty_attempts >= MAX_EMPTY_STEP_RETRIES {
+            tracing::warn!(
+                repo_root = %ctx.repo_root.display(),
+                attempts = empty_attempts,
+                schema = %schema_str,
+                raw_response = %assistant_text,
+                "the model answered with nothing actionable after every corrective round"
+            );
+            return Err(SystemError::Other(format!(
+                "The model produced an empty response after {empty_attempts} additional attempt(s)."
+            )));
+        }
+        empty_attempts += 1;
+        let banner = format!(
+            "\n\n---\n**[Empty Response {}/{}]** The previous reply carried nothing actionable; asking for a concrete result...\n\n",
+            empty_attempts, MAX_EMPTY_STEP_RETRIES
+        );
+        ctx.events.emit(StreamEvent::TextDelta(banner));
     }
-    if let Some(message) = stream_error {
-        return Err(SystemError::Provider(message));
-    }
-    if assistant_text.trim().is_empty() {
-        return Ok(ResponseEnvelope::default());
-    }
-
-    let commands = protocol.decode(&assistant_text, &context_paths);
-    Ok(ResponseEnvelope::from_commands(&commands).with_raw_text(assistant_text))
 }

@@ -119,7 +119,7 @@ impl ApplyPolicy for DirectApplyPolicy {
 mod tests {
     use super::{ApplyPolicy, DirectApplyPolicy};
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, ProjectConfig};
+    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, EditReplace, ProjectConfig};
 
     #[tokio::test]
     async fn direct_policy_stages_applies_and_finalizes_without_commit() {
@@ -129,11 +129,11 @@ mod tests {
         let mut cm = ContextManager::new(root.to_path_buf());
         cm.add_file("a.rs", ContextAccess::Editable).unwrap();
 
-        let edits = vec![EditOperation::Replace {
+        let edits = vec![EditOperation::Replace(EditReplace {
             path: "a.rs".to_string(),
             old_text: "one\n".to_string(),
             new_text: "two\n".to_string(),
-        }];
+        })];
 
         let mut policy = DirectApplyPolicy::new();
         let project = ProjectConfig::default();

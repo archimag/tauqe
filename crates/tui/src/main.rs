@@ -60,11 +60,7 @@ async fn main() -> anyhow::Result<()> {
         handshake.available_workflows
     };
     let available_edit_protocols = if handshake.available_edit_protocols.is_empty() {
-        vec![
-            tauqe_protocol::EditProtocolKind::Xml,
-            tauqe_protocol::EditProtocolKind::Structured,
-            tauqe_protocol::EditProtocolKind::Mixed,
-        ]
+        vec![tauqe_protocol::EditProtocolKind::Structured]
     } else {
         handshake.available_edit_protocols
     };

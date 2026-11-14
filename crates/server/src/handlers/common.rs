@@ -16,7 +16,9 @@ use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
 use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::research::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
-use tauqe_protocol::{events, ContextAccess, Event, ModelEscalatedEvent};
+use tauqe_protocol::{
+    events, ContextAccess, Event, LlmCapability, LlmCommand, ModelEscalatedEvent,
+};
 use tokio::sync::{mpsc, watch};
 
 /// Emits a server event with an optional serialized parameter payload.
@@ -59,7 +61,33 @@ pub(crate) fn withdraw_streamed_attempt(
         .ok(),
     );
 }
+/// Extracts the semantic block a turn declared, if any.
+///
+/// The block is the verdict of the model about the approved decision, so every
+/// contour that classifies a turn reads it from the decoded command instead of
+/// inspecting the wording it produced.
+#[allow(dead_code)]
+pub(crate) fn blocked_reason(
+    envelope: &tauqe_core::control::outcome::ResponseEnvelope,
+) -> Option<String> {
+    let mut envelope = envelope.clone();
+    envelope
+        .take(LlmCapability::Blocked)
+        .into_iter()
+        .find_map(|command| match command {
+            LlmCommand::Blocked(command) => {
+                let details = command.details.trim();
+                Some(if details.is_empty() {
+                    command.reason.trim().to_string()
+                } else {
+                    format!("{}\n\n{}", command.reason.trim(), details)
+                })
+            }
+            _ => None,
+        })
+}
 
+/// Relays the coder promotions a batch raises to the client.
 /// Relays the coder promotions a batch raises to the client.
 ///
 /// The batch channel carries the telemetry the implementation machinery raises
@@ -111,6 +139,10 @@ pub(crate) fn spawn_escalation_relay(
 /// Plan steps and review findings ask the model to modify code: explanatory text
 /// alone, even when accompanied by a terminal success tag, must not satisfy the
 /// contract.
+/// Retained for the regression suites that still assert the legacy success
+/// contract; the control contour classifies a completed step turn through its
+/// own typed outcome instead.
+#[allow(dead_code)]
 pub(crate) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
     match &turn.result {
         Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
@@ -130,6 +162,10 @@ pub(crate) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult)
 /// change set never touched disk, and a turn without an edit result owns no
 /// change set at all. A supervisor ends the step with a recovery instruction on
 /// this signal instead of retrying on a dirty tree.
+/// Retained for the regression suites that still assert the legacy recovery
+/// contract; the control contour reports an unreverted working tree through
+/// `StepFailure::unreverted` of the implementation machinery.
+#[allow(dead_code)]
 pub fn turn_left_unreverted_changes(turn: &crate::handlers::model::ModelTurnResult) -> bool {
     match &turn.result {
         Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
@@ -285,6 +321,7 @@ pub(crate) async fn preload_readonly_files(
 /// A trust decision belongs to the developer: no round of the run can widen a
 /// declaration the repository cannot reach, so the refusal travels outward with
 /// the exact cause and the `[[workspace]]` block that would authorize the source.
+#[allow(dead_code)]
 pub(crate) struct OuterDocsRefusal {
     /// Declared entry the refusal addresses.
     pub id: String,
@@ -327,6 +364,7 @@ impl OuterDocsRefusal {
 /// widen a declaration the repository cannot reach. A delivery failure stays a
 /// diagnostic: the step still runs, and the model routes around the missing
 /// document instead of waiting for material that will never arrive.
+#[allow(dead_code)]
 pub(crate) async fn preload_declared_outer_docs(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -428,6 +466,7 @@ pub(crate) async fn preload_declared_outer_docs(
 /// document is already in the read-only OuterDocs layer, so announcing it would
 /// restate the context block. The prompt tells the model to route around the
 /// missing material instead of spending a round waiting for it.
+#[allow(dead_code)]
 pub(crate) fn append_outer_docs_diagnostics(prompt: &mut String, diagnostics: &[String]) {
     if diagnostics.is_empty() {
         return;
@@ -450,6 +489,7 @@ pub(crate) fn append_outer_docs_diagnostics(prompt: &mut String, diagnostics: &[
 /// Every prompt contour that can be started with developer directives — a plan
 /// step, a review finding, a review sub-step — appends them the same way, so a
 /// directive section never drifts between the workflows that accept one.
+#[allow(dead_code)]
 pub(crate) fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) {
     if let Some(dirs) = instructions.map(str::trim).filter(|d| !d.is_empty()) {
         prompt.push_str("\n## Developer Directives:\n");

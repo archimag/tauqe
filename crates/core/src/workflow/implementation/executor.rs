@@ -863,7 +863,7 @@ mod tests {
                 auto_level_up: true,
                 ..ModelsConfig::default()
             },
-            protocol: EditProtocolKind::Xml,
+            protocol: EditProtocolKind::Structured,
             marker: None,
             selection: None,
             instructions: None,

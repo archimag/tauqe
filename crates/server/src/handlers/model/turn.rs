@@ -5,23 +5,31 @@
 //! turn in the background, while [`execute_model_turn`] awaits one as a batch
 //! member step.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use tauqe_core::control::context::{CancellationToken, EventSink, LoopContext};
+use tauqe_core::control::outcome::{LoopResult, SystemError};
+use tauqe_core::control::plan::sequence::{
+    run_plan_sequence_loop_with, PlanSequenceArtifact, PlanSequenceLoopConfig,
+    ReviewMemberPersistence,
+};
+use tauqe_core::control::plan::step::PlanStepLoopConfig;
+use tauqe_core::control::prompt::PromptBuilder;
+use tauqe_core::control::turn::{run_turn_loop, TurnArtifact, TurnLoopConfig};
 use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
-use tauqe_core::prompt::xml::XmlPromptProtocol;
+use tauqe_core::prompt::TurnBrief;
 use tauqe_core::providers::{
     create_provider, format_session_id, LlmProvider, StreamEvent, SESSION_PREFIX_REPL,
 };
 use tauqe_core::review::ReviewStorage;
-use tauqe_core::workflow::{ExecutionMode, SingleExecution};
+use tauqe_core::workflow::research::journal::TurnResearchJournal;
 use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
-    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditHunkEvent,
-    EditOutcome, Event, GitCommitCreatedEvent, LlmCapability, ModelEscalatedEvent,
-    ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort, ResponseError, ReviewItem,
-    ReviewSession, ReviewUpdatedEvent, TurnIntent,
+    events, CapabilityExpr, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent,
+    EditFileStartedEvent, EditHunkEvent, EditOutcome, Event, GitCommitCreatedEvent,
+    ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
+    ResponseError, ReviewItem, ReviewSession, ReviewUpdatedEvent,
 };
 use tokio::sync::watch;
 
@@ -34,6 +42,7 @@ use crate::usage::UsageGuard;
 
 /// Result of an executed model turn, capturing termination status, errors, and outcomes.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModelTurnResult {
     pub operation_id: String,
     pub result: Option<tauqe_protocol::ModelResult>,
@@ -46,7 +55,7 @@ pub struct ModelTurnResult {
     /// Coder's abort report when the turn ended with a semantic `<abort>`
     /// signal. Preserved so a supervisor can stop its queue without architect
     /// escalation while the developer receives the exact action to perform.
-    pub abort: Option<tauqe_core::workflow::fsm::AbortReport>,
+    pub abort: Option<tauqe_core::control::outcome::AbortReport>,
 }
 
 impl ModelTurnResult {
@@ -59,6 +68,7 @@ impl ModelTurnResult {
     ///
     /// A turn that reported an unconditional `<abort>` never succeeded: the
     /// requested work needs an action only the developer can perform.
+    #[allow(dead_code)]
     pub fn is_success(&self) -> bool {
         if self.is_cancelled || self.error.is_some() || self.abort.is_some() {
             return false;
@@ -81,6 +91,7 @@ impl ModelTurnResult {
 /// the operation belongs to the batch that owns it, so the failure carries no
 /// identifier of its own.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TurnError {
     /// The failure reported to the client.
     ///
@@ -106,8 +117,15 @@ struct PreparedTurn {
     app_config: tauqe_core::config::AppConfig,
     reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
-    /// Semantic mode of the turn, declared by the caller that starts it.
-    intent: TurnIntent,
+    /// Capability surface the turn advertises and accepts.
+    ///
+    /// The tree belongs to the contour that started the turn, so the rendered
+    /// rules, the response schema, and the decoder observe one declaration.
+    capabilities: CapabilityExpr,
+    /// Whether the turn executes one isolated plan step.
+    is_isolated_step: bool,
+    /// Dialogue branch the turn is anchored on, if any.
+    focus: Option<DiscussionTarget>,
     /// Whether the turn runs as a member of a batch supervisor. Recorded so the
     /// turn's terminal log can distinguish batch steps from interactive turns.
     is_batch: bool,
@@ -121,8 +139,6 @@ struct PreparedTurn {
     /// registration; a batch step shares the batch-level registration so the
     /// slot never lapses between steps.
     operation: Arc<OperationGuard>,
-    /// Active turn marker binding structural protocol tags to this turn.
-    marker: Option<String>,
     /// Provider session identifier binding the turn to a warm prompt prefix.
     ///
     /// `None` for a turn that carries no dialogue, so an isolated step never
@@ -140,7 +156,7 @@ struct PreparedTurn {
 
 /// Builds a real network provider from configuration, mapping failures to a
 /// `NO_API_KEY` response error.
-fn build_configured_provider(
+pub(crate) fn build_configured_provider(
     config: &tauqe_core::config::AppConfig,
     kind: tauqe_protocol::ProviderKind,
 ) -> Result<Arc<dyn LlmProvider>, ResponseError> {
@@ -231,13 +247,14 @@ pub(crate) fn build_apply_policy(
 #[allow(clippy::too_many_arguments)]
 async fn prepare_turn(
     state: &Arc<AppState>,
-    intent: TurnIntent,
+    capabilities: CapabilityExpr,
+    is_isolated_step: bool,
+    focus: Option<DiscussionTarget>,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     work_context: Option<TurnWorkContext>,
     reasoning_effort: Option<ReasoningEffort>,
     is_batch: bool,
-    marker: Option<String>,
     session_id: Option<String>,
     shared_operation: Option<Arc<OperationGuard>>,
 ) -> Result<PreparedTurn, ResponseError> {
@@ -284,7 +301,7 @@ async fn prepare_turn(
     // stays stateless.
     let session_id = match session_id {
         Some(session) => Some(session),
-        None => resolve_session_id(intent, state.session_uuid().await),
+        None => resolve_session_id(is_isolated_step, state.session_uuid().await),
     };
 
     let role = match &selection {
@@ -314,7 +331,7 @@ async fn prepare_turn(
         role = ?role,
         effort = ?effort,
         alias = alias.as_deref().unwrap_or("none"),
-        intent = ?intent,
+        isolated_step = is_isolated_step,
         work = work_kind(work_context.as_ref()),
         is_batch,
         session = session_id.as_deref().unwrap_or("none"),
@@ -342,11 +359,12 @@ async fn prepare_turn(
         app_config,
         reasoning_effort: effort,
         op_id,
-        intent,
+        capabilities,
+        is_isolated_step,
+        focus,
         is_batch,
         work_context,
         operation,
-        marker,
         session_id,
         // The daemon channel is the default telemetry sink; a step endpoint
         // replaces it with the sink its supervisor supplies.
@@ -354,83 +372,25 @@ async fn prepare_turn(
     })
 }
 
-/// Resolves the prompt protocol for a turn from its declared intent.
+/// Resolves the prompt protocol that carries a declared capability surface.
 ///
-/// The configured `repl.protocol` chooses the encoding for every dialogue
-/// contour: an interactive turn, a focused review dialogue, and a plan
-/// discussion all serialize their commands through the transport the project
-/// declares. The transport never narrows or widens the capability surface — the
-/// declared intent decides what a turn may do — so a `structured` project and an
-/// `xml` project advertise the same operational surface for the same intent and
-/// differ only in how those commands travel.
+/// The tree belongs to the contour that starts the turn: a dialogue composes
+/// the surface its anchor authorizes, and an isolated step composes the surface
+/// of one implementation turn. The transport never narrows or widens that
+/// surface, so it only decides how the commands travel.
 ///
-/// Plan mutation follows the declared intent alone: no focus anchor and no
-/// transport can hand it to a turn. `TurnIntent::narrow_capabilities` is the
-/// single source of truth for the resulting surface, and a plan discussion
-/// carries the mutation by its regime, because `build_model_ask_prompt`
-/// already maps a plan-anchored dialogue onto `TurnIntent::PlanDiscussion`.
-/// An interactive turn therefore composes the interactive profile and never
-/// advertises plan mutation, whatever the focus anchor is, and an isolated
-/// step owns no plan permission at all. The grant runs through
-/// `with_capability_set`, so both encodings advertise and decode the very same
-/// mutation, and the harness keeps validating the mutation itself after
-/// decoding.
-///
-/// The review decision follows the same discipline: a review-anchored dialogue
-/// travels as `TurnIntent::ReviewDiscussion`, its regime authorizes the
-/// decision, and the grant runs through the same idempotent
-/// `with_capability_set`. The decision owns no control tag, so the grant widens
-/// a structured schema with the `review_update` field while the XML contour
-/// decodes nothing from it.
+/// The grant runs through the idempotent `with_capability_expr`, so the rendered
+/// instructions, the response schema, and the decoder observe one declaration:
+/// a plan anchor adds plan mutation, a review anchor adds the recorded decision,
+/// and the harness keeps validating either mutation itself after decoding.
 ///
 /// Under Structured Output the operating mode follows the surface: a surface
 /// that permits file edits composes the registry edit schema, where
 /// `plan_update` is already declared, so a plan discussion shares the composite
 /// schema instead of a separate read-only discussion schema.
-///
-/// The active turn marker is bound onto the chosen protocol when its wire format
-/// supports it; a structured protocol encodes its structure in JSON Schema and
-/// therefore declines the marker.
-pub(super) fn resolve_turn_protocol(
-    intent: TurnIntent,
-    develop_protocol: tauqe_protocol::EditProtocolKind,
-    marker: Option<&str>,
-) -> Box<dyn PromptProtocol> {
-    let base_protocol: Box<dyn PromptProtocol> = match develop_protocol {
-        tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::edits()),
-        tauqe_protocol::EditProtocolKind::Xml | tauqe_protocol::EditProtocolKind::Mixed => {
-            Box::new(XmlPromptProtocol)
-        }
-    };
-    // A plan discussion owns the mutation by its regime, and a review
-    // discussion owns the decision it records. Both grants are idempotent: a
-    // protocol that already advertises the capability keeps it exactly once.
-    let base_protocol = if intent.is_plan_discussion() {
-        let capabilities = base_protocol
-            .capability_set()
-            .with(LlmCapability::PlanUpdate);
-        base_protocol.with_capability_set(capabilities)
-    } else {
-        base_protocol
-    };
-    // The decision is authorized by the review-discussion regime alone. The
-    // grant is orthogonal to the transport: the structured contour declares the
-    // field its schema carries, while the XML contour keeps a surface that owns
-    // no control tag for it.
-    let base_protocol = if intent.is_review_discussion() {
-        let capabilities = base_protocol
-            .capability_set()
-            .with(LlmCapability::ReviewUpdate);
-        base_protocol.with_capability_set(capabilities)
-    } else {
-        base_protocol
-    };
-    match marker {
-        Some(marker) => base_protocol
-            .with_turn_marker(marker)
-            .unwrap_or(base_protocol),
-        None => base_protocol,
-    }
+pub(super) fn resolve_turn_protocol(capabilities: CapabilityExpr) -> Box<dyn PromptProtocol> {
+    let base_protocol: Box<dyn PromptProtocol> = Box::new(JsonPromptProtocol::edits());
+    base_protocol.with_capability_expr(capabilities)
 }
 
 /// Resolves the provider session identifier that binds a turn to a warm prompt
@@ -440,8 +400,11 @@ pub(super) fn resolve_turn_protocol(
 /// discussions share one identifier, so successive rounds reuse the backend's
 /// cached prefix. A turn without a dialogue receives `None`, so an isolated step
 /// never inherits — or poisons — the interactive cache.
-pub(super) fn resolve_session_id(intent: TurnIntent, dialogue_session: String) -> Option<String> {
-    if intent.is_isolated_step() {
+pub(super) fn resolve_session_id(
+    is_isolated_step: bool,
+    dialogue_session: String,
+) -> Option<String> {
+    if is_isolated_step {
         None
     } else {
         Some(format_session_id(SESSION_PREFIX_REPL, &dialogue_session))
@@ -452,835 +415,9 @@ async fn run_prepared_turn(
     state: &Arc<AppState>,
     prompt: String,
     prepared: PreparedTurn,
-    mut policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
+    policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
-    if prepared.app_config.repl.use_control_loops
-        && (prepared.intent.is_interactive_repl()
-            || prepared.intent.is_plan_discussion()
-            || prepared.intent.is_review_discussion())
-    {
-        return run_prepared_turn_control_loops(state, prompt, prepared, policy).await;
-    }
-    let PreparedTurn {
-        provider,
-        model,
-        app_config,
-        reasoning_effort,
-        op_id,
-        intent,
-        is_batch,
-        work_context,
-        operation,
-        marker,
-        session_id,
-        phase_out,
-    } = prepared;
-
-    // The relay paces itself against the outbound queue, and that wait ends
-    // with the operation, so it holds the very signal that interrupts the turn.
-    let mut cancel_rx = operation.cancel_receiver();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
-    let protocol = resolve_turn_protocol(intent, app_config.repl.protocol, marker.as_deref());
-
-    let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
-    // The prepared effort already carries the role-resolved reasoning depth, so
-    // the workflow receives exactly the depth the turn reports instead of
-    // resolving it a second time.
-    workflow_opts.reasoning_effort = reasoning_effort;
-    // A dialogue anchored on a review session may record a decision for one of
-    // its findings, so the anchored session identity travels with the turn
-    // options: the engine persists a decoded decision against that explicit
-    // session and never against whichever session the interface happens to
-    // render as active. Both review regimes qualify, because a decision is
-    // decoded identically whether the anchor addresses one finding or a group.
-    // A group dialogue is anchored on the session that declares the group,
-    // because a group identifier is unique only inside its session.
-    let review_session_id = if intent.is_interactive_repl() || intent.is_review_discussion() {
-        match state.discussion_focus().await.target() {
-            Some(tauqe_protocol::DiscussionTarget::Review { id }) => Some(id.clone()),
-            Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
-                Some(session_id.clone())
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    // The session as it stood before the turn is the reference the terminal
-    // publication compares against: only the findings the dialogue actually
-    // moved are republished, so a turn that records no decision publishes
-    // nothing and the client never rewrites state it already holds.
-    let review_baseline = match review_session_id.as_deref() {
-        Some(review_id) => load_review_session(state, review_id).await,
-        None => None,
-    };
-    workflow_opts.review_session_id = review_session_id.clone();
-    workflow_opts.session_id = session_id;
-    let execution = SingleExecution::new(workflow_opts);
-    let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
-    drop(tx);
-
-    let state_clone = Arc::clone(state);
-    let model_clone = model.clone();
-    let prompt_clone = prompt.clone();
-
-    // The turn works on a private clone of the shared history manager, exactly
-    // as it does on a private clone of the context: the guard is taken only
-    // long enough to clone. Holding it across the whole bounded turn would
-    // exclude every other history user, and because the request loop awaits its
-    // inline handlers, a single `history/get` would wedge the daemon — the very
-    // `model/cancel` that could interrupt the turn would never be read.
-    let workflow_future = async move {
-        let _session_guard = state_clone.session_lock.lock().await;
-        let mut local_context = state_clone.context.read().await.clone();
-        let mut history = {
-            let shared = state_clone.history.lock().await;
-            shared.clone()
-        };
-        let res = execution
-            .execute(
-                policy.as_mut(),
-                &prompt_clone,
-                intent,
-                provider.as_ref(),
-                &model_clone,
-                &mut local_context,
-                &mut history,
-                protocol.as_ref(),
-                wf_tx,
-                wf_rx,
-            )
-            .await;
-        // Adopt the turn's history back before anything else: the entries it
-        // appended are already in the journal, so the shared manager must carry
-        // the identifier watermark they consumed or the next record would reuse
-        // one of them.
-        state_clone.adopt_history(history).await;
-        if let Err(err) = state_clone
-            .mutate_context(move |ctx| ctx.merge_turn_context(&local_context))
-            .await
-        {
-            tracing::warn!(error = %err, "Failed to merge the turn context");
-        }
-        res
-    };
-
-    let mut wf_task = tokio::spawn(workflow_future);
-    operation.set_abort_handle(wf_task.abort_handle());
-
-    let mut raw_streamed_text = String::new();
-    // Open the shared usage window for this turn under the identifier the turn
-    // already published in `model/started`. Every provider call reports into it,
-    // and only the terminal flush folds it into the session totals, so
-    // intermediate usage events can never be counted twice.
-    let mut usage_guard = Some(state.begin_usage(&op_id).await);
-    // The relay opens the edit cycle on the first edit event and answers for
-    // closing it on every exit; a path that bypasses it is closed by the
-    // handle's drop guard.
-    let edit_cycle = EditCycle::new(state.out.clone(), op_id.clone());
-    let mut is_cancelled = false;
-    let mut is_error = false;
-    let mut stream_error_msg = None;
-
-    while let Some(event) = rx.recv().await {
-        // The transport owns the pacing classification, so the relay applies it
-        // once for every variant: a terminal notice publishes immediately while
-        // telemetry waits for the writer to catch up, so a client that stopped
-        // reading pauses the stream here instead of growing daemon memory for
-        // the rest of the turn.
-        state.out.pace_event(&event, &mut cancel_rx).await;
-        match event {
-            StreamEvent::ReasoningDelta(delta) => {
-                state.out.send_event(&Event {
-                    method: events::MODEL_REASONING_DELTA.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id.clone(),
-                        "delta": delta,
-                    })),
-                });
-            }
-            StreamEvent::TextDelta(delta) => {
-                // The answer passes through the same gate as reasoning, so the
-                // accumulated answer and the client copy pause together.
-                raw_streamed_text.push_str(&delta);
-                state.out.send_event(&Event {
-                    method: events::MODEL_TEXT_DELTA.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id.clone(),
-                        "delta": delta,
-                    })),
-                });
-            }
-            StreamEvent::ContextChanged(ctx_state) => {
-                state.out.send_event(&Event {
-                    method: events::CONTEXT_CHANGED.to_string(),
-                    params: Some(serde_json::json!({ "state": ctx_state })),
-                });
-            }
-            StreamEvent::EditStarted => {
-                edit_cycle.open();
-            }
-            StreamEvent::EditFileStarted { path, op_type } => {
-                edit_cycle.open();
-                state.out.send_event(&Event {
-                    method: events::EDIT_FILE_STARTED.to_string(),
-                    params: serde_json::to_value(EditFileStartedEvent {
-                        operation_id: op_id.clone(),
-                        path,
-                        op_type,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::EditHunk {
-                path,
-                hunk_index,
-                old_start,
-                old_lines,
-                new_start,
-                new_lines,
-                context_hint,
-                old_text,
-                new_text,
-            } => {
-                state.out.send_event(&Event {
-                    method: events::EDIT_HUNK.to_string(),
-                    params: serde_json::to_value(EditHunkEvent {
-                        operation_id: op_id.clone(),
-                        path,
-                        hunk_index,
-                        old_start,
-                        old_lines,
-                        new_start,
-                        new_lines,
-                        context_hint,
-                        old_text,
-                        new_text,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::EditFileDone {
-                path,
-                status,
-                error,
-                hunks_count,
-            } => {
-                state.out.send_event(&Event {
-                    method: events::EDIT_FILE_DONE.to_string(),
-                    params: serde_json::to_value(EditFileDoneEvent {
-                        operation_id: op_id.clone(),
-                        path,
-                        status,
-                        error,
-                        hunks_count,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::EditFileRetrying {
-                path,
-                attempt,
-                max_retries,
-                reason,
-            } => {
-                state.out.send_event(&Event {
-                    method: events::EDIT_FILE_RETRYING.to_string(),
-                    params: serde_json::to_value(EditFileRetryingEvent {
-                        operation_id: op_id.clone(),
-                        path,
-                        attempt,
-                        max_retries,
-                        reason,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::TurnPhase {
-                phase,
-                round,
-                max_rounds,
-                detail,
-            } => {
-                phase_out.send_event(&Event {
-                    method: events::TURN_PHASE.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
-                        operation_id: op_id.clone(),
-                        phase,
-                        round,
-                        max_rounds,
-                        detail,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::RepoMapTokens(tokens) => {
-                state.out.send_event(&Event {
-                    method: events::TURN_REPOMAP.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::RepoMapInfoEvent {
-                        operation_id: op_id.clone(),
-                        tokens,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::ToolchainStarted { command } => {
-                phase_out.send_event(&Event {
-                    method: events::TOOLCHAIN_STARTED.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ToolchainStartedEvent {
-                        operation_id: op_id.clone(),
-                        command,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::ToolchainFinished {
-                command,
-                success,
-                message,
-            } => {
-                phase_out.send_event(&Event {
-                    method: events::TOOLCHAIN_FINISHED.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
-                        operation_id: op_id.clone(),
-                        command,
-                        success,
-                        message,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::TierEscalated {
-                tier,
-                model,
-                role,
-                effort,
-            } => {
-                state.out.send_event(&Event {
-                    method: events::MODEL_ESCALATED.to_string(),
-                    params: serde_json::to_value(ModelEscalatedEvent {
-                        operation_id: op_id.clone(),
-                        model,
-                        role: Some(role),
-                        alias: None,
-                        effort,
-                        tier,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::Usage(usage) => {
-                if let Some(guard) = usage_guard.as_ref() {
-                    guard.observe(&usage).await;
-                }
-                emit_legacy_usage_event(state, &op_id).await;
-            }
-            StreamEvent::RetryingConnection {
-                attempt,
-                max_attempts,
-                delay_secs,
-                reason,
-            } => {
-                state.out.send_event(&Event {
-                    method: events::MODEL_CONNECTION_RETRYING.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ModelConnectionRetryingEvent {
-                        operation_id: op_id.clone(),
-                        attempt,
-                        max_attempts,
-                        delay_secs,
-                        reason,
-                    })
-                    .ok(),
-                });
-            }
-            StreamEvent::ResetStream => {
-                // The provider broke after partial output: everything streamed
-                // so far belongs to the aborted attempt, so the client discards
-                // it and this turn stops carrying it as assistant text. The
-                // withdrawal itself is shared with every other stream contour.
-                edit_cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None);
-                withdraw_streamed_attempt(&state.out, &op_id, || raw_streamed_text.clear());
-            }
-            StreamEvent::Done => {}
-            StreamEvent::Cancelled => {
-                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
-                state.out.send_event(&Event {
-                    method: events::MODEL_CANCELLED.to_string(),
-                    params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
-                });
-                is_cancelled = true;
-                break;
-            }
-            StreamEvent::Error(err) => {
-                close_failed(
-                    &edit_cycle,
-                    EditTermination::ProviderError,
-                    format!("Operation failed before edits were applied: {}", err),
-                );
-                state.out.send_event(&Event {
-                    method: events::MODEL_ERROR.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id.clone(),
-                        "message": err.clone(),
-                    })),
-                });
-                stream_error_msg = Some(err);
-                is_error = true;
-                break;
-            }
-        }
-    }
-
-    if is_cancelled || is_error {
-        // Cooperative cancellation is the primary path: the workflow observes
-        // the cancel signal and unwinds its own transaction. The handle is
-        // polled by reference, so the grace wait never consumes the join result
-        // and the task stays owned while this turn decides what happens next.
-        let unwind = tokio::time::timeout(unwind_grace(), &mut wf_task).await;
-        let mut unwound_error = None;
-        match unwind {
-            Ok(Ok(Err(err))) => {
-                // The workflow unwound on its own but reported a failure: the
-                // detail belongs to the turn instead of a discarded join.
-                unwound_error = Some(err.to_string());
-            }
-            Ok(Ok(Ok(_))) => {
-                tracing::info!(
-                    operation_id = %op_id,
-                    "Cancelled turn finished its workflow before the grace period elapsed",
-                );
-            }
-            Ok(Err(join_err)) => {
-                tracing::warn!(
-                    operation_id = %op_id,
-                    error = %join_err,
-                    "Cancelled turn's workflow task did not join cleanly",
-                );
-                // The task panicked or was aborted before it could adopt its
-                // history, so the shared manager is rebuilt from the journal.
-                resync_history(state).await;
-            }
-            Err(_elapsed) => {
-                // Force-aborting is a last resort with a generous grace period,
-                // and it is deferred while a git transaction is still open,
-                // because an abort lands at the next `.await` and could
-                // otherwise strand a half-finished checkpoint or step commit
-                // until startup crash recovery runs.
-                if state.git_transaction_active.load(Ordering::SeqCst) {
-                    tracing::warn!(
-                        operation_id = %op_id,
-                        grace_secs = unwind_grace().as_secs(),
-                        "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
-                    );
-                    // The task and this turn's operation registration move into
-                    // the watchdog together, so returning here never hands a
-                    // half-unwound workflow back to the client. The watchdog
-                    // confirms the task's exit within the shared task-exit
-                    // deadline and releases the slot either way, so a task wedged
-                    // in a non-yielding stretch cannot pin the registration for
-                    // the daemon's lifetime.
-                    state.defer_abort_owning_operation(Arc::clone(&operation), wf_task);
-                } else {
-                    tracing::warn!(
-                        operation_id = %op_id,
-                        grace_secs = unwind_grace().as_secs(),
-                        "Turn did not unwind within the grace period; aborting workflow task",
-                    );
-                    wf_task.abort();
-                    // The handle is polled by reference, exactly as the
-                    // cooperative wait above does, so this branch keeps
-                    // ownership of the task on every outcome: a task that has
-                    // just proven it reaches no abort landing point must never
-                    // be detached while the turn releases its slot.
-                    match tokio::time::timeout(unwind_grace(), &mut wf_task).await {
-                        // The turn settled before the abort landed and adopted
-                        // its own history, so the ordinary return releases the
-                        // slot.
-                        Ok(Ok(_)) => {}
-                        // The abort dropped the turn together with its private
-                        // history clone, so the shared manager is rebuilt from
-                        // the journal the turn may already have appended to.
-                        Ok(Err(join_err)) => {
-                            tracing::warn!(
-                                operation_id = %op_id,
-                                error = %join_err,
-                                "Aborted turn exited without adopting its history",
-                            );
-                            resync_history(state).await;
-                        }
-                        // The task outlived the abort as well, so it is handed
-                        // to the shared watchdog together with this turn's
-                        // registration: releasing the slot here would let a new
-                        // turn register and then park on the session lock the
-                        // zombie still holds, with no registered operation left
-                        // to cancel. The watchdog confirms the task's exit within
-                        // the shared task-exit deadline and releases the slot
-                        // either way, so the zombie can never pin it.
-                        Err(_) => {
-                            tracing::warn!(
-                                operation_id = %op_id,
-                                grace_secs = unwind_grace().as_secs(),
-                                "Aborted turn did not settle within the grace period; deferring the reaping",
-                            );
-                            state.defer_abort_owning_operation(Arc::clone(&operation), wf_task);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Close the usage window exactly once on this terminal path: tokens and
-        // time already consumed by a cancelled or failed turn are still charged,
-        // and the partial report never leaks into the next operation.
-        let snapshot = flush_usage(state, &mut usage_guard).await;
-        emit_legacy_usage_event(state, &op_id).await;
-
-        let reason = if is_cancelled {
-            Some("Operation cancelled".to_string())
-        } else {
-            stream_error_msg
-        };
-        // A workflow that unwound with its own failure keeps that detail: the
-        // cancellation reason alone would hide why the transaction failed.
-        let error = match (reason, unwound_error) {
-            (Some(reason), Some(detail)) => Some(format!("{}: {}", reason, detail)),
-            (None, detail) => detail,
-            (reason, None) => reason,
-        };
-
-        let status = if is_cancelled { "cancelled" } else { "error" };
-        log_turn_finished(
-            &op_id,
-            &model,
-            is_batch,
-            status,
-            &snapshot.prev,
-            error.as_deref(),
-            work_context.as_ref(),
-        );
-
-        return Ok(ModelTurnResult {
-            operation_id: op_id,
-            result: None,
-            is_cancelled,
-            error,
-            has_terminal_success: false,
-            blocked: None,
-            abort: None,
-        });
-    }
-
-    // Each arm yields the turn result together with the usage totals of the
-    // operation it just closed, so the terminal log never re-derives them.
-    let (turn_result, final_usage) = match wf_task.await {
-        Ok(Ok(wf_result)) => {
-            let snapshot = flush_usage(state, &mut usage_guard).await;
-            emit_legacy_usage_event(state, &op_id).await;
-            let operation_totals = snapshot.prev.clone();
-
-            // A plan mutation the storage engine refused is a diagnostic, not a
-            // failed turn: the reasons travel to the developer through the turn
-            // stream and the session history, and the daemon records them once
-            // per turn so the refusal stays reconstructible from the journal.
-            if !wf_result.plan_errors.is_empty() {
-                // Each rejection carries the wording its birthplace reported, so
-                // the journal renders those messages verbatim while the typed
-                // category stays available to every later surface.
-                let kinds = wf_result
-                    .plan_errors
-                    .iter()
-                    .map(|rejection| rejection.kind)
-                    .collect::<Vec<_>>();
-                let reasons = wf_result
-                    .plan_errors
-                    .iter()
-                    .map(|rejection| rejection.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                tracing::warn!(
-                    operation_id = %op_id,
-                    rejected = wf_result.plan_errors.len(),
-                    kinds = ?kinds,
-                    reasons = %reasons,
-                    "plan mutations were rejected during the turn",
-                );
-            }
-
-            // Both plan-mutation lists are projections of the classified turn
-            // outcome: every refusal keeps the category its birthplace decided
-            // and every normalization note stays verbatim, so the terminal event
-            // never reclassifies a refusal or rephrases a note.
-            let (plan_rejections, plan_warnings) = plan_mutation_fields(&wf_result);
-
-            if let tauqe_protocol::ModelResult::Edit {
-                ref summary,
-                ref outcome,
-                ..
-            } = wf_result.result
-            {
-                // The cycle closes with the typed outcome of the application
-                // attempt — its classification and its named error alike —
-                // before any terminal event of the turn is published.
-                edit_cycle.open();
-                let termination = termination_of(&wf_result, true);
-                edit_cycle.close_outcome(termination, outcome.clone());
-
-                if let Some(hash) = &outcome.commit_hash {
-                    state.out.send_event(&Event {
-                        method: events::GIT_COMMIT_CREATED.to_string(),
-                        params: serde_json::to_value(GitCommitCreatedEvent {
-                            commit_hash: hash.clone(),
-                            summary: summary.clone(),
-                            changed_files: outcome.changed_files.clone(),
-                        })
-                        .ok(),
-                    });
-
-                    // Reading the repository state shells out to git; offload
-                    // it and resolve the repository from the authoritative
-                    // shared root instead of the process CWD.
-                    let repo_root = state.repo_root().await;
-                    match offload(move || {
-                        let root = repo_root.as_path();
-                        tauqe_core::git::get_repository_state(Some(root))
-                    })
-                    .await
-                    {
-                        Ok(repo_state) => {
-                            state.out.send_event(&Event {
-                                method: events::GIT_STATE_CHANGED.to_string(),
-                                params: Some(serde_json::json!({ "repository": repo_state })),
-                            });
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "Failed to read repository state after commit"
-                            );
-                        }
-                    }
-                }
-            }
-
-            let ctx_state = state.context.read().await.get_state();
-            state.out.send_event(&Event {
-                method: events::CONTEXT_CHANGED.to_string(),
-                params: Some(serde_json::json!({ "state": ctx_state })),
-            });
-
-            // A dialogue anchored on a review session may have recorded
-            // decisions for its findings. The decisions are already durable, so
-            // the findings the turn actually moved are published beside the
-            // turn's other state publications instead of being re-derived from
-            // the stream.
-            if let Some(review_id) = review_session_id.as_deref() {
-                publish_review_decisions(state, review_id, review_baseline.as_ref()).await;
-            }
-
-            let repo_root = state.repo_root().await;
-            let (active_id, plans) = offload(move || {
-                let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
-                    .ok()
-                    .flatten();
-                let plans = tauqe_core::plan::storage::PlanStorage::load_all(&repo_root).ok();
-                (active, plans)
-            })
-            .await
-            .unwrap_or((None, None));
-
-            if let Some(plans) = plans {
-                if let Some(ref aid) = active_id {
-                    if let Some(active_plan) = plans.iter().find(|p| &p.id == aid) {
-                        state.out.send_event(&Event {
-                            method: events::PLAN_UPDATED.to_string(),
-                            params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
-                                plan: active_plan.clone(),
-                                is_save: wf_result.plan_saved,
-                            })
-                            .ok(),
-                        });
-                    }
-                }
-                state.out.send_event(&Event {
-                    method: events::PLAN_LIST_CHANGED.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
-                        plans,
-                        active_id,
-                    })
-                    .ok(),
-                });
-            }
-
-            // A turn that ended with an answer while edit events were open
-            // produced no change set: the cycle still closes, unapplied, before
-            // the terminal result is published.
-            let termination = termination_of(&wf_result, edit_cycle.is_open());
-            edit_cycle.close_unapplied(termination, Vec::new(), None);
-
-            state.out.send_event(&Event {
-                method: events::MODEL_RESULT.to_string(),
-                params: Some(serde_json::json!(ModelResultEvent {
-                    operation_id: op_id.clone(),
-                    result: wf_result.result.clone(),
-                    usage: Some(operation_totals.to_usage_info()),
-                    session_total_cost: Some(snapshot.session.cost),
-                    current_cost: Some(operation_totals.cost),
-                    plan_rejections,
-                    plan_warnings,
-                })),
-            });
-
-            state.out.send_event(&Event {
-                method: events::MODEL_FINISHED.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id.clone(),
-                    "full_text": wf_result.assistant_text.clone(),
-                })),
-            });
-
-            // A dialogue turn that applied code edits swept the transient auto
-            // context layer away inside the FSM, so the stable prompt prefix
-            // those files warmed no longer exists. The dialogue starts a fresh
-            // provider session instead of being routed to a node holding a stale
-            // prefix cache. An isolated step owns no dialogue session, so it
-            // never rotates the interactive one.
-            if !intent.is_isolated_step()
-                && matches!(
-                    &wf_result.result,
-                    tauqe_protocol::ModelResult::Edit { outcome, .. } if outcome.applied
-                )
-            {
-                state.reset_session_uuid().await;
-            }
-
-            // The FSM already classified the turn, so its verdict leads here; the
-            // text scans keep covering turns whose terminal tag never reached the
-            // packed outcome, such as an applied edit that closed with one.
-            let has_terminal_success = wf_result.has_terminal_success
-                || tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text).is_some()
-                || tauqe_core::edits::protocol::xml::extract_success(&wf_result.assistant_text)
-                    .is_some();
-
-            let turn_error = match &wf_result.result {
-                tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
-                    outcome.error.clone()
-                }
-                _ => None,
-            };
-
-            (
-                ModelTurnResult {
-                    operation_id: op_id,
-                    result: Some(wf_result.result),
-                    is_cancelled: false,
-                    error: turn_error,
-                    has_terminal_success,
-                    blocked: wf_result.blocked,
-                    abort: wf_result.abort,
-                },
-                operation_totals,
-            )
-        }
-        Ok(Err(err)) => {
-            let snapshot = flush_usage(state, &mut usage_guard).await;
-            emit_legacy_usage_event(state, &op_id).await;
-            close_failed(
-                &edit_cycle,
-                EditTermination::ProviderError,
-                format!("Workflow failed: {}", err),
-            );
-            state.out.send_event(&Event {
-                method: events::MODEL_ERROR.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id.clone(),
-                    "message": err.to_string(),
-                })),
-            });
-
-            (
-                ModelTurnResult {
-                    operation_id: op_id,
-                    result: None,
-                    is_cancelled: false,
-                    error: Some(err.to_string()),
-                    has_terminal_success: false,
-                    blocked: None,
-                    abort: None,
-                },
-                snapshot.prev,
-            )
-        }
-        Err(join_err) => {
-            let snapshot = flush_usage(state, &mut usage_guard).await;
-            emit_legacy_usage_event(state, &op_id).await;
-            // A panicked or force-aborted workflow task never reached its
-            // history adoption, so the shared manager is rebuilt from the
-            // journal the turn may already have appended to.
-            resync_history(state).await;
-            // A task that died without a result either panicked or was aborted,
-            // and the raised cancel signal decides which one the client is told
-            // about. The signal is the authoritative classification on every
-            // other seam, so a workflow that ignored it must not surface as a
-            // provider failure the model never produced.
-            let cancelled = *cancel_rx.borrow();
-            if cancelled {
-                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
-            } else {
-                close_failed(
-                    &edit_cycle,
-                    EditTermination::Aborted,
-                    format!("Workflow task failed: {}", join_err),
-                );
-            }
-            let error = if cancelled {
-                tracing::warn!(
-                    operation_id = %op_id,
-                    error = %join_err,
-                    "Workflow task terminated after the operation was cancelled",
-                );
-                state.out.send_event(&Event {
-                    method: events::MODEL_CANCELLED.to_string(),
-                    params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
-                });
-                "Operation cancelled".to_string()
-            } else {
-                state.out.send_event(&Event {
-                    method: events::MODEL_ERROR.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id.clone(),
-                        "message": join_err.to_string(),
-                    })),
-                });
-                join_err.to_string()
-            };
-
-            (
-                ModelTurnResult {
-                    operation_id: op_id,
-                    result: None,
-                    is_cancelled: cancelled,
-                    error: Some(error),
-                    has_terminal_success: false,
-                    blocked: None,
-                    abort: None,
-                },
-                snapshot.prev,
-            )
-        }
-    };
-
-    log_turn_finished(
-        &turn_result.operation_id,
-        &model,
-        is_batch,
-        turn_status(&turn_result),
-        &final_usage,
-        turn_result.error.as_deref(),
-        work_context.as_ref(),
-    );
-
-    Ok(turn_result)
+    run_prepared_turn_control_loops(state, prompt, prepared, policy).await
 }
 
 async fn run_prepared_turn_control_loops(
@@ -1301,18 +438,19 @@ async fn run_prepared_turn_control_loops(
         model,
         app_config,
         op_id,
-        intent,
+        capabilities,
+        is_isolated_step,
+        focus,
         is_batch,
         work_context,
         operation,
-        marker,
         session_id,
         phase_out: _,
         reasoning_effort,
     } = prepared;
 
     let mut cancel_rx = operation.cancel_receiver();
-    let protocol = resolve_turn_protocol(intent, app_config.repl.protocol, marker.as_deref());
+    let protocol = resolve_turn_protocol(capabilities);
     let (event_sink, mut event_rx) = EventSink::channel();
 
     let state_clone = Arc::clone(state);
@@ -1320,30 +458,44 @@ async fn run_prepared_turn_control_loops(
     let prompt_clone = prompt.clone();
     let cancel_token = CancellationToken::from_receiver(cancel_rx.clone());
     let repo_root = state.repo_root().await;
-    let focus = state.discussion_focus().await;
-    let focus_target = focus.target().cloned();
+    // The dialogue branch travels with the turn: the caller that started it
+    // resolved the anchor from the typed discussion target, so the loop opens
+    // exactly the branch the declared surface authorizes.
+    let focus_target = focus.clone();
 
+    // The starting context is captured before the history lock is taken: the
+    // highest insertion watermark it carries is what a chronological transcript
+    // uses to place a file discovered later, so the turn records it together
+    // with the prompt instead of leaving the arrival signal permanently absent.
+    let (context_files, context_watermark) = {
+        let context = state.context.read().await;
+        let watermark = context
+            .get_state()
+            .items
+            .iter()
+            .map(|item| item.insertion_seq)
+            .max()
+            .filter(|watermark| *watermark > 0);
+        let files = context
+            .read_context_files()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        (files, watermark)
+    };
     let (turn_id, history_snapshot) = {
         let mut history = state.history.lock().await;
         let snapshot = history.snapshot().ok();
-        let context_files: Vec<String> = state
-            .context
-            .read()
-            .await
-            .read_context_files()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
         let turn_id = history
-            .record_turn(&prompt, context_files)
+            .record_turn_with_watermark(&prompt, context_files, context_watermark)
             .ok()
-            .and_then(|e| e.id());
+            .and_then(|entry| entry.id());
         (turn_id, snapshot)
     };
 
     let loop_config = {
         let mut cfg = ReplLoopConfig::from_app_config(&app_config);
-        cfg.edit.staging.reasoning_effort = reasoning_effort;
+        cfg.turn.edit.staging.reasoning_effort = reasoning_effort;
         cfg
     };
     let history_snapshot_clone = history_snapshot.clone();
@@ -1352,7 +504,7 @@ async fn run_prepared_turn_control_loops(
         let _session_guard = state_clone.session_lock.lock().await;
         let mut context_manager = state_clone.context.read().await.clone();
         let mut journal = TurnResearchJournal::default();
-        let mut input_cache = tauqe_core::workflow::fsm::cache::TurnInputCache::default();
+        let mut input_cache = tauqe_core::control::cache::TurnInputCache::default();
         let mut policy = policy;
 
         let capabilities = tauqe_core::control::repl_capabilities(focus_target.as_ref());
@@ -1370,10 +522,11 @@ async fn run_prepared_turn_control_loops(
             app_config_clone.context.repomap_token_budget,
         )
         .with_patch_strategy(app_config_clone.repl.patch_strategy)
-        .with_prompt_layout(Some(app_config_clone.resolve_prompt_layout(intent)))
+        .with_prompt_layout(Some(
+            app_config_clone.resolve_prompt_layout(!is_isolated_step),
+        ))
         .with_workflow(app_config_clone.repl.workflow.to_string())
         .with_outer_docs(app_config_clone.outer_docs.clone())
-        .with_intent(intent)
         .with_reasoning_effort(reasoning_effort);
 
         let mut ctx = LoopContext::new(
@@ -1620,36 +773,82 @@ async fn run_prepared_turn_control_loops(
         }
     }
 
-    if is_cancelled || is_error {
-        if is_cancelled {
-            if let Some(id) = turn_id {
-                let mut history = state.history.lock().await;
-                let _ = history.rollback_entry(id, "Operation cancelled");
-            }
-        } else {
-            let text = if !raw_streamed_text.trim().is_empty() {
-                raw_streamed_text.clone()
+    let joined = wf_task.await;
+    let (loop_res, local_context) = match joined {
+        Ok(res) => (res.0, res.1),
+        Err(join_err) => {
+            let cancelled = is_cancelled || *cancel_rx.borrow();
+            let text = if cancelled {
+                "Operation cancelled".to_string()
             } else {
-                stream_error_msg
-                    .clone()
-                    .unwrap_or_else(|| "Operation error".to_string())
+                format!("Workflow task failed: {}", join_err)
             };
+            {
+                let mut history = state.history.lock().await;
+                if cancelled {
+                    if let Some(id) = turn_id {
+                        let _ = history.rollback_entry(id, "Operation cancelled");
+                    }
+                } else {
+                    let _ = history.record_response(&text, None, None, Vec::new());
+                }
+            }
+            let snapshot = flush_usage(state, &mut usage_guard).await;
+            emit_legacy_usage_event(state, &op_id).await;
+            let error = if cancelled {
+                Some("Operation cancelled".to_string())
+            } else {
+                Some(join_err.to_string())
+            };
+            let status = if cancelled { "cancelled" } else { "error" };
+            log_turn_finished(
+                &op_id,
+                &model,
+                is_batch,
+                status,
+                &snapshot.prev,
+                error.as_deref(),
+                work_context.as_ref(),
+            );
+            if cancelled && !is_cancelled {
+                edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+                state.out.send_event(&Event {
+                    method: events::MODEL_CANCELLED.to_string(),
+                    params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
+                });
+            }
+            return Ok(ModelTurnResult {
+                operation_id: op_id,
+                result: None,
+                is_cancelled: cancelled,
+                error,
+                has_terminal_success: false,
+                blocked: None,
+                abort: None,
+            });
+        }
+    };
+
+    if is_cancelled || *cancel_rx.borrow() {
+        if !is_cancelled {
+            edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+            state.out.send_event(&Event {
+                method: events::MODEL_CANCELLED.to_string(),
+                params: Some(serde_json::json!({ "operation_id": op_id.clone() })),
+            });
+        }
+        if let Some(id) = turn_id {
             let mut history = state.history.lock().await;
-            let _ = history.record_response(&text, None, None, Vec::new());
+            let _ = history.rollback_entry(id, "Operation cancelled");
         }
         let snapshot = flush_usage(state, &mut usage_guard).await;
         emit_legacy_usage_event(state, &op_id).await;
-        let error = if is_cancelled {
-            Some("Operation cancelled".to_string())
-        } else {
-            stream_error_msg
-        };
-        let status = if is_cancelled { "cancelled" } else { "error" };
+        let error = Some("Operation cancelled".to_string());
         log_turn_finished(
             &op_id,
             &model,
             is_batch,
-            status,
+            "cancelled",
             &snapshot.prev,
             error.as_deref(),
             work_context.as_ref(),
@@ -1657,7 +856,7 @@ async fn run_prepared_turn_control_loops(
         return Ok(ModelTurnResult {
             operation_id: op_id,
             result: None,
-            is_cancelled,
+            is_cancelled: true,
             error,
             has_terminal_success: false,
             blocked: None,
@@ -1665,28 +864,39 @@ async fn run_prepared_turn_control_loops(
         });
     }
 
-    let (loop_res, local_context) = match wf_task.await {
-        Ok(res) => res,
-        Err(join_err) => {
-            let text = format!("Workflow task failed: {}", join_err);
-            {
-                let mut history = state.history.lock().await;
-                let _ = history.record_response(&text, None, None, Vec::new());
-            }
-            let _ = flush_usage(state, &mut usage_guard).await;
-            emit_legacy_usage_event(state, &op_id).await;
-            let cancelled = *cancel_rx.borrow();
-            return Ok(ModelTurnResult {
-                operation_id: op_id,
-                result: None,
-                is_cancelled: cancelled,
-                error: Some(join_err.to_string()),
-                has_terminal_success: false,
-                blocked: None,
-                abort: None,
-            });
+    if is_error {
+        let text = if !raw_streamed_text.trim().is_empty() {
+            raw_streamed_text.clone()
+        } else {
+            stream_error_msg
+                .clone()
+                .unwrap_or_else(|| "Operation error".to_string())
+        };
+        {
+            let mut history = state.history.lock().await;
+            let _ = history.record_response(&text, None, None, Vec::new());
         }
-    };
+        let snapshot = flush_usage(state, &mut usage_guard).await;
+        emit_legacy_usage_event(state, &op_id).await;
+        log_turn_finished(
+            &op_id,
+            &model,
+            is_batch,
+            "error",
+            &snapshot.prev,
+            stream_error_msg.as_deref(),
+            work_context.as_ref(),
+        );
+        return Ok(ModelTurnResult {
+            operation_id: op_id,
+            result: None,
+            is_cancelled: false,
+            error: stream_error_msg,
+            has_terminal_success: false,
+            blocked: None,
+            abort: None,
+        });
+    }
 
     let snapshot = flush_usage(state, &mut usage_guard).await;
     emit_legacy_usage_event(state, &op_id).await;
@@ -1789,6 +999,12 @@ async fn run_prepared_turn_control_loops(
                     );
                 }
 
+                // The transient context of the turn is released on the commit
+                // path: the material that served this decision never inflates the
+                // next one. The commit is the boundary the release belongs to, so
+                // the dialogue session identifier rotates with the prompt prefix
+                // the finished task rebuilt, and the next round is never routed to
+                // a provider cache warmed by material the dialogue no longer sends.
                 let _ = state.clear_transient_context().await;
                 state.reset_session_uuid().await;
 
@@ -1867,11 +1083,9 @@ async fn run_prepared_turn_control_loops(
     }
 
     if !review_decisions_applied.is_empty() {
-        let review_id_opt = match focus.target() {
-            Some(tauqe_protocol::DiscussionTarget::Review { id }) => Some(id.clone()),
-            Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
-                Some(session_id.clone())
-            }
+        let review_id_opt = match focus.as_ref() {
+            Some(DiscussionTarget::Review { id }) => Some(id.clone()),
+            Some(DiscussionTarget::ReviewGroup { session_id, .. }) => Some(session_id.clone()),
             _ => None,
         };
         if let Some(review_id) = review_id_opt {
@@ -1944,6 +1158,7 @@ async fn run_prepared_turn_control_loops(
 /// journal. Rebuilding the manager from `<repo_root>/.tauqe/history.jsonl`
 /// restores the watermark the daemon itself derives at startup, so the next
 /// record can never reuse an identifier that is already written.
+#[allow(dead_code)]
 async fn resync_history(state: &Arc<AppState>) {
     if let Err(err) = state.resync_history_from_journal().await {
         tracing::warn!(
@@ -1990,6 +1205,7 @@ async fn load_review_session(state: &Arc<AppState>, review_id: &str) -> Option<R
 /// remediation of the finding, so exactly those fields decide whether the turn
 /// affected it. Presentation-only data and the finding's prose are never part of
 /// a decision and never make a finding affected.
+#[allow(dead_code)]
 fn finding_moved(before: &ReviewItem, after: &ReviewItem) -> bool {
     before.status != after.status
         || before.resolution_notes != after.resolution_notes
@@ -2009,6 +1225,7 @@ fn finding_moved(before: &ReviewItem, after: &ReviewItem) -> bool {
 /// event carries the refreshed session, which is the shape the wire contract
 /// declares, so a client that tracks a finding by identity observes each change
 /// the turn made.
+#[allow(dead_code)]
 async fn publish_review_decisions(
     state: &Arc<AppState>,
     review_id: &str,
@@ -2067,14 +1284,16 @@ async fn publish_review_decisions(
 pub async fn start_model_turn(
     state: &Arc<AppState>,
     prompt: String,
-    intent: TurnIntent,
+    focus: Option<DiscussionTarget>,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<String, ResponseError> {
-    let marker = state.next_turn_marker().await;
+    let capabilities = tauqe_core::control::repl_capabilities(focus.as_ref());
     let prepared = prepare_turn(
         state,
-        intent,
+        capabilities,
+        false,
+        focus,
         custom_selection,
         plan_context,
         // An interactive turn answers the developer rather than executing
@@ -2083,7 +1302,6 @@ pub async fn start_model_turn(
         Some(TurnWorkContext::Interactive),
         None,
         false,
-        marker,
         None,
         None,
     )
@@ -2119,8 +1337,15 @@ pub async fn start_model_turn(
 /// `work_context` names the work the step executes, so the client renders the
 /// running work from typed fields instead of reconstructing it from the stored
 /// plans and reviews.
+// The legacy turn contour keeps this request alive until it is removed together
+// with the bounded-turn FSM; the step chain of the daemon already runs on the
+// control loops.
+#[allow(dead_code)]
 pub struct StepTurnOptions {
-    pub intent: TurnIntent,
+    /// Capability surface the turn advertises and accepts.
+    pub capabilities: CapabilityExpr,
+    /// Whether the turn executes one isolated plan step.
+    pub is_isolated_step: bool,
     pub custom_selection: Option<tauqe_protocol::ModelSelection>,
     pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     /// Work the step executes, declared by the caller that starts it.
@@ -2149,6 +1374,7 @@ pub struct StepTurnOptions {
 /// enabling server-side step orchestration to inspect step success
 /// deterministically. Turns started here always execute inside a batch
 /// supervisor, so they are marked as batch members to let clients suppress
+#[allow(dead_code)]
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
@@ -2156,25 +1382,28 @@ pub async fn execute_model_turn(
     options: StepTurnOptions,
 ) -> Result<ModelTurnResult, TurnError> {
     let StepTurnOptions {
-        intent,
+        capabilities,
+        is_isolated_step,
         custom_selection,
         plan_context,
         work_context,
         reasoning_effort,
-        marker,
+        marker: _marker,
         session_id,
         shared_operation,
         phase_out,
     } = options;
+    let focus = state.discussion_focus().await.target().cloned();
     let mut prepared = prepare_turn(
         state,
-        intent,
+        capabilities,
+        is_isolated_step,
+        focus,
         custom_selection,
         plan_context,
         work_context,
         reasoning_effort,
         true,
-        marker,
         session_id,
         shared_operation,
     )
@@ -2189,6 +1418,588 @@ pub async fn execute_model_turn(
     run_prepared_turn(state, prompt, prepared, policy)
         .await
         .map_err(TurnError::from)
+}
+
+/// Which run body a step endpoint executes through the control contour.
+#[allow(dead_code)]
+pub(crate) enum StepLoopBody {
+    /// One bounded turn assembled from the prompt the caller prepared.
+    Single(String),
+    /// An ordered sequence of the steps a review horizon made ready.
+    Sequence {
+        /// Document that records the executed steps.
+        persistence: ReviewMemberPersistence,
+        /// Identifiers of the steps to execute, in dependency order.
+        steps: Vec<String>,
+    },
+}
+
+/// Options of one step-endpoint execution through the control loops.
+pub(crate) struct StepLoopOptions {
+    /// Explicit model selection, or the active selection of the session.
+    pub(crate) selection: Option<tauqe_protocol::ModelSelection>,
+    /// Reasoning depth of the run.
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Turn marker bound to the tagged control channel.
+    pub(crate) marker: Option<String>,
+    /// Provider session identifier shared by every turn of the run.
+    pub(crate) session_id: Option<String>,
+    /// Registration of the batch that owns the run.
+    pub(crate) operation: Arc<OperationGuard>,
+    /// Plan coordinates published with `model/started`.
+    pub(crate) plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    /// Work the run executes, published with `model/started`.
+    pub(crate) work_context: Option<TurnWorkContext>,
+    /// Body the run executes.
+    pub(crate) body: StepLoopBody,
+}
+
+/// Terminal report of one step-endpoint execution.
+#[allow(dead_code)]
+pub(crate) enum StepLoopReport {
+    /// A single bounded turn reached its terminal result.
+    Turn(LoopResult<TurnArtifact>),
+    /// A sequence of plan steps reached its terminal result.
+    Sequence(LoopResult<PlanSequenceArtifact>),
+    /// The run observed a cancellation request.
+    Cancelled,
+    /// The run could not be started or failed outside the domain outcome.
+    Failed(String),
+}
+
+/// Executes one step endpoint through `control::plan` and `control::turn`.
+///
+/// The daemon contributes what only it owns — the provider, the protocol of the
+/// turn, the context snapshot, the apply policy, the usage window, and the
+/// telemetry relay — while the engine drives the bounded turn itself: research,
+/// staging, verification, healing, the coder ladder, and the durable step
+/// transitions all belong to the control loops. Every event the loops emit is
+/// translated into the wire telemetry the interface already reads, so a step
+/// run observes the same stream an interactive turn does.
+pub(crate) async fn run_step_loop(
+    state: &Arc<AppState>,
+    options: StepLoopOptions,
+) -> StepLoopReport {
+    let StepLoopOptions {
+        selection,
+        reasoning_effort,
+        marker,
+        session_id,
+        operation,
+        plan_context,
+        work_context,
+        body,
+    } = options;
+
+    let (provider, model, selection, config, effort) = {
+        let guard = state.config.lock().await;
+        let config = guard.config.clone();
+        let selection = selection.unwrap_or_else(|| guard.selection.clone());
+        let model = config.resolve_model(&selection);
+        let effort = reasoning_effort
+            .or_else(|| config.resolve_selection_effort(ModelRole::Coder, &selection));
+        // Deterministic unit tests inject a scripted provider through the state's
+        // test seam; production builds always construct a real network provider.
+        #[cfg(test)]
+        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
+            Some(provider) => provider,
+            None => match build_configured_provider(&config, model.provider) {
+                Ok(provider) => provider,
+                Err(err) => return StepLoopReport::Failed(err.message),
+            },
+        };
+        #[cfg(not(test))]
+        let provider: Arc<dyn LlmProvider> =
+            match build_configured_provider(&config, model.provider) {
+                Ok(provider) => provider,
+                Err(err) => return StepLoopReport::Failed(err.message),
+            };
+        (provider, model, selection, config, effort)
+    };
+
+    let op_id = format!("op-{}", next_operation_id());
+    let role = match &selection {
+        tauqe_protocol::ModelSelection::Role(role) => Some(*role),
+        tauqe_protocol::ModelSelection::Specific(_) => None,
+        tauqe_protocol::ModelSelection::Tier { .. } => None,
+    };
+    tracing::info!(
+        operation_id = %op_id,
+        model = %model,
+        role = ?role,
+        effort = ?effort,
+        work = work_kind(work_context.as_ref()),
+        session = session_id.as_deref().unwrap_or("none"),
+        "step run started"
+    );
+    state.out.send_event(&Event {
+        method: events::MODEL_STARTED.to_string(),
+        params: serde_json::to_value(ModelStartedEvent {
+            operation_id: op_id.clone(),
+            model: model.clone(),
+            role,
+            alias: config.model_alias(&model).map(str::to_string),
+            effort,
+            plan_context,
+            work_context,
+            is_batch: true,
+        })
+        .ok(),
+    });
+
+    let protocol = resolve_turn_protocol(tauqe_core::control::turn::turn_capability_expr());
+    let cancel_rx = operation.cancel_receiver();
+    let cancel = CancellationToken::from_receiver(cancel_rx.clone());
+    let policy = build_apply_policy(state, config.repl.workflow, cancel_rx.clone());
+    let repo_root = state.repo_root().await;
+    let mut context_manager = state.context.read().await.clone();
+    let mut journal = TurnResearchJournal::default();
+    let mut input_cache = tauqe_core::control::cache::TurnInputCache::default();
+    let capabilities = tauqe_core::control::turn::turn_capability_expr();
+
+    let prompt = match &body {
+        StepLoopBody::Single(prompt) => Some(prompt.clone()),
+        StepLoopBody::Sequence { .. } => None,
+    };
+    let turn_config = TurnLoopConfig::from_app_config(&config);
+    let sequence_config = PlanSequenceLoopConfig {
+        step: PlanStepLoopConfig {
+            turn: turn_config.clone(),
+            models: config.models.clone(),
+            protocol: tauqe_protocol::EditProtocolKind::Structured,
+            marker: marker.clone(),
+            selection: Some(selection.clone()),
+        },
+    };
+
+    let (sink, mut event_rx) = EventSink::channel();
+    let edit_cycle = Arc::new(EditCycle::new(state.out.clone(), op_id.clone()));
+    let relay = {
+        let out = state.out.clone();
+        let relay_op = op_id.clone();
+        let usage_guard = state.begin_usage(&op_id).await;
+        let relay_edit_cycle = Arc::clone(&edit_cycle);
+        tokio::spawn(async move {
+            let mut usage_guard = usage_guard;
+            let mut assistant_text = String::new();
+            while let Some(event) = event_rx.recv().await {
+                match &event {
+                    StreamEvent::TextDelta(delta) => {
+                        assistant_text.push_str(delta);
+                    }
+                    StreamEvent::ResetStream => {
+                        assistant_text.clear();
+                    }
+                    _ => {}
+                }
+                forward_step_event(&out, &relay_op, event, &mut usage_guard, &relay_edit_cycle)
+                    .await;
+            }
+            // The run publishes the same terminal event an interactive turn does,
+            // so a client observes the answer of the step before the verdict of
+            // the entity the step addressed is settled and published.
+            out.send_event(&Event {
+                method: events::MODEL_FINISHED.to_string(),
+                params: Some(serde_json::json!({
+                    "operation_id": relay_op,
+                    "full_text": assistant_text,
+                })),
+            });
+            usage_guard.flush().await;
+        })
+    };
+
+    // The run is spawned so a hard cancel reaches the task that really executes
+    // it: the operation slot registers the abort handle of this very task, exactly
+    // as an interactive turn does, and the task hands its context back so the
+    // material the step discovered survives the run.
+    let task_state = Arc::clone(state);
+    let task_sink = sink.clone();
+    let loop_task = tokio::spawn(async move {
+        let mut policy = policy;
+        let prompt_builder = PromptBuilder::new(
+            provider.as_ref(),
+            &model,
+            protocol.as_ref(),
+            &mut input_cache,
+        )
+        .with_session_id(session_id)
+        .with_prompt(prompt)
+        .with_history(None)
+        .with_repo_map_config(
+            config.context.include_repo_map,
+            config.context.repomap_token_budget,
+        )
+        .with_patch_strategy(config.repl.patch_strategy)
+        .with_prompt_layout(Some(config.resolve_prompt_layout(false)))
+        .with_workflow(config.repl.workflow.to_string())
+        .with_outer_docs(config.outer_docs.clone())
+        .with_turn_brief(Some(TurnBrief::step()))
+        .with_reasoning_effort(effort);
+        let mut ctx = LoopContext::new(
+            &cancel,
+            &task_sink,
+            &repo_root,
+            &mut context_manager,
+            &mut journal,
+            policy.as_mut(),
+            capabilities,
+            prompt_builder,
+        );
+        let report = match body {
+            StepLoopBody::Single(_) => match run_turn_loop(&mut ctx, None, &turn_config).await {
+                Ok(result) => StepLoopReport::Turn(result),
+                Err(SystemError::Cancelled) => StepLoopReport::Cancelled,
+                Err(err) => StepLoopReport::Failed(err.to_string()),
+            },
+            StepLoopBody::Sequence { persistence, steps } => {
+                match run_plan_sequence_loop_with(
+                    &mut ctx,
+                    &persistence,
+                    &steps,
+                    &sequence_config,
+                    None,
+                )
+                .await
+                {
+                    Ok(result) => StepLoopReport::Sequence(result),
+                    Err(SystemError::Cancelled) => StepLoopReport::Cancelled,
+                    Err(err) => StepLoopReport::Failed(err.to_string()),
+                }
+            }
+        };
+        (report, context_manager)
+    });
+    operation.set_abort_handle(loop_task.abort_handle());
+    let joined = loop_task.await;
+    operation.clear_abort_handle();
+
+    let (report, context_manager) = match joined {
+        Ok(joined) => joined,
+        Err(join_err) => {
+            // A task force-aborted through the operation slot never reports its own
+            // outcome, so the authoritative cancel signal classifies the ending: a
+            // raised cancel stays a cancellation, while a task that died without it
+            // keeps its failure classification.
+            let cancelled = *cancel_rx.borrow();
+            if !cancelled {
+                tracing::warn!(
+                    operation_id = op_id.as_str(),
+                    error = %join_err,
+                    "step run task terminated unexpectedly"
+                );
+            }
+            let report = if cancelled {
+                StepLoopReport::Cancelled
+            } else {
+                StepLoopReport::Failed(format!(
+                    "The step run task terminated unexpectedly: {join_err}"
+                ))
+            };
+            (report, task_state.context.read().await.clone())
+        }
+    };
+
+    // The run widened the context of the step, so the material it discovered is
+    // merged back before the relay closes: the next step starts from it.
+    if let Err(err) = state
+        .mutate_context(move |ctx| ctx.merge_turn_context(&context_manager))
+        .await
+    {
+        tracing::warn!(error = %err, "Failed to merge the step context");
+    }
+    match &report {
+        StepLoopReport::Turn(LoopResult::Success(success)) => {
+            let artifact = &success.value;
+            if let Some(err) = &artifact.commit_error {
+                let outcome = EditOutcome {
+                    applied: false,
+                    error: Some(err.clone()),
+                    changed_files: artifact.modified_paths.clone(),
+                    commit_hash: None,
+                    verification: artifact.verification,
+                };
+                edit_cycle.close_outcome(EditTermination::StagingRefused, outcome);
+            } else if artifact.commit_hash.is_some() {
+                let outcome = EditOutcome {
+                    applied: true,
+                    error: None,
+                    changed_files: artifact.modified_paths.clone(),
+                    commit_hash: artifact.commit_hash.clone(),
+                    verification: artifact.verification,
+                };
+                edit_cycle.close_outcome(EditTermination::Answered, outcome);
+            } else {
+                edit_cycle.close_unapplied(
+                    EditTermination::Answered,
+                    artifact.modified_paths.clone(),
+                    artifact.verification,
+                );
+            }
+        }
+        StepLoopReport::Turn(LoopResult::Exhausted(_)) => {
+            edit_cycle.close_unapplied(EditTermination::StagingRefused, Vec::new(), None);
+        }
+        StepLoopReport::Turn(LoopResult::Diverged(_)) => {
+            edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+        }
+        StepLoopReport::Cancelled => {
+            edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+        }
+        StepLoopReport::Failed(reason) => {
+            let outcome = EditOutcome {
+                applied: false,
+                error: Some(reason.clone()),
+                changed_files: Vec::new(),
+                commit_hash: None,
+                verification: None,
+            };
+            edit_cycle.close_outcome(EditTermination::ProtocolFailure, outcome);
+        }
+        StepLoopReport::Sequence(LoopResult::Success(seq)) => {
+            if seq.value.is_success() {
+                let modified: Vec<String> = seq
+                    .value
+                    .executed_steps
+                    .iter()
+                    .flat_map(|s| s.modified_paths.clone())
+                    .collect();
+                let last_commit = seq
+                    .value
+                    .executed_steps
+                    .iter()
+                    .rev()
+                    .find_map(|s| s.commit.clone());
+                edit_cycle.close_outcome(
+                    EditTermination::Answered,
+                    EditOutcome {
+                        applied: true,
+                        error: None,
+                        changed_files: modified,
+                        commit_hash: last_commit,
+                        verification: Some(tauqe_protocol::VerificationVerdict::Passed),
+                    },
+                );
+            } else {
+                edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+            }
+        }
+        StepLoopReport::Sequence(_) => {
+            edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+        }
+    }
+    drop(sink);
+    if let Err(err) = relay.await {
+        tracing::warn!(
+            operation_id = op_id.as_str(),
+            error = %err,
+            "step telemetry relay terminated unexpectedly"
+        );
+    }
+    emit_legacy_usage_event(state, &op_id).await;
+
+    report
+}
+
+/// Translates one control-loop event into the wire telemetry of the client.
+pub(crate) async fn forward_step_event(
+    out: &OutChannel,
+    operation_id: &str,
+    event: StreamEvent,
+    usage: &mut UsageGuard,
+    edit_cycle: &EditCycle,
+) {
+    match event {
+        StreamEvent::TextDelta(delta) => out.send_event(&Event {
+            method: events::MODEL_TEXT_DELTA.to_string(),
+            params: Some(serde_json::json!({
+                "operation_id": operation_id,
+                "delta": delta,
+            })),
+        }),
+        StreamEvent::ReasoningDelta(delta) => out.send_event(&Event {
+            method: events::MODEL_REASONING_DELTA.to_string(),
+            params: Some(serde_json::json!({
+                "operation_id": operation_id,
+                "delta": delta,
+            })),
+        }),
+        StreamEvent::ContextChanged(ctx_state) => {
+            out.send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            });
+        }
+        StreamEvent::EditStarted => {
+            edit_cycle.open();
+        }
+        StreamEvent::EditFileStarted { path, op_type } => {
+            edit_cycle.open();
+            out.send_event(&Event {
+                method: events::EDIT_FILE_STARTED.to_string(),
+                params: serde_json::to_value(EditFileStartedEvent {
+                    operation_id: operation_id.to_string(),
+                    path,
+                    op_type,
+                })
+                .ok(),
+            });
+        }
+        StreamEvent::EditHunk {
+            path,
+            hunk_index,
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            context_hint,
+            old_text,
+            new_text,
+        } => {
+            out.send_event(&Event {
+                method: events::EDIT_HUNK.to_string(),
+                params: serde_json::to_value(EditHunkEvent {
+                    operation_id: operation_id.to_string(),
+                    path,
+                    hunk_index,
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                    context_hint,
+                    old_text,
+                    new_text,
+                })
+                .ok(),
+            });
+        }
+        StreamEvent::EditFileDone {
+            path,
+            status,
+            error,
+            hunks_count,
+        } => {
+            out.send_event(&Event {
+                method: events::EDIT_FILE_DONE.to_string(),
+                params: serde_json::to_value(EditFileDoneEvent {
+                    operation_id: operation_id.to_string(),
+                    path,
+                    status,
+                    error,
+                    hunks_count,
+                })
+                .ok(),
+            });
+        }
+        StreamEvent::EditFileRetrying {
+            path,
+            attempt,
+            max_retries,
+            reason,
+        } => {
+            out.send_event(&Event {
+                method: events::EDIT_FILE_RETRYING.to_string(),
+                params: serde_json::to_value(EditFileRetryingEvent {
+                    operation_id: operation_id.to_string(),
+                    path,
+                    attempt,
+                    max_retries,
+                    reason,
+                })
+                .ok(),
+            });
+        }
+        StreamEvent::TurnPhase {
+            phase,
+            round,
+            max_rounds,
+            detail,
+        } => out.send_event(&Event {
+            method: events::TURN_PHASE.to_string(),
+            params: serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
+                operation_id: operation_id.to_string(),
+                phase,
+                round,
+                max_rounds,
+                detail,
+            })
+            .ok(),
+        }),
+        StreamEvent::ToolchainStarted { command } => out.send_event(&Event {
+            method: events::TOOLCHAIN_STARTED.to_string(),
+            params: serde_json::to_value(tauqe_protocol::ToolchainStartedEvent {
+                operation_id: operation_id.to_string(),
+                command,
+            })
+            .ok(),
+        }),
+        StreamEvent::ToolchainFinished {
+            command,
+            success,
+            message,
+        } => out.send_event(&Event {
+            method: events::TOOLCHAIN_FINISHED.to_string(),
+            params: serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
+                operation_id: operation_id.to_string(),
+                command,
+                success,
+                message,
+            })
+            .ok(),
+        }),
+        StreamEvent::RepoMapTokens(tokens) => out.send_event(&Event {
+            method: events::TURN_REPOMAP.to_string(),
+            params: serde_json::to_value(tauqe_protocol::RepoMapInfoEvent {
+                operation_id: operation_id.to_string(),
+                tokens,
+            })
+            .ok(),
+        }),
+        StreamEvent::TierEscalated {
+            tier,
+            model,
+            role,
+            effort,
+        } => out.send_event(&Event {
+            method: events::MODEL_ESCALATED.to_string(),
+            params: serde_json::to_value(ModelEscalatedEvent {
+                operation_id: operation_id.to_string(),
+                model,
+                role: Some(role),
+                alias: None,
+                effort,
+                tier,
+            })
+            .ok(),
+        }),
+        StreamEvent::ResetStream => {
+            edit_cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None);
+            withdraw_streamed_attempt(out, operation_id, || ());
+        }
+        StreamEvent::Usage(observed) => usage.observe(&observed).await,
+        StreamEvent::Cancelled => {
+            edit_cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None);
+            out.send_event(&Event {
+                method: events::MODEL_CANCELLED.to_string(),
+                params: Some(serde_json::json!({ "operation_id": operation_id })),
+            });
+        }
+        StreamEvent::Error(message) => {
+            close_failed(
+                edit_cycle,
+                EditTermination::ProviderError,
+                format!("Operation failed before edits were applied: {message}"),
+            );
+            out.send_event(&Event {
+                method: events::MODEL_ERROR.to_string(),
+                params: Some(serde_json::json!({
+                    "operation_id": operation_id,
+                    "message": message,
+                })),
+            });
+        }
+        _ => {}
+    }
 }
 
 /// Classifies a completed turn into a stable status label for the journal.
@@ -2319,189 +2130,15 @@ fn close_failed(cycle: &EditCycle, termination: EditTermination, reason: String)
     );
 }
 
-/// Projects a completed turn onto the typed plan-mutation fields of the
-/// terminal `model/result` event.
-///
-/// The projection is a pass-through of what the engine already classified: the
-/// category of every refusal was decided where the refusal was born, and every
-/// normalization note was recorded by the barrier that produced it. The daemon
-/// therefore never reclassifies a refusal or rephrases a note, so the client
-/// renders exactly the outcome the storage engine reported.
-fn plan_mutation_fields(
-    result: &tauqe_core::workflow::WorkflowExecutionResult,
-) -> (Vec<tauqe_protocol::PlanRejection>, Vec<String>) {
-    (result.plan_errors.clone(), result.plan_warnings.clone())
-}
-
-/// Classifies why a completed turn leaves its edit cycle unapplied.
-///
-/// The reason is read from the typed state the engine already settled — the
-/// cancellation flag, the blocker, the abort report, and the protocol-failure
-/// fact — and never from any text, so every ending that finds the cycle open
-/// closes it with a stated reason. A semantic ending outranks a protocol
-/// violation: a turn that was cancelled, blocked, or aborted reports that
-/// ending even when its last proposal also violated the edit protocol.
-fn termination_of(
-    result: &tauqe_core::workflow::WorkflowExecutionResult,
-    edits_streamed: bool,
-) -> EditTermination {
-    if result.is_cancelled {
-        EditTermination::Cancelled
-    } else if result.blocked.is_some() {
-        EditTermination::Blocked
-    } else if result.abort.is_some() {
-        EditTermination::Aborted
-    } else if result.protocol_failure.is_some() {
-        EditTermination::ProtocolFailure
-    } else {
-        silent_ending(result, edits_streamed)
-    }
-}
-
-fn silent_ending(
-    result: &tauqe_core::workflow::WorkflowExecutionResult,
-    edits_streamed: bool,
-) -> EditTermination {
-    match &result.result {
-        tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
-            EditTermination::StagingRefused
-        }
-        _ if edits_streamed => EditTermination::Superseded,
-        _ => EditTermination::Answered,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_core::workflow::WorkflowExecutionResult;
-    use tauqe_protocol::{ModelResult, PlanRejection, PlanRejectionKind};
 
-    fn turn_result(
-        plan_errors: Vec<PlanRejection>,
-        plan_warnings: Vec<String>,
-    ) -> WorkflowExecutionResult {
-        WorkflowExecutionResult {
-            result: ModelResult::Answer {
-                text: String::new(),
-            },
-            assistant_text: String::new(),
-            is_cancelled: false,
-            has_terminal_success: false,
-            blocked: None,
-            skip_reason: None,
-            abort: None,
-            protocol_failure: None,
-            plan_saved: false,
-            plan_errors,
-            plan_warnings,
-        }
-    }
-
+    /// A dialogue turn binds the interactive session, while an isolated step
+    /// stays stateless so it can never inherit the interactive prefix cache.
     #[test]
-    fn test_plan_mutation_fields_keep_the_typed_outcome() {
-        let result = turn_result(
-            vec![
-                PlanRejection::payload_defect("the payload breaks the planning contract"),
-                PlanRejection::mode_forbidden("the turn regime forbids the mutation"),
-            ],
-            vec!["requested status corrected to in progress".to_string()],
-        );
-
-        let (rejections, warnings) = plan_mutation_fields(&result);
-
-        assert_eq!(rejections, result.plan_errors);
-        assert_eq!(warnings, result.plan_warnings);
-        let kinds: Vec<PlanRejectionKind> = rejections.iter().map(|item| item.kind).collect();
-        assert_eq!(
-            kinds,
-            [
-                PlanRejectionKind::PayloadDefect,
-                PlanRejectionKind::ModeForbidden
-            ],
-            "the projection keeps the category every refusal declared",
-        );
-    }
-
-    #[test]
-    fn test_plan_mutation_fields_of_an_untouched_plan_stay_empty() {
-        let result = turn_result(Vec::new(), Vec::new());
-
-        let (rejections, warnings) = plan_mutation_fields(&result);
-
-        assert!(rejections.is_empty());
-        assert!(warnings.is_empty());
-    }
-    #[test]
-    fn test_termination_of_reads_the_typed_state() {
-        let mut result = turn_result(Vec::new(), Vec::new());
-        assert_eq!(termination_of(&result, false), EditTermination::Answered);
-        assert_eq!(termination_of(&result, true), EditTermination::Superseded);
-
-        result.result = ModelResult::Edit {
-            summary: String::new(),
-            edits: Vec::new(),
-            proposal: None,
-            outcome: EditOutcome {
-                applied: false,
-                ..Default::default()
-            },
-        };
-        assert_eq!(
-            termination_of(&result, true),
-            EditTermination::StagingRefused
-        );
-
-        result.blocked = Some("the invariant cannot hold".to_string());
-        assert_eq!(termination_of(&result, true), EditTermination::Blocked);
-
-        result.is_cancelled = true;
-        assert_eq!(
-            termination_of(&result, true),
-            EditTermination::Cancelled,
-            "a cancellation outranks every other ending"
-        );
-    }
-
-    #[test]
-    fn test_termination_of_maps_the_protocol_failure_fact() {
-        let mut result = turn_result(Vec::new(), Vec::new());
-        assert_eq!(
-            termination_of(&result, false),
-            EditTermination::Answered,
-            "a turn without a stated ending keeps the fallback"
-        );
-
-        result.protocol_failure = Some("unclosed <edit>".to_string());
-        assert_eq!(
-            termination_of(&result, false),
-            EditTermination::ProtocolFailure,
-            "the typed fact classifies the ending without reading its wording"
-        );
-
-        result.blocked = Some("the invariant cannot hold".to_string());
-        assert_eq!(
-            termination_of(&result, false),
-            EditTermination::Blocked,
-            "a semantic block outranks the protocol violation"
-        );
-
-        result.blocked = None;
-        result.abort = Some(tauqe_core::workflow::fsm::AbortReport {
-            reason: "host capability missing".to_string(),
-            recommendation: "install the missing package".to_string(),
-        });
-        assert_eq!(
-            termination_of(&result, false),
-            EditTermination::Aborted,
-            "an abort outranks the protocol violation"
-        );
-
-        result.is_cancelled = true;
-        assert_eq!(
-            termination_of(&result, false),
-            EditTermination::Cancelled,
-            "a cancellation outranks every other ending"
-        );
+    fn resolve_session_id_keeps_isolated_steps_stateless() {
+        assert_eq!(resolve_session_id(true, "session-1".to_string()), None);
+        assert!(resolve_session_id(false, "session-1".to_string()).is_some());
     }
 }

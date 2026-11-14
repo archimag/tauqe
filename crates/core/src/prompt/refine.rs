@@ -6,8 +6,8 @@
 //! the typed wire surface of that contour, so a caller asks the protocol for its
 //! response schema and its instructions instead of assembling either by hand.
 //!
-//! The advertised surface is [`CapabilitySet::architect_research`]: the
-//! Architect reads context, searches the repository, requests symbol contours,
+//! The advertised surface is the synthesis tree of the Architect control loop:
+//! the Architect reads context, searches the repository, requests symbol contours,
 //! consults the documentation, records working notes, and reports a terminal
 //! status. It never edits a file and never runs the toolchain, so neither
 //! [`LlmCapability::FileEdits`] nor [`LlmCapability::ToolchainVerify`] belongs
@@ -29,8 +29,9 @@
 use std::borrow::Cow;
 
 use tauqe_protocol::{
-    CapabilitySet, ContextAccess, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome,
-    PatchStrategy, ProjectConfig,
+    AbortCommand, BlockedCommand, CapabilityExpr, CommitMessageCommand, ContextAccess,
+    ContextRequestCommand, EditProtocolKind, LlmCommand, PatchStrategy, ProjectConfig,
+    RepoMapCommand, RepoSearchCommand, TextCommand,
 };
 
 use crate::edits::stream::discussion::DiscussionStreamFilter;
@@ -46,7 +47,8 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 /// Wire surface of the Architect horizon-synthesis contour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRefinePromptProtocol {
-    capabilities: CapabilitySet,
+    /// Strict capability tree this protocol advertises.
+    capabilities: CapabilityExpr,
 }
 
 impl Default for PlanRefinePromptProtocol {
@@ -59,7 +61,7 @@ impl PlanRefinePromptProtocol {
     /// Creates the protocol bound to the architect research surface.
     pub fn new() -> Self {
         Self {
-            capabilities: CapabilitySet::architect_research(),
+            capabilities: crate::control::refine::architect_synthesis_capability_expr(),
         }
     }
 
@@ -211,16 +213,12 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         EditProtocolKind::Structured
     }
 
-    fn capabilities(&self) -> &[LlmCapability] {
-        self.capabilities.as_slice()
-    }
-
-    fn capability_set(&self) -> CapabilitySet {
+    fn capability_expr(&self) -> CapabilityExpr {
         self.capabilities.clone()
     }
 
-    fn with_capability_set(&self, capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
-        Box::new(Self { capabilities })
+    fn with_capability_expr(&self, expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
+        Box::new(Self { capabilities: expr })
     }
 
     fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
@@ -242,9 +240,9 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         let mut commands = Vec::new();
         let explanation = output.explanation.trim().to_string();
         if !explanation.is_empty() {
-            commands.push(LlmCommand::Text {
+            commands.push(LlmCommand::Text(TextCommand {
                 content: explanation.clone(),
-            });
+            }));
         }
 
         // An active abort supersedes the declared status: the round reports work
@@ -253,10 +251,10 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         // defaults the edit contour uses, so an abort always states a cause.
         if let Some(abort) = output.abort.as_ref().filter(|abort| abort.is_aborted) {
             let (reason, recommendation) = abort_payload(&abort.reason, &abort.recommendation);
-            commands.push(LlmCommand::Abort {
+            commands.push(LlmCommand::Abort(AbortCommand {
                 reason,
                 recommendation,
-            });
+            }));
             return commands;
         }
 
@@ -265,19 +263,19 @@ impl PromptProtocol for PlanRefinePromptProtocol {
                 // The horizon is not synthesized yet: the round names the evidence
                 // it still needs, so the caller widens the context and asks again.
                 for path in &output.context_requests {
-                    commands.push(LlmCommand::ContextRequest {
+                    commands.push(LlmCommand::ContextRequest(ContextRequestCommand {
                         path: path.clone(),
                         access: ContextAccess::ReadOnly,
-                    });
+                    }));
                 }
                 for search in &output.repo_searches {
-                    commands.push(LlmCommand::RepoSearch {
+                    commands.push(LlmCommand::RepoSearch(RepoSearchCommand {
                         path: search.path.clone(),
                         regex: search.regex.clone(),
-                    });
+                    }));
                 }
                 for path in &output.repo_maps {
-                    commands.push(LlmCommand::RepoMap { path: path.clone() });
+                    commands.push(LlmCommand::RepoMap(RepoMapCommand { path: path.clone() }));
                 }
             }
             "blocked" => {
@@ -291,21 +289,16 @@ impl PromptProtocol for PlanRefinePromptProtocol {
                     .map(str::to_string)
                     .unwrap_or_else(|| explanation.clone());
                 let details = if explanation.is_empty() {
-                    None
+                    String::new()
                 } else {
-                    Some(explanation.clone())
+                    explanation.clone()
                 };
-                commands.push(LlmCommand::Blocked { reason, details });
+                commands.push(LlmCommand::Blocked(BlockedCommand { reason, details }));
             }
             "success" => {
-                let commit_message = if explanation.is_empty() {
-                    None
-                } else {
-                    Some(explanation.clone())
-                };
-                commands.push(LlmCommand::Outcome {
-                    outcome: LlmOutcome::Success { commit_message },
-                });
+                commands.push(LlmCommand::CommitMessage(CommitMessageCommand {
+                    commit_message: explanation.clone(),
+                }));
             }
             other => commands.push(LlmCommand::ProtocolError {
                 message: format!("Unsupported plan refinement status '{other}'"),
@@ -348,6 +341,9 @@ impl PromptProtocol for PlanRefinePromptProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::{
+        AbortCommand, BlockedCommand, CommitMessageCommand, LlmCapability, TextCommand,
+    };
 
     /// A round that still needs evidence instead of a horizon.
     const NEEDS_CONTEXT: &str = r#"{
@@ -366,12 +362,12 @@ mod tests {
         assert_eq!(protocol.name(), "plan_refinement");
         assert_eq!(protocol.kind(), EditProtocolKind::Structured);
         assert_eq!(
-            protocol.capability_set(),
-            CapabilitySet::architect_research()
+            protocol.capability_expr(),
+            crate::control::refine::architect_synthesis_capability_expr()
         );
-        assert!(protocol.supports(LlmCapability::Research));
+        assert!(protocol.supports(LlmCapability::ContextRequest));
         assert!(protocol.supports(LlmCapability::PlanUpdate));
-        assert!(!protocol.supports(LlmCapability::FileEdits));
+        assert!(!protocol.supports(LlmCapability::EditReplace));
         // A synthesis runs unattended exactly as an isolated step does, so the
         // surface keeps the escape hatch that demands a host action instead of
         // improvising a surrogate change or misreporting a blocker.
@@ -449,23 +445,27 @@ mod tests {
         let protocol = PlanRefinePromptProtocol::default();
         let commands = protocol.decode(NEEDS_CONTEXT, &[]);
 
-        assert!(commands.contains(&LlmCommand::Text {
+        assert!(commands.contains(&LlmCommand::Text(TextCommand {
             content: "The toolchain contract is not verified yet".to_string(),
-        }));
-        assert!(commands.contains(&LlmCommand::ContextRequest {
-            path: "crates/core/src/toolchain.rs".to_string(),
-            access: ContextAccess::ReadOnly,
-        }));
-        assert!(commands.contains(&LlmCommand::RepoSearch {
-            path: "crates/core".to_string(),
-            regex: "fn run_verification_pipeline".to_string(),
-        }));
-        assert!(commands.contains(&LlmCommand::RepoMap {
+        })));
+        assert!(
+            commands.contains(&LlmCommand::ContextRequest(ContextRequestCommand {
+                path: "crates/core/src/toolchain.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            }))
+        );
+        assert!(
+            commands.contains(&LlmCommand::RepoSearch(RepoSearchCommand {
+                path: "crates/core".to_string(),
+                regex: "fn run_verification_pipeline".to_string(),
+            }))
+        );
+        assert!(commands.contains(&LlmCommand::RepoMap(RepoMapCommand {
             path: "crates/core/src/plan".to_string(),
-        }));
+        })));
         assert!(!commands
             .iter()
-            .any(|command| matches!(command, LlmCommand::Outcome { .. })));
+            .any(|command| matches!(command, LlmCommand::CommitMessage(_))));
     }
 
     #[test]
@@ -482,13 +482,13 @@ mod tests {
         }"#;
         let commands = protocol.decode(blocked, &[]);
 
-        assert!(commands.contains(&LlmCommand::Blocked {
+        assert!(commands.contains(&LlmCommand::Blocked(BlockedCommand {
             reason: "Trait Display is not implemented for the chosen type".to_string(),
-            details: Some("The signature cannot be satisfied".to_string()),
-        }));
+            details: "The signature cannot be satisfied".to_string(),
+        })));
         assert!(!commands
             .iter()
-            .any(|command| matches!(command, LlmCommand::Outcome { .. })));
+            .any(|command| matches!(command, LlmCommand::CommitMessage(_))));
     }
 
     #[test]
@@ -507,14 +507,12 @@ mod tests {
         assert_eq!(
             protocol.decode(success, &[]),
             vec![
-                LlmCommand::Text {
+                LlmCommand::Text(TextCommand {
                     content: "Decomposed into three verified steps".to_string(),
-                },
-                LlmCommand::Outcome {
-                    outcome: LlmOutcome::Success {
-                        commit_message: Some("Decomposed into three verified steps".to_string()),
-                    },
-                },
+                }),
+                LlmCommand::CommitMessage(CommitMessageCommand {
+                    commit_message: "Decomposed into three verified steps".to_string(),
+                }),
             ]
         );
     }
@@ -566,13 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn test_no_turn_marker_and_streamed_explanation() {
+    fn test_streamed_explanation() {
         let protocol = PlanRefinePromptProtocol::default();
-        // The contour is structured, so it mints no marker-bound variant and
-        // leaves the value unset on every level that would carry one.
-        assert!(protocol.turn_marker().is_none());
-        assert!(protocol.with_turn_marker("M12345").is_none());
-
         let mut filter = protocol.create_stream_filter(
             vec![],
             std::path::PathBuf::from("/tmp"),
@@ -611,30 +604,28 @@ mod tests {
 
         // The escape hatch reaches the harness as one command, with the payload
         // trimmed exactly as the edit contour trims it.
-        assert!(commands.contains(&LlmCommand::Abort {
+        assert!(commands.contains(&LlmCommand::Abort(AbortCommand {
             reason: "Native build approval required".to_string(),
             recommendation: "pnpm approve-builds".to_string(),
-        }));
+        })));
 
         // The declared status is superseded: no terminal outcome, no blocker, and
         // no research request is decoded beside the abort.
         assert!(!commands
             .iter()
-            .any(|command| matches!(command, LlmCommand::Outcome { .. })));
+            .any(|command| matches!(command, LlmCommand::CommitMessage(_))));
         assert!(!commands
             .iter()
-            .any(|command| matches!(command, LlmCommand::Blocked { .. })));
+            .any(|command| matches!(command, LlmCommand::Blocked(_))));
         assert!(!commands.iter().any(|command| matches!(
             command,
-            LlmCommand::ContextRequest { .. }
-                | LlmCommand::RepoSearch { .. }
-                | LlmCommand::RepoMap { .. }
+            LlmCommand::ContextRequest(_) | LlmCommand::RepoSearch(_) | LlmCommand::RepoMap(_)
         )));
 
         // The explanation still reaches the developer as conversational text.
-        assert!(commands.contains(&LlmCommand::Text {
+        assert!(commands.contains(&LlmCommand::Text(TextCommand {
             content: "The native build needs an approval only the developer can give".to_string(),
-        }));
+        })));
     }
 
     #[test]
@@ -652,10 +643,10 @@ mod tests {
         }"#;
         assert_eq!(
             protocol.decode(blank, &[]),
-            vec![LlmCommand::Abort {
+            vec![LlmCommand::Abort(AbortCommand {
                 reason: "Execution aborted".to_string(),
                 recommendation: "No recommendation was stated.".to_string(),
-            }]
+            })]
         );
     }
 

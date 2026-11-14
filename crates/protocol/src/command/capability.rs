@@ -103,10 +103,31 @@ impl fmt::Display for CapabilityDelivery {
 pub enum LlmCapability {
     /// Free-form conversational Markdown text.
     TextMessage,
-    /// File creation, replacement, overwrite, deletion, and move operations.
-    FileEdits,
-    /// Requests to add or drop files from the working context.
-    Research,
+    /// Replace text or an anchored line range in an existing file.
+    ///
+    /// Projected through `PatchStrategy`: `EditReplace` under
+    /// `SearchReplace`, or `EditLineAnchor` under `LineAnchor`.
+    EditReplace,
+    /// Create a new file.
+    EditCreate,
+    /// Delete an existing file.
+    EditDelete,
+    /// Move or rename an existing file.
+    EditMove,
+    /// Move or rename a directory subtree.
+    EditMoveDir,
+    /// Overwrite an existing file.
+    EditOverwrite,
+    /// Request to add a file to the working context.
+    ContextRequest,
+    /// Search repository files using Rust/ripgrep regex.
+    RepoSearch,
+    /// Request the compact repository directory tree.
+    RepoDirs,
+    /// Request a targeted symbol map of one subdirectory.
+    RepoMap,
+    /// Request a tracked-file listing of one directory.
+    DirList,
     /// Requests for system documentation of this harness by topic.
     DocRequest,
     /// Requests for external project documentation by its logical identifier.
@@ -136,21 +157,19 @@ pub enum LlmCapability {
     ReviewUpdate,
     /// Ephemeral working-memory notes for multi-round reasoning.
     Scratchpad,
-    /// Explicit terminal outcome (`success` or `error`) of a turn.
-    Outcome,
+    /// Terminal commit message stated by the model when a turn succeeds.
+    CommitMessage,
+    /// Terminal error stated by the model when a turn fails.
+    TurnError,
+    /// Terminal skip reason stated by the model when the work is already satisfied.
+    TurnSkip,
     /// Explicit semantic blocker emitted when preconditions or assumptions are violated.
     Blocked,
     /// Explicit unconditional abort emitted when external host environment actions or developer intervention is required.
     Abort,
-    /// Detected primary natural language of the user prompt.
-    UserLanguage,
-    /// Invocation of a project-declared custom tool.
-    ///
-    /// The project registers a closed allowlist of typed commands in
-    /// `tauqe.toml`, and the model may invoke one of them by name with typed
-    /// arguments. The capability grants exactly the declared commands and never
-    /// an arbitrary shell.
     CustomTools,
+    /// Concise explanation accompanying code modifications in turn/step execution.
+    ShortDescription,
 }
 
 impl LlmCapability {
@@ -160,8 +179,17 @@ impl LlmCapability {
     /// composition, and tests stay deterministic.
     pub const ALL: &'static [LlmCapability] = &[
         Self::TextMessage,
-        Self::FileEdits,
-        Self::Research,
+        Self::EditReplace,
+        Self::EditCreate,
+        Self::EditDelete,
+        Self::EditMove,
+        Self::EditMoveDir,
+        Self::EditOverwrite,
+        Self::ContextRequest,
+        Self::RepoSearch,
+        Self::RepoDirs,
+        Self::RepoMap,
+        Self::DirList,
         Self::DocRequest,
         Self::OuterDocRequest,
         Self::ToolchainVerify,
@@ -169,19 +197,30 @@ impl LlmCapability {
         Self::PlanUpdate,
         Self::ReviewUpdate,
         Self::Scratchpad,
-        Self::Outcome,
+        Self::CommitMessage,
+        Self::TurnError,
+        Self::TurnSkip,
         Self::Blocked,
         Self::Abort,
-        Self::UserLanguage,
         Self::CustomTools,
+        Self::ShortDescription,
     ];
 
     /// Canonical lower-case identifier used on the wire.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TextMessage => "text_message",
-            Self::FileEdits => "file_edits",
-            Self::Research => "research",
+            Self::EditReplace => "edit_replace",
+            Self::EditCreate => "edit_create",
+            Self::EditDelete => "edit_delete",
+            Self::EditMove => "edit_move",
+            Self::EditMoveDir => "edit_move_dir",
+            Self::EditOverwrite => "edit_overwrite",
+            Self::ContextRequest => "context_request",
+            Self::RepoSearch => "repo_search",
+            Self::RepoDirs => "repo_dirs",
+            Self::RepoMap => "repo_map",
+            Self::DirList => "dir_list",
             Self::DocRequest => "doc_request",
             Self::OuterDocRequest => "outer_doc_request",
             Self::ToolchainVerify => "toolchain_verify",
@@ -189,28 +228,45 @@ impl LlmCapability {
             Self::PlanUpdate => "plan_update",
             Self::ReviewUpdate => "review_update",
             Self::Scratchpad => "scratchpad",
-            Self::Outcome => "outcome",
+            Self::CommitMessage => "commit_message",
+            Self::TurnError => "turn_error",
+            Self::TurnSkip => "turn_skip",
             Self::Blocked => "blocked",
             Self::Abort => "abort",
-            Self::UserLanguage => "user_language",
             Self::CustomTools => "custom_tools",
+            Self::ShortDescription => "short_description",
         }
     }
 
     /// Phase of the bounded turn this capability belongs to.
     pub const fn phase(self) -> CapabilityPhase {
         match self {
-            Self::Research | Self::DocRequest | Self::OuterDocRequest => CapabilityPhase::Research,
+            Self::ContextRequest
+            | Self::RepoSearch
+            | Self::RepoDirs
+            | Self::RepoMap
+            | Self::DirList
+            | Self::DocRequest
+            | Self::OuterDocRequest => CapabilityPhase::Research,
             Self::TextMessage
-            | Self::FileEdits
+            | Self::EditReplace
+            | Self::EditCreate
+            | Self::EditDelete
+            | Self::EditMove
+            | Self::EditMoveDir
+            | Self::EditOverwrite
             | Self::PlanCreation
             | Self::PlanUpdate
             | Self::ReviewUpdate
             | Self::Scratchpad
-            | Self::UserLanguage
-            | Self::CustomTools => CapabilityPhase::Execution,
+            | Self::CustomTools
+            | Self::ShortDescription => CapabilityPhase::Execution,
             Self::ToolchainVerify => CapabilityPhase::Verification,
-            Self::Outcome | Self::Blocked | Self::Abort => CapabilityPhase::Outcome,
+            Self::CommitMessage
+            | Self::TurnError
+            | Self::TurnSkip
+            | Self::Blocked
+            | Self::Abort => CapabilityPhase::Outcome,
         }
     }
 
@@ -221,7 +277,14 @@ impl LlmCapability {
     /// instead of special-casing capability names.
     pub const fn delivery(self) -> CapabilityDelivery {
         match self {
-            Self::TextMessage | Self::FileEdits => CapabilityDelivery::LiveStreaming,
+            Self::TextMessage
+            | Self::EditReplace
+            | Self::EditCreate
+            | Self::EditDelete
+            | Self::EditMove
+            | Self::EditMoveDir
+            | Self::EditOverwrite
+            | Self::ShortDescription => CapabilityDelivery::LiveStreaming,
             _ => CapabilityDelivery::RoundDeferred,
         }
     }
@@ -237,400 +300,263 @@ impl fmt::Display for LlmCapability {
 ///
 /// In a single round, an agent or model can operate within exactly one branch
 /// (for example, either performing discovery or applying modifications),
-/// enforcing mutual exclusion at the protocol and schema level.
+/// enforcing mutual exclusion at the protocol and schema level. The branch
+/// label is data, not a derived property: the contour that assembles the tree
+/// declares `kind` explicitly, so no consumer sniffs the leaves to recover it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityBranch {
-    /// Machine-readable identifier of the branch (e.g. "research", "execution").
+    /// Machine-readable identifier of the branch (e.g. "research", "edit").
     pub kind: String,
-    /// Capabilities contained in this branch.
-    pub capabilities: CapabilitySet,
+    /// Capability expression carried by this branch.
+    pub expr: CapabilityExpr,
 }
 
 impl CapabilityBranch {
     /// Creates a new capability branch.
-    pub fn new(kind: impl Into<String>, capabilities: CapabilitySet) -> Self {
+    pub fn new(kind: impl Into<String>, expr: CapabilityExpr) -> Self {
         Self {
             kind: kind.into(),
-            capabilities,
+            expr,
         }
     }
 }
 
-/// Declarative placement of one turn regime's capabilities across the prompt.
+/// Algebraic composition of capabilities into an operational branch tree.
 ///
-/// A regime profile is a pair of typed capability lists. The `core` list is
-/// rendered into the byte-stable head of the system prompt, which every
-/// dialogue contour shares, so switching between the REPL, a plan discussion,
-/// and a review discussion keeps the provider prefix cache warm. The `delta`
-/// list is rendered into a contour-specific block of the trailing user
-/// message, where only the capabilities of the active regime travel.
+/// A protocol surface is rarely a flat list when incompatible actions must be
+/// excluded from the same round. A capability expression makes that structure
+/// explicit: [`Leaf`](Self::Leaf) names one atomic capability,
+/// [`Set`](Self::Set) conjoins children into one operational branch, and
+/// [`AnyOf`](Self::AnyOf) declares mutually exclusive branches of a single
+/// round, each carried as a [`CapabilityBranch`] with its own label beside the
+/// capabilities it holds, so the JSON constrained decoder can select one branch
+/// and physically exclude the properties of every other branch from the
+/// produced object. The flat projection a consumer acts upon is recovered
+/// through [`leaves`](Self::leaves), so a consumer that needs the flat list
+/// reads it here instead of walking the tree itself.
 ///
-/// Placement is a property of the regime composition, never of a capability's
-/// identity: the same capability sits in the head of one regime, in the delta
-/// of another, or is absent from a third entirely.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityProfile {
-    core: CapabilitySet,
-    delta: CapabilitySet,
+/// The expression is a pure algebraic value: it carries no behavior of its own
+/// and drives no turn. It states only which capabilities belong to which
+/// branch, so the prompt, the response schema, and the XML decoder can read
+/// one declaration instead of restating the grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapabilityExpr {
+    /// A single atomic capability.
+    Leaf(LlmCapability),
+    /// Conjunction: every child belongs to the same operational branch.
+    Set(Vec<CapabilityExpr>),
+    /// Disjunction of mutually exclusive branches.
+    ///
+    /// The label names the discriminated union the branches collapse into
+    /// (for example `"action"`), while every branch carries its own
+    /// [`CapabilityBranch::kind`] beside the capabilities it holds, so the
+    /// JSON constrained decoder can select one branch and physically exclude
+    /// the properties of every other branch from the produced object.
+    AnyOf(String, Vec<CapabilityBranch>),
 }
 
-impl CapabilityProfile {
-    /// Builds a profile from its head and delta lists.
-    pub fn new(core: CapabilitySet, delta: CapabilitySet) -> Self {
-        Self { core, delta }
+impl CapabilityExpr {
+    /// Builds a leaf expression from a single capability.
+    pub fn leaf(capability: LlmCapability) -> Self {
+        Self::Leaf(capability)
     }
 
-    /// Capabilities rendered into the byte-stable head.
-    pub fn core(&self) -> &CapabilitySet {
-        &self.core
+    /// Builds a conjunction over the given child expressions.
+    pub fn set(items: impl IntoIterator<Item = CapabilityExpr>) -> Self {
+        Self::Set(items.into_iter().collect())
     }
 
-    /// Capabilities rendered into the contour delta of the trailing user message.
-    pub fn delta(&self) -> &CapabilitySet {
-        &self.delta
-    }
-
-    /// Union of both lists, ordered by the canonical capability declaration.
+    /// Builds a conjunction over the given atomic capabilities.
     ///
-    /// The canonical order keeps the surface deterministic no matter how a
-    /// profile lays its two lists out, so every consumer observes the same
-    /// sequence for the same set.
-    pub fn surface(&self) -> CapabilitySet {
-        let mut surface = CapabilitySet::new();
-        for capability in LlmCapability::ALL {
-            if self.core.contains(*capability) || self.delta.contains(*capability) {
-                surface.insert(*capability);
-            }
-        }
-        surface
+    /// A caller that holds a flat list of capabilities — a narrowed surface, a
+    /// test fixture, an ad-hoc contour — declares it as a tree without
+    /// re-deriving the leaf shape by hand. The result is the same conjunction
+    /// [`set`](Self::set) builds, so every consumer observes one tree shape
+    /// whichever constructor produced it.
+    pub fn from_leaves(capabilities: impl IntoIterator<Item = LlmCapability>) -> Self {
+        Self::Set(capabilities.into_iter().map(Self::Leaf).collect())
     }
 
-    /// Decomposes this profile's active surface into invariant ambient capabilities
-    /// and mutually exclusive operational branches.
-    pub fn branches(&self) -> (CapabilitySet, Vec<CapabilityBranch>) {
-        self.surface().branches()
+    /// Builds a disjunction of labeled branches.
+    pub fn any_of(
+        name: impl Into<String>,
+        branches: impl IntoIterator<Item = CapabilityBranch>,
+    ) -> Self {
+        Self::AnyOf(name.into(), branches.into_iter().collect())
     }
 
-    /// Free interactive REPL dialogue: the whole dialogue surface in the head.
-    pub fn interactive_repl() -> Self {
-        Self::new(Self::dialogue_head(), CapabilitySet::new())
+    /// Reports whether the expression is a leaf.
+    pub fn is_leaf(&self) -> bool {
+        matches!(self, Self::Leaf(_))
     }
 
-    /// Plan discussion: the shared head plus plan mutation in the delta.
-    ///
-    /// Plan mutation stays a delta because authorizing it depends on an active
-    /// plan focus, which is a property of the regime rather than of the head
-    /// every dialogue contour renders identically.
-    pub fn discussion() -> Self {
-        Self::new(
-            Self::dialogue_head(),
-            CapabilitySet::from_slice(&[LlmCapability::PlanUpdate]),
-        )
-    }
-
-    /// Review finding dialogue: the shared head plus the decision in the delta.
-    ///
-    /// A decision belongs to the delta for the same reason plan mutation does:
-    /// authorizing it depends on a review anchor, which is a property of the
-    /// regime rather than of the head every dialogue contour renders
-    /// identically. The module that publishes the field renders no rule, so a
-    /// decision reaches the prompt through the schema of this regime alone.
-    pub fn review_discussion() -> Self {
-        Self::new(
-            Self::dialogue_head(),
-            CapabilitySet::from_slice(&[LlmCapability::ReviewUpdate]),
-        )
-    }
-
-    /// One isolated step: the dialogue head minus plan authoring, the internal
-    /// documentation of the harness, and toolchain verification, no delta.
-    ///
-    /// External project documentation stays available, because a step reads the
-    /// contracts it was pointed at; only knowledge about the harness itself is
-    /// noise the step cannot act on.
-    ///
-    /// Toolchain verification is excluded here, in the profile itself, because
-    /// the harness owns a step's verification and runs it deterministically, so
-    /// the profile is the single place that decides the surface of a step.
-    pub fn isolated_step() -> Self {
-        Self::new(
-            Self::dialogue_head()
-                .without(LlmCapability::PlanCreation)
-                .without(LlmCapability::DocRequest)
-                .without(LlmCapability::ToolchainVerify),
-            CapabilitySet::new(),
-        )
-    }
-
-    /// Architect research: plan mutation moves to the delta, the discovery
-    /// surface stays.
-    ///
-    /// File edits and toolchain verification stay excluded, because a synthesis
-    /// projects a horizon instead of patching a tree. The abort escape hatch
-    /// stays included, because a synthesis runs unattended exactly as an
-    /// isolated step does: a host-environment impossibility only the developer
-    /// can repair is reported through `abort` instead of an improvised
-    /// surrogate or a misreported blocker.
-    pub fn architect_research() -> Self {
-        Self::new(
-            CapabilitySet::from_slice(&[
-                LlmCapability::TextMessage,
-                LlmCapability::Research,
-                LlmCapability::DocRequest,
-                LlmCapability::OuterDocRequest,
-                LlmCapability::PlanCreation,
-                LlmCapability::Scratchpad,
-                LlmCapability::Outcome,
-                LlmCapability::Blocked,
-                LlmCapability::Abort,
-                LlmCapability::UserLanguage,
-            ]),
-            CapabilitySet::from_slice(&[LlmCapability::PlanUpdate]),
-        )
-    }
-
-    /// Head shared by every dialogue contour: the REPL surface.
-    fn dialogue_head() -> CapabilitySet {
-        // Plan mutation and a review decision are authorized by the regime of
-        // a dialogue anchor, so both travel in the contour delta instead of the
-        // head every dialogue contour renders identically.
-        CapabilitySet::from_slice(LlmCapability::ALL)
-            .without(LlmCapability::PlanUpdate)
-            .without(LlmCapability::ReviewUpdate)
-    }
-}
-
-/// Ordered, de-duplicated collection of capabilities a protocol advertises.
-///
-/// A set preserves first-seen order and never holds a duplicate, so the
-/// prompt, the response schema, and the decoder all observe one deterministic
-/// surface for the same declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct CapabilitySet {
-    capabilities: Vec<LlmCapability>,
-}
-
-impl CapabilitySet {
-    /// Creates an empty set.
-    pub fn new() -> Self {
-        Self {
-            capabilities: Vec::new(),
+    /// Returns the atomic capability of a leaf expression.
+    pub fn as_leaf(&self) -> Option<LlmCapability> {
+        match self {
+            Self::Leaf(capability) => Some(*capability),
+            _ => None,
         }
     }
 
-    /// Builds a set from a slice, dropping duplicates and keeping first-seen
-    /// order.
-    pub fn from_slice(capabilities: &[LlmCapability]) -> Self {
-        let mut set = Self::new();
-        for capability in capabilities {
-            set.insert(*capability);
-        }
-        set
-    }
-
-    /// Returns the capabilities in the order they entered the set.
-    pub fn as_slice(&self) -> &[LlmCapability] {
-        &self.capabilities
-    }
-
-    /// Iterates the capabilities of the set.
-    pub fn iter(&self) -> std::slice::Iter<'_, LlmCapability> {
-        self.capabilities.iter()
-    }
-
-    /// Reports whether the set holds no capability.
-    pub fn is_empty(&self) -> bool {
-        self.capabilities.is_empty()
-    }
-
-    /// Reports whether `capability` belongs to the set.
+    /// Reports whether the tree reaches `capability` through any branch.
     pub fn contains(&self, capability: LlmCapability) -> bool {
-        self.capabilities.contains(&capability)
-    }
-
-    /// Inserts `capability` when it is absent.
-    pub fn insert(&mut self, capability: LlmCapability) {
-        if !self.contains(capability) {
-            self.capabilities.push(capability);
-        }
-    }
-
-    /// Returns a copy extended with `capability`.
-    pub fn with(&self, capability: LlmCapability) -> Self {
-        let mut set = self.clone();
-        set.insert(capability);
-        set
-    }
-
-    /// Returns a copy without `capability`.
-    pub fn without(&self, capability: LlmCapability) -> Self {
-        Self {
-            capabilities: self
-                .capabilities
+        match self {
+            Self::Leaf(leaf) => *leaf == capability,
+            Self::Set(items) => items.iter().any(|item| item.contains(capability)),
+            Self::AnyOf(_, branches) => branches
                 .iter()
-                .copied()
-                .filter(|kept| *kept != capability)
-                .collect(),
+                .any(|branch| branch.expr.contains(capability)),
         }
     }
 
-    /// Keeps only the capabilities of `phase`, preserving their order.
-    pub fn by_phase(&self, phase: CapabilityPhase) -> Self {
-        Self {
-            capabilities: self
-                .capabilities
-                .iter()
-                .copied()
-                .filter(|capability| capability.phase() == phase)
-                .collect(),
-        }
-    }
-
-    /// Decomposes the surface into invariant ambient capabilities and mutually
-    /// exclusive operational branches.
+    /// Flat projection of the expression: every atomic capability the tree
+    /// reaches, in first-seen depth-first order and without duplicates.
     ///
-    /// The textual answer, the scratchpad, and the detected language accompany
-    /// every round, so they form no branch of their own; the discovery commands
-    /// form the research branch, and every command the harness acts upon forms
-    /// the execution branch. The decomposition is a pure projection of the
-    /// declared surface, so the prompt, the response schema, and the decoder read
-    /// one declaration instead of restating the grouping.
-    pub fn branches(&self) -> (CapabilitySet, Vec<CapabilityBranch>) {
-        let mut ambient = CapabilitySet::new();
-        let mut research = CapabilitySet::new();
-        let mut execution = CapabilitySet::new();
+    /// This is the surface a round actually consumes, so a consumer that needs
+    /// the flat list — schema validation, prompt-head composition, envelope
+    /// filtering — reads it here instead of walking the tree itself. The
+    /// projection is total for every shape of the tree, so an empty `Set` or an
+    /// empty `AnyOf` drops out of the surface rather than fabricating a
+    /// capability the tree never declared.
+    pub fn leaves(&self) -> Vec<LlmCapability> {
+        let mut leaves = Vec::new();
+        self.walk_leaves(&mut leaves);
+        leaves
+    }
 
-        for capability in self.iter() {
-            match capability {
-                LlmCapability::TextMessage
-                | LlmCapability::Scratchpad
-                | LlmCapability::UserLanguage => {
-                    ambient.insert(*capability);
-                }
-                LlmCapability::Research
-                | LlmCapability::DocRequest
-                | LlmCapability::OuterDocRequest => {
-                    research.insert(*capability);
-                }
-                LlmCapability::FileEdits
+    pub fn has_operational_capability(&self) -> bool {
+        match self {
+            // A marker branch holds no leaf, yet it stays an operational
+            // branch of its own, so narrowing keeps it in the tree.
+            Self::Set(items) if items.is_empty() => true,
+            _ => self.leaves().iter().any(|c| match c {
+                LlmCapability::EditReplace
+                | LlmCapability::EditCreate
+                | LlmCapability::EditDelete
+                | LlmCapability::EditMove
+                | LlmCapability::EditMoveDir
+                | LlmCapability::EditOverwrite
                 | LlmCapability::ToolchainVerify
+                | LlmCapability::ContextRequest
+                | LlmCapability::RepoSearch
+                | LlmCapability::RepoDirs
+                | LlmCapability::RepoMap
+                | LlmCapability::DirList
+                | LlmCapability::DocRequest
+                | LlmCapability::OuterDocRequest
+                | LlmCapability::CustomTools
                 | LlmCapability::PlanCreation
                 | LlmCapability::PlanUpdate
                 | LlmCapability::ReviewUpdate
-                | LlmCapability::Outcome
+                // A terminal signal owns its branch, so the branch survives
+                // narrowing instead of being dropped as foliage beside the
+                // capabilities that act.
                 | LlmCapability::Blocked
                 | LlmCapability::Abort
-                | LlmCapability::CustomTools => {
-                    execution.insert(*capability);
+                // The conversational channel is operational: a branch that
+                // carries only the text field still acts on the response, so
+                // it survives narrowing and filtering.
+                | LlmCapability::TextMessage
+                | LlmCapability::ShortDescription => true,
+                LlmCapability::Scratchpad
+                | LlmCapability::CommitMessage
+                | LlmCapability::TurnError
+                | LlmCapability::TurnSkip => false,
+            }),
+        }
+    }
+
+    /// Returns a filtered expression retaining only capabilities that satisfy
+    /// `predicate`. A retained branch keeps its kind, so a filtered tree
+    /// carries the same labels as the tree it was filtered from.
+    pub fn filter<F>(&self, predicate: &F) -> Option<Self>
+    where
+        F: Fn(LlmCapability) -> bool,
+    {
+        match self {
+            Self::Leaf(capability) => {
+                if predicate(*capability) {
+                    Some(Self::Leaf(*capability))
+                } else {
+                    None
+                }
+            }
+            Self::Set(items) => {
+                let filtered: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| item.filter(predicate))
+                    .collect();
+                // A Set that was empty before filtering stays: the answer
+                // marker holds no leaf, so narrowing keeps the conversational
+                // branch instead of dropping it as exhausted foliage.
+                if filtered.is_empty() && !items.is_empty() {
+                    None
+                } else {
+                    Some(Self::Set(filtered))
+                }
+            }
+            Self::AnyOf(label, branches) => {
+                let filtered: Vec<CapabilityBranch> = branches
+                    .iter()
+                    .filter_map(|branch| {
+                        branch
+                            .expr
+                            .filter(predicate)
+                            .map(|expr| CapabilityBranch::new(branch.kind.clone(), expr))
+                    })
+                    .filter(|branch| branch.expr.has_operational_capability())
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(Self::AnyOf(label.clone(), filtered))
                 }
             }
         }
+    }
 
-        let mut branches = Vec::new();
-        if !research.is_empty() {
-            branches.push(CapabilityBranch::new("research", research));
+    /// Depth-first walk that appends every leaf to `out`. Duplicates are
+    /// dropped by the contains-check, so a capability reached through two
+    /// branches appears only once in the projection.
+    fn walk_leaves(&self, out: &mut Vec<LlmCapability>) {
+        match self {
+            Self::Leaf(capability) => {
+                if !out.contains(capability) {
+                    out.push(*capability);
+                }
+            }
+            Self::Set(items) => {
+                for item in items {
+                    item.walk_leaves(out);
+                }
+            }
+            Self::AnyOf(_, branches) => {
+                for branch in branches {
+                    branch.expr.walk_leaves(out);
+                }
+            }
         }
-        if !execution.is_empty() {
-            branches.push(CapabilityBranch::new("execution", execution));
-        }
-
-        (ambient, branches)
-    }
-
-    /// Free interactive REPL dialogue capability set.
-    ///
-    /// The set is the declared surface of [`CapabilityProfile::interactive_repl`]:
-    /// the dialogue head every interactive contour renders, without plan
-    /// mutation, which the delta of a focused discussion carries instead.
-    pub fn interactive_repl() -> Self {
-        CapabilityProfile::interactive_repl().surface()
-    }
-
-    /// Discussion and planning capability set.
-    ///
-    /// The set is the declared surface of [`CapabilityProfile::discussion`], so a
-    /// plan discussion carries the whole dialogue head — the very list every
-    /// dialogue contour renders into its byte-stable head — plus the plan
-    /// mutation the regime authorizes. The head and the delta therefore stay one
-    /// declaration, and a capability can never belong to the discussion without
-    /// also belonging to its profile.
-    pub fn discussion() -> Self {
-        CapabilityProfile::discussion().surface()
-    }
-
-    /// Review finding discussion capability set.
-    ///
-    /// The set is the declared surface of [`CapabilityProfile::review_discussion`]:
-    /// the shared dialogue head plus the decision the review regime authorizes.
-    /// A review that only edits code therefore keeps the whole dialogue surface,
-    /// while the decision field appears exclusively where a decision can be
-    /// recorded.
-    pub fn review_discussion() -> Self {
-        CapabilityProfile::review_discussion().surface()
-    }
-
-    /// Capability set of one isolated step.
-    ///
-    /// Plan creation and modification are excluded: while an isolated step
-    /// runs the plan is immutable and progress is recorded deterministically
-    /// by the harness, never by the model.
-    ///
-    /// Documentation requests of the harness are excluded as well: an isolated
-    /// step executes an approved design inside the codebase, so knowledge about
-    /// the harness itself is noise the step cannot act on. External project
-    /// documentation stays reachable, because a step implements the contracts it
-    /// was pointed at.
-    ///
-    /// Toolchain verification is excluded in the profile itself, because the
-    /// harness owns a step's verification and runs it deterministically: the
-    /// profile is the single place that decides the surface of a step, and the
-    /// turn-intent narrowing stays a pure intersection for every intent.
-    pub fn isolated_step() -> Self {
-        CapabilityProfile::isolated_step().surface()
-    }
-
-    /// Architect discovery capability set.
-    ///
-    /// The architect gathers context and refines plans but never edits files
-    /// or runs toolchain verification, so the file-edit and verification
-    /// capabilities are excluded.
-    ///
-    /// The abort escape hatch stays included: a synthesis runs unattended
-    /// exactly as an isolated step does, so a host-environment impossibility
-    /// only the developer can repair is reported through `abort` instead of an
-    /// improvised surrogate or a misreported blocker.
-    pub fn architect_research() -> Self {
-        CapabilityProfile::architect_research().surface()
-    }
-}
-
-impl Default for CapabilitySet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'de> Deserialize<'de> for CapabilitySet {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let capabilities = Vec::<LlmCapability>::deserialize(deserializer)?;
-        Ok(Self::from_slice(&capabilities))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_llm_capability_serde_roundtrip() {
         let cases = [
             (LlmCapability::TextMessage, "\"text_message\""),
-            (LlmCapability::FileEdits, "\"file_edits\""),
-            (LlmCapability::Research, "\"research\""),
+            (LlmCapability::EditReplace, "\"edit_replace\""),
+            (LlmCapability::EditCreate, "\"edit_create\""),
+            (LlmCapability::EditDelete, "\"edit_delete\""),
+            (LlmCapability::EditMove, "\"edit_move\""),
+            (LlmCapability::EditMoveDir, "\"edit_move_dir\""),
+            (LlmCapability::EditOverwrite, "\"edit_overwrite\""),
+            (LlmCapability::ContextRequest, "\"context_request\""),
+            (LlmCapability::RepoSearch, "\"repo_search\""),
+            (LlmCapability::RepoDirs, "\"repo_dirs\""),
+            (LlmCapability::RepoMap, "\"repo_map\""),
+            (LlmCapability::DirList, "\"dir_list\""),
             (LlmCapability::DocRequest, "\"doc_request\""),
             (LlmCapability::OuterDocRequest, "\"outer_doc_request\""),
             (LlmCapability::ToolchainVerify, "\"toolchain_verify\""),
@@ -638,11 +564,13 @@ mod tests {
             (LlmCapability::PlanUpdate, "\"plan_update\""),
             (LlmCapability::ReviewUpdate, "\"review_update\""),
             (LlmCapability::Scratchpad, "\"scratchpad\""),
-            (LlmCapability::Outcome, "\"outcome\""),
+            (LlmCapability::CommitMessage, "\"commit_message\""),
+            (LlmCapability::TurnError, "\"turn_error\""),
+            (LlmCapability::TurnSkip, "\"turn_skip\""),
             (LlmCapability::Blocked, "\"blocked\""),
             (LlmCapability::Abort, "\"abort\""),
-            (LlmCapability::UserLanguage, "\"user_language\""),
             (LlmCapability::CustomTools, "\"custom_tools\""),
+            (LlmCapability::ShortDescription, "\"short_description\""),
         ];
 
         for (capability, expected) in cases {
@@ -671,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_llm_capability_as_str_and_phase() {
-        assert_eq!(LlmCapability::ALL.len(), 15);
+        assert_eq!(LlmCapability::ALL.len(), 26);
         for capability in LlmCapability::ALL {
             let encoded = format!("\"{}\"", capability.as_str());
             assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
@@ -682,22 +610,32 @@ mod tests {
         assert!(LlmCapability::ALL.contains(&LlmCapability::CustomTools));
 
         let expectations = [
-            (LlmCapability::Research, CapabilityPhase::Research),
+            (LlmCapability::ContextRequest, CapabilityPhase::Research),
+            (LlmCapability::RepoSearch, CapabilityPhase::Research),
+            (LlmCapability::RepoDirs, CapabilityPhase::Research),
+            (LlmCapability::RepoMap, CapabilityPhase::Research),
+            (LlmCapability::DirList, CapabilityPhase::Research),
             (LlmCapability::DocRequest, CapabilityPhase::Research),
             (LlmCapability::OuterDocRequest, CapabilityPhase::Research),
             (LlmCapability::TextMessage, CapabilityPhase::Execution),
-            (LlmCapability::FileEdits, CapabilityPhase::Execution),
+            (LlmCapability::EditReplace, CapabilityPhase::Execution),
+            (LlmCapability::EditCreate, CapabilityPhase::Execution),
+            (LlmCapability::EditDelete, CapabilityPhase::Execution),
+            (LlmCapability::EditMove, CapabilityPhase::Execution),
+            (LlmCapability::EditMoveDir, CapabilityPhase::Execution),
+            (LlmCapability::EditOverwrite, CapabilityPhase::Execution),
             (LlmCapability::PlanCreation, CapabilityPhase::Execution),
             (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
             (LlmCapability::ReviewUpdate, CapabilityPhase::Execution),
             (LlmCapability::Scratchpad, CapabilityPhase::Execution),
-            (LlmCapability::UserLanguage, CapabilityPhase::Execution),
-            (LlmCapability::CustomTools, CapabilityPhase::Execution),
+            (LlmCapability::ShortDescription, CapabilityPhase::Execution),
             (
                 LlmCapability::ToolchainVerify,
                 CapabilityPhase::Verification,
             ),
-            (LlmCapability::Outcome, CapabilityPhase::Outcome),
+            (LlmCapability::CommitMessage, CapabilityPhase::Outcome),
+            (LlmCapability::TurnError, CapabilityPhase::Outcome),
+            (LlmCapability::TurnSkip, CapabilityPhase::Outcome),
             (LlmCapability::Blocked, CapabilityPhase::Outcome),
             (LlmCapability::Abort, CapabilityPhase::Outcome),
         ];
@@ -727,9 +665,14 @@ mod tests {
     fn test_capability_delivery_is_declared_per_capability() {
         for capability in LlmCapability::ALL {
             let expected = match capability {
-                LlmCapability::TextMessage | LlmCapability::FileEdits => {
-                    CapabilityDelivery::LiveStreaming
-                }
+                LlmCapability::TextMessage
+                | LlmCapability::EditReplace
+                | LlmCapability::EditCreate
+                | LlmCapability::EditDelete
+                | LlmCapability::EditMove
+                | LlmCapability::EditMoveDir
+                | LlmCapability::EditOverwrite
+                | LlmCapability::ShortDescription => CapabilityDelivery::LiveStreaming,
                 _ => CapabilityDelivery::RoundDeferred,
             };
             assert_eq!(capability.delivery(), expected);
@@ -738,347 +681,142 @@ mod tests {
         // Delivery is orthogonal to phase: the execution phase mixes streamed
         // text and edits with round-deferred plan, scratchpad, and tool
         // payloads, so neither property may be derived from the other.
-        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
-        let execution = advertised.by_phase(CapabilityPhase::Execution);
+        let execution: Vec<LlmCapability> = LlmCapability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| capability.phase() == CapabilityPhase::Execution)
+            .collect();
         assert!(execution.iter().any(|c| c.delivery().is_live()));
         assert!(execution.iter().any(|c| !c.delivery().is_live()));
 
         // Discovery, verification, and outcome capabilities are never streamed.
-        for phase in [
-            CapabilityPhase::Research,
-            CapabilityPhase::Verification,
-            CapabilityPhase::Outcome,
-        ] {
-            for capability in advertised.by_phase(phase).iter() {
-                assert_eq!(capability.delivery(), CapabilityDelivery::RoundDeferred);
+        for capability in LlmCapability::ALL.iter().copied() {
+            if capability.phase() == CapabilityPhase::Execution {
+                continue;
             }
+            assert_eq!(capability.delivery(), CapabilityDelivery::RoundDeferred);
         }
     }
 
     #[test]
-    fn test_capability_set_composition_and_dedup() {
-        let empty = CapabilitySet::new();
-        assert!(empty.is_empty());
-        assert!(!empty.contains(LlmCapability::TextMessage));
+    fn test_capability_expr_leaf_projection() {
+        let expr = CapabilityExpr::leaf(LlmCapability::EditReplace);
+        assert!(expr.is_leaf());
+        assert_eq!(expr.as_leaf(), Some(LlmCapability::EditReplace));
+        assert_eq!(expr.leaves().as_slice(), &[LlmCapability::EditReplace]);
+        assert!(expr.contains(LlmCapability::EditReplace));
+        assert!(!expr.contains(LlmCapability::TextMessage));
+    }
 
-        // Duplicates are dropped and first-seen order is preserved.
-        let set = CapabilitySet::from_slice(&[
-            LlmCapability::FileEdits,
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
+    #[test]
+    fn test_capability_expr_set_unions_children_in_first_seen_order() {
+        let expr = CapabilityExpr::set([
+            CapabilityExpr::leaf(LlmCapability::ContextRequest),
+            CapabilityExpr::leaf(LlmCapability::EditReplace),
+            CapabilityExpr::leaf(LlmCapability::CommitMessage),
         ]);
         assert_eq!(
-            set.as_slice(),
-            &[LlmCapability::FileEdits, LlmCapability::TextMessage]
+            expr.leaves().as_slice(),
+            &[
+                LlmCapability::ContextRequest,
+                LlmCapability::EditReplace,
+                LlmCapability::CommitMessage,
+            ]
         );
-        assert_eq!(set.iter().count(), 2);
-
-        // `with` adds a new capability and is idempotent.
-        let extended = set.with(LlmCapability::Research);
-        assert!(extended.contains(LlmCapability::Research));
-        assert_eq!(extended.iter().count(), 3);
-        assert_eq!(extended.with(LlmCapability::Research), extended);
-
-        // `without` removes a capability and tolerates a missing one.
-        let reduced = set.without(LlmCapability::FileEdits);
-        assert_eq!(reduced.as_slice(), &[LlmCapability::TextMessage]);
-        assert_eq!(reduced.without(LlmCapability::Outcome), reduced);
-
-        // `by_phase` keeps only the requested phase, preserving order.
-        let research = extended.by_phase(CapabilityPhase::Research);
-        assert_eq!(research.as_slice(), &[LlmCapability::Research]);
-        assert!(extended.by_phase(CapabilityPhase::Outcome).is_empty());
     }
 
     #[test]
-    fn test_capability_set_profiles() {
-        // Profiles name a turn regime, never a wire format: both transports
-        // decode the same capability surface, so format-specific profile
-        // factories no longer exist.
-        let discussion = CapabilitySet::discussion();
-        assert!(discussion.contains(LlmCapability::TextMessage));
-        assert!(discussion.contains(LlmCapability::Research));
-        assert!(discussion.contains(LlmCapability::PlanCreation));
-        assert!(discussion.contains(LlmCapability::PlanUpdate));
-        // A plan discussion carries the full dialogue surface: the developer may
-        // ask for the fix directly, exactly as in a review discussion, so the
-        // edit, verification, abort, and tool capabilities travel with it.
-        assert!(discussion.contains(LlmCapability::FileEdits));
-        assert!(discussion.contains(LlmCapability::ToolchainVerify));
-        assert!(discussion.contains(LlmCapability::Abort));
-        assert!(discussion.contains(LlmCapability::CustomTools));
-        // The set is the surface of the regime profile, never a second list.
-        assert_eq!(discussion, CapabilityProfile::discussion().surface());
-        // The discussion surface is the shared head plus plan mutation, so the
-        // review decision a review discussion authorizes never joins it.
+    fn test_capability_expr_any_of_unions_branches_and_dedups() {
+        let expr = CapabilityExpr::any_of(
+            "action",
+            [
+                CapabilityBranch::new(
+                    "research",
+                    CapabilityExpr::set([
+                        CapabilityExpr::leaf(LlmCapability::ContextRequest),
+                        CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                    ]),
+                ),
+                CapabilityBranch::new(
+                    "edit",
+                    CapabilityExpr::set([
+                        CapabilityExpr::leaf(LlmCapability::EditReplace),
+                        CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                    ]),
+                ),
+            ],
+        );
         assert_eq!(
-            discussion,
-            CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::ReviewUpdate)
+            expr.leaves().as_slice(),
+            &[
+                LlmCapability::ContextRequest,
+                LlmCapability::CommitMessage,
+                LlmCapability::EditReplace,
+            ]
         );
-
-        // A review discussion composes the very same head, and the decision it
-        // records is the only difference.
-        let review = CapabilitySet::review_discussion();
-        assert_eq!(review, CapabilityProfile::review_discussion().surface());
-        assert!(review.contains(LlmCapability::ReviewUpdate));
-        assert!(!discussion.contains(LlmCapability::ReviewUpdate));
-
-        let architect = CapabilitySet::architect_research();
-        assert!(architect.contains(LlmCapability::DocRequest));
-        assert!(architect.contains(LlmCapability::OuterDocRequest));
-        assert!(architect.contains(LlmCapability::PlanCreation));
-        assert!(architect.contains(LlmCapability::Scratchpad));
-        assert!(!architect.contains(LlmCapability::FileEdits));
-        // A synthesis runs unattended exactly as an isolated step does, so the
-        // profile keeps the escape hatch that demands a host action instead of
-        // improvising a surrogate change or misreporting a blocker.
-        assert!(architect.contains(LlmCapability::Abort));
-        assert!(!architect.contains(LlmCapability::ToolchainVerify));
-        assert!(!architect.contains(LlmCapability::CustomTools));
     }
 
     #[test]
-    fn test_plan_permission_matrix() {
-        // A user may ask for a plan at any moment of a dialogue, but changing
-        // an existing plan requires an active plan focus, which the base REPL
-        // profile does not assume.
-        let repl = CapabilitySet::interactive_repl();
-        assert!(repl.contains(LlmCapability::PlanCreation));
-        assert!(!repl.contains(LlmCapability::PlanUpdate));
-
-        // A dedicated plan discussion owns both permissions.
-        let discussion = CapabilitySet::discussion();
-        assert!(discussion.contains(LlmCapability::PlanCreation));
-        assert!(discussion.contains(LlmCapability::PlanUpdate));
-
-        // A plan is immutable while an isolated step runs.
-        let step = CapabilitySet::isolated_step();
-        assert!(!step.contains(LlmCapability::PlanCreation));
-        assert!(!step.contains(LlmCapability::PlanUpdate));
-    }
-
-    #[test]
-    fn test_interactive_repl_and_isolated_step_composition() {
-        let repl = CapabilitySet::interactive_repl();
-        for capability in [
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-            LlmCapability::Research,
-            LlmCapability::DocRequest,
-            LlmCapability::OuterDocRequest,
-            LlmCapability::ToolchainVerify,
-            LlmCapability::PlanCreation,
-            LlmCapability::Scratchpad,
-            LlmCapability::Outcome,
-            LlmCapability::Blocked,
-            LlmCapability::Abort,
-            LlmCapability::UserLanguage,
-            LlmCapability::CustomTools,
-        ] {
-            assert!(
-                repl.contains(capability),
-                "interactive_repl must carry {capability}"
-            );
-        }
-
-        // The profile is the advertised surface minus plan mutation, so the two
-        // definitions cannot drift apart when a capability is added.
-        let expected = CapabilitySet::from_slice(LlmCapability::ALL)
-            .without(LlmCapability::PlanUpdate)
-            .without(LlmCapability::ReviewUpdate);
-        assert_eq!(repl.as_slice(), expected.as_slice());
-
-        // A step keeps the operational surface of a dialogue except plan
-        // authoring, documentation, and toolchain verification; the last one is
-        // excluded by the profile itself, because the harness owns a step's
-        // verification.
-        let step = CapabilitySet::isolated_step();
-        assert_eq!(
-            step.as_slice(),
-            repl.without(LlmCapability::PlanCreation)
-                .without(LlmCapability::DocRequest)
-                .without(LlmCapability::ToolchainVerify)
-                .as_slice()
-        );
-        assert!(!step.contains(LlmCapability::PlanCreation));
-        assert!(!step.contains(LlmCapability::DocRequest));
-        assert!(!step.contains(LlmCapability::ToolchainVerify));
-        assert!(step.contains(LlmCapability::Blocked));
-        assert!(step.contains(LlmCapability::Abort));
-        // External project documentation stays researchable inside a step: a
-        // step reads the contracts it was pointed at, while the internal
-        // documentation of the harness itself remains closed.
-        assert!(step.contains(LlmCapability::OuterDocRequest));
-        assert!(!step.contains(LlmCapability::DocRequest));
-    }
-
-    #[test]
-    fn test_capability_set_serde_normalizes_duplicates() {
-        let set = CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::ToolchainVerify,
+    fn test_capability_expr_nested_tree_yields_flat_surface() {
+        let expr = CapabilityExpr::set([
+            CapabilityExpr::leaf(LlmCapability::TextMessage),
+            CapabilityExpr::any_of(
+                "action",
+                [
+                    CapabilityBranch::new(
+                        "edit",
+                        CapabilityExpr::set([
+                            CapabilityExpr::leaf(LlmCapability::EditReplace),
+                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                        ]),
+                    ),
+                    CapabilityBranch::new(
+                        "plan",
+                        CapabilityExpr::set([
+                            CapabilityExpr::leaf(LlmCapability::PlanCreation),
+                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                        ]),
+                    ),
+                ],
+            ),
         ]);
-        let json = serde_json::to_string(&set).unwrap();
-        assert_eq!(json, "[\"text_message\",\"toolchain_verify\"]");
-
-        let raw = "[\"toolchain_verify\",\"text_message\",\"toolchain_verify\"]";
-        let decoded: CapabilitySet = serde_json::from_str(raw).unwrap();
+        let leaves = expr.leaves();
+        assert!(leaves.contains(&LlmCapability::TextMessage));
+        assert!(leaves.contains(&LlmCapability::EditReplace));
+        assert!(leaves.contains(&LlmCapability::PlanCreation));
+        // A capability reached through two branches appears once in the
+        // projection, so a consumer cannot double-count the atom.
         assert_eq!(
-            decoded.as_slice(),
-            &[LlmCapability::ToolchainVerify, LlmCapability::TextMessage]
+            leaves
+                .iter()
+                .filter(|c| **c == LlmCapability::CommitMessage)
+                .count(),
+            1
         );
     }
 
     #[test]
-    fn test_capability_profile_dialogue_heads_are_shared() {
-        // Every dialogue contour renders the same head, which is what keeps the
-        // provider prefix cache warm across focus switching. The review
-        // discussion runs through the REPL profile, so its head is shared by
-        // construction rather than by coincidence.
-        let head = CapabilitySet::from_slice(LlmCapability::ALL)
-            .without(LlmCapability::PlanUpdate)
-            .without(LlmCapability::ReviewUpdate);
-
-        for profile in [
-            CapabilityProfile::interactive_repl(),
-            CapabilityProfile::discussion(),
-        ] {
-            assert_eq!(profile.core().as_slice(), head.as_slice());
-        }
+    fn test_capability_expr_empty_children_project_to_empty_surface() {
+        let expr = CapabilityExpr::set(std::iter::empty::<CapabilityExpr>());
+        assert!(expr.leaves().is_empty());
+        let expr = CapabilityExpr::any_of("action", std::iter::empty::<CapabilityBranch>());
+        assert!(expr.leaves().is_empty());
     }
 
     #[test]
-    fn test_capability_profile_placement_per_regime() {
-        let discussion = CapabilityProfile::discussion();
-        assert_eq!(discussion.delta().as_slice(), &[LlmCapability::PlanUpdate]);
-        assert!(!discussion.core().contains(LlmCapability::PlanUpdate));
-        assert!(discussion.surface().contains(LlmCapability::PlanUpdate));
-
-        assert!(CapabilityProfile::interactive_repl().delta().is_empty());
-        assert!(CapabilityProfile::isolated_step().delta().is_empty());
-
-        let step = CapabilityProfile::isolated_step();
-        assert!(
-            !step.core().contains(LlmCapability::PlanCreation),
-            "an isolated step never authors a plan"
+    fn test_capability_expr_serde_roundtrip() {
+        let expr = CapabilityExpr::any_of(
+            "action",
+            [CapabilityBranch::new(
+                "research",
+                CapabilityExpr::set([
+                    CapabilityExpr::leaf(LlmCapability::ContextRequest),
+                    CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                ]),
+            )],
         );
-        assert!(
-            !step.core().contains(LlmCapability::DocRequest),
-            "an isolated step never consults the harness documentation"
-        );
-        assert!(
-            !step.core().contains(LlmCapability::ToolchainVerify),
-            "an isolated step never runs toolchain verification: the harness owns it"
-        );
-    }
-
-    #[test]
-    fn test_capability_profile_architect_moves_plan_update_to_delta() {
-        let architect = CapabilityProfile::architect_research();
-        assert_eq!(architect.delta().as_slice(), &[LlmCapability::PlanUpdate]);
-        assert!(!architect.core().contains(LlmCapability::PlanUpdate));
-
-        // Only the placement changes: the declared surface stays identical.
-        let expected = CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::Research,
-            LlmCapability::DocRequest,
-            LlmCapability::OuterDocRequest,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::Scratchpad,
-            LlmCapability::Outcome,
-            LlmCapability::Blocked,
-            LlmCapability::Abort,
-            LlmCapability::UserLanguage,
-        ]);
-        assert_eq!(architect.surface(), expected);
-        assert_eq!(CapabilitySet::architect_research(), expected);
-    }
-
-    #[test]
-    fn test_capability_profile_surface_matches_factories() {
-        let cases = [
-            (
-                CapabilityProfile::interactive_repl(),
-                CapabilitySet::interactive_repl(),
-            ),
-            (CapabilityProfile::discussion(), CapabilitySet::discussion()),
-            (
-                CapabilityProfile::isolated_step(),
-                CapabilitySet::isolated_step(),
-            ),
-            (
-                CapabilityProfile::architect_research(),
-                CapabilitySet::architect_research(),
-            ),
-        ];
-
-        for (profile, factory) in cases {
-            let surface = profile.surface();
-            assert_eq!(surface, factory);
-
-            // The union is rendered in the canonical declaration order, so a
-            // profile cannot make the surface order depend on how it laid the
-            // head and delta lists out.
-            let mut previous = None;
-            for capability in surface.iter() {
-                let index = LlmCapability::ALL
-                    .iter()
-                    .position(|declared| declared == capability)
-                    .expect("surface carries only declared capabilities");
-                assert!(
-                    previous.is_none_or(|last| last < index),
-                    "surface is rendered in the canonical declaration order"
-                );
-                previous = Some(index);
-            }
-        }
-    }
-
-    #[test]
-    fn test_capability_profile_head_loss_is_a_configuration_defect() {
-        // A dialogue profile that drops any capability of the shared head
-        // invalidates the prefix cache of every other dialogue contour, so the
-        // head is audited as a whole rather than per capability.
-        let head = CapabilityProfile::interactive_repl().core().clone();
-        for profile in [
-            CapabilityProfile::interactive_repl(),
-            CapabilityProfile::discussion(),
-        ] {
-            for capability in head.iter() {
-                assert!(
-                    profile.core().contains(*capability),
-                    "{capability} disappeared from the shared head"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_capability_profile_branches() {
-        let repl = CapabilityProfile::interactive_repl();
-        let (ambient, branches) = repl.branches();
-        assert!(ambient.contains(LlmCapability::TextMessage));
-        assert!(ambient.contains(LlmCapability::Scratchpad));
-        assert!(ambient.contains(LlmCapability::UserLanguage));
-        assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].kind, "research");
-        assert!(branches[0].capabilities.contains(LlmCapability::Research));
-        assert_eq!(branches[1].kind, "execution");
-        assert!(branches[1].capabilities.contains(LlmCapability::FileEdits));
-    }
-
-    #[test]
-    fn test_capability_set_branches_follow_the_declared_surface() {
-        // A surface that carries no discovery command has nothing to exclude,
-        // so it declares only the branch it can actually emit.
-        let set =
-            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
-        let (ambient, branches) = set.branches();
-        assert!(ambient.contains(LlmCapability::TextMessage));
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].kind, "execution");
-        assert!(branches[0].capabilities.contains(LlmCapability::FileEdits));
+        let json = serde_json::to_string(&expr).expect("expression serializes");
+        let decoded: CapabilityExpr = serde_json::from_str(&json).expect("expression deserializes");
+        assert_eq!(decoded, expr);
     }
 }

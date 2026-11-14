@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_protocol::{CapabilitySet, LlmCapability};
+use tauqe_protocol::{CapabilityExpr, LlmCapability};
 use tokio::sync::{mpsc, watch};
 
 use super::outcome::{ResponseEnvelope, SystemError};
@@ -11,6 +11,7 @@ use super::prompt::PromptBuilder;
 use crate::context::ContextManager;
 use crate::edits::StagedEditsState;
 use crate::history::HistorySnapshot;
+use crate::prompt::TurnBrief;
 use crate::providers::types::StreamEvent;
 use crate::workflow::policy::ApplyPolicy;
 use crate::workflow::research::journal::TurnResearchJournal;
@@ -137,9 +138,7 @@ pub struct LoopContext<'a> {
     /// Transactional apply policy governing checkpoints, step commits, and rollback.
     pub policy: &'a mut dyn ApplyPolicy,
     /// Active model capability surface for the current execution branch.
-    pub capabilities: CapabilitySet,
-    /// Natural language determined for user-facing responses and diagnostics.
-    pub target_language: Option<String>,
+    pub capabilities: CapabilityExpr,
     /// Model round assembly and execution builder.
     pub(crate) prompt_builder: PromptBuilder<'a>,
 }
@@ -154,7 +153,7 @@ impl<'a> LoopContext<'a> {
         context_manager: &'a mut ContextManager,
         journal: &'a mut TurnResearchJournal,
         policy: &'a mut dyn ApplyPolicy,
-        capabilities: CapabilitySet,
+        capabilities: CapabilityExpr,
         prompt_builder: PromptBuilder<'a>,
     ) -> Self {
         Self {
@@ -165,7 +164,6 @@ impl<'a> LoopContext<'a> {
             journal,
             policy,
             capabilities,
-            target_language: None,
             prompt_builder,
         }
     }
@@ -173,7 +171,7 @@ impl<'a> LoopContext<'a> {
     /// Derives a child execution context with a replaced capability surface via reborrow.
     pub fn reborrow_with_capabilities<'b>(
         &'b mut self,
-        capabilities: CapabilitySet,
+        capabilities: CapabilityExpr,
     ) -> LoopContext<'b> {
         LoopContext {
             cancel: self.cancel,
@@ -183,7 +181,6 @@ impl<'a> LoopContext<'a> {
             journal: self.journal,
             policy: self.policy,
             capabilities,
-            target_language: self.target_language.clone(),
             prompt_builder: self.prompt_builder.reborrow(),
         }
     }
@@ -193,28 +190,27 @@ impl<'a> LoopContext<'a> {
         &'b mut self,
         extra: impl IntoIterator<Item = LlmCapability>,
     ) -> LoopContext<'b> {
-        let mut caps = self.capabilities.clone();
-        for cap in extra {
-            caps.insert(cap);
+        let mut expr = self.capabilities.clone();
+        for capability in extra {
+            if !expr.contains(capability) {
+                expr = CapabilityExpr::set([expr, CapabilityExpr::leaf(capability)]);
+            }
         }
-        self.reborrow_with_capabilities(caps)
-    }
-
-    /// Sets the target natural language on this context.
-    pub fn set_target_language(&mut self, target_language: Option<String>) -> &mut Self {
-        self.target_language = target_language;
-        self
-    }
-
-    /// Consumes and sets the target natural language on this context.
-    pub fn with_target_language(mut self, target_language: Option<String>) -> Self {
-        self.target_language = target_language;
-        self
+        self.reborrow_with_capabilities(expr)
     }
 
     /// Sets turn scratchpad notes on the underlying prompt builder.
     pub fn set_scratchpad(&mut self, scratchpad: Option<String>) -> &mut Self {
         self.prompt_builder.set_scratchpad(scratchpad);
+        self
+    }
+
+    /// Sets the introductory brief of the turn on the underlying prompt builder.
+    ///
+    /// The brief belongs to the loop that drives the turn, so the contour and the
+    /// opening text travel as typed values instead of a rendering flag.
+    pub fn set_turn_brief(&mut self, brief: Option<TurnBrief>) -> &mut Self {
+        self.prompt_builder.set_turn_brief(brief);
         self
     }
 
@@ -270,7 +266,7 @@ impl<'a> LoopContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::MockLlmProvider;
     use tauqe_protocol::ModelRef;
 
@@ -320,11 +316,11 @@ mod tests {
         let mut journal = TurnResearchJournal::default();
         let provider = MockLlmProvider::new();
         let model = ModelRef::openrouter("mock/model");
-        let protocol = XmlPromptProtocol;
+        let protocol = JsonPromptProtocol::default();
         let cancel = CancellationToken::new();
         let sink = EventSink::noop();
-        let base_caps = CapabilitySet::from_slice(&[LlmCapability::TextMessage]);
-        let mut cache = crate::workflow::fsm::cache::TurnInputCache::default();
+        let base_caps = CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]);
+        let mut cache = crate::control::cache::TurnInputCache::default();
         let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
         let mut policy = crate::workflow::policy::DirectApplyPolicy::new();
         let mut ctx = LoopContext::new(
@@ -339,22 +335,25 @@ mod tests {
         );
 
         assert!(ctx.capabilities.contains(LlmCapability::TextMessage));
-        assert!(!ctx.capabilities.contains(LlmCapability::FileEdits));
-
+        assert!(!ctx.capabilities.contains(LlmCapability::EditReplace));
         let mut derived = ctx.reborrow_extending_capabilities([
-            LlmCapability::FileEdits,
+            LlmCapability::EditReplace,
             LlmCapability::ToolchainVerify,
         ]);
         assert!(derived.capabilities.contains(LlmCapability::TextMessage));
-        assert!(derived.capabilities.contains(LlmCapability::FileEdits));
+        assert!(derived.capabilities.contains(LlmCapability::EditReplace));
         assert!(derived
             .capabilities
             .contains(LlmCapability::ToolchainVerify));
 
-        let replaced = derived
-            .reborrow_with_capabilities(CapabilitySet::from_slice(&[LlmCapability::Research]));
-        assert!(replaced.capabilities.contains(LlmCapability::Research));
-        assert!(!replaced.capabilities.contains(LlmCapability::FileEdits));
+        let replaced =
+            derived.reborrow_with_capabilities(CapabilityExpr::set([CapabilityExpr::leaf(
+                LlmCapability::ContextRequest,
+            )]));
+        assert!(replaced
+            .capabilities
+            .contains(LlmCapability::ContextRequest));
+        assert!(!replaced.capabilities.contains(LlmCapability::EditReplace));
         assert_eq!(replaced.repo_root, dir.path());
     }
 }

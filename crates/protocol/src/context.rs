@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Access level granted to one file of the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAccess {
+    /// Reference material the model reads but never modifies.
     ReadOnly,
+    /// Material the model may modify through an edit.
     Editable,
 }
 

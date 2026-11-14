@@ -205,15 +205,10 @@ repl = ["openrouter:~google/gemini-flash-latest"]
 # # `git` runs every turn inside a checkpointed transaction that rolls the working
 # # tree back on failure; `naive` writes bytes directly and keeps no checkpoint.
 # workflow = "git"
-# # The format changes only the transport, the token cost, and the prefix caching:
-# # `structured` drives strict JSON-Schema structured output, `xml` drives
-# # marker-protected XML tags, and `mixed` pairs both contours — XML for code
-# # edits, structured output for every discussion and synthesis.
-# protocol = "structured"
 # # `line_anchor` names an inclusive line range through the compact opaque anchors
 # # rendered beside every context line, so the model copies a short token instead
 # # of reproducing the text it replaces; `search_replace` echoes the replaced text
-# # and matches it exactly. The strategy is orthogonal to `protocol`.
+# # and matches it exactly.
 # patch_strategy = "line_anchor"
 # # Prompt layout policy. Absent by default, because the layout then follows the
 # # turn intent: a dialogue contour builds the append-only chronological

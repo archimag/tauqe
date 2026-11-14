@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauqe_protocol::{
     ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig,
-    PromptLayoutKind, ReasoningEffort, TurnIntent,
+    PromptLayoutKind, ReasoningEffort,
 };
 
 mod context;
@@ -307,25 +307,26 @@ impl AppConfig {
     /// Resolves the prompt layout policy for a bounded turn.
     ///
     /// This is the single typed point that decides the layout: an explicitly
-    /// configured [`PromptLayoutKind`] wins, otherwise the turn intent decides.
+    /// configured [`PromptLayoutKind`] wins, otherwise the caller's typed
+    /// argument decides.
     ///
-    /// - An interactive REPL turn, a plan discussion, and a review discussion
-    ///   keep a growing history and share one byte-stable head, so all three
-    ///   build the chronological transcript: its append-only growth keeps the
-    ///   provider prefix cache warm across dialogue focus switches.
-    /// - An isolated step and an Architect synthesis carry no growing dialogue
-    ///   history to interleave — both suppress it — so they keep the semantic
-    ///   block order.
-    pub fn resolve_prompt_layout(&self, intent: TurnIntent) -> PromptLayoutKind {
+    /// - A contour that carries a growing session history — an interactive REPL
+    ///   turn, a plan discussion, and a review discussion — shares one
+    ///   byte-stable head and builds the chronological transcript: its
+    ///   append-only growth keeps the provider prefix cache warm across
+    ///   dialogue focus switches.
+    /// - A contour that carries no growing dialogue history to interleave — an
+    ///   isolated step and an Architect synthesis — keeps the semantic block
+    ///   order.
+    pub fn resolve_prompt_layout(&self, carries_session_history: bool) -> PromptLayoutKind {
         if let Some(explicit) = self.repl.prompt_layout {
             return explicit;
         }
 
-        match intent {
-            TurnIntent::InteractiveRepl
-            | TurnIntent::PlanDiscussion
-            | TurnIntent::ReviewDiscussion => PromptLayoutKind::Chronological,
-            TurnIntent::IsolatedStep | TurnIntent::ArchitectSynthesis => PromptLayoutKind::Semantic,
+        if carries_session_history {
+            PromptLayoutKind::Chronological
+        } else {
+            PromptLayoutKind::Semantic
         }
     }
 }
@@ -491,8 +492,7 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use tauqe_protocol::review::PostAnalysisMode;
-    use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent, WorkflowKind};
-
+    use tauqe_protocol::{PromptLayoutKind, WorkflowKind};
     #[test]
     fn test_models_config_and_roles_resolution() {
         let toml_str = r#"
@@ -946,7 +946,6 @@ repl = ["anthropc:claude"]
             ModelRef::openrouter(BUILTIN_DEFAULT_REPL_MODEL)
         );
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
-        assert_eq!(config.repl.protocol, EditProtocolKind::Structured);
         assert_eq!(config.repl.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
     }
@@ -959,7 +958,6 @@ repl = ["anthropc:claude"]
             "[models]\nrepl = [\"openrouter:anthropic/claude-3.5-sonnet\"]\n",
         )
         .unwrap();
-
         let dot_wb = temp_dir.path().join(".tauqe");
         std::fs::create_dir_all(&dot_wb).unwrap();
         std::fs::write(
@@ -1242,50 +1240,30 @@ args = ["check", "--all-targets"]
     }
 
     #[test]
-    fn test_resolve_prompt_layout_follows_intent_and_configuration() {
-        // Without an explicit override the turn intent decides.
+    fn test_resolve_prompt_layout_follows_the_session_history_and_configuration() {
+        // Without an explicit override the caller's typed argument decides.
         let default_cfg = AppConfig::default();
         assert_eq!(
-            default_cfg.resolve_prompt_layout(TurnIntent::InteractiveRepl),
+            default_cfg.resolve_prompt_layout(true),
             PromptLayoutKind::Chronological
         );
         assert_eq!(
-            default_cfg.resolve_prompt_layout(TurnIntent::PlanDiscussion),
-            PromptLayoutKind::Chronological
-        );
-        // A review discussion is a dialogue contour as well: it keeps the
-        // growing session history and the chronological transcript.
-        assert_eq!(
-            default_cfg.resolve_prompt_layout(TurnIntent::ReviewDiscussion),
-            PromptLayoutKind::Chronological
-        );
-        assert_eq!(
-            default_cfg.resolve_prompt_layout(TurnIntent::IsolatedStep),
-            PromptLayoutKind::Semantic
-        );
-        assert_eq!(
-            default_cfg.resolve_prompt_layout(TurnIntent::ArchitectSynthesis),
+            default_cfg.resolve_prompt_layout(false),
             PromptLayoutKind::Semantic
         );
 
-        // A declared value overrides the resolution for every intent.
+        // A declared value overrides the resolution for every contour.
         for (declared, expected) in [
             ("semantic", PromptLayoutKind::Semantic),
             ("chronological", PromptLayoutKind::Chronological),
         ] {
             let toml_str = format!("[repl]\nprompt_layout = \"{declared}\"\n");
             let config: AppConfig = toml::from_str(&toml_str).expect("parse config");
-            for intent in [
-                TurnIntent::InteractiveRepl,
-                TurnIntent::PlanDiscussion,
-                TurnIntent::IsolatedStep,
-                TurnIntent::ReviewDiscussion,
-                TurnIntent::ArchitectSynthesis,
-            ] {
+            for carries_session_history in [true, false] {
                 assert_eq!(
-                    config.resolve_prompt_layout(intent),
+                    config.resolve_prompt_layout(carries_session_history),
                     expected,
-                    "declared {declared} must apply to {intent:?}"
+                    "declared {declared} must apply to a turn with history = {carries_session_history}"
                 );
             }
         }

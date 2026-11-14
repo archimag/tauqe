@@ -102,7 +102,7 @@ mod tests {
         let plan = sample_plan();
 
         let prompt =
-            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Xml, Some("XYZ"))
+            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Structured, None)
                 .unwrap();
         assert!(prompt.contains("Target Plan Step Execution: [jwt-auth:2] Endpoint"));
         assert!(prompt.contains("Already Completed Prerequisites:"));
@@ -116,26 +116,24 @@ mod tests {
 
         assert!(prompt.contains("- [x] #1 Models"));
         assert!(prompt.contains("- **ID**: `2`"));
-        assert!(prompt.contains("<success_XYZ commit_message=\"...\" />"));
-        assert!(prompt.contains("<error_XYZ message=\"...\" />"));
+        assert!(prompt.contains("`changes`"));
+        assert!(prompt.contains("commit_message"));
     }
-
     #[test]
     fn test_format_plan_step_retry_prompt() {
         let prompt = format_plan_step_retry_prompt(
             "I think we are done.",
             Some("No edits were applied"),
-            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
             None,
         );
         assert!(prompt.contains("Correction Required"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I think we are done."));
         assert!(prompt.contains("No edits were applied"));
-        assert!(prompt.contains("terminal success tag"));
+        assert!(prompt.contains("`reason`"));
 
-        let empty = format_plan_step_retry_prompt("   ", None, EditProtocolKind::Xml, None);
-        assert!(empty.contains("(empty response)"));
+        let empty = format_plan_step_retry_prompt("   ", None, EditProtocolKind::Structured, None);
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));
     }
@@ -362,11 +360,11 @@ mod tests {
         step.outer_docs = vec!["vendor/api.md".to_string()];
 
         let tagged =
-            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Xml, Some("MK"))
+            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Structured, None)
                 .expect("the execution prompt");
         assert!(tagged.contains("Preloaded External Specifications (read-only reference)"));
         assert!(tagged.contains("vendor/api.md"));
-        assert!(tagged.contains("<outer_doc_request_MK id=\"root/relative.md\" />"));
+        assert!(tagged.contains("`outer_doc_requests`"));
         assert!(tagged.contains("never name a path that climbs above the declared root"));
 
         // A structured turn emits no command tag, so the same contract arrives

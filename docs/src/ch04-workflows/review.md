@@ -644,7 +644,7 @@ with the blocker recorded in `note`, and the queue advances.
 
 **Managed skip.** When the model determines that the defect was already addressed by
 earlier work or is not reproducible, it emits the typed skip outcome with a reason —
-the skip tag in the XML contour, `outcome` with status `skip` in the structured
+the skip tag in the XML contour, the `reason` field in the structured
 contour. The server records the explanation in `note`, transitions the finding to
 `Skipped`, and closes the turn cleanly without requiring code changes.
 

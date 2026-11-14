@@ -25,8 +25,8 @@ pub mod stream;
 
 pub use apply::{apply_edit_proposal, apply_edit_proposal_with_config};
 pub use protocol::{
-    ContextRequest, EditProtocolFactory, MarkedXmlEditProtocol, StructuredEditProtocol,
-    TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget, XmlEditProtocol,
+    ContextRequest, EditProtocolFactory, StructuredEditProtocol, TerminalOutcome, VerifyOnSuccess,
+    VerifyRequest, VerifyTarget,
 };
 pub use stage::{prepare_staged_edits, prepare_staged_edits_with_config, stage_and_validate_edits};
 pub use tauqe_tools::edits::anchor;

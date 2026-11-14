@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use tauqe_protocol::{EditOperation, PatchStrategy};
+use tauqe_protocol::{
+    EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOverwrite,
+    EditReplace, PatchStrategy,
+};
 
 use crate::context::ContextManager;
 use crate::edits::strategy::StrategyProfile;
@@ -25,7 +28,6 @@ pub fn build_patch_retry_prompt(
     succeeded_files: &HashSet<String>,
     failed_files: &HashMap<String, EditError>,
     protocol_errors: &[String],
-    target_language: Option<&str>,
     patch_strategy: PatchStrategy,
 ) -> String {
     let profile = StrategyProfile::of(patch_strategy);
@@ -71,12 +73,6 @@ pub fn build_patch_retry_prompt(
         );
         prompt.push_str(profile.retry_instruction);
     }
-    if let Some(lang) = target_language {
-        prompt.push_str(&format!(
-            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
-            lang
-        ));
-    }
     prompt
 }
 
@@ -95,17 +91,18 @@ pub fn retain_retried_failed_files(
     let mut retried_paths = HashSet::new();
     for edit in edits {
         match edit {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. }
-            | EditOperation::LineAnchor { path, .. } => {
+            EditOperation::Replace(EditReplace { path, .. })
+            | EditOperation::Create(EditCreate { path, .. })
+            | EditOperation::Delete(EditDelete { path })
+            | EditOperation::Overwrite(EditOverwrite { path, .. })
+            | EditOperation::LineAnchor(EditLineAnchor { path, .. }) => {
                 let clean = context_manager
                     .normalize_path(path)
                     .unwrap_or_else(|_| path.clone());
                 retried_paths.insert(clean);
             }
-            EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
+            EditOperation::Move(EditMove { from, to })
+            | EditOperation::MoveDir(EditMoveDir { from, to }) => {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -142,17 +139,18 @@ pub fn prepare_staged_for_retry(
     let mut touched_paths = HashSet::new();
     for edit in new_edits {
         match edit {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. }
-            | EditOperation::LineAnchor { path, .. } => {
+            EditOperation::Replace(EditReplace { path, .. })
+            | EditOperation::Create(EditCreate { path, .. })
+            | EditOperation::Delete(EditDelete { path })
+            | EditOperation::Overwrite(EditOverwrite { path, .. })
+            | EditOperation::LineAnchor(EditLineAnchor { path, .. }) => {
                 let clean = context_manager
                     .normalize_path(path)
                     .unwrap_or_else(|_| path.clone());
                 touched_paths.insert(clean);
             }
-            EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
+            EditOperation::Move(EditMove { from, to })
+            | EditOperation::MoveDir(EditMoveDir { from, to }) => {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -173,7 +171,9 @@ pub fn prepare_staged_for_retry(
     while changed {
         changed = false;
         for op in cumulative_edits.iter() {
-            if let EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } = op {
+            if let EditOperation::Move(EditMove { from, to })
+            | EditOperation::MoveDir(EditMoveDir { from, to }) = op
+            {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -195,17 +195,18 @@ pub fn prepare_staged_for_retry(
     }
 
     cumulative_edits.retain(|op| match op {
-        EditOperation::Replace { path, .. }
-        | EditOperation::Create { path, .. }
-        | EditOperation::Delete { path }
-        | EditOperation::Overwrite { path, .. }
-        | EditOperation::LineAnchor { path, .. } => {
+        EditOperation::Replace(EditReplace { path, .. })
+        | EditOperation::Create(EditCreate { path, .. })
+        | EditOperation::Delete(EditDelete { path })
+        | EditOperation::Overwrite(EditOverwrite { path, .. })
+        | EditOperation::LineAnchor(EditLineAnchor { path, .. }) => {
             let op_path = context_manager
                 .normalize_path(path)
                 .unwrap_or_else(|_| path.clone());
             !touched_paths.contains(&op_path)
         }
-        EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
+        EditOperation::Move(EditMove { from, to })
+        | EditOperation::MoveDir(EditMoveDir { from, to }) => {
             let clean_from = context_manager
                 .normalize_path(from)
                 .unwrap_or_else(|_| from.clone());
@@ -246,14 +247,12 @@ mod tests {
             &succeeded,
             &failed,
             &proto_errors,
-            Some("Russian"),
             PatchStrategy::SearchReplace,
         );
 
         assert!(prompt.contains("Protocol parsing errors encountered in your edit blocks:"));
         assert!(prompt.contains("Malformed XML edit block: Unclosed tag"));
 
-        assert!(prompt.contains("Russian"));
         assert!(prompt.contains("Successfully applied edits for:"));
         assert!(prompt.contains("- crates/core/src/lib.rs"));
         assert!(prompt.contains("(Do NOT regenerate changes for the above files; their updated versions are already present in <context>)."));
@@ -286,11 +285,11 @@ mod tests {
             },
         );
 
-        let edits = vec![EditOperation::Replace {
+        let edits = vec![EditOperation::Replace(EditReplace {
             path: "b.rs".to_string(),
             old_text: "old".to_string(),
             new_text: "new".to_string(),
-        }];
+        })];
 
         let unretried = retain_retried_failed_files(&mut failed, &cm, &edits);
         assert!(!failed.contains_key("a.rs"));
@@ -322,27 +321,27 @@ mod tests {
             .insert("b.rs".to_string(), b"staged b".to_vec());
 
         let mut cumulative = vec![
-            EditOperation::Replace {
+            EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "old a".to_string(),
                 new_text: "staged a".to_string(),
-            },
-            EditOperation::Replace {
+            }),
+            EditOperation::Replace(EditReplace {
                 path: "b.rs".to_string(),
                 old_text: "old b".to_string(),
                 new_text: "staged b".to_string(),
-            },
+            }),
         ];
 
         let mut succeeded = HashSet::new();
         succeeded.insert("a.rs".to_string());
         succeeded.insert("b.rs".to_string());
 
-        let retry_edits = vec![EditOperation::Replace {
+        let retry_edits = vec![EditOperation::Replace(EditReplace {
             path: "a.rs".to_string(),
             old_text: "old a".to_string(),
             new_text: "fresh a".to_string(),
-        }];
+        })];
 
         prepare_staged_for_retry(
             &mut staged,
@@ -355,7 +354,9 @@ mod tests {
         assert!(!staged.staged_files.contains_key("a.rs"));
         assert!(staged.staged_files.contains_key("b.rs"));
         assert_eq!(cumulative.len(), 1);
-        assert!(matches!(&cumulative[0], EditOperation::Replace { path, .. } if path == "b.rs"));
+        assert!(
+            matches!(&cumulative[0], EditOperation::Replace(EditReplace { path, .. }) if path == "b.rs")
+        );
         assert!(!succeeded.contains("a.rs"));
         assert!(succeeded.contains("b.rs"));
     }
@@ -371,15 +372,15 @@ mod tests {
         staged.deleted_paths.insert("a.rs".to_string());
 
         let mut cumulative = vec![
-            EditOperation::Move {
+            EditOperation::Move(EditMove {
                 from: "a.rs".to_string(),
                 to: "b.rs".to_string(),
-            },
-            EditOperation::Replace {
+            }),
+            EditOperation::Replace(EditReplace {
                 path: "c.rs".to_string(),
                 old_text: "old".to_string(),
                 new_text: "new".to_string(),
-            },
+            }),
         ];
 
         let mut succeeded = HashSet::new();
@@ -388,11 +389,11 @@ mod tests {
         succeeded.insert("c.rs".to_string());
 
         // Retry touches only the `to` side of the earlier move.
-        let retry_edits = vec![EditOperation::Replace {
+        let retry_edits = vec![EditOperation::Replace(EditReplace {
             path: "b.rs".to_string(),
             old_text: "content of a".to_string(),
             new_text: "fixed".to_string(),
-        }];
+        })];
 
         prepare_staged_for_retry(
             &mut staged,
@@ -405,7 +406,9 @@ mod tests {
         assert!(!staged.staged_files.contains_key("b.rs"));
         assert!(!staged.deleted_paths.contains("a.rs"));
         assert_eq!(cumulative.len(), 1);
-        assert!(matches!(&cumulative[0], EditOperation::Replace { path, .. } if path == "c.rs"));
+        assert!(
+            matches!(&cumulative[0], EditOperation::Replace(EditReplace { path, .. }) if path == "c.rs")
+        );
         assert!(!succeeded.contains("a.rs"));
         assert!(!succeeded.contains("b.rs"));
         assert!(succeeded.contains("c.rs"));
@@ -433,13 +436,8 @@ mod tests {
             ),
         ]);
 
-        let prompt = build_patch_retry_prompt(
-            &HashSet::new(),
-            &failed,
-            &[],
-            None,
-            PatchStrategy::LineAnchor,
-        );
+        let prompt =
+            build_patch_retry_prompt(&HashSet::new(), &failed, &[], PatchStrategy::LineAnchor);
 
         // The anchored contour addresses lines by anchors, so the retry request
         // must never teach the model a field it was never asked to send.

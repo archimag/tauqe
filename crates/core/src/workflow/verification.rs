@@ -18,6 +18,7 @@ pub struct VerificationOutcome {
     /// Explicit verdict of the run.
     pub status: VerificationStatus,
     /// Human-readable report of the run, empty when nothing needs reporting.
+    #[allow(dead_code)]
     pub report: String,
 }
 
@@ -26,11 +27,13 @@ impl VerificationOutcome {
     ///
     /// Cancellation is a verdict of its own, so the phase boundary reads it
     /// from the status instead of a second flag that could disagree with it.
+    #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         self.status == VerificationStatus::Cancelled
     }
 
     /// Whether the change set may be committed under this verdict.
+    #[allow(dead_code)]
     pub fn allows_commit(&self) -> bool {
         self.status.allows_commit()
     }
@@ -411,35 +414,20 @@ pub fn extract_error_paths(report: &str, available_files: &[String]) -> Vec<Stri
 }
 
 /// Constructs a prompt asking the model to fix compiler, clippy, or test failures.
-pub fn build_verification_retry_prompt(report: &str, target_language: Option<&str>) -> String {
+pub fn build_verification_retry_prompt(report: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str("Code verification failed with the following errors:\n\n```\n");
     prompt.push_str(report.trim());
     prompt.push_str("\n```\n\nPlease fix the errors by proposing corrected edits that follow the edit protocol defined in your system instructions. If you need additional files to understand or fix the issue, request them through the research protocol defined in your system instructions.");
-    if let Some(lang) = target_language {
-        prompt.push_str(&format!(
-            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
-            lang
-        ));
-    }
     prompt
 }
 
 /// Constructs a prompt reminding the model that it must provide code edits when fixing verification failures.
-pub fn build_verification_missing_edits_prompt(
-    report: &str,
-    target_language: Option<&str>,
-) -> String {
+pub fn build_verification_missing_edits_prompt(report: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str("Your previous response contained explanations but did not include any code edits that follow the edit protocol defined in your system instructions.\n\nCode verification is still failing with the following errors:\n\n```\n");
     prompt.push_str(report.trim());
     prompt.push_str("\n```\n\nYou MUST propose concrete code edits to resolve the compilation or verification errors, following the edit protocol defined in your system instructions. If you need additional files, request them through the research protocol defined in your system instructions.");
-    if let Some(lang) = target_language {
-        prompt.push_str(&format!(
-            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
-            lang
-        ));
-    }
     prompt
 }
 
@@ -447,18 +435,16 @@ pub fn build_verification_missing_edits_prompt(
 mod tests {
     #[test]
     fn test_build_verification_missing_edits_prompt() {
-        let prompt =
-            build_verification_missing_edits_prompt("error: mismatched types", Some("Russian"));
+        let prompt = build_verification_missing_edits_prompt("error: mismatched types");
         assert!(prompt.contains("did not include any code edits"));
         assert!(prompt.contains("error: mismatched types"));
-        assert!(prompt.contains("Russian"));
         assert!(!prompt.contains("<tauqe_edits"));
         assert!(!prompt.contains("<context_request"));
     }
 
     #[test]
     fn test_build_verification_retry_prompt_is_protocol_neutral() {
-        let prompt = build_verification_retry_prompt("error[E0308]: mismatched types", None);
+        let prompt = build_verification_retry_prompt("error[E0308]: mismatched types");
         assert!(prompt.contains("error[E0308]: mismatched types"));
         assert!(prompt.contains("edit protocol defined in your system instructions"));
         assert!(prompt.contains("research protocol defined in your system instructions"));

@@ -72,24 +72,26 @@ proposes no change set, and a round that patches the tree asks for nothing. A
 response that mixes the two is a protocol defect: the turn keeps its change set
 and reports the discovery request as the defect to correct in a later round (*The
 Autonomous Bounded Turn FSM* §3.3.2), so exploration never silently costs the
-model the edits it already wrote.
+model the edits it already wrote. The research branch reports through the short
+description of the action it performs, so a discovery round states in `message`
+what it is about to inspect instead of answering at length.
 
-### 2.2 Commands and handlers
-
-| Command | Handler | What it returns |
+| Request | Handler | What it returns |
 | --- | --- | --- |
-| `<context_request path access>` | context request | files added to the Auto layer, or "not found" |
-| `<repo_search path regex>` | repository search | matching tracked files with hit counts |
-| `<repo_dirs />` | directory tree | the compact folder outline |
-| `<repo_map path>` | targeted outline | the symbol map of one subtree |
-| `<dir_list path recursive>` | directory listing | tracked files of one directory |
-| `<tauqe_doc_request topic>` | documentation | the embedded chapter of one topic |
-| `<outer_doc_request id>` | outer documentation | the declared document the identifier names, or the relative document below its root |
-
+| `context_requests` (`path`, `access`) | context request | files added to the Auto layer, or "not found" |
+| `repo_searches` (`path`, `regex`) | repository search | matching tracked files with hit counts |
+| `repo_dirs` (`boolean`) | directory tree | the compact folder outline |
+| `repo_maps` (`path`) | targeted outline | the symbol map of one subtree |
+| `dir_lists` (`path`, `recursive`) | directory listing | tracked files of one directory |
+| `tauqe_doc_requests` (`topic`) | documentation | the embedded chapter of one topic |
+| `outer_doc_requests` (`id`) | outer documentation | the declared document the identifier names, or the relative document below its root |
 Each handler implements `ResearchCapabilityHandler` and owns its validation, its
 disk work, and its feedback text. The turn loop dispatches polymorphically instead
 of branching on individual command types, so a capability cannot drift from its
-validation or its explanation.
+validation or its explanation. Each atomic discovery capability is mapped directly
+by `capability_schema`, `decode_capability_expr`, and `contract_rule` /
+`structured_instruction` from the same `CapabilityExpr` tree, so the request the
+model is told to send and the request the harness reads back cannot diverge. The schema is the single source of the structure of a round — which properties it requires and which values each accepts — while the contract text states what a round is for, so the two never disagree about a command.
 
 ### 2.3 Feedback blocks
 
@@ -201,15 +203,15 @@ that names the limitation instead of an opaque engine error.
 
 ### 3.4 Navigating structure
 
-- `<repo_dirs />` renders the tracked folder tree and marks pinned files. It is the
+- `repo_dirs: true` renders the tracked folder tree and marks pinned files. It is the
   navigation view when the eager symbol map is disabled.
-- `<repo_map path="..." />` renders one subtree's symbols within the outline
-  budget. The target is matched on whole path components; an unknown prefix yields
-  an explanatory block; at most three distinct targets are honored per round.
-- `<dir_list path="..." />` lists tracked files. Without `recursive` it reports the
-  direct files and the names of direct subdirectories with a trailing slash; with
-  `recursive="true"` it reports every tracked file under the prefix. A listing is
-  capped at 100 entries, and the block states how many entries were omitted.
+- `repo_maps` renders one subtree's symbols within the outline budget. The target
+  is matched on whole path components; an unknown prefix yields an explanatory
+  block; at most three distinct targets are honored per round.
+- `dir_lists` (`path`, `recursive`) lists tracked files. With `recursive: false` it
+  reports the direct files and the names of direct subdirectories with a trailing
+  slash; with `recursive: true` it reports every tracked file under the prefix. A
+  listing is capped at 100 entries, and the block states how many entries were
 
 ### 3.5 Declared external documents
 
@@ -261,7 +263,7 @@ field of its leaf, and the harness mounts it before the step turn starts (*Local
 
 ### 3.6 Requesting harness documentation
 
-`<tauqe_doc_request topic="..." />` returns embedded chapters for `overview`, `context`,
+Documentation requests (`tauqe_doc_requests`) return embedded chapters for `overview`,
 `workflow`, `git`, `interface`, `review`, `plan`, `config`, or `all`. The model asks
 for the authoritative chapter instead of reconstructing behavior from partial source
 memory.

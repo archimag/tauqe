@@ -6,8 +6,8 @@ use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
-    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, DiscussionTarget,
-    EditProtocolKind, Event, ModelRef, ModelSelection, UsageTotalsSnapshot,
+    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, DiscussionTarget, Event,
+    ModelRef, ModelSelection, UsageTotalsSnapshot,
 };
 use tokio::sync::{watch, Mutex};
 
@@ -195,10 +195,6 @@ pub struct AppState {
     /// provider instead of building a real network provider from config.
     #[cfg(test)]
     pub provider_override: Mutex<Option<Arc<dyn tauqe_core::providers::LlmProvider>>>,
-    /// Test-only seam pinning the active turn marker so deterministic tests can
-    /// exercise marker-bound protocol output without generating a fresh marker.
-    #[cfg(test)]
-    pub marker_override: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -258,8 +254,6 @@ impl AppState {
             git_transaction_active: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             provider_override: Mutex::new(None),
-            #[cfg(test)]
-            marker_override: Mutex::new(None),
         })
     }
 
@@ -466,6 +460,7 @@ impl AppState {
     ///
     /// The deadline is resolved by this spawner and handed to the watchdog,
     /// because a task-scoped value does not cross `tokio::spawn`.
+    #[allow(dead_code)]
     pub fn defer_abort_owning_operation<T>(
         self: &Arc<Self>,
         operation: Arc<OperationGuard>,
@@ -703,6 +698,7 @@ impl AppState {
     /// already holds the entries — so the next record can never reuse one of
     /// them and a `history/get` served while the turn runs keeps reading a
     /// coherent manager.
+    #[allow(dead_code)]
     pub async fn adopt_history(&self, history: HistoryManager) {
         let mut shared = self.history.lock().await;
         *shared = history;
@@ -718,6 +714,7 @@ impl AppState {
     /// derives at startup, so the next record can never reuse an identifier that
     /// is already written. The journal is reread on the blocking pool, under the
     /// same exclusive guard the mutations use.
+    #[allow(dead_code)]
     pub async fn resync_history_from_journal(self: &Arc<Self>) -> Result<(), String> {
         let repo_root = self.repo_root().await;
         let mut rebuilt = tokio::task::spawn_blocking(move || HistoryManager::new(repo_root))
@@ -939,36 +936,7 @@ impl AppState {
         }
         Ok((removed, snapshot))
     }
-
-    /// Returns the turn marker for the current turn, or `None` when markers are
-    /// disabled or the active protocol does not carry them.
-    ///
-    /// The marker binds structural protocol tags to a single turn so literal
-    /// source tags are never mistaken for protocol commands. It protects XML
-    /// markup only, so a `Structured` turn neither generates nor carries a
-    /// marker at any level of the server or the FSM: the check runs before the
-    /// test seams, because pinning a marker is meaningful in the XML contour
-    /// alone. Production XML and mixed turns always generate a fresh marker;
-    /// deterministic tests may pin it through the `marker_override` seam or
-    /// disable it by injecting a scripted provider.
-    pub async fn next_turn_marker(&self) -> Option<String> {
-        let protocol = self.config.lock().await.config.repl.protocol;
-        if protocol == EditProtocolKind::Structured {
-            return None;
-        }
-        #[cfg(test)]
-        {
-            if let Some(marker) = self.marker_override.lock().await.clone() {
-                return Some(marker);
-            }
-            if self.provider_override.lock().await.is_some() {
-                return None;
-            }
-        }
-        Some(tauqe_core::edits::protocol::xml::generate_turn_marker())
-    }
 }
-
 static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_operation_id() -> u64 {
@@ -1426,54 +1394,6 @@ mod tests {
                 .maybe_rotate_session_on_model_change(&alpha, &beta)
                 .await,
             "a model change must rotate the session"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The default configuration drives the structured-output protocol, which
-    /// carries no XML markup and therefore needs no injection marker at all.
-    #[tokio::test]
-    async fn next_turn_marker_is_absent_for_the_structured_protocol() {
-        let root = scratch_root("state-marker");
-
-        let (out, _rx) = OutChannel::new();
-        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
-
-        assert_eq!(
-            state.config.lock().await.config.repl.protocol,
-            EditProtocolKind::Structured,
-            "the default configuration must use the structured protocol"
-        );
-        assert!(
-            state.next_turn_marker().await.is_none(),
-            "the structured protocol must not generate a turn marker"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The XML contour protects its markup with a fresh hex marker, so the
-    /// gate must not suppress it.
-    #[tokio::test]
-    async fn next_turn_marker_is_generated_for_the_xml_protocol() {
-        let root = scratch_root("state-marker");
-
-        let mut config = AppConfig::default();
-        config.repl.protocol = EditProtocolKind::Xml;
-        let (out, _rx) = OutChannel::new();
-        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(config, root.clone(), history_sender, out);
-
-        let marker = state
-            .next_turn_marker()
-            .await
-            .expect("the xml protocol must generate a turn marker");
-        assert_eq!(marker.len(), 16, "the marker must be 16 characters long");
-        assert!(
-            marker.chars().all(|c| c.is_ascii_hexdigit()),
-            "the marker must consist of ASCII hexadecimal digits"
         );
 
         let _ = std::fs::remove_dir_all(&root);

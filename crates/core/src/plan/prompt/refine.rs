@@ -13,12 +13,16 @@ use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus, RepoSearchRequ
 /// The flag is spelled `is_aborted` because that is the wire name the shared
 /// schema declares; the protocol-layer `StructuredAbortProposal` keeps its own
 /// edit-contour spelling untouched.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlanRefinementAbort {
+    /// True only when the work cannot continue without a developer action in the host terminal.
     #[serde(default)]
     pub is_aborted: bool,
+    /// The concrete missing capability (empty string when no abort is reported).
     #[serde(default)]
     pub reason: String,
+    /// The exact command or instruction the developer must run (empty string when no abort is reported).
     #[serde(default)]
     pub recommendation: String,
 }
@@ -229,7 +233,32 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
 /// therefore holds no escape hatch of its own, and a change to the shape reaches
 /// both contours at once.
 fn abort_property() -> serde_json::Value {
-    crate::capabilities::abort_fragment()["abort"].clone()
+    let root = schemars::schema_for!(PlanRefinementAbort);
+    let mut value = serde_json::to_value(&root.schema).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.remove("$schema");
+        map.remove("title");
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        map.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let required: Vec<serde_json::Value> = map
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|props| {
+                props
+                    .keys()
+                    .map(|k| serde_json::Value::String(k.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        map.insert("required".to_string(), serde_json::Value::Array(required));
+    }
+    value
 }
 
 /// Strict JSON Schema for deep plan refinement output.
@@ -728,9 +757,6 @@ mod tests {
         let schema = plan_refine_response_schema();
         let abort = schema["properties"]["abort"].clone();
 
-        // The escape hatch is the very shape the structured edit contour
-        // publishes, so the two contours cannot describe different fields.
-        assert_eq!(abort, crate::capabilities::abort_fragment()["abort"]);
         assert_eq!(abort["type"], "object");
         assert_eq!(abort["additionalProperties"], serde_json::json!(false));
         assert_eq!(abort["properties"]["is_aborted"]["type"], "boolean");

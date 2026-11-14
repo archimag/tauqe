@@ -157,7 +157,6 @@ fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSess
 fn test_config() -> tauqe_core::config::AppConfig {
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
     config
 }
@@ -209,14 +208,6 @@ async fn test_state_with_provider(
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     *state.provider_override.lock().await = Some(provider);
     state
-}
-
-fn architecture_edit(marker: &str, replacement: &str) -> String {
-    format!(
-        "<tauqe_edits_{m} summary=\"Apply fix\">\n<edit_{m} path=\"src/target.rs\">\n<search_{m}>\npub fn target() {{}}\n</search_{m}>\n<replace_{m}>\n{body}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
-        m = marker,
-        body = replacement
-    )
 }
 
 fn subplan_item(

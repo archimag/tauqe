@@ -7,7 +7,10 @@
 
 use std::path::Path;
 
-use tauqe_protocol::{ContextAccess, ContextLayer, EditOperation, EditProposal, ProjectConfig};
+use tauqe_protocol::{
+    ContextAccess, ContextLayer, EditCreate, EditOperation, EditProposal, EditReplace,
+    ProjectConfig,
+};
 
 use crate::context::ContextManager;
 use crate::git::cmd::run_git;
@@ -36,11 +39,11 @@ fn editable_context(root: &Path) -> ContextManager {
 
 /// A staged replace that rewrites `a.rs` in memory.
 fn replace_edit() -> Vec<EditOperation> {
-    vec![EditOperation::Replace {
+    vec![EditOperation::Replace(EditReplace {
         path: "a.rs".to_string(),
         old_text: "one\n".to_string(),
         new_text: "two\n".to_string(),
-    }]
+    })]
 }
 
 fn head_subject(root: &Path) -> String {
@@ -243,16 +246,16 @@ async fn applying_a_change_set_preserves_the_owning_layer_of_every_file() {
     let mut cm = two_layer_context(root);
 
     let edits = vec![
-        EditOperation::Replace {
+        EditOperation::Replace(EditReplace {
             path: "user_file.rs".to_string(),
             old_text: "one\n".to_string(),
             new_text: "ONE\n".to_string(),
-        },
-        EditOperation::Replace {
+        }),
+        EditOperation::Replace(EditReplace {
             path: "auto_file.rs".to_string(),
             old_text: "two\n".to_string(),
             new_text: "TWO\n".to_string(),
-        },
+        }),
     ];
 
     let mut policy = DirectApplyPolicy::new();
@@ -293,10 +296,10 @@ async fn creating_a_file_joins_the_auto_layer_and_never_the_user_layer() {
 
     let proposal = EditProposal {
         summary: "create generated.rs".to_string(),
-        edits: vec![EditOperation::Create {
+        edits: vec![EditOperation::Create(EditCreate {
             path: "generated.rs".to_string(),
             content: "pub fn generated() {}\n".to_string(),
-        }],
+        })],
     };
 
     let mut policy = DirectApplyPolicy::new();
@@ -324,11 +327,11 @@ async fn rolling_back_a_change_set_keeps_the_auto_layer_intact() {
     let root = dir.path();
     let mut cm = two_layer_context(root);
 
-    let edits = vec![EditOperation::Replace {
+    let edits = vec![EditOperation::Replace(EditReplace {
         path: "auto_file.rs".to_string(),
         old_text: "two\n".to_string(),
         new_text: "TWO\n".to_string(),
-    }];
+    })];
 
     let mut policy = GitTransactionPolicy::new();
     assert!(policy

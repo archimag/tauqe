@@ -255,39 +255,53 @@ mod tests {
     fn test_apply_parsed_plans_and_discussion_enforce_done_immutability() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-
-        let initial_text = r#"
-<plan action="save" id="guard-plan" title="Guard">
-  <concept>
-    <concept_item id="c-1" title="Invariant" />
-  </concept>
-  <item id="1" title="Step 1" status="done" files="src/step1.rs" />
-  <item id="2" title="Step 2" status="todo" files="src/step2.rs" />
-</plan>
-"#;
-        let initial_res = PlanStorage::apply_plan_tags(root, initial_text);
-        assert!(initial_res.errors.is_empty());
-        assert_eq!(initial_res.applied.len(), 1);
-        // Steps are authored as TODO; completion is recorded by the execution
-        // pipeline, so the fixture reaches DONE through it.
-        PlanStorage::update_item(
-            root,
-            "guard-plan",
-            "1",
-            Some(PlanItemStatus::Done),
+        let initial_plan = Plan::from_parts(
+            "guard-plan".to_string(),
+            "Guard".to_string(),
             None,
-            None,
-        )
-        .unwrap()
-        .expect("the seeded step must exist");
+            10,
+            10,
+            vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Step 1".to_string(),
+                    status: PlanItemStatus::Done,
+                    files: vec!["src/step1.rs".to_string()],
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Step 2".to_string(),
+                    status: PlanItemStatus::Todo,
+                    files: vec!["src/step2.rs".to_string()],
+                    ..Default::default()
+                },
+            ],
+        );
+        PlanStorage::save_plan(root, &initial_plan).unwrap();
 
-        // 1. apply_plan_tags update attempting status regression
-        let invalid_update = r#"
-<plan action="update" id="guard-plan">
-  <item id="1" status="todo" />
-</plan>
-"#;
-        let invalid_res = PlanStorage::apply_plan_tags(root, invalid_update);
+        // 1. apply_discussion_plan_update attempting status regression
+        let invalid_update = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Update,
+            id: Some("guard-plan".to_string()),
+            title: None,
+            description: None,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/step1.rs".to_string()],
+                ..Default::default()
+            }],
+        };
+        let invalid_res = PlanStorage::apply_discussion_plan_update(root, &invalid_update);
         assert!(invalid_res.applied.is_empty());
         assert!(!invalid_res.errors.is_empty());
         assert!(invalid_res.errors[0]

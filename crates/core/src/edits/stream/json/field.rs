@@ -169,4 +169,25 @@ mod tests {
         assert_eq!(filter.raw_buffer(), json);
         assert_eq!(filter.buffer(), json);
     }
+    #[test]
+    fn json_field_stream_filter_reads_the_field_inside_the_operational_branch() {
+        // The conversational field travels inside the operational branch, so the
+        // filter streams it at the depth the envelope gives it and never lets the
+        // change set reach the text channel.
+        let json = concat!(
+            "{\"action\":{\"kind\":\"edit\",\"changes\":[{\"op\":\"create\",",
+            "\"path\":\"a.rs\",\"content\":\"let message = \\\"message\\\";\\n\"}],",
+            "\"message\":\"Branch answer\"},\"count\":7}"
+        );
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let mut streamed = String::new();
+        for c in json.chars() {
+            if let Some(delta) = filter.push_chunk(&c.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "Branch answer");
+        assert!(!streamed.contains("let message"), "{streamed}");
+        assert_eq!(filter.raw_buffer(), json);
+    }
 }

@@ -17,9 +17,7 @@ pub mod normalize;
 pub mod schema;
 
 pub use normalize::normalize_repo_map_path;
-pub use schema::{
-    custom_tool_call_schema, discussion_response_schema, discussion_response_schema_definition,
-};
+pub use schema::custom_tool_call_schema;
 
 /// Action to perform on a project plan as part of discussion structured output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -28,7 +26,6 @@ pub enum DiscussionPlanAction {
     #[default]
     Update,
     Save,
-    Delete,
 }
 
 impl std::fmt::Display for DiscussionPlanAction {
@@ -36,7 +33,6 @@ impl std::fmt::Display for DiscussionPlanAction {
         match self {
             Self::Update => write!(f, "update"),
             Self::Save => write!(f, "save"),
-            Self::Delete => write!(f, "delete"),
         }
     }
 }
@@ -415,8 +411,6 @@ pub struct DiscussionResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub dir_lists: Vec<DirListRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_language: Option<String>,
     /// Decode diagnosis of a `plan_update` payload the DTO could not honor.
     ///
     /// The structured stream filter rebuilds this response from a partially
@@ -440,7 +434,6 @@ impl DiscussionResponse {
             repo_dirs: None,
             repo_maps: Vec::new(),
             dir_lists: Vec::new(),
-            user_language: None,
             plan_update_error: None,
         }
     }
@@ -489,11 +482,6 @@ impl DiscussionResponse {
             .into_iter()
             .filter_map(DirListRequest::normalized)
             .collect();
-        self
-    }
-
-    pub fn with_user_language(mut self, language: impl Into<String>) -> Self {
-        self.user_language = Some(language.into());
         self
     }
 }
@@ -703,7 +691,6 @@ mod tests {
     fn test_discussion_plan_action_display_and_serde() {
         assert_eq!(DiscussionPlanAction::Update.to_string(), "update");
         assert_eq!(DiscussionPlanAction::Save.to_string(), "save");
-        assert_eq!(DiscussionPlanAction::Delete.to_string(), "delete");
 
         let json = serde_json::to_string(&DiscussionPlanAction::Save).unwrap();
         assert_eq!(json, "\"save\"");
@@ -731,7 +718,6 @@ mod tests {
         assert!(resp.repo_dirs.is_none());
         assert!(resp.repo_maps.is_empty());
         assert!(resp.dir_lists.is_empty());
-        assert!(resp.user_language.is_none());
         assert!(resp.review_update.is_none());
     }
 
@@ -790,8 +776,7 @@ mod tests {
             "repo_searches": null,
             "repo_dirs": null,
             "repo_maps": null,
-            "dir_lists": null,
-            "user_language": null
+            "dir_lists": null
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Acknowledged");
@@ -802,7 +787,6 @@ mod tests {
         assert!(resp.repo_dirs.is_none());
         assert!(resp.repo_maps.is_empty());
         assert!(resp.dir_lists.is_empty());
-        assert!(resp.user_language.is_none());
     }
 
     #[test]
@@ -844,8 +828,7 @@ mod tests {
                     depends_on: vec![],
                     children: vec![],
                 }],
-            })
-            .with_user_language("Russian");
+            });
 
         let json = serde_json::to_string_pretty(&resp).unwrap();
         let de: DiscussionResponse = serde_json::from_str(&json).unwrap();

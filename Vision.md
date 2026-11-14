@@ -65,7 +65,7 @@ A prevalent failure mode of autonomous agent loops is silent requirement drift: 
 
 TAUQE enforces strict **decision immutability**:
 - Conceptual invariants (`concept`) and finished steps (`Done`) are immutable during plan execution.
-- The Coder role cannot unilaterally relax requirements or re-architect boundaries.
+- When an invariant cannot be satisfied or an unexpected dependency fails, the model emits a structured `blocked` protocol outcome, initiating a controlled replanning cycle rather than speculative drift.
 - When an invariant cannot be satisfied or an unexpected dependency fails, the model emits a structured `<blocked>` protocol outcome, initiating a controlled replanning cycle rather than speculative drift.
 
 ### 1.6. Economic Efficiency via Role-Based Escalation
@@ -109,9 +109,8 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```text
                User Prompt
                     ↓
-        ┌─► [Research Phase] ──── (requests missing files via <context_request>,
-        │           ↓               searches codebase via <repo_search>,
-        │           │               or system docs via <doc_request>)
+        ┌─► [Research Phase] ──── (requests missing files, searches codebase
+        │           ↓               via regex, or requests system docs)
         │   [Proposal Generation] ─ (generates minimal coherent patches)
         │           ↓
         │   [In-Memory Staging] ── (validates patches in memory with fuzzy matching)
@@ -127,7 +126,7 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```
 
 Every phase in the turn is deterministic:
-1. **Research:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via `<repo_search>`, and requests required definitions or system documentation via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
+1. **Research:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via regex search, and requests required definitions or system documentation via structured protocol requests. The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
 2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
 4. **Git Transaction:** The turn is transactional. It is finalized as a single isolated commit only after the full change set converges and verifies cleanly; if the turn fails or is cancelled before that point, the working tree is restored to its exact pre-turn state. Managing the resulting permanent history is left entirely to standard Git tooling.
@@ -143,17 +142,16 @@ The scratchpad is strictly isolated from every other layer:
 
 Its purpose is to let the model hold state across multi-round discovery and verification-healing cycles without polluting the persistent conversation or the user-facing surface.
 
-### 3.2. Deterministic Protocol Tags
+### 3.2 Deterministic Protocol Operations
 
-The model communicates its intent exclusively through typed protocol tags. Each tag is a deterministic command rather than free-form prose:
+The model communicates its intent exclusively through typed protocol operations governed by a strict JSON schema (`response_format: json_schema`). Each operation is a deterministic command rather than free-form prose:
 
-- Research tags (`<context_request>`, `<repo_search>`, `<doc_request>`) request missing files, search codebase symbols across repository files, or request authoritative reference material.
-- The scratchpad tag (`<scratchpad>`) records isolated, turn-local working memory.
-- The verification tag (`<verify>`) requests deterministic toolchain execution.
-- Terminal outcome tags (`<success>`, `<error>`, `<blocked>`) declare how the turn ends; the `<blocked>` outcome triggers semantic recovery instead of a blind retry.
-- The language tag (`<user_language>`) pins the natural language for user-facing output.
+- Research requests (`file`, `search`, `dir_list`, `repo_dirs`, `doc`, `outer_doc`) request missing files, search codebase symbols across repository files, or request authoritative reference material.
+- The scratchpad (`scratchpad`) records isolated, turn-local working memory.
+- Terminal outcome operations (`success`, `error`, `blocked`, `skip`) declare how the turn ends; the `blocked` outcome triggers semantic recovery instead of a blind retry.
+- The answer language is unconditional: user-facing output is always formulated in the language of the developer's request, and no separate language field is declared.
 
-Because these tags are parsed deterministically, the harness can enforce boundaries, react to declared outcomes, and guarantee that no unrecognized side effect ever reaches the operating system. There is no arbitrary shell: interaction with the world happens solely through typed, auditable protocol operations.
+Because these operations are enforced via constrained decoding and parsed deterministically, the harness can enforce boundaries, react to declared outcomes, and guarantee that no unrecognized side effect ever reaches the operating system. There is no arbitrary shell: interaction with the world happens solely through typed, auditable protocol operations.
 
 ### 3.3. Project Integration: Sovereign CLI Contracts & Task Runners
 
@@ -182,7 +180,7 @@ The integration rests on four invariants:
 4. **Minimal Coherent Change**  
    Modifications are made via localized search/replace blocks and atomic file operations. Gratuitous reformatting and unrelated refactoring are strictly avoided.
 5. **Dual-Use Documentation as Concept Ontology**  
-   Documentation serves a dual purpose: authoritative technical reference for developers and high-density semantic concept ontology for the AI model. When asked about system architecture, shortcuts, or workflows, the model requests authoritative documentation via `<doc_request>` rather than hallucinating.
+   Documentation serves a dual purpose: authoritative technical reference for developers and high-density semantic concept ontology for the AI model. When asked about system architecture, shortcuts, or workflows, the model requests authoritative documentation via system doc requests rather than hallucinating.
 6. **Deterministic Process Over Agentic Delegation**  
    Workflow lifecycles, state transitions, invariant checks, and Git transactions are hardcoded in environment software (Rust), never delegated to probabilistic LLM decision-making. The model is an intellectual transformation engine within a disciplined harness, not a process dispatcher.
 7. **Declarative Invariants Over Imperative Steering**  

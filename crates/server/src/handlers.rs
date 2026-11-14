@@ -463,7 +463,7 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         (
             guard.config.resolve_model(&guard.selection),
             guard.config.repl.workflow,
-            guard.config.repl.protocol,
+            tauqe_protocol::EditProtocolKind::Structured,
             guard.config.available_models(),
         )
     };

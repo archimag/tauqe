@@ -232,18 +232,12 @@ impl DiscussionStreamFilter {
                 .and_then(|v| serde_json::from_value::<Vec<RepoSearchRequest>>(v.clone()).ok())
                 .unwrap_or_default();
 
-            let user_language = val
-                .get("user_language")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
             let mut response = DiscussionResponse {
                 message,
                 plan_update,
                 plan_update_error,
                 context_requests,
                 repo_searches,
-                user_language,
                 ..Default::default()
             };
             // Repository discovery requests survive the degraded decode through
@@ -260,12 +254,7 @@ impl DiscussionStreamFilter {
 
         // Non-JSON plain text fallback
         info!("Discussion response parsed as plain text fallback");
-        let searches = crate::edits::protocol::xml::tags::parse_repo_search_tags(raw);
-        let mut resp = DiscussionResponse::new(raw.trim());
-        if !searches.is_empty() {
-            resp.repo_searches = searches;
-        }
-        resp
+        DiscussionResponse::new(raw.trim())
     }
 
     fn sanitize_plan_update(resp: &mut DiscussionResponse) {
@@ -308,7 +297,7 @@ mod tests {
     #[test]
     fn test_discussion_stream_filter_character_by_character() {
         let mut filter = DiscussionStreamFilter::new();
-        let json = r#"{"message":"Hello developer! How can I help?","plan_update":null,"context_requests":[],"user_language":"Russian"}"#;
+        let json = r#"{"message":"Hello developer! How can I help?","plan_update":null,"context_requests":[]}"#;
 
         let mut streamed = String::new();
         for c in json.chars() {
@@ -329,7 +318,6 @@ mod tests {
 
         assert_eq!(streamed, "Hello developer! How can I help?");
         assert_eq!(response.message, "Hello developer! How can I help?");
-        assert_eq!(response.user_language.as_deref(), Some("Russian"));
         assert!(response.plan_update.is_none());
         assert!(response.context_requests.is_empty());
     }
@@ -337,7 +325,7 @@ mod tests {
     #[test]
     fn test_discussion_stream_filter_escaped_characters() {
         let mut filter = DiscussionStreamFilter::new();
-        let json = r#"{"message":"Line 1\nLine 2 with \"quotes\" and \\slash and \u0041","plan_update":null,"context_requests":[],"user_language":null}"#;
+        let json = r#"{"message":"Line 1\nLine 2 with \"quotes\" and \\slash and \u0041","plan_update":null,"context_requests":[]}"#;
 
         let mut streamed = String::new();
         for chunk in json.as_bytes().chunks(5) {
@@ -386,8 +374,7 @@ mod tests {
                     "path": "crates/core/src/lib.rs",
                     "access": "read_only"
                 }
-            ],
-            "user_language": "Russian"
+            ]
         })
         .to_string();
 
@@ -412,7 +399,6 @@ mod tests {
 
         assert_eq!(streamed, "Updating plan with new steps");
         assert_eq!(response.message, "Updating plan with new steps");
-        assert_eq!(response.user_language.as_deref(), Some("Russian"));
 
         let plan_update = response.plan_update.expect("plan_update must be present");
         assert_eq!(plan_update.action, DiscussionPlanAction::Update);
@@ -449,7 +435,7 @@ mod tests {
     #[test]
     fn test_discussion_stream_filter_markdown_fence() {
         let mut filter = DiscussionStreamFilter::new();
-        let raw = "```json\n{\"message\": \"Fenced response message\", \"plan_update\": null, \"context_requests\": [], \"user_language\": null}\n```";
+        let raw = "```json\n{\"message\": \"Fenced response message\", \"plan_update\": null, \"context_requests\": []}\n```";
 
         let mut streamed = String::new();
         for ev in filter.push_chunk(raw) {
@@ -528,8 +514,7 @@ mod tests {
     #[test]
     fn test_finish_does_not_leak_json_for_empty_message() {
         let mut filter = DiscussionStreamFilter::new();
-        let json =
-            r#"{"message":"","plan_update":null,"context_requests":[],"user_language":null}"#;
+        let json = r#"{"message":"","plan_update":null,"context_requests":[]}"#;
 
         let mut streamed = String::new();
         for c in json.chars() {
@@ -626,7 +611,7 @@ mod tests {
         filter.reset();
         let retried = concat!(
             "{\"message\":\"Second attempt\",\"plan_update\":null,",
-            "\"context_requests\":[],\"user_language\":null}"
+            "\"context_requests\":[]}"
         );
 
         let mut streamed = String::new();
@@ -645,6 +630,66 @@ mod tests {
         assert_eq!(
             filter.response().map(|response| response.message.as_str()),
             Some("Second attempt")
+        );
+    }
+    #[test]
+    fn test_discussion_filter_streams_the_field_inside_the_operational_branch() {
+        // The dialogue payload nests its text in the operational branch, so the
+        // filter must stream the field at the depth the branch gives it while the
+        // envelope itself stays hidden from the text channel.
+        let mut filter = DiscussionStreamFilter::new();
+        let json = concat!(
+            "{\"action\":{\"kind\":\"answer\",\"message\":\"Nested answer\"},",
+            "\"plan_update\":null,\"context_requests\":[]}"
+        );
+
+        let mut streamed = String::new();
+        for c in json.chars() {
+            for event in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(delta) = event {
+                    streamed.push_str(&delta);
+                }
+            }
+        }
+        for event in filter.finish_internal() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+
+        assert_eq!(streamed, "Nested answer");
+        assert!(!streamed.contains("action"), "{streamed}");
+    }
+
+    #[test]
+    fn test_error_message_never_becomes_the_response_channel() {
+        // The error channel is its own property: a failing round reports
+        // `error_message`, and the filter must never stream it as the answer.
+        let mut filter = DiscussionStreamFilter::new();
+        let payload = concat!(
+            "{\"message\":\"\",",
+            "\"action\":{\"kind\":\"edit\",\"changes\":[],",
+            "\"commit_message\":\"\",",
+            "\"error_message\":\"Missing dependency\",\"reason\":\"\"}}"
+        );
+
+        let mut streamed = String::new();
+        for c in payload.chars() {
+            for event in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(delta) = event {
+                    streamed.push_str(&delta);
+                }
+            }
+        }
+        for event in filter.finish_internal() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+
+        assert!(
+            streamed.is_empty(),
+            "the error channel must never reach the answer stream: {streamed}"
         );
     }
 }

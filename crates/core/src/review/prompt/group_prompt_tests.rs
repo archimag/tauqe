@@ -96,7 +96,7 @@ fn group_context_reaches_the_substep_prompt() {
     let prompt = crate::plan::prompt::format_plan_step_execution_prompt(
         &plan,
         "1",
-        EditProtocolKind::Xml,
+        EditProtocolKind::Structured,
         Some("M7"),
     )
     .expect("sub-step prompt");

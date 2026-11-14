@@ -534,7 +534,7 @@ mod tests {
             all_repo_files: Vec::new(),
             all_repo_files_revision: 1,
             workflow: tauqe_protocol::WorkflowKind::Git,
-            edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
+            edit_protocol: tauqe_protocol::EditProtocolKind::Structured,
             active_model: ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),

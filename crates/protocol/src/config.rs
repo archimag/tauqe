@@ -62,26 +62,14 @@ impl FromStr for WorkflowKind {
 
 /// Discrete edit protocol used to decode model output for a turn.
 ///
-/// Replaces the former free-form protocol string. `Structured` is the default
-/// and drives JSON-schema structured output, also known as the
-/// structured-output or JSON-schema mode. `Xml` drives the marker-tag edit
-/// protocol. `Mixed` is a two-contour mode that pairs both transports: XML for
-/// code edits, structured output for discussions, commit messages, and history
-/// compaction.
-///
-/// The choice is a transport decision only. The capabilities a turn exposes
-/// follow from its intent and the active discussion focus, never from the
-/// protocol, so both wire formats decode the same semantic command vocabulary.
+/// All turns interact with models exclusively via strict JSON-schema
+/// Structured Output (`response_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
 pub enum EditProtocolKind {
-    /// Marker-tag XML edit protocol.
-    Xml,
-    /// JSON-schema structured output protocol (default).
+    /// JSON-schema structured output protocol (default and only protocol).
     #[default]
     Structured,
-    /// Two-contour mode: XML for code edits, structured output elsewhere.
-    Mixed,
 }
 
 impl std::convert::TryFrom<String> for EditProtocolKind {
@@ -96,9 +84,7 @@ impl EditProtocolKind {
     /// Canonical lower-case identifier used on the wire.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Xml => "xml",
             Self::Structured => "structured",
-            Self::Mixed => "mixed",
         }
     }
 }
@@ -114,15 +100,11 @@ impl FromStr for EditProtocolKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "xml" => Ok(Self::Xml),
             "structured" => Ok(Self::Structured),
-            // `auto` is the historical name of the two-contour mode. It stays a
-            // permanent compatibility alias, so a configuration written before
-            // the rename keeps resolving to the same behavior instead of fading
-            // into a second code path.
-            "mixed" | "auto" => Ok(Self::Mixed),
+            // Backward compatibility aliases for reading older configurations
+            "xml" | "mixed" | "auto" => Ok(Self::Structured),
             other => Err(format!(
-                "Unknown edit protocol '{}'. Expected 'xml', 'structured' or 'mixed'",
+                "Unknown edit protocol '{}'. Expected 'structured'",
                 other
             )),
         }
@@ -361,7 +343,7 @@ mod tests {
     fn test_config_state_roles_serde() {
         let state = ConfigState {
             workflow: WorkflowKind::Git,
-            edit_protocol: EditProtocolKind::Xml,
+            edit_protocol: EditProtocolKind::Structured,
             model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
             selection: Some(ModelSelection::Role(ModelRole::Coder)),
             roles: Some(ModelRolesSummary {
@@ -375,7 +357,7 @@ mod tests {
             }),
             history_model: Some(ModelRef::openrouter("scribe-model")),
             available_workflows: vec![WorkflowKind::Git],
-            available_edit_protocols: vec![EditProtocolKind::Xml],
+            available_edit_protocols: vec![EditProtocolKind::Structured],
             available_models: vec![ModelRef::openrouter("coder-model")],
             review_presets: None,
         };
@@ -386,7 +368,7 @@ mod tests {
         let de: ConfigState = serde_json::from_str(&json).unwrap();
         assert_eq!(de.roles.unwrap().coder, ModelRef::openrouter("coder-model"));
         assert_eq!(de.workflow, WorkflowKind::Git);
-        assert_eq!(de.edit_protocol, EditProtocolKind::Xml);
+        assert_eq!(de.edit_protocol, EditProtocolKind::Structured);
     }
 
     #[test]
@@ -438,47 +420,24 @@ mod tests {
     #[test]
     fn test_edit_protocol_kind_serde_and_aliases() {
         assert_eq!(
-            serde_json::to_string(&EditProtocolKind::Xml).unwrap(),
-            "\"xml\""
-        );
-        assert_eq!(
             serde_json::to_string(&EditProtocolKind::Structured).unwrap(),
             "\"structured\""
         );
         assert_eq!(
-            serde_json::to_string(&EditProtocolKind::Mixed).unwrap(),
-            "\"mixed\""
+            serde_json::from_str::<EditProtocolKind>("\"structured\"").unwrap(),
+            EditProtocolKind::Structured
         );
-
         assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\"xml\"").unwrap(),
-            EditProtocolKind::Xml
+            EditProtocolKind::Structured
         );
-        // A retired spelling no longer names a wire protocol: only the
-        // canonical identifiers and the `auto` compatibility alias of the
-        // two-contour mode survive.
-        for retired in ["json", "json_schema", "structured_output"] {
-            let quoted = format!("\"{retired}\"");
-            assert!(
-                serde_json::from_str::<EditProtocolKind>(&quoted).is_err(),
-                "the retired spelling {quoted} must not name a protocol"
-            );
-        }
         assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\"mixed\"").unwrap(),
-            EditProtocolKind::Mixed
+            EditProtocolKind::Structured
         );
         assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\"auto\"").unwrap(),
-            EditProtocolKind::Mixed
-        );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\" AUTO \"").unwrap(),
-            EditProtocolKind::Mixed
-        );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\" XML \"").unwrap(),
-            EditProtocolKind::Xml
+            EditProtocolKind::Structured
         );
         assert!(serde_json::from_str::<EditProtocolKind>("\"yaml\"").is_err());
     }
@@ -486,30 +445,22 @@ mod tests {
     #[test]
     fn test_edit_protocol_kind_default_display_and_parsing() {
         assert_eq!(EditProtocolKind::default(), EditProtocolKind::Structured);
-        assert_eq!(EditProtocolKind::Xml.as_str(), "xml");
+        assert_eq!(EditProtocolKind::Structured.as_str(), "structured");
         assert_eq!(EditProtocolKind::Structured.to_string(), "structured");
-        assert_eq!(EditProtocolKind::Mixed.to_string(), "mixed");
         assert_eq!(
             "STRUCTURED".parse::<EditProtocolKind>().unwrap(),
             EditProtocolKind::Structured
         );
         assert_eq!(
+            "xml".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert_eq!(
             "mixed".parse::<EditProtocolKind>().unwrap(),
-            EditProtocolKind::Mixed
-        );
-        assert_eq!(
-            " MIXED ".parse::<EditProtocolKind>().unwrap(),
-            EditProtocolKind::Mixed
-        );
-        assert_eq!(
-            "auto".parse::<EditProtocolKind>().unwrap(),
-            EditProtocolKind::Mixed
-        );
-        assert_eq!(
-            " AUTO ".parse::<EditProtocolKind>().unwrap(),
-            EditProtocolKind::Mixed
+            EditProtocolKind::Structured
         );
         assert!("".parse::<EditProtocolKind>().is_err());
+        assert!("bogus".parse::<EditProtocolKind>().is_err());
     }
 
     #[test]
@@ -579,7 +530,7 @@ mod tests {
     fn config_state_without_presets() -> ConfigState {
         ConfigState {
             workflow: WorkflowKind::Git,
-            edit_protocol: EditProtocolKind::Mixed,
+            edit_protocol: EditProtocolKind::Structured,
             model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
             selection: None,
             roles: None,
@@ -648,7 +599,7 @@ mod tests {
 
         let legacy: LegacyConfigState = serde_json::from_str(&json).unwrap();
         assert_eq!(legacy.workflow, WorkflowKind::Git);
-        assert_eq!(legacy.edit_protocol, EditProtocolKind::Mixed);
+        assert_eq!(legacy.edit_protocol, EditProtocolKind::Structured);
         assert_eq!(
             legacy.model,
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")

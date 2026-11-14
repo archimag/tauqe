@@ -173,7 +173,9 @@ mod tests {
         apply_edit_proposal, stage_and_validate_edits, EditError, StagedEditsState,
     };
     use std::path::Path;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal};
+    use tauqe_protocol::{
+        ContextAccess, EditCreate, EditDelete, EditMove, EditOperation, EditProposal, EditReplace,
+    };
     use tempfile::tempdir;
 
     /// Names of the staging siblings currently present in `dir`.
@@ -192,11 +194,11 @@ mod tests {
     }
 
     fn replace(path: &str, old_text: &str, new_text: &str) -> EditOperation {
-        EditOperation::Replace {
+        EditOperation::Replace(EditReplace {
             path: path.to_string(),
             old_text: old_text.to_string(),
             new_text: new_text.to_string(),
-        }
+        })
     }
 
     #[tokio::test]
@@ -215,14 +217,14 @@ mod tests {
         let mut cm = ContextManager::new(root.to_path_buf());
         cm.add_file("old.rs", ContextAccess::Editable).unwrap();
 
-        let move_op = EditOperation::Move {
+        let move_op = EditOperation::Move(EditMove {
             from: "old.rs".into(),
             to: "new.rs".into(),
-        };
-        let failing_create = EditOperation::Create {
+        });
+        let failing_create = EditOperation::Create(EditCreate {
             path: "readonly_dir/new_file.rs".into(),
             content: "content".into(),
-        };
+        });
 
         let proposal = EditProposal {
             summary: "move and failing create".into(),
@@ -256,13 +258,13 @@ mod tests {
             summary: "multi".into(),
             edits: vec![
                 replace("a.rs", "one", "alpha"),
-                EditOperation::Create {
+                EditOperation::Create(EditCreate {
                     path: "c.rs".into(),
                     content: "gamma".into(),
-                },
-                EditOperation::Delete {
+                }),
+                EditOperation::Delete(EditDelete {
                     path: "b.rs".into(),
-                },
+                }),
             ],
         };
         let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
@@ -300,10 +302,10 @@ mod tests {
         let mut cm = ContextManager::new(repo_root.to_path_buf());
 
         // Attempt to create a file inside an escaping symlink directory
-        let create_op = EditOperation::Create {
+        let create_op = EditOperation::Create(EditCreate {
             path: "sym_dir/hacked.txt".into(),
             content: "payload".into(),
-        };
+        });
         let result =
             stage_and_validate_edits(repo_root, &cm, std::slice::from_ref(&create_op), None);
         assert!(!result.is_success());
@@ -323,11 +325,11 @@ mod tests {
         assert!(!outside_root.join("hacked.txt").exists());
 
         // Attempt to overwrite or replace a file via an escaping symlink
-        let replace_op = EditOperation::Replace {
+        let replace_op = EditOperation::Replace(EditReplace {
             path: "sym_file.txt".into(),
             old_text: "initial".into(),
             new_text: "modified".into(),
-        };
+        });
         let replace_res = stage_and_validate_edits(repo_root, &cm, &[replace_op], None);
         assert!(!replace_res.is_success());
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "initial");
@@ -349,10 +351,10 @@ mod tests {
 
         let mut cm = ContextManager::new(repo_root.to_path_buf());
 
-        let create_op = EditOperation::Create {
+        let create_op = EditOperation::Create(EditCreate {
             path: "dangling_dir/sub/hacked.txt".into(),
             content: "payload".into(),
-        };
+        });
         let result =
             stage_and_validate_edits(repo_root, &cm, std::slice::from_ref(&create_op), None);
         assert!(!result.is_success());

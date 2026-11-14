@@ -213,7 +213,7 @@ mod tests {
 
     use super::{ApplyPolicy, GitTransactionPolicy};
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, ProjectConfig};
+    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, EditReplace, ProjectConfig};
     use tokio::sync::watch;
 
     /// Project configuration the policy tests stage under: no formatter, no hook.
@@ -235,11 +235,11 @@ mod tests {
     }
 
     fn replace_edit() -> Vec<EditOperation> {
-        vec![EditOperation::Replace {
+        vec![EditOperation::Replace(EditReplace {
             path: "a.rs".to_string(),
             old_text: "one\n".to_string(),
             new_text: "two\n".to_string(),
-        }]
+        })]
     }
 
     #[tokio::test]
@@ -325,11 +325,11 @@ mod tests {
 
         let first = EditProposal {
             summary: "first attempt".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "one\n".to_string(),
                 new_text: "two\n".to_string(),
-            }],
+            })],
         };
         policy
             .apply_temporary(root, &project(), &mut cm, &first)
@@ -339,11 +339,11 @@ mod tests {
 
         let second = EditProposal {
             summary: "healing attempt".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "two\n".to_string(),
                 new_text: "three\n".to_string(),
-            }],
+            })],
         };
         policy
             .apply_temporary(root, &project(), &mut cm, &second)
@@ -376,11 +376,11 @@ mod tests {
 
         let first = EditProposal {
             summary: "first attempt".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "one\n".to_string(),
                 new_text: "two\n".to_string(),
-            }],
+            })],
         };
         policy
             .apply_temporary(root, &project(), &mut cm, &first)
@@ -389,11 +389,11 @@ mod tests {
 
         let second = EditProposal {
             summary: "healing attempt".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "two\n".to_string(),
                 new_text: "three\n".to_string(),
-            }],
+            })],
         };
         let changed = policy
             .apply_temporary(root, &project(), &mut cm, &second)
@@ -448,11 +448,11 @@ mod tests {
         // Attempt 2 (e.g. coder ladder escalation): Fresh checkpoint must be formed
         let second = EditProposal {
             summary: "escalated attempt".to_string(),
-            edits: vec![EditOperation::Replace {
+            edits: vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "developer edit\n".to_string(),
                 new_text: "three\n".to_string(),
-            }],
+            })],
         };
         let changed = policy
             .apply_temporary(root, &project(), &mut cm, &second)

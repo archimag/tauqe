@@ -216,17 +216,15 @@ the composite response schema of the capability registry, so the discussion
 message and the plan payload travel together in every contour and the plan change
 keeps one shape.
 
-Plan mutation belongs to exactly one turn regime. Whatever the contour, decoding
-narrows the advertised set to the capability surface of the declared intent: a
-dialogue anchored on a plan is mapped onto `TurnIntent::PlanDiscussion` and gains
-the plan-mutation delta that a plan discussion adds to the shared dialogue
-surface, while an interactive dialogue carries the dialogue head without plan
-mutation, whatever focus anchor is active. Asking for a new plan is not mutation
-— plan creation stays in the dialogue head, so a developer may request a plan at
-any moment of a dialogue, while changing an existing plan requires the
-plan-discussion regime. The delta travels in the leading block of the turn's
-trailing message, ahead of the plan snapshot itself, so refining the payload
-never moves the byte-stable head
+Plan mutation belongs to exactly one loop. Whatever the contour, decoding narrows the
+advertised set to the capability tree the dialogue loop declares: `repl_capability_expr`
+adds `PlanUpdate` when the dialogue is anchored on a plan and withholds it otherwise,
+so a free dialogue and a review-anchored dialogue carry the dialogue head without plan
+mutation. Asking for a new plan is not mutation — plan creation stays in the dialogue
+head, so a developer may request a plan at any moment of a dialogue, while changing an
+existing plan requires the plan-anchored surface. The active plan travels in the leading
+block of the turn's trailing message, so refining the payload never moves the byte-stable
+head
 ([The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md)).
 
 ### 2.6 The two mutation actions
@@ -438,7 +436,7 @@ that owns the horizon and hands one turn request to the seam. The daemon execute
    `files` as editable context and `readonly_files` as read-only reference context, and
    materializes the documents `outer_docs` names, which removes research latency for the
    material the plan already declared;
-2. it runs one streaming bounded turn under `TurnIntent::IsolatedStep`, as described in
+2. it runs one streaming bounded turn through `run_turn_loop`, as described in
    *The Autonomous Bounded Turn FSM*, with the whole concept tree and the completed
    milestones injected and the conversational history suppressed, so the turn reasons
    about the plan instead of the chat;
@@ -460,8 +458,8 @@ A budget breach is reported the same way.
 
 The pipeline then closes the lifecycle: the step becomes `Done` only if the turn
 succeeded — edits applied and the toolchain clean — or if the model declared completion
-through the active protocol: the terminal success tag of the XML contour, or an
-`outcome` field with status `success` in the structured contour. A prose-only answer
+through the active protocol: the terminal success tag of the XML contour, or the
+`commit_message` field of the structured contour. A prose-only answer
 without edits and without a protocol completion signal does not close the step.
 
 A step reports the phases of its turn while it runs. The turn phase, the
@@ -473,7 +471,7 @@ Injecting the whole concept tree is what makes the decision explicit to the
 executing model, and it is backed by two independent statements. The step prompt
 names the structures, libraries, interfaces, and concept invariants the step must
 not replace, and requires a blocked outcome when the step cannot be implemented
-inside them. The `IsolatedStep` system contract states the same prohibition as a
+inside them. The system contract of the bounded turn states the same prohibition as a
 rule of the environment, so the constraint does not depend on the step prompt
 remaining intact.
 
@@ -496,7 +494,7 @@ For the latter it re-runs the same step with a corrective prompt that echoes the
 previous answer, includes the diagnostic reason, and restates the active edit
 protocol in that protocol's own vocabulary: the XML contour asks for a valid edit
 block or the terminal success tag, while the structured contour asks for a `changes`
-array or an `outcome` with status `success`. Conversational text is never accepted in
+array or a `commit_message`. Conversational text is never accepted in
 place of a protocol operation.
 
 Between attempts the basis is reset deterministically: the failed turn's own file

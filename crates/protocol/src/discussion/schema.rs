@@ -1,50 +1,39 @@
-//! Strict JSON Schema for the discussion structured-output contract.
+//! Strict JSON Schemas of the plan and review structured-output payloads.
 //!
-//! The schema is written by hand instead of being derived, because
-//! `crates/protocol` is a dependency-free leaf crate: admitting a schema
-//! derivation dependency would violate its mandate (Conventions §2). To keep a
-//! single source of truth (Conventions §1.3), the schema is pinned to the
-//! authoritative Rust data model by `test_schema_matches_data_model`, which
-//! fails the build whenever a field, required key, enum variant, or numeric
-//! domain drifts away from `DiscussionResponse` and its nested types.
+//! The builders are written by hand instead of being derived, because the plan
+//! tree is unrolled into one definition per depth level instead of a cyclic
+//! `$ref`. To keep a single source of truth (Conventions §1.3), the builders are
+//! pinned to the authoritative Rust data model by the parity tests of this
+//! module, which fail the build whenever a field, required key, enum variant, or
+//! numeric domain drifts away from `DiscussionPlanUpdate`, `ConceptItem`,
+//! `PlanItem`, or `ReviewUpdateProposal`.
 //!
-//! Every schema is assembled once into a process-wide cache and served by
-//! shared reference, so a caller composes or serializes through the value the
-//! cache holds instead of paying a per-call deep copy of the tree. The
-//! accessors therefore return `&'static serde_json::Value`: a consumer that
-//! needs an owned tree clones the reference explicitly, and embedding one
-//! schema into another does exactly that once, while the cache is initialized.
-//! Property order is part of the wire contract: `message` must remain the first
-//! property so a language model emits the conversational answer before the
-//! heavier structural fields, letting the interface stream text immediately.
-//! That order survives only because the protocol crate enables `serde_json`'s
-//! `preserve_order` feature (see `crates/protocol/Cargo.toml`), which switches
-//! JSON objects from a `BTreeMap` to an insertion-ordered `IndexMap`. Dropping
-//! that feature would silently re-sort `properties` alphabetically and push
-//! `message` out of first position.
+//! The plan contract is split in two payloads: `plan_create` performs `save` and
+//! `plan_update` performs `update`. The plan branch of a composed surface wraps
+//! them in one discriminated union, so the two properties never share a level and
+//! never become simultaneously required; the discussion wire is composed from the
+//! capability tree this crate declares, never from a second flat schema.
+//!
+//! Every schema is assembled once into a process-wide cache and served by shared
+//! reference, so a caller composes or serializes through the value the cache
+//! holds instead of paying a per-call deep copy of the tree.
 
 use std::sync::OnceLock;
 
 use crate::plan::PlanItemStatus;
 use crate::review::{ReviewDecisionStatus, ReviewUpdateProposal};
 
-/// Process-wide cache of the assembled discussion schema.
-///
-/// The schema is immutable and depends only on compile-time structure, so it is
-/// assembled once and served by reference for the rest of the process.
-static DISCUSSION_RESPONSE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+/// Process-wide cache of the plan creation payload.
+static PLAN_CREATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
-/// Process-wide cache of the structured plan payload property.
+/// Process-wide cache of the plan mutation payload.
 static PLAN_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
-/// Process-wide cache of the shared definitions the plan payload references.
+/// Process-wide cache of the shared definitions the plan payloads reference.
 static PLAN_SCHEMA_DEFINITIONS: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Process-wide cache of the structured review decision property.
 static REVIEW_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
-
-/// Process-wide cache of the assembled structured-output wrapper.
-static DISCUSSION_RESPONSE_SCHEMA_DEFINITION: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Process-wide cache of the project custom tool invocation contract.
 static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
@@ -61,89 +50,97 @@ static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 /// silently truncated.
 pub const PLAN_TREE_DEPTH: usize = 3;
 
-/// Generates the structured plan payload property of the plan contract.
+/// Generates the plan creation payload of the plan contract.
 ///
-/// The plan shape is declared here once, beside the Rust plan model it mirrors,
-/// and every contour that can author a plan composes this builder: the
-/// discussion contract embeds it as its `plan_update` property and the
-/// code-modification contract re-exports it verbatim. A code-modification turn
-/// and a discussion turn therefore describe one identical plan, and no consumer
-/// re-declares the shape.
-///
-/// The property admits `null` because a turn that leaves the plan untouched
-/// carries no payload at all, which is the idle representation of a property
-/// the strict schema requires.
+/// `PlanCreation` owns this payload exclusively: its `action` admits `save`
+/// alone, so a response that creates or replaces a plan states it here instead of
+/// sharing one property with the mutation payload. The object carries no nullable
+/// wrapper, because the plan branch requires the payload its variant selects; a
+/// turn that leaves the plan untouched selects no plan branch at all.
 ///
 /// The payload is assembled once and served by a shared reference, so a caller
 /// that composes or serializes it pays no per-call deep copy of the tree.
-/// Embedding it elsewhere clones the reference explicitly, which is why the
-/// accessor hands workspace consumers a `&'static serde_json::Value` instead of
-/// an owned tree.
+pub fn plan_create_schema() -> &'static serde_json::Value {
+    PLAN_CREATE_SCHEMA.get_or_init(|| {
+        plan_payload_schema(
+            "save",
+            "Action to perform: 'save' creates a plan or replaces its entire implementation tree (every step already in 'done' status must be reproduced verbatim, otherwise the completed-step immutability check rejects the mutation)",
+        )
+    })
+}
+
+/// Generates the plan mutation payload of the plan contract.
+///
+/// `PlanUpdate` owns this payload exclusively: its `action` admits `update`
+/// alone, so a response that patches an existing plan states it here. The object
+/// shares the field shape of [`plan_create_schema`] and differs only in the
+/// action it admits, so the two payloads can never drift apart.
 pub fn plan_update_schema() -> &'static serde_json::Value {
-    PLAN_UPDATE_SCHEMA
-        .get_or_init(|| {
-            // The collection descriptions state the fixed unroll depth, so the
-            // model knows the tree stops at the deepest level instead of
-            // guessing why a `children` array stays empty.
-            let concept_description = format!("Hierarchical architectural concept items (requirements, invariants, decisions), unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children. Mandatory when action is 'save' to establish the conceptual foundation.");
-            let items_description = format!("Hierarchical implementation plan items or steps, unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children; an 'update' action may add leaf steps only");
-            serde_json::json!({
+    PLAN_UPDATE_SCHEMA.get_or_init(|| {
+        plan_payload_schema(
+            "update",
+            "Action to perform: 'update' patches existing steps and concept nodes by ID and appends new leaf steps to the plan root",
+        )
+    })
+}
+
+/// Builds one plan payload object of the given action.
+///
+/// Both payloads carry the identical plan fields — `action`, `id`, `title`,
+/// `description`, `concept`, and `items` — and differ only in the action value
+/// they admit, so one builder declares the shape once and no field can drift
+/// between the two operations.
+fn plan_payload_schema(action: &str, action_description: &str) -> serde_json::Value {
+    let concept_description = format!("Hierarchical architectural concept items (requirements, invariants, decisions), unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children. Mandatory when action is 'save' to establish the conceptual foundation.");
+    let items_description = format!("Hierarchical implementation plan items or steps, unrolled to at most {PLAN_TREE_DEPTH} nesting levels: the deepest level admits no children; an 'update' action may add leaf steps only");
+    serde_json::json!({
+        "type": "object",
+        "description": "Structured plan payload carried by the plan branch of the response: the operation this payload performs together with the concept tree and the implementation steps of the plan",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [action],
+                "description": action_description
+            },
+            "id": {
                 "anyOf": [
-                    {
-                        "type": "object",
-                        "description": "Modifications or creation/deletion of plan items. Must be null unless the user explicitly requested to update or modify the plan.",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["update", "save", "delete"],
-                                "description": "Action to perform: 'save' to create a plan or to replace its entire implementation tree (every step already in 'done' status must be reproduced verbatim, otherwise the completed-step immutability check rejects the mutation); 'update' to patch existing steps and concept nodes by ID and to append new leaf steps to the plan root; 'delete' to remove the plan"
-                            },
-                            "id": {
-                                "anyOf": [
-                                    { "type": "string" },
-                                    { "type": "null" }
-                                ],
-                                "description": "Target plan identifier"
-                            },
-                            "title": {
-                                "anyOf": [
-                                    { "type": "string" },
-                                    { "type": "null" }
-                                ],
-                                "description": "Plan title"
-                            },
-                            "description": {
-                                "anyOf": [
-                                    { "type": "string" },
-                                    { "type": "null" }
-                                ],
-                                "description": "Plan description and architectural rationale"
-                            },
-                            "concept": {
-                                "type": "array",
-                                "description": concept_description,
-                                "items": {
-                                    "$ref": "#/$defs/ConceptItemL1"
-                                }
-                            },
-                            "items": {
-                                "type": "array",
-                                "description": items_description,
-                                "items": {
-                                    "$ref": "#/$defs/PlanItemL1"
-                                }
-                            }
-                        },
-                        "required": ["action", "id", "title", "description", "concept", "items"],
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "null"
-                    }
+                    { "type": "string" },
+                    { "type": "null" }
                 ],
-                "description": "Optional plan update or creation to be applied at the end of the turn"
-            })
-        })
+                "description": "Target plan identifier"
+            },
+            "title": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ],
+                "description": "Plan title"
+            },
+            "description": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ],
+                "description": "Plan description and architectural rationale"
+            },
+            "concept": {
+                "type": "array",
+                "description": concept_description,
+                "items": {
+                    "$ref": "#/$defs/ConceptItemL1"
+                }
+            },
+            "items": {
+                "type": "array",
+                "description": items_description,
+                "items": {
+                    "$ref": "#/$defs/PlanItemL1"
+                }
+            }
+        },
+        "required": ["action", "id", "title", "description", "concept", "items"],
+        "additionalProperties": false
+    })
 }
 
 /// Builds the `children` property one unrolled definition level declares.
@@ -294,7 +291,8 @@ fn plan_item_definition(level: usize) -> serde_json::Value {
     })
 }
 
-/// Generates the shared definitions [`plan_update_schema`] references.
+/// Generates the shared definitions [`plan_create_schema`] and
+/// [`plan_update_schema`] reference.
 ///
 /// A plan is a tree: concept nodes and implementation steps nest their own
 /// kind, but strict Structured Output mode rejects a definition that
@@ -342,10 +340,8 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
 /// Generates the structured review decision property of the review contract.
 ///
 /// The decision shape is declared here once, beside the Rust review model it
-/// mirrors, so both contours describe one identical payload: the discussion
-/// contract embeds it as its `review_update` property and the
-/// code-modification schema forwards the very same builder through its own
-/// capability module.
+/// mirrors, so every contour describes one identical payload: the capability
+/// schema forwards it for `ReviewUpdate`.
 ///
 /// The property admits `null` because a turn that records no decision carries no
 /// payload at all, which is the idle representation of a property the strict
@@ -458,137 +454,6 @@ fn review_decision_status_enum() -> serde_json::Value {
     )
 }
 
-/// Generates a strict JSON Schema representing `DiscussionResponse`.
-///
-/// Guarantees that the `message` string property is listed first in `properties`
-/// and `required` so language models emit conversational text before plan
-/// updates or context requests. That order survives only because the protocol
-/// crate enables `serde_json`'s `preserve_order` feature (see
-/// `crates/protocol/Cargo.toml`), which switches JSON objects from a
-/// `BTreeMap` to an insertion-ordered `IndexMap`. Dropping that feature would
-/// silently re-sort `properties` alphabetically and push `message` out of
-/// first position.
-///
-/// The schema is assembled once and served by a shared reference, so the
-/// discussion request path composes its payload by borrowing this value instead
-/// of deep-copying the whole tree, `$defs` included.
-pub fn discussion_response_schema() -> &'static serde_json::Value {
-    DISCUSSION_RESPONSE_SCHEMA
-        .get_or_init(|| {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Conversational response, reasoning, and answers formatted in Markdown. This field is streamed immediately to the user interface."
-                    },
-                    "plan_update": plan_update_schema().clone(),
-                    "review_update": review_update_schema().clone(),
-                    "context_requests": {
-                        "type": "array",
-                        "description": "Files to request into context for inspection or editable access",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Repository-relative file path"
-                                },
-                                "access": {
-                                    "type": "string",
-                                    "enum": ["read_only", "editable"],
-                                    "description": "Access level requested for the file (default: read_only)"
-                                }
-                            },
-                            "required": ["path", "access"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "repo_searches": {
-                        "type": "array",
-                        "description": "Repository search requests to find symbols or text patterns across files",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Repository-relative directory or file path to search within"
-                                },
-                                "regex": {
-                                    "type": "string",
-                                    "description": "Regular expression pattern to search for"
-                                }
-                            },
-                            "required": ["path", "regex"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "repo_dirs": {
-                        "anyOf": [
-                            { "type": "boolean" },
-                            { "type": "null" }
-                        ],
-                        "description": "Request the compact repository directory tree when the repository layout is still unknown; use null or false when the provided contours are sufficient"
-                    },
-                    "repo_maps": {
-                        "type": "array",
-                        "description": "Targeted symbol map requests for specific subsystems; each entry is a repository-relative directory or file prefix, and an empty string or '.' requests the whole repository",
-                        "items": {
-                            "type": "string"
-                        }
-                    },
-                    "dir_lists": {
-                        "type": "array",
-                        "description": "Directory content listing requests over the tracked repository files; each entry names a repository-relative directory prefix, and an empty string or '.' requests the repository root. The listing is shallow unless 'recursive' is true.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Repository-relative directory path, or an empty string for the repository root"
-                                },
-                                "recursive": {
-                                    "type": "boolean",
-                                    "description": "List every tracked file underneath the directory instead of only its direct children"
-                                }
-                            },
-                            "required": ["path", "recursive"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "user_language": {
-                        "anyOf": [
-                            { "type": "string" },
-                            { "type": "null" }
-                        ],
-                        "description": "Detected primary natural language of the user prompt"
-                    }
-                },
-                "required": ["message", "plan_update", "review_update", "context_requests", "repo_searches", "repo_dirs", "repo_maps", "dir_lists", "user_language"],
-                "additionalProperties": false,
-                "$defs": plan_schema_definitions().clone()
-            })
-        })
-}
-
-/// Generates the complete JSON schema wrapper object for OpenAI/OpenRouter
-/// structured outputs.
-///
-/// The wrapper embeds the whole discussion schema, so it is assembled once into
-/// its own process-wide cache and served by a shared reference: composing a
-/// request from it borrows the cached wrapper instead of rebuilding it and
-/// deep-copying the schema tree it carries.
-pub fn discussion_response_schema_definition() -> &'static serde_json::Value {
-    DISCUSSION_RESPONSE_SCHEMA_DEFINITION.get_or_init(|| {
-        serde_json::json!({
-            "name": "discussion_response",
-            "description": "Structured response for discussion and planning modes",
-            "strict": true,
-            "schema": discussion_response_schema().clone()
-        })
-    })
-}
-
 /// Generates the JSON Schema of a single project custom tool invocation.
 ///
 /// A custom tool is a command the project declares in `tauqe.toml`. The harness
@@ -627,105 +492,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        discussion_response_schema, discussion_response_schema_definition, plan_item_status_wire,
-        plan_schema_definitions, plan_update_schema, PLAN_TREE_DEPTH,
+        custom_tool_call_schema, plan_create_schema, plan_item_status_wire,
+        plan_schema_definitions, plan_update_schema, review_update_schema, PLAN_TREE_DEPTH,
     };
-    use crate::context::ContextAccess;
-    use crate::discussion::{DiscussionPlanAction, DiscussionResponse};
+    use crate::discussion::DiscussionResponse;
     use crate::plan::PlanItemStatus;
-    use crate::review::{IssueStatus, ReviewDecisionStatus, ReviewUpdateProposal};
-
-    #[test]
-    fn test_custom_tool_call_schema_pins_the_invocation_contract() {
-        let schema = super::custom_tool_call_schema();
-        // The contract is assembled once and served by a shared reference, so a
-        // repeated call observes the same allocation instead of a rebuilt tree.
-        assert!(std::ptr::eq(schema, super::custom_tool_call_schema()));
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["properties"]["name"]["type"], "string");
-        // The argument container is an object whose properties are declared by
-        // the project, so a custom tool can never carry a free-form command line.
-        assert_eq!(schema["properties"]["args"]["type"], "object");
-        let properties = schema["properties"]
-            .as_object()
-            .expect("properties object must exist");
-        assert_eq!(properties.len(), 2);
-
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .expect("required array must exist")
-            .iter()
-            .filter_map(|field| field.as_str())
-            .collect();
-        assert_eq!(required, ["name", "args"]);
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-    }
-
-    #[test]
-    fn test_message_is_first_property_in_schema() {
-        let schema = discussion_response_schema();
-        let properties = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties object must exist");
-
-        let first_key = properties.keys().next().expect("first property must exist");
-        assert_eq!(
-            first_key, "message",
-            "message MUST be the first property for streaming"
-        );
-
-        let schema_str = serde_json::to_string(&schema).unwrap();
-        let msg_idx = schema_str.find("\"message\"").expect("message found");
-        let plan_idx = schema_str
-            .find("\"plan_update\"")
-            .expect("plan_update found");
-        let review_idx = schema_str
-            .find("\"review_update\"")
-            .expect("review_update found");
-        let ctx_idx = schema_str
-            .find("\"context_requests\"")
-            .expect("context_requests found");
-        let search_idx = schema_str
-            .find("\"repo_searches\"")
-            .expect("repo_searches found");
-        let dirs_idx = schema_str.find("\"repo_dirs\"").expect("repo_dirs found");
-        let maps_idx = schema_str.find("\"repo_maps\"").expect("repo_maps found");
-        let lists_idx = schema_str.find("\"dir_lists\"").expect("dir_lists found");
-        let lang_idx = schema_str
-            .find("\"user_language\"")
-            .expect("user_language found");
-
-        assert!(msg_idx < plan_idx);
-        assert!(plan_idx < review_idx);
-        assert!(review_idx < ctx_idx);
-        assert!(ctx_idx < search_idx);
-        assert!(search_idx < dirs_idx);
-        assert!(dirs_idx < maps_idx);
-        assert!(maps_idx < lists_idx);
-        assert!(lists_idx < lang_idx);
-    }
-
-    /// Collects the property names a schema object declares.
-    fn declared_fields(node: &serde_json::Value) -> BTreeSet<String> {
-        node["properties"]
-            .as_object()
-            .map(|properties| properties.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Collects the property names a schema object requires.
-    fn required_fields(node: &serde_json::Value) -> BTreeSet<String> {
-        node["required"]
-            .as_array()
-            .map(|required| {
-                required
-                    .iter()
-                    .filter_map(|field| field.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
+    use crate::review::ReviewUpdateProposal;
 
     /// Declaring source of the plan model, embedded at compile time.
     ///
@@ -734,23 +506,8 @@ mod tests {
     /// `skip_serializing_if` stays visible to the comparison.
     const PLAN_ITEM_SOURCE: &str = include_str!("../plan/item.rs");
 
-    /// Declaring source of the discussion wire model.
+    /// Declaring source of the plan payload wire model.
     const DISCUSSION_SOURCE: &str = include_str!("../discussion.rs");
-
-    /// Declaring source of the review wire model.
-    const REVIEW_ITEM_SOURCE: &str = include_str!("../review/item.rs");
-
-    /// Every struct whose declared fields the discussion schema mirrors.
-    const SCHEMA_MIRRORED_STRUCTS: &[&str] = &[
-        "DiscussionResponse",
-        "DiscussionPlanUpdate",
-        "ReviewUpdateProposal",
-        "DiscussionContextRequest",
-        "RepoSearchRequest",
-        "DirListRequest",
-        "ConceptItem",
-        "PlanItem",
-    ];
 
     /// A deliberate divergence between a declared field and the schema.
     struct SchemaFieldExemption {
@@ -762,25 +519,17 @@ mod tests {
         reason: &'static str,
     }
 
-    /// Every divergence the model-facing structured-output contract may carry.
+    /// Every divergence the unrolled plan tree may carry.
     ///
     /// The schema declares `additionalProperties: false` under `strict: true`,
     /// so a property it omits can never be emitted by constrained decoding. A
     /// field is therefore withheld only when the model must not author it, and
     /// recording that intent here is what tells a maintainer apart from drift.
-    /// `test_schema_field_exemption_table_stays_honest` checks every entry
-    /// against both the declaration and the schema.
     const SCHEMA_FIELD_EXEMPTIONS: &[SchemaFieldExemption] = &[SchemaFieldExemption {
         struct_name: "PlanItem",
         field: "blocked_reason",
         reason: "harness-authored diagnostic: the bounded turn records why the step could not proceed, so the model never authors the field",
-    },
-    SchemaFieldExemption {
-        struct_name: "DiscussionResponse",
-        field: "plan_update_error",
-        reason: "decode-boundary diagnostic: the structured stream records why a present plan_update could not be honored, so the model never authors the field",
-    },
-    ];
+    }];
 
     /// Net count of square brackets a line opens.
     fn bracket_balance(line: &str) -> i32 {
@@ -861,18 +610,25 @@ mod tests {
         fields
     }
 
-    /// Embedded source that declares a struct the schema mirrors.
-    fn source_for_struct(struct_name: &str) -> &'static str {
-        match struct_name {
-            "DiscussionResponse"
-            | "DiscussionPlanUpdate"
-            | "DiscussionContextRequest"
-            | "RepoSearchRequest"
-            | "DirListRequest" => DISCUSSION_SOURCE,
-            "ConceptItem" | "PlanItem" => PLAN_ITEM_SOURCE,
-            "ReviewUpdateProposal" => REVIEW_ITEM_SOURCE,
-            other => panic!("no embedded source declares {other}"),
-        }
+    /// Collects the property names a schema object declares.
+    fn declared_fields(node: &serde_json::Value) -> BTreeSet<String> {
+        node["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Collects the property names a schema object requires.
+    fn required_fields(node: &serde_json::Value) -> BTreeSet<String> {
+        node["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(|field| field.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns every unrolled level definition of one plan tree kind.
@@ -897,31 +653,6 @@ mod tests {
             .unwrap_or_else(|| panic!("the plan tree declares {name}"))
     }
 
-    /// Schema objects that mirror one struct declaration.
-    ///
-    /// The plan tree is unrolled into one definition per depth level, so a
-    /// mirrored struct can name several schema objects: every level of the
-    /// kind is compared against the same Rust declaration.
-    fn schema_objects_for<'a>(
-        schema: &'a serde_json::Value,
-        struct_name: &str,
-    ) -> Vec<&'a serde_json::Value> {
-        match struct_name {
-            "DiscussionResponse" => vec![schema],
-            "DiscussionPlanUpdate" => vec![&schema["properties"]["plan_update"]["anyOf"][0]],
-            "ReviewUpdateProposal" => vec![&schema["properties"]["review_update"]["anyOf"][0]],
-            "DiscussionContextRequest" => vec![&schema["properties"]["context_requests"]["items"]],
-            "RepoSearchRequest" => vec![&schema["properties"]["repo_searches"]["items"]],
-            "DirListRequest" => vec![&schema["properties"]["dir_lists"]["items"]],
-            "ConceptItem" | "PlanItem" => {
-                let definitions = schema["$defs"]
-                    .as_object()
-                    .expect("the plan payload ships its shared definitions");
-                plan_definition_levels(definitions, struct_name)
-            }
-            other => panic!("no schema object mirrors {other}"),
-        }
-    }
     /// Declared fields of a struct minus the recorded exemptions.
     fn expected_schema_fields(source: &str, struct_name: &str) -> BTreeSet<String> {
         let declared = declared_struct_fields(source, struct_name);
@@ -942,79 +673,112 @@ mod tests {
             .collect()
     }
 
-    /// Asserts a schema object declares exactly `expected` and requires all of
-    /// it, which is what a strict structured-output contract means.
-    fn assert_strict_object(label: &str, node: &serde_json::Value, expected: &BTreeSet<String>) {
-        let (properties, required) = (declared_fields(node), required_fields(node));
-        assert_eq!(
-            &properties, expected,
-            "{label} must declare exactly the fields of its Rust struct minus the recorded exemptions"
-        );
-        assert_eq!(
-            required, properties,
-            "{label} is strict, so it must require every field it declares"
-        );
+    #[test]
+    fn test_custom_tool_call_schema_pins_the_invocation_contract() {
+        let schema = custom_tool_call_schema();
+        // The contract is assembled once and served by a shared reference, so a
+        // repeated call observes the same allocation instead of a rebuilt tree.
+        assert!(std::ptr::eq(schema, custom_tool_call_schema()));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        // The argument container is an object whose properties are declared by
+        // the project, so a custom tool can never carry a free-form command line.
+        assert_eq!(schema["properties"]["args"]["type"], "object");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("properties object must exist");
+        assert_eq!(properties.len(), 2);
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array must exist")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert_eq!(required, ["name", "args"]);
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 
-    /// A plan is authored by two contours, so its payload is generated once.
+    /// The plan contract is split in two payloads, and each of them mirrors the
+    /// single Rust payload model while owning its own action.
     ///
-    /// The discussion contract embeds the authoritative builders verbatim, and
-    /// the code-modification contract re-exports them, which is what makes one
-    /// definition of the plan shape serve both.
+    /// `plan_create` admits `save` alone and `plan_update` admits `update`
+    /// alone, so neither payload can express the other operation and a response
+    /// never carries two plan properties at one level. Both share the shape of
+    /// `DiscussionPlanUpdate`, so a field added to the Rust model must be added
+    /// here twice and cannot drift between the two operations.
     #[test]
-    fn test_plan_payload_is_generated_once() {
-        let schema = discussion_response_schema();
-        assert_eq!(&schema["properties"]["plan_update"], plan_update_schema());
-        assert_eq!(&schema["$defs"], plan_schema_definitions());
+    fn test_plan_payloads_mirror_the_plan_payload_model() {
+        let expected = declared_struct_fields(DISCUSSION_SOURCE, "DiscussionPlanUpdate");
+        assert!(!expected.is_empty());
 
-        let payload = plan_update_schema();
-        let variants = payload["anyOf"]
-            .as_array()
-            .expect("the plan payload is a nullable union");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[1]["type"], "null");
-
-        let object = &variants[0];
-        assert_eq!(object["type"], "object");
-        assert_eq!(object["additionalProperties"], serde_json::json!(false));
-        assert_eq!(
-            declared_fields(object),
-            required_fields(object),
-            "the payload requires exactly the fields it declares"
-        );
-        assert_eq!(
-            object["properties"]["concept"]["items"]["$ref"],
-            "#/$defs/ConceptItemL1"
-        );
-        assert_eq!(
-            object["properties"]["items"]["items"]["$ref"],
-            "#/$defs/PlanItemL1"
-        );
-
-        // The collection descriptions state the fixed unroll depth, so the
-        // model learns the tree boundary from the payload contract itself.
-        for field in ["concept", "items"] {
-            let description = object["properties"][field]["description"]
-                .as_str()
-                .expect("the collection property states the unroll depth");
-            assert!(
-                description.contains(&format!("at most {PLAN_TREE_DEPTH} nesting levels")),
-                "{description}"
+        for (label, payload, action) in [
+            ("plan_create", plan_create_schema(), "save"),
+            ("plan_update", plan_update_schema(), "update"),
+        ] {
+            assert_eq!(payload["type"], "object", "{label}");
+            assert_eq!(
+                payload["additionalProperties"],
+                serde_json::json!(false),
+                "{label}"
             );
+            assert_eq!(
+                declared_fields(payload),
+                expected,
+                "{label} must declare exactly the fields of DiscussionPlanUpdate"
+            );
+            assert_eq!(
+                required_fields(payload),
+                expected,
+                "{label} is strict, so it must require every field it declares"
+            );
+            assert_eq!(
+                payload["properties"]["action"]["enum"],
+                serde_json::json!([action]),
+                "{label} owns its own action"
+            );
+            assert_eq!(
+                payload["properties"]["concept"]["items"]["$ref"],
+                "#/$defs/ConceptItemL1"
+            );
+            assert_eq!(
+                payload["properties"]["items"]["items"]["$ref"],
+                "#/$defs/PlanItemL1"
+            );
+            for field in ["concept", "items"] {
+                let description = payload["properties"][field]["description"]
+                    .as_str()
+                    .expect("the collection property states the unroll depth");
+                assert!(
+                    description.contains(&format!("at most {PLAN_TREE_DEPTH} nesting levels")),
+                    "{description}"
+                );
+            }
         }
     }
 
-    /// The definitions mirror `ConceptItem` and `PlanItem`, including `children`.
-    /// The unrolled definitions mirror `ConceptItem` and `PlanItem` at every
-    /// level.
-    ///
+    #[test]
+    fn test_plan_payloads_are_cached_and_distinct() {
+        // Each payload is assembled once and served by a shared reference.
+        assert!(std::ptr::eq(plan_create_schema(), plan_create_schema()));
+        assert!(std::ptr::eq(plan_update_schema(), plan_update_schema()));
+
+        // The two builders describe different operations, so their action
+        // vocabularies never coincide.
+        assert_ne!(plan_create_schema(), plan_update_schema());
+        assert_ne!(
+            plan_create_schema()["properties"]["action"]["enum"],
+            plan_update_schema()["properties"]["action"]["enum"]
+        );
+    }
+
     /// The definitions are grouped by kind — every concept level, then every
-    /// step level — and each level requires exactly the fields its Rust struct
-    /// declares. A level above the deepest chains `children` to the next level
-    /// of its own kind, and the deepest level seals the array, so the
-    /// reference chain is acyclic and the tree stops exactly where the schema
-    /// says it stops. The `status` enum is generated from the Rust model, and
-    /// its spellings are the spellings serde actually emits.
+    /// step level — and each level requires exactly the fields it declares. A
+    /// level above the deepest chains `children` to the next level of its own
+    /// kind, and the deepest level seals the array, so the reference chain is
+    /// acyclic and the tree stops exactly where the schema says it stops. The
+    /// `status` enum is generated from the Rust model, and its spellings are the
+    /// spellings serde actually emits.
     #[test]
     fn test_plan_definitions_mirror_the_plan_model() {
         // The calibration fixes the unrolled depth, so changing it is an
@@ -1181,7 +945,6 @@ mod tests {
     }
 
     /// The status property states the lifecycle barrier the storage enforces.
-    /// The status property states the lifecycle barrier the storage enforces.
     ///
     /// The enum admits every state a step can reach, while a mutation may
     /// introduce a step only as `todo` or `discussion`. The description carries
@@ -1207,208 +970,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_schema_definition_wrapper() {
-        let def = discussion_response_schema_definition();
-        assert_eq!(def["name"], "discussion_response");
-        assert_eq!(def["strict"], true);
-        assert!(def["schema"].is_object());
-    }
-
-    /// Pins the strict JSON Schema to the authoritative Rust data model.
+    /// Every level of the unrolled tree declares exactly the fields of the Rust
+    /// struct its kind mirrors, minus the recorded exemptions.
     ///
-    /// Every schema object must declare exactly the fields its Rust struct
-    /// declares, minus the divergences recorded in `SCHEMA_FIELD_EXEMPTIONS`,
-    /// and must require every field it declares. The declared fields are
-    /// enumerated from their sources instead of from a serialized fixture:
-    /// `skip_serializing_if` hides an absent `Option` from a fixture, which
-    /// would let the schema omit a declared field while the comparison stayed
-    /// green.
+    /// The mirror is checked against the declarations themselves, so a field
+    /// hidden from a fixture by `skip_serializing_if` stays visible, and a
+    /// recorded exemption must still name a declared field that the schema still
+    /// withholds — an entry that stopped diverging fails here instead of silently
+    /// widening the blind spot it was meant to record.
     #[test]
-    fn test_schema_matches_data_model() {
-        let schema = discussion_response_schema();
+    fn test_plan_tree_definitions_mirror_the_item_models() {
+        let definitions = plan_schema_definitions();
+        let map = definitions
+            .as_object()
+            .expect("the unrolled definitions are an object");
 
-        // 1. Every mirrored struct is compared against its own declaration, so
-        // 1. Every mirrored struct is compared against its own declaration, so
-        //    a field the schema withholds is either recorded as a deliberate
-        //    exemption or reported as drift. The unrolled plan tree mirrors one
-        //    struct at several depths, and every level is held to the same
-        //    contract.
-        for struct_name in SCHEMA_MIRRORED_STRUCTS {
-            let expected = expected_schema_fields(source_for_struct(struct_name), struct_name);
-            for object in schema_objects_for(schema, struct_name) {
-                assert_strict_object(struct_name, object, &expected);
-            }
-        }
-        // 2. The fields without an object shape carry their own contracts:
-        //    repo_dirs is a nullable boolean and repo_maps is a path array.
-        let dir_variants = schema["properties"]["repo_dirs"]["anyOf"]
-            .as_array()
-            .expect("repo_dirs anyOf array");
-        assert!(dir_variants.iter().any(|v| v["type"] == "boolean"));
-        assert!(dir_variants.iter().any(|v| v["type"] == "null"));
-        assert_eq!(schema["properties"]["repo_maps"]["type"], "array");
-        assert_eq!(schema["properties"]["repo_maps"]["items"]["type"], "string");
-
-        // 3. Every PlanItemStatus variant must be expressible in the status enum.
-        // 3. Every PlanItemStatus variant must be expressible in the status
-        //    enum of every unrolled step level.
-        for object in schema_objects_for(schema, "PlanItem") {
-            let status_enum: BTreeSet<String> = object["properties"]["status"]["enum"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for status in [
-                PlanItemStatus::Discussion,
-                PlanItemStatus::Todo,
-                PlanItemStatus::InProgress,
-                PlanItemStatus::Done,
-                PlanItemStatus::Blocked,
-                PlanItemStatus::Cancelled,
-            ] {
-                let wire = serde_json::to_value(status).unwrap();
-                let wire = wire.as_str().unwrap();
-                assert!(
-                    status_enum.contains(wire),
-                    "status enum is missing variant {wire}"
+        for struct_name in ["ConceptItem", "PlanItem"] {
+            let expected = expected_schema_fields(PLAN_ITEM_SOURCE, struct_name);
+            for level in 1..=PLAN_TREE_DEPTH {
+                let node = plan_definition_level(map, struct_name, level);
+                assert_eq!(
+                    declared_fields(node),
+                    expected,
+                    "{struct_name}L{level} declares exactly the fields of {struct_name}"
+                );
+                assert_eq!(
+                    required_fields(node),
+                    expected,
+                    "{struct_name}L{level} is strict, so it requires every field it declares"
                 );
             }
-        }
-        // 4. Every DiscussionPlanAction variant must be expressible in the
-        //    plan_update.action enum.
-        let action_enum: BTreeSet<String> = schema["properties"]["plan_update"]["anyOf"][0]
-            ["properties"]["action"]["enum"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for action in [
-            DiscussionPlanAction::Update,
-            DiscussionPlanAction::Save,
-            DiscussionPlanAction::Delete,
-        ] {
-            let wire = serde_json::to_value(action).unwrap();
-            let wire = wire.as_str().unwrap();
-            assert!(
-                action_enum.contains(wire),
-                "plan_update.action enum is missing variant {wire}"
-            );
-        }
-
-        // 5. Every decision a discussion may record is expressible in the
-        //    review_update.status enum, and no status owned by verification or
-        //    by execution is.
-        let decision_enum: BTreeSet<String> = schema["properties"]["review_update"]["anyOf"][0]
-            ["properties"]["status"]["enum"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for decision in [
-            ReviewDecisionStatus::Todo,
-            ReviewDecisionStatus::Skipped,
-            ReviewDecisionStatus::Rejected,
-        ] {
-            assert!(
-                decision_enum.contains(decision.as_str()),
-                "review_update.status enum is missing variant {decision:?}"
-            );
-        }
-        for status in [
-            IssueStatus::Discussion,
-            IssueStatus::InProgress,
-            IssueStatus::Fixed,
-        ] {
-            assert!(
-                !decision_enum.contains(status.as_str()),
-                "review_update.status enum must not admit {status:?}"
-            );
-        }
-
-        // 6. Every ContextAccess variant must be expressible in the
-        //    context_requests.access enum.
-        let access_enum: BTreeSet<String> = schema["properties"]["context_requests"]["items"]
-            ["properties"]["access"]["enum"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for access in [ContextAccess::ReadOnly, ContextAccess::Editable] {
-            let wire = serde_json::to_value(access).unwrap();
-            let wire = wire.as_str().unwrap();
-            assert!(
-                access_enum.contains(&*wire.to_string()),
-                "context_requests.access enum is missing variant {wire}"
-            );
-        }
-    }
-
-    /// A recorded divergence must still be a divergence, and still declared.
-    ///
-    /// An exemption is only meaningful while the field it names exists in the
-    /// declaration and is genuinely absent from the schema. Once the field
-    /// disappears or the schema starts publishing it, this test fails and the
-    /// entry must be retired instead of silently widening the blind spot it
-    /// was meant to record.
-    #[test]
-    fn test_schema_field_exemption_table_stays_honest() {
-        let schema = discussion_response_schema();
-        for exemption in SCHEMA_FIELD_EXEMPTIONS {
-            assert!(
-                !exemption.reason.trim().is_empty(),
-                "{}.{} is exempted without a reason, so its omission cannot be told apart from drift",
-                exemption.struct_name,
-                exemption.field
-            );
-            let declared = declared_struct_fields(
-                source_for_struct(exemption.struct_name),
-                exemption.struct_name,
-            );
-            assert!(
-                declared.contains(exemption.field),
-                "{}.{} is exempted but no longer declared",
-                exemption.struct_name,
-                exemption.field
-            );
-            for object in schema_objects_for(schema, exemption.struct_name) {
-                let properties = declared_fields(object);
+            for exemption in SCHEMA_FIELD_EXEMPTIONS
+                .iter()
+                .filter(|exemption| exemption.struct_name == struct_name)
+            {
                 assert!(
-                    !properties.contains(exemption.field),
-                    "{}.{} is published by the schema again, so its exemption must be retired",
-                    exemption.struct_name,
+                    !exemption.reason.trim().is_empty(),
+                    "{struct_name}.{} is exempted without a reason, so its omission cannot be told apart from drift",
                     exemption.field
                 );
+                for level in 1..=PLAN_TREE_DEPTH {
+                    let node = plan_definition_level(map, struct_name, level);
+                    assert!(
+                        !declared_fields(node).contains(exemption.field),
+                        "{struct_name}.{} is published by the schema again, so its exemption must be retired",
+                        exemption.field
+                    );
+                }
             }
         }
     }
 
-    /// The decision payload is authored by two contours, so it is declared once.
-    ///
-    /// The discussion contract embeds the authoritative builder verbatim, and
-    /// the code-modification schema forwards the same builder, which is what
-    /// makes one definition of the decision serve both.
+    /// The decision payload is declared once, from the typed model.
     #[test]
-    fn test_review_payload_is_generated_once() {
-        let schema = discussion_response_schema();
-        assert_eq!(
-            &schema["properties"]["review_update"],
-            super::review_update_schema()
-        );
-
-        let payload = super::review_update_schema();
+    fn test_review_payload_is_declared_once() {
+        let payload = review_update_schema();
         let variants = payload["anyOf"]
             .as_array()
             .expect("the review payload is a nullable union");
@@ -1469,13 +1085,12 @@ mod tests {
     ///
     /// A bare `integer` admits values the typed decoder rejects, and because the
     /// whole response is decoded as one unit, one such value discards the entire
-    /// turn output: the message, the plan update, and every discovery request
-    /// travel together with the offending field. The bounds are therefore read
-    /// from the field they describe instead of being restated here.
+    /// turn output. The bounds are therefore read from the field they describe
+    /// instead of being restated here.
     #[test]
     fn test_review_item_id_is_bounded_by_the_domain_of_its_field() {
-        let schema = discussion_response_schema();
-        let review_update = &schema["properties"]["review_update"]["anyOf"][0];
+        let payload = review_update_schema();
+        let review_update = &payload["anyOf"][0];
         let item_id = &review_update["properties"]["item_id"];
 
         assert_eq!(item_id["type"], "integer");

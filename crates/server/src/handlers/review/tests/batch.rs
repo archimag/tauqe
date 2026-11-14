@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use super::{
-    architecture_edit, init_repo_with_file, make_tasks, save_grouped_session, subplan_item,
-    test_config, test_item, test_session, test_state, test_state_with_provider, TestDir,
+    init_repo_with_file, make_tasks, save_grouped_session, subplan_item, test_config, test_item,
+    test_session, test_state, test_state_with_provider, TestDir,
 };
 
 use super::super::batch::{
@@ -48,11 +48,36 @@ fn stored_statuses(dir: &TestDir, review_id: &str) -> Vec<IssueStatus> {
         .unwrap()
         .expect("the session is stored")
         .items
-        .iter()
+        .into_iter()
         .map(|item| item.status)
         .collect()
 }
 
+fn json_edit_response(content: &str) -> String {
+    serde_json::json!({
+        "message": "Applied architecture fix",
+        "action": {
+            "kind": "edit",
+            "changes": [
+                {
+                    "op": "replace",
+                    "path": "src/target.rs",
+                    "to": "",
+                    "start": "",
+                    "end": "",
+                    "old_text": "pub fn target() {}\n",
+                    "new_text": format!("{content}\n"),
+                    "content": ""
+                }
+            ],
+            "commit_message": "Fix architecture issue",
+            "message": "",
+            "reason": ""
+        },
+        "scratchpad": ""
+    })
+    .to_string()
+}
 /// A member the queue cannot run stops it: without credentials the first turn
 /// never starts, so the second member is never scheduled.
 #[tokio::test]
@@ -159,12 +184,10 @@ async fn batch_dispatches_a_group_member_through_the_implementation_pipeline() {
         )],
     );
 
-    let marker = "REVIEWGROUPRUN1";
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
-        architecture_edit(marker, "pub fn target() { let value = 9; }"),
+        json_edit_response("pub fn target() { let value = 9; }"),
     )]));
     let state = test_state_with_provider(&dir, test_config(), provider).await;
-    *state.marker_override.lock().await = Some(marker.to_string());
 
     let operation = Arc::new(
         state
@@ -277,13 +300,12 @@ async fn event_state(
     dir: &TestDir,
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
-    marker: &str,
+    _marker: &str,
 ) -> (Arc<AppState>, mpsc::UnboundedReceiver<String>) {
     let (out, rx) = OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), history_sender, out);
     *state.provider_override.lock().await = Some(provider);
-    *state.marker_override.lock().await = Some(marker.to_string());
     (state, rx)
 }
 
@@ -325,11 +347,10 @@ async fn batch_publishes_the_lifecycle_of_a_single_finding_run() {
     init_repo_with_file(&dir, "src/target.rs");
     save_session(&dir, "rev-lifecycle", &[IssueStatus::Todo]);
 
-    let marker = "REVIEWLIFECYCLE1";
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
-        architecture_edit(marker, "pub fn target() { let value = 9; }"),
+        json_edit_response("pub fn target() { let value = 9; }"),
     )]));
-    let (state, mut event_rx) = event_state(&dir, test_config(), provider, marker).await;
+    let (state, mut event_rx) = event_state(&dir, test_config(), provider, "").await;
 
     let operation = Arc::new(
         state
@@ -458,11 +479,10 @@ async fn batch_publishes_the_lifecycle_of_a_group_member_run() {
         )],
     );
 
-    let marker = "REVIEWGROUPLIFECYCLE1";
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
-        architecture_edit(marker, "pub fn target() { let value = 9; }"),
+        json_edit_response("pub fn target() { let value = 9; }"),
     )]));
-    let (state, mut event_rx) = event_state(&dir, test_config(), provider, marker).await;
+    let (state, mut event_rx) = event_state(&dir, test_config(), provider, "").await;
 
     let operation = Arc::new(
         state

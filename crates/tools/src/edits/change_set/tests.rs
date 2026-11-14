@@ -8,7 +8,10 @@
 
 use std::path::Path;
 
-use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
+use tauqe_protocol::{
+    ContextAccess, ContextItem, ContextLayer, EditCreate, EditDelete, EditMove, EditMoveDir,
+    EditOverwrite, EditReplace,
+};
 
 use super::*;
 
@@ -115,13 +118,13 @@ fn a_rename_takes_a_destination_the_same_change_set_deletes() {
     write(root, "b.txt", "from b\n");
 
     let edits = [
-        EditOperation::Delete {
+        EditOperation::Delete(EditDelete {
             path: "b.txt".to_string(),
-        },
-        EditOperation::Move {
+        }),
+        EditOperation::Move(EditMove {
             from: "a.txt".to_string(),
             to: "b.txt".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -165,13 +168,13 @@ fn a_directory_move_takes_a_destination_the_same_change_set_deletes() {
     track_all(root);
 
     let edits = [
-        EditOperation::Delete {
+        EditOperation::Delete(EditDelete {
             path: "src/new/moved.rs".to_string(),
-        },
-        EditOperation::MoveDir {
+        }),
+        EditOperation::MoveDir(EditMoveDir {
             from: "src/old".to_string(),
             to: "src/new".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -213,10 +216,10 @@ fn a_rename_onto_an_undeleted_existing_path_is_refused() {
     write(root, "a.txt", "from a\n");
     write(root, "b.txt", "from b\n");
 
-    let edits = [EditOperation::Move {
+    let edits = [EditOperation::Move(EditMove {
         from: "a.txt".to_string(),
         to: "b.txt".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -255,13 +258,13 @@ fn a_refused_directory_move_restores_exactly_the_addressed_paths() {
     track_all(root);
 
     let edits = [
-        EditOperation::Delete {
+        EditOperation::Delete(EditDelete {
             path: "src/new/a.rs".to_string(),
-        },
-        EditOperation::MoveDir {
+        }),
+        EditOperation::MoveDir(EditMoveDir {
             from: "src/old".to_string(),
             to: "src/new".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -308,10 +311,10 @@ fn a_large_directory_move_reports_every_relocated_path_once() {
     }
     track_all(root);
 
-    let edits = [EditOperation::MoveDir {
+    let edits = [EditOperation::MoveDir(EditMoveDir {
         from: "src/old".to_string(),
         to: "src/new".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -366,16 +369,16 @@ fn a_member_touching_a_refused_path_is_reported_with_the_earlier_reason() {
 
     let edits = [
         // `b.txt` is taken, so the rename is refused and claims both sides.
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "a.txt".to_string(),
             to: "b.txt".to_string(),
-        },
+        }),
         // The later member addresses the refused source, so it is refused too.
-        EditOperation::Replace {
+        EditOperation::Replace(EditReplace {
             path: "a.txt".to_string(),
             old_text: "from a\n".to_string(),
             new_text: "edited\n".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -432,15 +435,15 @@ fn a_refused_rename_claims_the_side_that_normalized() {
     let edits = [
         // The destination escapes the repository, so the rename never becomes
         // a member, yet both of its sides are claimed.
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "a.txt".to_string(),
             to: "../outside.txt".to_string(),
-        },
-        EditOperation::Replace {
+        }),
+        EditOperation::Replace(EditReplace {
             path: "a.txt".to_string(),
             old_text: "from a\n".to_string(),
             new_text: "edited\n".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -492,10 +495,10 @@ fn a_move_carries_a_binary_source_verbatim() {
     let binary: &[u8] = &[0x89, b'P', b'N', b'G', 0x00, 0xff];
     write_bytes(root, "assets/logo.png", binary);
 
-    let edits = [EditOperation::Move {
+    let edits = [EditOperation::Move(EditMove {
         from: "assets/logo.png".to_string(),
         to: "assets/brand/logo.png".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -541,10 +544,10 @@ fn a_directory_move_relocates_a_binary_member_verbatim() {
     write_bytes(root, "src/old/logo.bin", binary);
     track_all(root);
 
-    let edits = [EditOperation::MoveDir {
+    let edits = [EditOperation::MoveDir(EditMoveDir {
         from: "src/old".to_string(),
         to: "src/new".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -587,10 +590,10 @@ fn a_directory_move_relocates_a_quoting_sensitive_member() {
     }
     track_all(root);
 
-    let edits = [EditOperation::MoveDir {
+    let edits = [EditOperation::MoveDir(EditMoveDir {
         from: "src/old".to_string(),
         to: "src/new".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -637,22 +640,22 @@ fn a_replacement_addressing_a_binary_move_destination_is_refused() {
     write(root, "assets/notes.txt", "notes\n");
 
     let edits = [
-        EditOperation::Move {
+        EditOperation::Move(EditMove {
             from: "assets/logo.bin".to_string(),
             to: "assets/brand/logo.bin".to_string(),
-        },
-        EditOperation::Replace {
+        }),
+        EditOperation::Replace(EditReplace {
             path: "assets/brand/logo.bin".to_string(),
             old_text: "anything".to_string(),
             new_text: "replacement".to_string(),
-        },
-        EditOperation::Delete {
+        }),
+        EditOperation::Delete(EditDelete {
             path: "assets/notes.txt".to_string(),
-        },
-        EditOperation::Overwrite {
+        }),
+        EditOperation::Overwrite(EditOverwrite {
             path: "assets/brand/logo.bin".to_string(),
             content: "text".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -770,11 +773,11 @@ fn a_replacement_addressing_binary_staged_content_is_refused() {
         .staged_files
         .insert("assets/logo.bin".to_string(), binary);
 
-    let edits = [EditOperation::Replace {
+    let edits = [EditOperation::Replace(EditReplace {
         path: "assets/logo.bin".to_string(),
         old_text: "anything".to_string(),
         new_text: "replacement".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -828,10 +831,10 @@ fn a_refused_ignore_probe_refuses_a_create() {
     let dir = repository_with_unreadable_index();
     let root = dir.path();
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: "generated/build.log".into(),
         content: "artifact\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -872,10 +875,10 @@ fn a_refused_ignore_probe_refuses_a_sandbox_write_too() {
     let dir = repository_with_unreadable_index();
     let root = dir.path();
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: ".tauqe/mockups/prototype.rs".into(),
         content: "pub fn prototype() {}\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -906,10 +909,10 @@ fn an_uninspectable_target_admits_a_create() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: "generated.rs".into(),
         content: "pub fn generated() {}\n".into(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -938,22 +941,22 @@ fn a_refused_file_member_keeps_the_effect_of_an_earlier_member() {
     let root = dir.path();
 
     let edits = [
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "src/a.rs".to_string(),
             content: "pub fn a() {}\n".to_string(),
-        },
+        }),
         // The intervening member keeps the two operations on `src/a.rs` in
         // separate members, so the refusal below addresses content an earlier
         // member already staged.
-        EditOperation::Create {
+        EditOperation::Create(EditCreate {
             path: "src/b.rs".to_string(),
             content: "pub fn b() {}\n".to_string(),
-        },
-        EditOperation::Replace {
+        }),
+        EditOperation::Replace(EditReplace {
             path: "src/a.rs".to_string(),
             old_text: "pub fn missing() {}\n".to_string(),
             new_text: "pub fn replaced() {}\n".to_string(),
-        },
+        }),
     ];
     let result = stage_and_validate_edits(
         root,
@@ -999,10 +1002,10 @@ fn a_create_beneath_a_file_blocked_parent_is_refused() {
     let root = dir.path();
     write(root, "src/new", "not a directory\n");
 
-    let created = EditOperation::Create {
+    let created = EditOperation::Create(EditCreate {
         path: "src/new/a.rs".to_string(),
         content: "pub fn a() {}\n".to_string(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -1034,10 +1037,10 @@ fn an_overwrite_beneath_a_file_blocked_parent_is_refused() {
     let root = dir.path();
     write(root, "src/new", "not a directory\n");
 
-    let overwritten = EditOperation::Overwrite {
+    let overwritten = EditOperation::Overwrite(EditOverwrite {
         path: "src/new/a.rs".to_string(),
         content: "pub fn a() {}\n".to_string(),
-    };
+    });
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -1069,10 +1072,10 @@ fn a_rename_beneath_a_file_blocked_parent_is_refused() {
     write(root, "a.txt", "from a\n");
     write(root, "src/new", "not a directory\n");
 
-    let edits = [EditOperation::Move {
+    let edits = [EditOperation::Move(EditMove {
         from: "a.txt".to_string(),
         to: "src/new/a.txt".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),
@@ -1104,10 +1107,10 @@ fn a_directory_move_beneath_a_file_blocked_parent_is_refused() {
     write(root, "src/new", "not a directory\n");
     track_all(root);
 
-    let edits = [EditOperation::MoveDir {
+    let edits = [EditOperation::MoveDir(EditMoveDir {
         from: "src/old".to_string(),
         to: "src/new".to_string(),
-    }];
+    })];
     let result = stage_and_validate_edits(
         root,
         &ProjectConfig::default(),

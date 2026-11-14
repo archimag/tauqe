@@ -4,29 +4,24 @@
 //! discovery context enrichment via [`run_research_loop`], and code modification
 //! with toolchain verification via [`run_edit_loop`].
 
-use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand, TurnPhase};
+use tauqe_protocol::{CapabilityBranch, CapabilityExpr, LlmCapability, LlmCommand};
 
 use super::context::LoopContext;
-use super::edit::{run_edit_loop, EditLoopConfig, EDIT_CAPABILITIES};
 use super::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
-use super::research::{run_research_loop, ResearchLoopConfig, RESEARCH_CAPABILITIES};
-use crate::providers::StreamEvent;
-
+use super::turn::{run_turn_loop, TurnLoopConfig};
+use crate::prompt::TurnBrief;
 /// Configuration for the interactive REPL loop.
 #[derive(Debug, Clone, Default)]
 pub struct ReplLoopConfig {
-    /// Configuration for research and context expansion rounds.
-    pub research: ResearchLoopConfig,
-    /// Configuration for in-memory staging and toolchain verification.
-    pub edit: EditLoopConfig,
+    /// Configuration for the underlying bounded turn loop.
+    pub turn: TurnLoopConfig,
 }
 
 impl ReplLoopConfig {
     /// Creates REPL loop configuration from authoritative project configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
         Self {
-            research: ResearchLoopConfig::from_context(&config.context),
-            edit: EditLoopConfig::from_repl_config(&config.repl),
+            turn: TurnLoopConfig::from_app_config(config),
         }
     }
 }
@@ -35,32 +30,148 @@ impl ReplLoopConfig {
 pub const REPL_OWN_CAPABILITIES: &[LlmCapability] = &[
     LlmCapability::TextMessage,
     LlmCapability::PlanCreation,
-    LlmCapability::Outcome,
-    LlmCapability::UserLanguage,
+    LlmCapability::CommitMessage,
+    LlmCapability::TurnError,
+    LlmCapability::TurnSkip,
 ];
-
-/// Assembles the complete capability set supported by the interactive REPL loop
-/// from research, edits, conversational dialogue, plan creation, and optional
-/// focused capabilities (plan modification or review decisions).
-pub fn repl_capabilities(focus: Option<&tauqe_protocol::DiscussionTarget>) -> CapabilitySet {
-    let mut caps = CapabilitySet::from_slice(RESEARCH_CAPABILITIES);
-    for cap in EDIT_CAPABILITIES {
-        caps.insert(*cap);
-    }
-    for cap in REPL_OWN_CAPABILITIES {
-        caps.insert(*cap);
-    }
-    match focus {
-        Some(tauqe_protocol::DiscussionTarget::Plan { .. }) => {
-            caps.insert(LlmCapability::PlanUpdate);
-        }
+/// Builds the algebraic capability expression for the interactive REPL loop.
+///
+/// The dialogue contours share one head: a free dialogue composes it as is, a
+/// plan-anchored dialogue adds plan mutation, and a review-anchored dialogue
+/// adds the recorded review decision. The tree is composed here, so the
+/// capability surface of a dialogue is declared once beside the loop that
+/// drives it.
+pub fn repl_capability_expr(focus: Option<&tauqe_protocol::DiscussionTarget>) -> CapabilityExpr {
+    let (plan_update, review_decision) = match focus {
+        Some(tauqe_protocol::DiscussionTarget::Plan { .. }) => (true, false),
         Some(tauqe_protocol::DiscussionTarget::Review { .. })
-        | Some(tauqe_protocol::DiscussionTarget::ReviewGroup { .. }) => {
-            caps.insert(LlmCapability::ReviewUpdate);
-        }
-        None => {}
+        | Some(tauqe_protocol::DiscussionTarget::ReviewGroup { .. }) => (false, true),
+        None => (false, false),
+    };
+    dialogue_capability_expr(plan_update, review_decision)
+}
+
+/// Composes the capability surface every dialogue contour advertises.
+///
+/// The head is shared by construction, which is what keeps the provider prefix
+/// cache warm across focus switching. A focused regime declares the capability
+/// its focus authorizes beside that head: plan mutation joins the plan branch,
+/// and a recorded review decision opens a review branch of the same union, so a
+/// decision never widens the head its sibling contours render.
+pub(crate) fn dialogue_capability_expr(plan_update: bool, review_decision: bool) -> CapabilityExpr {
+    // The root of a dialogue carries only the working-memory channel: the
+    // conversational channel belongs to the branch a round selects, so one
+    // composed wire never declares two `message` properties.
+    let ambient = CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::Scratchpad)]);
+    let research = CapabilityBranch::new(
+        "research",
+        CapabilityExpr::set([
+            CapabilityExpr::leaf(LlmCapability::ShortDescription),
+            CapabilityExpr::leaf(LlmCapability::ContextRequest),
+            CapabilityExpr::leaf(LlmCapability::RepoSearch),
+            CapabilityExpr::leaf(LlmCapability::RepoDirs),
+            CapabilityExpr::leaf(LlmCapability::RepoMap),
+            CapabilityExpr::leaf(LlmCapability::DirList),
+            CapabilityExpr::leaf(LlmCapability::DocRequest),
+            CapabilityExpr::leaf(LlmCapability::OuterDocRequest),
+            CapabilityExpr::leaf(LlmCapability::CustomTools),
+        ]),
+    );
+    // A discovery round reports through the short description of the action it
+    // performs, while a round that acts on the working tree explains the change
+    // it proposes.
+    let edit = CapabilityBranch::new(
+        "edit",
+        CapabilityExpr::set([
+            CapabilityExpr::leaf(LlmCapability::TextMessage),
+            CapabilityExpr::leaf(LlmCapability::EditReplace),
+            CapabilityExpr::leaf(LlmCapability::EditCreate),
+            CapabilityExpr::leaf(LlmCapability::EditDelete),
+            CapabilityExpr::leaf(LlmCapability::EditMove),
+            CapabilityExpr::leaf(LlmCapability::EditMoveDir),
+            CapabilityExpr::leaf(LlmCapability::EditOverwrite),
+            CapabilityExpr::leaf(LlmCapability::ToolchainVerify),
+            CapabilityExpr::leaf(LlmCapability::CommitMessage),
+            CapabilityExpr::leaf(LlmCapability::TurnError),
+            CapabilityExpr::leaf(LlmCapability::TurnSkip),
+        ]),
+    );
+    // A dialogue anchored on a plan advertises both plan capabilities, so the
+    // branch wraps them in one discriminated union: their payloads never share a
+    // level and never become simultaneously required. A free dialogue
+    // advertises plan authorship alone and carries the leaf directly.
+    let plan_capabilities = if plan_update {
+        CapabilityExpr::any_of(
+            "plan_action",
+            [
+                CapabilityBranch::new("create", CapabilityExpr::leaf(LlmCapability::PlanCreation)),
+                CapabilityBranch::new("modify", CapabilityExpr::leaf(LlmCapability::PlanUpdate)),
+            ],
+        )
+    } else {
+        CapabilityExpr::leaf(LlmCapability::PlanCreation)
+    };
+    let plan = CapabilityBranch::new(
+        "plan",
+        CapabilityExpr::set([
+            CapabilityExpr::leaf(LlmCapability::ShortDescription),
+            plan_capabilities,
+            CapabilityExpr::leaf(LlmCapability::CommitMessage),
+            CapabilityExpr::leaf(LlmCapability::TurnError),
+            CapabilityExpr::leaf(LlmCapability::TurnSkip),
+        ]),
+    );
+    // The `answer` branch carries the conversational channel and nothing else,
+    // so a purely conversational round names the branch its message belongs to
+    // instead of smuggling itself through `plan` with an idle payload.
+    let answer = CapabilityBranch::new(
+        "answer",
+        CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]),
+    );
+    // A terminal signal owns its branch instead of riding beside a change set
+    // or a plan payload: one response states exactly one of them.
+    let blocked = CapabilityBranch::new(
+        "blocked",
+        CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::Blocked)]),
+    );
+    let abort = CapabilityBranch::new(
+        "abort",
+        CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::Abort)]),
+    );
+    let mut branches = vec![research, edit, plan, answer, blocked, abort];
+    if review_decision {
+        branches.push(CapabilityBranch::new(
+            "review",
+            CapabilityExpr::set([
+                CapabilityExpr::leaf(LlmCapability::TextMessage),
+                CapabilityExpr::leaf(LlmCapability::ReviewUpdate),
+                CapabilityExpr::leaf(LlmCapability::CommitMessage),
+                CapabilityExpr::leaf(LlmCapability::TurnError),
+                CapabilityExpr::leaf(LlmCapability::TurnSkip),
+            ]),
+        ));
     }
-    caps
+    CapabilityExpr::set([ambient, CapabilityExpr::any_of("action", branches)])
+}
+
+/// Appends one leaf to a capability tree without disturbing its branches.
+///
+/// A conjunction gains the leaf beside its existing children, so a contour that
+/// declared a branch structure keeps it; any other tree is wrapped in a
+/// conjunction with the leaf.
+pub(crate) fn append_leaf(expr: CapabilityExpr, capability: LlmCapability) -> CapabilityExpr {
+    match expr {
+        CapabilityExpr::Set(mut items) => {
+            items.push(CapabilityExpr::leaf(capability));
+            CapabilityExpr::Set(items)
+        }
+        other => CapabilityExpr::set([other, CapabilityExpr::leaf(capability)]),
+    }
+}
+
+/// Returns the capability tree supported by the interactive REPL loop.
+pub fn repl_capabilities(focus: Option<&tauqe_protocol::DiscussionTarget>) -> CapabilityExpr {
+    repl_capability_expr(focus)
 }
 pub struct ReplArtifact {
     /// Conversational response text addressed to the developer.
@@ -90,40 +201,17 @@ pub async fn run_repl_loop(
 
     let repl_caps = repl_capabilities(focus);
     let mut ctx = ctx.reborrow_with_capabilities(repl_caps);
-    // 1. Initial request to the model
-    ctx.events.emit(StreamEvent::TurnPhase {
-        phase: TurnPhase::Proposal,
-        round: Some(1),
-        max_rounds: None,
-        detail: Some("Awaiting initial response".into()),
-    });
+    // The dialogue owns its introductory brief: the loop that drives the turn
+    // declares the contour and the text it opens with.
+    ctx.set_turn_brief(Some(TurnBrief::dialogue()));
+    // 1. Run the turn loop (prompt -> research -> edit/verify/healing)
+    let turn_result = run_turn_loop(&mut ctx, None, &config.turn).await?;
 
-    let initial_envelope = ctx.request_round().await?;
-    // 2. Run research loop to handle discovery, doc requests, and custom tools
-    let research_result = run_research_loop(&mut ctx, initial_envelope, &config.research).await?;
-
-    let mut envelope = match research_result {
-        LoopResult::Success(success) => success.response,
+    let (mut envelope, turn_artifact) = match turn_result {
+        LoopResult::Success(success) => (success.response, success.value),
         LoopResult::Diverged(env) => return Ok(LoopResult::Diverged(env)),
         LoopResult::Exhausted(report) => return Ok(LoopResult::Exhausted(report)),
     };
-
-    // 3. Delegate to run_edit_loop if change set is present
-    let mut modified_paths = Vec::new();
-    let mut commit_hash = None;
-    if envelope.has(LlmCapability::FileEdits) {
-        let edit_result = run_edit_loop(&mut ctx, Some(envelope), &config.edit).await?;
-        match edit_result {
-            LoopResult::Success(edit_success) => {
-                modified_paths = edit_success.value.modified_paths;
-                commit_hash = edit_success.value.commit_hash;
-                envelope = edit_success.response;
-            }
-            LoopResult::Diverged(env) => return Ok(LoopResult::Diverged(env)),
-            LoopResult::Exhausted(report) => return Ok(LoopResult::Exhausted(report)),
-        }
-    }
-
     // 4. Drain remaining REPL capabilities (TextMessage, PlanCreation, PlanUpdate, ReviewUpdate)
     let message = extract_text_message(&mut envelope);
 
@@ -135,8 +223,11 @@ pub async fn run_repl_loop(
     // not the change set reached the disk. Draining it explicitly keeps the
     // anti-leak invariant meaningful: a capability REPL owns must never
     // survive the turn.
-    let _ = envelope.take(LlmCapability::Outcome);
-    // 5. Anti-leak invariant (§13.5): log any unhandled capabilities
+    let _ = envelope.take_any(&[
+        LlmCapability::CommitMessage,
+        LlmCapability::TurnError,
+        LlmCapability::TurnSkip,
+    ]);
     let remaining = envelope.remaining_capabilities();
     if !remaining.is_empty() {
         tracing::warn!(
@@ -149,13 +240,13 @@ pub async fn run_repl_loop(
     Ok(LoopResult::Success(LoopSuccess::new(
         ReplArtifact {
             message,
-            modified_paths,
+            modified_paths: turn_artifact.modified_paths,
             plans_applied,
             plan_rejections,
             plan_warnings,
             review_decisions_applied,
             envelope: envelope.clone(),
-            commit_hash,
+            commit_hash: turn_artifact.commit_hash,
         },
         envelope,
     )))
@@ -276,14 +367,24 @@ async fn apply_review_commands(
 }
 
 fn extract_text_message(envelope: &mut ResponseEnvelope) -> Option<String> {
-    let text_cmds = envelope.take(LlmCapability::TextMessage);
+    let mut text_cmds = envelope.take(LlmCapability::TextMessage);
+    text_cmds.extend(envelope.take(LlmCapability::ShortDescription));
     let mut combined = String::new();
     for cmd in text_cmds {
-        if let LlmCommand::Text { content } = cmd {
-            if !combined.is_empty() {
-                combined.push('\n');
+        match cmd {
+            LlmCommand::Text(command) => {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&command.content);
             }
-            combined.push_str(&content);
+            LlmCommand::ShortDescription(command) => {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&command.content);
+            }
+            _ => {}
         }
     }
     if combined.is_empty() {
@@ -298,10 +399,11 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::control::turn::{EDIT_CAPABILITIES, RESEARCH_CAPABILITIES};
+    use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{CapabilitySet, ContextAccess, ModelRef};
+    use tauqe_protocol::{ContextAccess, ModelRef};
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -309,8 +411,8 @@ mod tests {
         journal: TurnResearchJournal,
         provider: MockLlmProvider,
         model: ModelRef,
-        protocol: XmlPromptProtocol,
-        cache: crate::workflow::fsm::cache::TurnInputCache,
+        protocol: JsonPromptProtocol,
+        cache: crate::control::cache::TurnInputCache,
         cancel: CancellationToken,
         events: EventSink,
         policy: crate::workflow::git_policy::GitTransactionPolicy,
@@ -355,8 +457,8 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: XmlPromptProtocol,
-                cache: crate::workflow::fsm::cache::TurnInputCache::default(),
+                protocol: JsonPromptProtocol::edits(),
+                cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
                 policy: crate::workflow::git_policy::GitTransactionPolicy::new(),
@@ -364,12 +466,15 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilitySet::from_slice(&[
-                LlmCapability::TextMessage,
-                LlmCapability::FileEdits,
-                LlmCapability::Research,
-            ]);
-            let prompt_builder = super::super::prompt::PromptBuilder::new(
+            let caps = CapabilityExpr::set(
+                EDIT_CAPABILITIES
+                    .iter()
+                    .copied()
+                    .chain(RESEARCH_CAPABILITIES.iter().copied())
+                    .chain([LlmCapability::TextMessage])
+                    .map(CapabilityExpr::leaf),
+            );
+            let prompt_builder = crate::control::prompt::PromptBuilder::new(
                 &self.provider,
                 &self.model,
                 &self.protocol,
@@ -408,18 +513,28 @@ mod tests {
     async fn repl_loop_executes_edits_when_changes_present() {
         let mut fixture = Fixture::new(
             &[("hello.rs", "fn hello() {}\n")],
-            vec![MockResponse::text(concat!(
-                "<edits summary=\"Update hello\">\n",
-                "  <edit path=\"hello.rs\">\n",
-                "    <search>\n",
-                "fn hello() {}\n",
-                "    </search>\n",
-                "    <replace>\n",
-                "fn hello() -> i32 { 1 }\n",
-                "    </replace>\n",
-                "  </edit>\n",
-                "</edits>\n",
-            ))],
+            vec![MockResponse::text(
+                serde_json::json!({
+                    "message": "Update hello",
+                    "action": {
+                        "kind": "edit",
+                        "changes": [{
+                            "op": "replace",
+                            "path": "hello.rs",
+                            "to": "",
+                            "start": "",
+                            "end": "",
+                            "content": "",
+                            "old_text": "fn hello() {}\n",
+                            "new_text": "fn hello() -> i32 { 1 }\n"
+                        }],
+                        "commit_message": "Update hello",
+                        "message": "",
+                        "reason": ""
+                    }
+                })
+                .to_string(),
+            )],
         );
         let mut ctx = fixture.context();
 
@@ -439,19 +554,28 @@ mod tests {
     async fn repl_loop_commits_with_the_message_the_round_declared() {
         let mut fixture = Fixture::new(
             &[("hello.rs", "fn hello() {}\n")],
-            vec![MockResponse::text(concat!(
-                "<edits summary=\"Update hello\">\n",
-                "  <edit path=\"hello.rs\">\n",
-                "    <search>\n",
-                "fn hello() {}\n",
-                "    </search>\n",
-                "    <replace>\n",
-                "fn hello() -> i32 { 1 }\n",
-                "    </replace>\n",
-                "  </edit>\n",
-                "</edits>\n",
-                "<success>feat(hello): return a value</success>\n",
-            ))],
+            vec![MockResponse::text(
+                serde_json::json!({
+                    "message": "Update hello",
+                    "action": {
+                        "kind": "edit",
+                        "changes": [{
+                            "op": "replace",
+                            "path": "hello.rs",
+                            "to": "",
+                            "start": "",
+                            "end": "",
+                            "content": "",
+                            "old_text": "fn hello() {}\n",
+                            "new_text": "fn hello() -> i32 { 1 }\n"
+                        }],
+                        "commit_message": "feat(hello): return a value",
+                        "message": "",
+                        "reason": ""
+                    }
+                })
+                .to_string(),
+            )],
         );
         let mut ctx = fixture.context();
 
@@ -477,18 +601,28 @@ mod tests {
     async fn repl_loop_falls_back_to_default_summary_without_a_declared_message() {
         let mut fixture = Fixture::new(
             &[("hello.rs", "fn hello() {}\n")],
-            vec![MockResponse::text(concat!(
-                "<edits summary=\"Update hello\">\n",
-                "  <edit path=\"hello.rs\">\n",
-                "    <search>\n",
-                "fn hello() {}\n",
-                "    </search>\n",
-                "    <replace>\n",
-                "fn hello() -> i32 { 1 }\n",
-                "    </replace>\n",
-                "  </edit>\n",
-                "</edits>\n",
-            ))],
+            vec![MockResponse::text(
+                serde_json::json!({
+                    "message": "Update hello",
+                    "action": {
+                        "kind": "edit",
+                        "changes": [{
+                            "op": "replace",
+                            "path": "hello.rs",
+                            "to": "",
+                            "start": "",
+                            "end": "",
+                            "content": "",
+                            "old_text": "fn hello() {}\n",
+                            "new_text": "fn hello() -> i32 { 1 }\n"
+                        }],
+                        "commit_message": "REPL changes",
+                        "message": "",
+                        "reason": ""
+                    }
+                })
+                .to_string(),
+            )],
         );
         let mut ctx = fixture.context();
 
@@ -539,7 +673,7 @@ max_research_rounds = 8
         let app_config: crate::config::AppConfig =
             toml::from_str(toml_str).expect("parse app config");
         let repl_config = ReplLoopConfig::from_app_config(&app_config);
-        assert_eq!(repl_config.research.max_rounds, 8);
+        assert_eq!(repl_config.turn.research.max_rounds, 8);
     }
 
     #[test]
@@ -551,8 +685,8 @@ max_retries = 7
         let app_config: crate::config::AppConfig =
             toml::from_str(toml_str).expect("parse app config");
         let repl_config = ReplLoopConfig::from_app_config(&app_config);
-        assert_eq!(repl_config.edit.max_healing_rounds, 7);
-        assert_eq!(repl_config.edit.staging.max_retries, 7);
+        assert_eq!(repl_config.turn.edit.max_healing_rounds, 7);
+        assert_eq!(repl_config.turn.edit.staging.max_retries, 7);
     }
 
     #[tokio::test]
@@ -606,15 +740,42 @@ max_retries = 7
 
     #[tokio::test]
     async fn repl_loop_applies_plan_creation_in_repl_mode() {
-        let plan_xml = r#"
-<plan action="save" id="test-repl-plan" title="Test REPL Plan">
-  <concept>
-    <concept_item id="c-1" title="Concept 1" />
-  </concept>
-  <item id="1" title="Step 1" status="todo" files="src/step1.rs" />
-</plan>
-"#;
-        let mut fixture = Fixture::new(&[], vec![MockResponse::text(plan_xml)]);
+        let plan_json = serde_json::json!({
+            "message": "Test Plan",
+            "action": {
+                "kind": "plan",
+                "plan_create": {
+                    "action": "save",
+                    "id": "test-repl-plan",
+                    "title": "Test REPL Plan",
+                    "description": "description",
+                    "concept": [{
+                        "id": "c-1",
+                        "title": "Concept 1",
+                        "details": null,
+                        "children": []
+                    }],
+                    "items": [{
+                        "id": "1",
+                        "title": "Step 1",
+                        "details": null,
+                        "status": "todo",
+                        "commit": null,
+                        "files": ["src/step1.rs"],
+                        "readonly_files": [],
+                        "outer_docs": [],
+                        "concept_refs": [],
+                        "depends_on": [],
+                        "children": []
+                    }]
+                },
+                "commit_message": "create test plan",
+                "message": "",
+                "reason": ""
+            }
+        })
+        .to_string();
+        let mut fixture = Fixture::new(&[], vec![MockResponse::text(plan_json)]);
         let mut ctx = fixture.context();
 
         let outcome = run_repl_loop(&mut ctx, &ReplLoopConfig::default(), None)
@@ -638,8 +799,8 @@ max_retries = 7
         assert!(base.contains(LlmCapability::PlanCreation));
         assert!(!base.contains(LlmCapability::PlanUpdate));
         assert!(!base.contains(LlmCapability::ReviewUpdate));
-        assert!(!base.contains(LlmCapability::Blocked));
-        assert!(!base.contains(LlmCapability::Abort));
+        assert!(base.contains(LlmCapability::Blocked));
+        assert!(base.contains(LlmCapability::Abort));
 
         let plan_focus = tauqe_protocol::DiscussionTarget::Plan { id: "p1".into() };
         let with_plan = repl_capabilities(Some(&plan_focus));
@@ -652,5 +813,134 @@ max_retries = 7
         assert!(with_rev.contains(LlmCapability::PlanCreation));
         assert!(!with_rev.contains(LlmCapability::PlanUpdate));
         assert!(with_rev.contains(LlmCapability::ReviewUpdate));
+    }
+
+    #[test]
+    fn repl_capability_expr_branches_are_mutually_exclusive() {
+        let expr = repl_capability_expr(None);
+        let leaves = expr.leaves();
+        assert!(leaves.contains(&LlmCapability::TextMessage));
+        assert!(leaves.contains(&LlmCapability::EditReplace));
+        assert!(leaves.contains(&LlmCapability::PlanCreation));
+        assert!(leaves.contains(&LlmCapability::Blocked));
+        assert!(leaves.contains(&LlmCapability::Abort));
+        assert!(!leaves.contains(&LlmCapability::PlanUpdate));
+
+        let CapabilityExpr::Set(items) = expr else {
+            panic!("expected Set at root");
+        };
+        assert_eq!(items.len(), 2);
+        let CapabilityExpr::AnyOf(label, branches) = &items[1] else {
+            panic!("expected AnyOf for action branches");
+        };
+        assert_eq!(label, "action");
+        let kinds: Vec<&str> = branches.iter().map(|branch| branch.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["research", "edit", "plan", "answer", "blocked", "abort"]
+        );
+        // The answer branch owns the conversational channel, so a purely
+        // conversational round names the branch its message belongs to and the
+        // branch stays operational on its own.
+        assert_eq!(branches[3].expr.leaves(), vec![LlmCapability::TextMessage]);
+        // The terminal signals own single-leaf branches.
+        assert_eq!(branches[4].expr.leaves(), vec![LlmCapability::Blocked]);
+        assert_eq!(branches[5].expr.leaves(), vec![LlmCapability::Abort]);
+        let edit_leaves = branches[1].expr.leaves();
+        let plan_leaves = branches[2].expr.leaves();
+        assert!(edit_leaves.contains(&LlmCapability::EditReplace));
+        assert!(!edit_leaves.contains(&LlmCapability::PlanCreation));
+        assert!(!edit_leaves.contains(&LlmCapability::Blocked));
+        assert!(!edit_leaves.contains(&LlmCapability::Abort));
+        assert!(plan_leaves.contains(&LlmCapability::PlanCreation));
+        assert!(!plan_leaves.contains(&LlmCapability::EditReplace));
+        assert!(!plan_leaves.contains(&LlmCapability::Abort));
+    }
+
+    /// A dialogue anchored on a plan advertises both plan capabilities, so the
+    /// plan branch wraps them in one discriminated union: their payloads never
+    /// share a level and never become simultaneously required. A free dialogue
+    /// advertises plan authorship alone and carries the leaf directly.
+    #[test]
+    fn a_plan_focused_dialogue_wraps_the_plan_capabilities_in_one_union() {
+        let focused = repl_capability_expr(Some(&tauqe_protocol::DiscussionTarget::Plan {
+            id: "p1".into(),
+        }));
+        let CapabilityExpr::Set(items) = &focused else {
+            panic!("expected Set at root");
+        };
+        let CapabilityExpr::AnyOf(label, branches) = &items[1] else {
+            panic!("expected AnyOf for action branches");
+        };
+        assert_eq!(label, "action");
+        let plan = branches
+            .iter()
+            .find(|branch| branch.kind == "plan")
+            .expect("the plan branch is declared");
+        let CapabilityExpr::Set(children) = &plan.expr else {
+            panic!("expected Set for the plan branch");
+        };
+        let union = children
+            .iter()
+            .find_map(|child| match child {
+                CapabilityExpr::AnyOf(label, variants) if label == "plan_action" => Some(variants),
+                _ => None,
+            })
+            .expect("the plan branch wraps its payloads in one union");
+        let kinds: Vec<&str> = union.iter().map(|branch| branch.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["create", "modify"]);
+        assert_eq!(union[0].expr.leaves(), vec![LlmCapability::PlanCreation]);
+        assert_eq!(union[1].expr.leaves(), vec![LlmCapability::PlanUpdate]);
+
+        // A free dialogue advertises plan authorship alone, so its branch keeps
+        // the leaf instead of opening a union of a single variant.
+        let unfocused = repl_capability_expr(None);
+        assert!(unfocused.contains(LlmCapability::PlanCreation));
+        assert!(!unfocused.contains(LlmCapability::PlanUpdate));
+    }
+
+    #[test]
+    fn every_branch_that_carries_the_text_channel_survives_narrowing() {
+        // The conversational channel is operational, so a surface narrowed to
+        // the text capability keeps every branch that carries it — the answer
+        // of a dialogue and the explanation of a change set — instead of
+        // dropping them as exhausted foliage.
+        let narrowed = repl_capability_expr(None)
+            .filter(&|capability| capability == LlmCapability::TextMessage)
+            .expect("the narrowing keeps the branches that carry the text channel");
+        let branches = match &narrowed {
+            CapabilityExpr::Set(items) => match items.as_slice() {
+                [CapabilityExpr::AnyOf(_, branches)] => branches,
+                other => panic!("expected one branch envelope, got {other:?}"),
+            },
+            other => panic!("expected a conjunction at the root, got {other:?}"),
+        };
+        let kinds: Vec<&str> = branches.iter().map(|branch| branch.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["edit", "answer"]);
+        for branch in branches {
+            assert_eq!(branch.expr.leaves(), vec![LlmCapability::TextMessage]);
+        }
+    }
+
+    /// The loop owns the brief of its contour, so the assembled prompt opens
+    /// with the dialogue introduction and states the dialogue rules instead of
+    /// the scope of an isolated step.
+    #[tokio::test]
+    async fn repl_loop_assembles_the_dialogue_contour() {
+        let mut fixture = Fixture::new(&[], vec![MockResponse::text("OK")]);
+        let mut ctx = fixture.context();
+
+        let outcome = run_repl_loop(&mut ctx, &ReplLoopConfig::default(), None)
+            .await
+            .expect("runs loop");
+        assert!(outcome.is_success());
+
+        let requests = fixture.provider.requests();
+        assert_eq!(requests.len(), 1);
+        let system = &requests[0].messages[0].content;
+        assert!(system.contains("proactive engineering assistant"));
+        assert!(!system.contains("Tauqe Coder"));
+        assert!(system.contains("Action Authorization"));
+        assert!(!system.contains("Step Execution Scope"));
     }
 }

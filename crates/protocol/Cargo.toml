@@ -13,3 +13,8 @@ serde.workspace = true
 # observes the same unified feature set and this crate stays free of a
 # member-level feature declaration.
 serde_json.workspace = true
+# The strict response schema is derived from the command types, never written by
+# hand, so the schema a model is constrained by and the type the decoder reads
+# are one declaration. Generating a schema reads no file, spawns no process, and
+# opens no socket.
+schemars.workspace = true

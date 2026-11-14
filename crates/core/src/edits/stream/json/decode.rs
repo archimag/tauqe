@@ -97,7 +97,7 @@ enum LocatePhase {
     /// Scanning for the opening `{` of the payload.
     #[default]
     Header,
-    /// Walking the object body for the top-level key that names the field.
+    /// Walking the object body for the key that names the field.
     Body,
     /// The key matched; the `:` of its value is still to be read.
     Colon,
@@ -105,23 +105,35 @@ enum LocatePhase {
     Value,
 }
 
-/// Incremental locator for a top-level string field of a streaming JSON object.
+/// One container the field locator has entered.
+#[derive(Debug, Clone, Copy)]
+enum LocateContainer {
+    /// A JSON object; `expect_key` marks the next string as a key.
+    Object { expect_key: bool },
+    /// A JSON array.
+    Array,
+}
+
+/// Incremental locator for a string field of a streaming JSON object.
 ///
 /// The locator never re-reads a byte it has already classified: the scan offset,
-/// the brace depth, the key expectation, and the string and escape state all
+/// the open containers, the key expectation, and the string and escape state all
 /// travel between chunks. A field that appears late in the payload — after a large
 /// `changes` array, for instance — therefore costs one pass over the whole document
 /// instead of one pass per provider delta.
+///
+/// The key is resolved by the innermost open object rather than by a fixed nesting
+/// depth, so a payload that carries the field inside an operational branch envelope
+/// (`action.message`) streams exactly like a flat one: the filter never inspects the
+/// envelope it walks, and the branch structure of the response cannot hide the field.
 #[derive(Debug, Default)]
 struct FieldLocator {
     /// What the locator is currently looking for.
     phase: LocatePhase,
     /// Absolute offset of the next byte to classify.
     pos: usize,
-    /// Nesting depth relative to the opening `{` of the payload.
-    depth: usize,
-    /// Whether the next depth-1 string is an object key.
-    expect_key: bool,
+    /// Containers open around the current position, outermost first.
+    containers: Vec<LocateContainer>,
     /// Whether the locator is inside a string literal.
     in_string: bool,
     /// Absolute offset of the opening quote of the string being scanned.
@@ -181,26 +193,30 @@ impl FieldLocator {
             match self.phase {
                 LocatePhase::Body => match byte {
                     b'"' => self.begin_string(),
-                    b'{' | b'[' => {
-                        self.depth += 1;
-                        if self.depth == 1 {
-                            self.expect_key = true;
-                        }
+                    b'{' => {
+                        self.containers
+                            .push(LocateContainer::Object { expect_key: true });
+                        self.pos += 1;
+                    }
+                    b'[' => {
+                        self.containers.push(LocateContainer::Array);
                         self.pos += 1;
                     }
                     b'}' | b']' => {
-                        self.depth = self.depth.saturating_sub(1);
+                        self.containers.pop();
                         self.pos += 1;
-                        if self.depth == 0 {
-                            // The object closed without the field: no later chunk
+                        if self.containers.is_empty() {
+                            // The payload closed without the field: no later chunk
                             // can make it appear.
                             self.exhausted = true;
                             return None;
                         }
                     }
                     b',' => {
-                        if self.depth == 1 {
-                            self.expect_key = true;
+                        if let Some(LocateContainer::Object { expect_key }) =
+                            self.containers.last_mut()
+                        {
+                            *expect_key = true;
                         }
                         self.pos += 1;
                     }
@@ -213,10 +229,10 @@ impl FieldLocator {
                     }
                     b if b.is_ascii_whitespace() => self.pos += 1,
                     _ => {
-                        // The key names a value that is not a plain string, so the
-                        // field can never be streamed out of this payload.
-                        self.exhausted = true;
-                        return None;
+                        // The matched key names a value that is not written as
+                        // `: value`, so the walk resumes the body scan instead of
+                        // concluding the field is absent.
+                        self.phase = LocatePhase::Body;
                     }
                 },
                 LocatePhase::Value => match byte {
@@ -226,8 +242,10 @@ impl FieldLocator {
                     }
                     b if b.is_ascii_whitespace() => self.pos += 1,
                     _ => {
-                        self.exhausted = true;
-                        return None;
+                        // The matched key names a non-string value. Reading that
+                        // payload as text would leak structure, so the walk keeps
+                        // scanning for the string form the branch may still carry.
+                        self.phase = LocatePhase::Body;
                     }
                 },
                 // The header is resolved above, before the body walk starts.
@@ -278,13 +296,17 @@ impl FieldLocator {
 
     /// Records what a completed string was, reporting whether it named the field.
     ///
-    /// Only a string that closed at the top level while a key was expected can name
-    /// the field, so the same text inside another value never matches.
+    /// Only a string that closed while the innermost open object expected a key can
+    /// name the field, so the same text inside another value never matches and the
+    /// key is found at whatever depth the response nests it.
     fn after_string(&mut self, buffer: &str, field_name: &str) -> bool {
-        if self.depth != 1 || !self.expect_key {
+        let Some(LocateContainer::Object { expect_key }) = self.containers.last_mut() else {
+            return false;
+        };
+        if !*expect_key {
             return false;
         }
-        self.expect_key = false;
+        *expect_key = false;
         let body = buffer
             .get(self.string_start.saturating_add(1)..self.pos.saturating_sub(1))
             .unwrap_or_default();
@@ -618,5 +640,56 @@ mod tests {
             "locating a late field in a {} byte payload took {elapsed:?}; the per-chunk cost must follow the appended bytes",
             json.len()
         );
+    }
+    #[test]
+    fn test_field_nested_in_an_operational_branch_is_located() {
+        // The message sits inside the operational branch envelope while the change
+        // set of that branch precedes it, so the key must be resolved at the depth
+        // the branch gives it instead of only at the root of the payload.
+        let json = concat!(
+            r#"{"action":{"kind":"edit","changes":[{"op":"create","path":"a.rs","#,
+            r#""content":"let s = \"message\";"}],"message":"Branch text"}}"#
+        );
+        let expected = find_string_field_value_start(json, "message");
+        assert!(expected.is_some());
+
+        for split in json
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(json.len()))
+        {
+            let mut cursor = StringFieldCursor::new();
+            let mut streamed = String::new();
+            if let (Some(delta), _) =
+                extract_streamed_string_field(&json[..split], "message", &mut cursor)
+            {
+                streamed.push_str(&delta);
+            }
+            let (delta, finished) = extract_streamed_string_field(json, "message", &mut cursor);
+            if let Some(delta) = delta {
+                streamed.push_str(&delta);
+            }
+            assert_eq!(streamed, "Branch text", "split {split}");
+            assert!(finished, "split {split}");
+        }
+    }
+
+    #[test]
+    fn test_non_string_candidate_does_not_hide_the_streamed_field() {
+        // The field name appears first with a non-string value. Treating that
+        // occurrence as authoritative would abandon the whole payload, so the walk
+        // resumes and streams the string form the branch carries later.
+        let json = r#"{"meta":{"message":null},"action":{"kind":"edit","message":"Later"}}"#;
+        let mut buffer = String::new();
+        let mut streamed = String::new();
+        let mut cursor = StringFieldCursor::new();
+        for c in json.chars() {
+            buffer.push(c);
+            let (delta, _) = extract_streamed_string_field(&buffer, "message", &mut cursor);
+            if let Some(delta) = delta {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "Later");
     }
 }

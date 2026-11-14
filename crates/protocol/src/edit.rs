@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+pub mod operation;
 pub mod proposal;
 
-pub use proposal::{
-    normalize_repo_path, ChangeConversionError, EditOperation, EditProposal,
-    StructuredChangeProposal,
+pub use operation::{
+    normalize_repo_path, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
+    EditOperation, EditOverwrite, EditReplace,
 };
+pub use proposal::{ChangeConversionError, EditProposal, StructuredChangeProposal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]

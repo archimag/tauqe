@@ -12,21 +12,23 @@
 //!   valid alternative model responses ([`LoopResult::Diverged`]), and retry exhaustion
 //!   ([`LoopResult::Exhausted`]).
 
+pub mod cache;
 pub mod context;
-pub mod edit;
 pub mod outcome;
+pub mod plan;
 pub mod prompt;
+pub mod refine;
 pub mod repl;
-pub mod research;
-pub mod staging;
+pub mod turn;
 
 pub use context::{CancellationToken, EventSink, LoopContext};
-pub use edit::{run_edit_loop, EditArtifact, EditLoopConfig};
 pub use outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
+pub use plan::{run_plan_step_loop, PlanStepArtifact, PlanStepLoopConfig};
 pub use prompt::PromptBuilder;
 pub use repl::{repl_capabilities, run_repl_loop, ReplArtifact, ReplLoopConfig};
-pub use research::{
-    handle_research_commands, run_research_loop, ResearchArtifact, ResearchFeedback,
-    ResearchLoopConfig, RESEARCH_CAPABILITIES,
+pub use turn::{
+    handle_research_commands, run_edit_loop, run_research_loop, run_staging_loop, run_turn_loop,
+    EditArtifact, EditLoopConfig, ResearchArtifact, ResearchFeedback, ResearchLoopConfig,
+    StagingArtifact, StagingLoopConfig, TurnArtifact, TurnLoopConfig, EDIT_CAPABILITIES,
+    RESEARCH_CAPABILITIES,
 };
-pub use staging::{run_staging_loop, StagingArtifact, StagingLoopConfig};

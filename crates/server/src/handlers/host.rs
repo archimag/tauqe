@@ -12,18 +12,21 @@
 //! batch and a review run cannot drift apart in how they reach a provider, how
 //! they publish telemetry, or how they interpret a blocked, aborted, cancelled,
 //! or unverified turn.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tauqe_core::config::AppConfig;
+use tauqe_core::control::outcome::{LoopResult, ResponseEnvelope};
+use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
+use tauqe_core::control::turn::TurnArtifact;
 use tauqe_core::outer_docs::OuterDocsRegistry;
 use tauqe_core::plan::prompt::{
     build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, PlanHorizonDiagnostics,
 };
 use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT, SESSION_PREFIX_REVIEW};
-use tauqe_core::workflow::fsm::structured::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::workflow::implementation::{
     ExecutionScope, ImplementationFrame, ImplementationHost, RefinementRequest, RefinementResult,
     StepFailure, StepTurnRequest, StepTurnResult,
@@ -31,18 +34,18 @@ use tauqe_core::workflow::implementation::{
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::model::{TurnWorkContext, TurnWorkQueue};
 use tauqe_protocol::{
-    events, ArchitectTier, ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent,
-    ModelTurnPlanContext, ReasoningEffort, TurnIntent,
+    events, ArchitectTier, LlmCapability, LlmCommand, ModelFinishedEvent, ModelRole,
+    ModelSelection, ModelStartedEvent, ModelTurnPlanContext, ReasoningEffort, VerificationVerdict,
 };
 use tokio::sync::watch;
 
 use crate::handlers::architect::run_contour_synthesis;
 use crate::handlers::common::{
-    append_developer_directives, append_outer_docs_diagnostics, cleanup_transient_context, emit,
-    preload_declared_files, preload_declared_outer_docs, turn_applied_edits,
-    turn_left_unreverted_changes, OuterDocsRefusal,
+    append_developer_directives, append_outer_docs_diagnostics, blocked_reason,
+    cleanup_transient_context, emit, preload_declared_files, preload_declared_outer_docs,
+    OuterDocsRefusal,
 };
-use crate::handlers::model::{build_apply_policy, execute_model_turn, StepTurnOptions};
+use crate::handlers::model::turn::{run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport};
 use crate::handlers::offload;
 use crate::handlers::review::publish_review;
 use crate::state::{AppState, OperationGuard};
@@ -302,79 +305,37 @@ impl ImplementationHost for ServerImplementationHost {
             publish_review(&self.state, &self.repo_root, review_id).await;
         }
 
-        // The step's own cancellation signal reaches the policy, so cancelling the
-        // batch releases a repository hook that holds the checkpoint capture.
-        let policy = build_apply_policy(&self.state, self.config.repl.workflow, cancel_rx.clone());
-        let options = StepTurnOptions {
-            intent: TurnIntent::IsolatedStep,
-            custom_selection: Some(selection),
-            plan_context,
-            work_context,
-            reasoning_effort,
-            marker,
-            session_id,
-            // The step borrows the batch-level registration, so the operation
-            // slot keeps owning the run across every member.
-            shared_operation: Some(Arc::clone(&self.operation)),
-            phase_out: Some(self.state.out.clone()),
-        };
+        // The step turn runs through the control contour: the engine's bounded
+        // turn drives research, staging, verification, and healing, while the
+        // apply policy of the run gates the Git transaction of the step.
+        let report = run_step_loop(
+            &self.state,
+            StepLoopOptions {
+                selection: Some(selection),
+                reasoning_effort,
+                marker,
+                session_id,
+                operation: Arc::clone(&self.operation),
+                plan_context,
+                work_context,
+                body: StepLoopBody::Single(prompt),
+            },
+        )
+        .await;
 
-        let turn = match execute_model_turn(&self.state, prompt, policy, options).await {
-            Ok(turn) => turn,
-            Err(err) => {
-                return StepTurnResult::Failed(StepFailure::infrastructure(err.error.message))
-            }
-        };
-
-        // A semantic block is a verdict about the approved decision, never a
-        // content failure of the step: it travels as its own outcome so the
-        // pipeline engages the Architect instead of climbing the coder ladder.
-        if let Some(reason) = turn.blocked.clone() {
-            return StepTurnResult::Blocked(reason);
-        }
-        // An unconditional abort needs an action only the developer can perform in
-        // the host environment, so it stops the queue without spending a wave.
-        if let Some(abort) = turn.abort.clone() {
-            return StepTurnResult::Abort(abort.to_message());
-        }
-        if turn.is_success() && turn_applied_edits(&turn) {
-            // The commit that carried the change set is the durable pointer of
-            // the completed step, so it travels with the success instead of
-            // being read back from the repository afterwards.
-            let (summary, commit) = match &turn.result {
-                Some(tauqe_protocol::ModelResult::Edit {
-                    summary, outcome, ..
-                }) => (summary.clone(), outcome.commit_hash.clone()),
-                _ => (String::new(), None),
-            };
-            return StepTurnResult::Success { summary, commit };
-        }
-        if turn.is_cancelled || *cancel_rx.borrow() {
+        if *cancel_rx.borrow() {
             return StepTurnResult::Cancelled;
         }
-        // A turn without a model result ended on an infrastructure failure: the
-        // provider stream broke, the connection was interrupted, or the workflow
-        // failed before proposing anything. A stronger model would meet the same
-        // broken transport, so the failure is never classified as a domain one.
-        if turn.result.is_none() {
-            let reason = turn.error.clone().unwrap_or_else(|| {
-                "The step turn ended without producing a model result".to_string()
-            });
-            return StepTurnResult::Failed(StepFailure::infrastructure(reason));
+        match report {
+            StepLoopReport::Cancelled => StepTurnResult::Cancelled,
+            StepLoopReport::Failed(reason) => {
+                StepTurnResult::Failed(StepFailure::infrastructure(reason))
+            }
+            StepLoopReport::Sequence(_) => StepTurnResult::Failed(StepFailure::infrastructure(
+                "A single step turn reported a sequence outcome",
+            )),
+            StepLoopReport::Turn(result) => classify_step_turn(result),
         }
-        // A failed change set the turn could not roll back leaves the working tree
-        // carrying the bytes of the aborted attempt. Retrying on a dirty tree would
-        // build the next attempt on lines nobody verified.
-        if turn_left_unreverted_changes(&turn) {
-            let cause = turn.error.clone().unwrap_or_default();
-            return StepTurnResult::Failed(StepFailure::unreverted(format!(
-                "The failed change set was not rolled back to the step checkpoint, so the working tree carries unverified lines. Run `git status` to inspect them and `git checkout -- .` to restore the step base. {cause}"
-            )));
-        }
-        let reason = turn.error.clone().unwrap_or_else(|| {
-            "The step turn finished without applying a verified change set".to_string()
-        });
-        StepTurnResult::Failed(StepFailure::domain(reason))
     }
 
     async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult {
@@ -519,6 +480,135 @@ impl ImplementationHost for ServerImplementationHost {
             },
         }
     }
+}
+
+/// Classifies the terminal result of a control-loop step turn.
+///
+/// The category decides the pipeline behavior: a blocked or exhausted turn is a
+/// domain verdict the step loop may retry on a stronger coder tier, while a
+/// broken transport or a change set the harness could not commit is fatal to the
+/// whole run.
+fn classify_step_turn(result: LoopResult<TurnArtifact>) -> StepTurnResult {
+    match result {
+        LoopResult::Success(success) => {
+            if let Some(err) = success.value.commit_error.clone() {
+                return StepTurnResult::Failed(StepFailure::infrastructure(format!(
+                    "Failed to commit the change set of the step: {err}"
+                )));
+            }
+            if let Some(reason) = blocked_reason(&success.response) {
+                return StepTurnResult::Blocked(reason);
+            }
+            if success.response.has(LlmCapability::Abort) {
+                return StepTurnResult::Abort(abort_message(&success.response));
+            }
+            let summary = envelope_text(&success.response)
+                .unwrap_or_else(|| success.value.modified_paths.join(", "));
+            let verdict = success.value.verification;
+            // A repository that declares no verification command did not fail its
+            // verification: the harness simply had nothing to run, and the Git
+            // transaction accepts the commit exactly as it does for a passed run.
+            let verified = match &verdict {
+                Some(VerificationVerdict::Passed) | Some(VerificationVerdict::NotConfigured) => {
+                    true
+                }
+                Some(_) => false,
+                None => declares_success(&success.response),
+            };
+            if verified {
+                StepTurnResult::Success {
+                    summary,
+                    commit: success.value.commit_hash,
+                }
+            } else if verdict.is_some() {
+                StepTurnResult::Failed(StepFailure::domain(
+                    "The change set of the step did not pass toolchain verification",
+                ))
+            } else {
+                tracing::warn!(
+                    remaining = ?success.response.remaining_capabilities(),
+                    commands = ?success.response.commands(),
+                    "step turn produced neither a verified change set nor a declared outcome"
+                );
+                StepTurnResult::Failed(StepFailure::domain(
+                    "The step turn produced neither a verified change set nor a declared outcome",
+                ))
+            }
+        }
+        LoopResult::Diverged(envelope) => {
+            if let Some(reason) = blocked_reason(&envelope) {
+                return StepTurnResult::Blocked(reason);
+            }
+            if envelope.has(LlmCapability::Abort) {
+                return StepTurnResult::Abort(abort_message(&envelope));
+            }
+            StepTurnResult::Failed(StepFailure::domain(
+                "The step turn diverged without a completed change set",
+            ))
+        }
+        LoopResult::Exhausted(report) => StepTurnResult::Failed(StepFailure::domain(report.reason)),
+    }
+}
+
+/// Renders the conversational text a turn produced, if any.
+fn envelope_text(envelope: &ResponseEnvelope) -> Option<String> {
+    let mut envelope = envelope.clone();
+    let mut combined = String::new();
+    for command in envelope.take(LlmCapability::TextMessage) {
+        if let LlmCommand::Text(command) = command {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&command.content);
+        }
+    }
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// Renders the unconditional abort a turn declared, together with the host action
+/// it requires.
+///
+/// An abort is a host-environment verdict rather than a content failure, so the
+/// supervisor reports the exact instruction the developer must perform instead of
+/// a summary of the turn.
+fn abort_message(envelope: &ResponseEnvelope) -> String {
+    let mut envelope = envelope.clone();
+    envelope
+        .take(LlmCapability::Abort)
+        .into_iter()
+        .find_map(|command| match command {
+            LlmCommand::Abort(command) => Some(
+                tauqe_core::control::outcome::AbortReport {
+                    reason: command.reason,
+                    recommendation: command.recommendation,
+                }
+                .to_message(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| "The step declared an unconditional abort.".to_string())
+}
+
+/// Whether a turn declared a terminal success outcome.
+fn declares_success(envelope: &ResponseEnvelope) -> bool {
+    let mut envelope = envelope.clone();
+    envelope
+        .take_any(&[
+            LlmCapability::CommitMessage,
+            LlmCapability::TurnError,
+            LlmCapability::TurnSkip,
+        ])
+        .into_iter()
+        .any(|command| {
+            matches!(
+                command,
+                LlmCommand::CommitMessage(_) | LlmCommand::TurnSkip(_)
+            )
+        })
 }
 
 #[cfg(test)]

@@ -15,12 +15,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tauqe_protocol::{
-    EditOperation, LlmCapability, LlmCommand, PatchStrategy, ReasoningEffort, TurnPhase,
-};
+use tauqe_protocol::{EditOperation, LlmCommand, PatchStrategy, ReasoningEffort, TurnPhase};
 
-use super::context::LoopContext;
-use super::outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
+use crate::control::context::LoopContext;
+use crate::control::outcome::{
+    FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError,
+};
 use crate::edits::{stage_and_validate_edits, EditError, StagedEditsState};
 use crate::providers::StreamEvent;
 use crate::workflow::retry::{
@@ -177,13 +177,8 @@ pub async fn run_staging_loop(
                 reason: reason.clone(),
             });
         }
-        let repair_prompt = build_patch_retry_prompt(
-            &succeeded,
-            &failed,
-            &[],
-            ctx.target_language.as_deref(),
-            config.patch_strategy,
-        );
+        let repair_prompt =
+            build_patch_retry_prompt(&succeeded, &failed, &[], config.patch_strategy);
         let mut reply = ctx
             .request_repair(&repair_prompt, staged_state.as_ref())
             .await?;
@@ -258,12 +253,9 @@ fn render_failures(
 /// Extracts all file edit operations from the envelope by draining its [`LlmCapability::FileEdits`].
 fn extract_file_edits(envelope: &mut ResponseEnvelope) -> Vec<EditOperation> {
     envelope
-        .take(LlmCapability::FileEdits)
+        .take_any(super::edit::EDIT_CAPABILITIES)
         .into_iter()
-        .filter_map(|cmd| match cmd {
-            LlmCommand::Edit { operation } => Some(operation),
-            _ => None,
-        })
+        .filter_map(LlmCommand::into_edit_operation)
         .collect()
 }
 
@@ -272,20 +264,35 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
-    use crate::prompt::xml::XmlPromptProtocol;
+    use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_protocol::{CapabilitySet, ContextAccess, LlmCapability, LlmCommand, ModelRef};
+    use tauqe_protocol::{
+        CapabilityExpr, ContextAccess, EditReplace, LlmCapability, LlmCommand, ModelRef,
+        TextCommand,
+    };
 
     const TARGET: &str = "pub fn compute() -> i32 { 0 }\n";
     const CORRECTED: &str = "pub fn compute() -> i32 { 42 }\n";
 
     /// Builds an XML change set for `a.rs` in the dialect the tests speak.
     fn edit_block(search: &str, replace: &str) -> String {
-        format!(
-            "<tauqe_edits summary=\"Edit\">\n<edit path=\"a.rs\">\n<search>\n{search}\n</search>\n<replace>\n{replace}\n</replace>\n</edit>\n</tauqe_edits>"
-        )
+        serde_json::json!({
+            "message": "Edit",
+            "changes": [{
+                "op": "replace",
+                "path": "a.rs",
+                "to": "",
+                "start": "",
+                "end": "",
+                "content": "",
+                "old_text": search,
+                "new_text": replace
+            }],
+            "commit_message": "Edit",
+            "reason": ""
+        })
+        .to_string()
     }
-
     /// Owns the whole operating environment one staging contour observes.
     struct Fixture {
         dir: tempfile::TempDir,
@@ -293,8 +300,8 @@ mod tests {
         journal: crate::workflow::research::journal::TurnResearchJournal,
         provider: MockLlmProvider,
         model: ModelRef,
-        protocol: XmlPromptProtocol,
-        cache: crate::workflow::fsm::cache::TurnInputCache,
+        protocol: JsonPromptProtocol,
+        cache: crate::control::cache::TurnInputCache,
         cancel: CancellationToken,
         events: EventSink,
         policy: crate::workflow::policy::DirectApplyPolicy,
@@ -327,8 +334,8 @@ mod tests {
                 context,
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: XmlPromptProtocol,
-                cache: crate::workflow::fsm::cache::TurnInputCache::default(),
+                protocol: JsonPromptProtocol::edits(),
+                cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
                 journal: crate::workflow::research::journal::TurnResearchJournal::default(),
@@ -337,9 +344,14 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps =
-                CapabilitySet::from_slice(&[LlmCapability::FileEdits, LlmCapability::TextMessage]);
-            let prompt_builder = super::super::prompt::PromptBuilder::new(
+            let caps = CapabilityExpr::set(
+                crate::control::turn::EDIT_CAPABILITIES
+                    .iter()
+                    .copied()
+                    .chain([LlmCapability::TextMessage])
+                    .map(CapabilityExpr::leaf),
+            );
+            let prompt_builder = crate::control::prompt::PromptBuilder::new(
                 &self.provider,
                 &self.model,
                 &self.protocol,
@@ -361,9 +373,9 @@ mod tests {
     #[tokio::test]
     async fn a_round_without_a_change_set_diverges_with_its_envelope() {
         let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text {
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand {
             content: "no change set".to_string(),
-        }]);
+        })]);
 
         let mut ctx = fixture.context();
         let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
@@ -380,13 +392,11 @@ mod tests {
     #[tokio::test]
     async fn a_converging_change_set_returns_its_virtual_state() {
         let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Edit {
-            operation: EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "pub fn compute() -> i32 { 0 }".to_string(),
-                new_text: "pub fn compute() -> i32 { 42 }".to_string(),
-            },
-        }]);
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "pub fn compute() -> i32 { 0 }".to_string(),
+            new_text: "pub fn compute() -> i32 { 42 }".to_string(),
+        })]);
 
         let mut ctx = fixture.context();
         let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
@@ -419,13 +429,11 @@ mod tests {
             "pub fn compute() -> i32 { 42 }",
         ))];
         let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], responses);
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Edit {
-            operation: EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "nonexistent text".to_string(),
-                new_text: "irrelevant".to_string(),
-            },
-        }]);
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "nonexistent text".to_string(),
+            new_text: "irrelevant".to_string(),
+        })]);
 
         let mut ctx = fixture.context();
         let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
@@ -454,13 +462,11 @@ mod tests {
             "irrelevant",
         ))];
         let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], responses);
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Edit {
-            operation: EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "nonexistent text".to_string(),
-                new_text: "irrelevant".to_string(),
-            },
-        }]);
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "nonexistent text".to_string(),
+            new_text: "irrelevant".to_string(),
+        })]);
         let config = StagingLoopConfig {
             max_retries: 1,
             ..StagingLoopConfig::default()
@@ -478,5 +484,66 @@ mod tests {
         assert_eq!(report.attempts, 1);
         assert!(!report.diagnostics.is_empty());
         assert!(report.diagnostics[0].contains("a.rs"));
+    }
+
+    #[tokio::test]
+    async fn staging_loop_records_unretried_file_in_abandoned_failures() {
+        let responses = vec![MockResponse::text(edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ))];
+        let mut fixture = Fixture::new(
+            &[("a.rs", TARGET), ("b.rs", "pub fn b() {}")],
+            &["a.rs", "b.rs"],
+            responses,
+        );
+        let envelope = ResponseEnvelope::from_commands(&[
+            LlmCommand::EditReplace(EditReplace {
+                path: "a.rs".to_string(),
+                old_text: "nonexistent in a".to_string(),
+                new_text: "irrelevant".to_string(),
+            }),
+            LlmCommand::EditReplace(EditReplace {
+                path: "b.rs".to_string(),
+                old_text: "nonexistent in b".to_string(),
+                new_text: "irrelevant".to_string(),
+            }),
+        ]);
+
+        let mut ctx = fixture.context();
+        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
+            .await
+            .expect("staging completes");
+        let success = outcome.into_success().expect("success");
+
+        assert_eq!(success.value.abandoned_failures.len(), 1);
+        assert_eq!(success.value.abandoned_failures[0].0, "b.rs");
+    }
+
+    #[tokio::test]
+    async fn a_concrete_edit_command_converges_through_into_edit_operation() {
+        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
+        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: "pub fn compute() -> i32 { 0 }".to_string(),
+            new_text: "pub fn compute() -> i32 { 42 }".to_string(),
+        })]);
+
+        let mut ctx = fixture.context();
+        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
+            .await
+            .expect("staging completes");
+        let success = outcome.into_success().expect("concrete edit converges");
+
+        assert_eq!(success.value.cumulative_edits.len(), 1);
+        assert_eq!(
+            success
+                .value
+                .staged_state
+                .staged_text_files()
+                .get("a.rs")
+                .map(String::as_str),
+            Some(CORRECTED)
+        );
     }
 }

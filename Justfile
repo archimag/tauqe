@@ -9,7 +9,8 @@ install:
     cargo install --path crates/tui --locked
     @echo "Tauqe installed successfully in release mode! The 'tauqe' command is available."
 
-logs *args="":
+[group('tauqe')]
+server-logs *args="":
     lnav -I .lnav {{args}} .tauqe/server.log
 
 logs-live:

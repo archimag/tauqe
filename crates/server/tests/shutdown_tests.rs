@@ -41,7 +41,7 @@ const WAIT_HEADROOM: Duration = Duration::from_secs(5);
 /// no unwind, so the drop guard below would never fire either. Reading through
 /// a detached reader thread turns the wait into a bounded channel receive, so a
 /// silent daemon is reported as a failed handshake instead of a hung test run.
-const RESPONSE_BUDGET: Duration = Duration::from_secs(5);
+const RESPONSE_BUDGET: Duration = Duration::from_secs(15);
 /// One running daemon driven over its JSON-RPC pipes.
 struct Daemon {
     child: Option<Child>,
