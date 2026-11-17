@@ -10,12 +10,12 @@ use serde_json::Value;
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::review::ReviewUpdateProposal;
 use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityExpr, CommitMessageCommand, ContextAccess,
+    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextAccess,
     ContextRequestCommand, CustomToolCommand, DirListCommand, DirListRequest, DiscussionPlanAction,
     DiscussionPlanUpdate, DocRequestCommand, DocTopic, EditFileOp, LlmCapability, LlmCommand,
     OuterDocRequestCommand, PatchStrategy, RepoDirsCommand, RepoMapCommand, RepoSearchCommand,
-    RepoSearchRequest, ScratchpadCommand, ShortDescriptionCommand, StructuredChangeProposal,
-    TextCommand, TurnErrorCommand, TurnSkipCommand, VerifyCommand, VerifyOnSuccess, VerifyTarget,
+    RepoSearchRequest, ScratchpadCommand, StructuredChangeProposal, TextCommand, TurnErrorCommand,
+    TurnSkipCommand,
 };
 
 use crate::capabilities::PromptRenderContext;
@@ -25,13 +25,13 @@ use crate::edits::protocol::ContextRequest;
 /// Decodes a structured JSON response by walking `expr` synchronously with
 /// `node`.
 pub(crate) fn decode_capability_expr(
-    expr: &CapabilityExpr,
+    expr: &CapabilityTree,
     node: &Value,
     ctx: &PromptRenderContext<'_>,
 ) -> Vec<LlmCommand> {
     match expr {
-        CapabilityExpr::Leaf(cap) => decode_leaf(*cap, node, ctx),
-        CapabilityExpr::Set(items) => {
+        CapabilityTree::Leaf(cap) => decode_leaf(*cap, node, ctx),
+        CapabilityTree::Set(_, items) => {
             let mut commands = Vec::new();
             for item in items {
                 for cmd in decode_capability_expr(item, node, ctx) {
@@ -43,33 +43,54 @@ pub(crate) fn decode_capability_expr(
             }
             commands
         }
-        CapabilityExpr::AnyOf(label, branches) => {
+        CapabilityTree::AnyOf(label, branches) => {
             if branches.is_empty() {
                 return Vec::new();
             }
             if branches.len() == 1 {
-                return decode_capability_expr(&branches[0].expr, node, ctx);
+                return decode_capability_expr(&branches[0], node, ctx);
             }
-            let Some(branch_node) = node.get(label).filter(|v| v.is_object()) else {
-                return vec![LlmCommand::ProtocolError {
+            // A branch that carries no name takes part in the level that holds
+            // the union, exactly as the schema places it there.
+            let mut commands = Vec::new();
+            for branch in branches {
+                if branch.label().is_some_and(|kind| !kind.is_empty()) {
+                    continue;
+                }
+                commands.extend(decode_capability_expr(branch, node, ctx));
+            }
+            let Some(branch_node) = node.get(label).filter(|value| value.is_object()) else {
+                commands.push(LlmCommand::ProtocolError {
                     message: format!("missing or invalid '{label}' object for operational branch"),
-                }];
+                });
+                return commands;
             };
             let Some(kind) = branch_node.get("kind").and_then(Value::as_str) else {
-                return vec![LlmCommand::ProtocolError {
+                commands.push(LlmCommand::ProtocolError {
                     message: format!("missing or non-string '{label}.kind' discriminator"),
-                }];
+                });
+                return commands;
             };
-            let Some(branch) = branches.iter().find(|b| b.kind == kind) else {
-                let expected: Vec<&str> = branches.iter().map(|b| b.kind.as_str()).collect();
-                return vec![LlmCommand::ProtocolError {
+            let selected = branches.iter().find(|branch| {
+                branch
+                    .label()
+                    .is_some_and(|branch_kind| !branch_kind.is_empty() && branch_kind == kind)
+            });
+            let Some(branch) = selected else {
+                let expected: Vec<&str> = branches
+                    .iter()
+                    .filter_map(|branch| branch.label().filter(|kind| !kind.is_empty()))
+                    .collect();
+                commands.push(LlmCommand::ProtocolError {
                     message: format!(
                         "unknown '{label}.kind' value '{kind}'; expected one of: {}",
                         expected.join(", ")
                     ),
-                }];
+                });
+                return commands;
             };
-            decode_capability_expr(&branch.expr, branch_node, ctx)
+            commands.extend(decode_capability_expr(branch, branch_node, ctx));
+            commands
         }
     }
 }
@@ -84,17 +105,6 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
                 return Vec::new();
             }
             vec![LlmCommand::Text(TextCommand {
-                content: content.to_string(),
-            })]
-        }
-        LlmCapability::ShortDescription => {
-            let Some(content) = node.get("message").and_then(Value::as_str) else {
-                return Vec::new();
-            };
-            if content.trim().is_empty() {
-                return Vec::new();
-            }
-            vec![LlmCommand::ShortDescription(ShortDescriptionCommand {
                 content: content.to_string(),
             })]
         }
@@ -120,7 +130,6 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
         LlmCapability::DirList => decode_dir_lists(node),
         LlmCapability::DocRequest => decode_doc_requests(node),
         LlmCapability::OuterDocRequest => decode_outer_doc_requests(node),
-        LlmCapability::ToolchainVerify => decode_verify(node),
         LlmCapability::PlanCreation => {
             decode_plan_property(node, "plan_create", &[DiscussionPlanAction::Save])
         }
@@ -349,30 +358,6 @@ fn decode_outer_doc_requests(node: &Value) -> Vec<LlmCommand> {
     commands
 }
 
-fn decode_verify(node: &Value) -> Vec<LlmCommand> {
-    let Some(v_val) = node.get("verify") else {
-        return Vec::new();
-    };
-    if let Ok(cmd) = serde_json::from_value::<VerifyCommand>(v_val.clone()) {
-        return vec![LlmCommand::Verify(cmd)];
-    }
-    let Some(target_str) = v_val.get("target").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let target = match target_str {
-        "all" => VerifyTarget::All,
-        "check" => VerifyTarget::Check,
-        "test" => VerifyTarget::Test,
-        "clippy" => VerifyTarget::Clippy,
-        _ => return Vec::new(),
-    };
-    let on_success = match v_val.get("on_success").and_then(Value::as_str) {
-        Some("report") => VerifyOnSuccess::Report,
-        _ => VerifyOnSuccess::Silent,
-    };
-    vec![LlmCommand::Verify(VerifyCommand { target, on_success })]
-}
-
 fn decode_plan_property(
     node: &Value,
     property: &str,
@@ -484,8 +469,8 @@ mod tests {
     use crate::capabilities::capability_expr_schema;
     use serde_json::json;
     use tauqe_protocol::{
-        CapabilityBranch, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
-        EditOverwrite, EditReplace, ProjectConfig,
+        EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOverwrite, EditReplace,
+        ProjectConfig,
     };
 
     fn project_with_command() -> ProjectConfig {
@@ -503,7 +488,7 @@ mod tests {
             .with_project(Some(&project))
             .with_patch_strategy(PatchStrategy::LineAnchor);
 
-        let flat_all = CapabilityExpr::from_leaves(LlmCapability::ALL.iter().copied());
+        let flat_all = CapabilityTree::from_leaves(LlmCapability::ALL.iter().copied());
         let schema = capability_expr_schema(&flat_all, &search_ctx);
         assert!(schema["properties"].is_object());
 
@@ -524,7 +509,6 @@ mod tests {
             "dir_lists": [{"path": "crates", "recursive": true}],
             "tauqe_doc_requests": ["workflow"],
             "outer_doc_requests": ["openrouter/models"],
-            "verify": {"target": "clippy", "on_success": "report"},
             "plan_create": {"action": "save", "id": "p-1", "title": "Plan"},
             "plan_update": {"action": "update", "id": "p-1"},
             "review_update": {"item_id": 3, "status": "todo", "note": "fix", "recommendations": []},
@@ -541,11 +525,6 @@ mod tests {
         assert!(commands.contains(&LlmCommand::Text(TextCommand {
             content: "Working on it".into()
         })));
-        assert!(
-            commands.contains(&LlmCommand::ShortDescription(ShortDescriptionCommand {
-                content: "Working on it".into()
-            }))
-        );
         assert!(commands.contains(&LlmCommand::EditReplace(EditReplace {
             path: "src/a.rs".into(),
             old_text: "old".into(),
@@ -600,10 +579,6 @@ mod tests {
                 id: "openrouter/models".into()
             }))
         );
-        assert!(commands.contains(&LlmCommand::Verify(VerifyCommand {
-            target: VerifyTarget::Clippy,
-            on_success: VerifyOnSuccess::Report
-        })));
         assert!(commands.iter().any(|c| matches!(c, LlmCommand::Plan { update } if update.action == DiscussionPlanAction::Save)));
         assert!(commands.iter().any(|c| matches!(c, LlmCommand::Plan { update } if update.action == DiscussionPlanAction::Update)));
         assert!(commands
@@ -668,7 +643,7 @@ mod tests {
 
         // Selecting `edit` decodes only `edit` branch and ignores hostile top-level fields.
         let edit_payload = json!({
-            "message": "",
+            "message": "Updating file",
             "scratchpad": "s",
             "context_requests": [{"path": "src/hostile.rs", "access": "read_only"}],
             "action": {
@@ -676,7 +651,6 @@ mod tests {
                 "changes": [{"op": "create", "path": "src/x.rs", "to": "", "old_text": "", "new_text": "", "content": "fn x() {}"}],
                 "verify": {"target": "none", "on_success": "silent"},
                 "commit_message": "feat: add x",
-                "message": "Updating file",
                 "reason": ""
             }
         });
@@ -696,8 +670,9 @@ mod tests {
         assert!(!cmds
             .iter()
             .any(|c| matches!(c, LlmCommand::ContextRequest(_))));
-        // The branch declares the `message` field itself, so the terminal
-        // channel that reads the same field carries the same text.
+        // The message channel is ambient: the root `message` field carries the
+        // conversational text of the round, while the selected branch owns only
+        // the commands of its kind.
 
         // Unknown kind yields ProtocolError naming the unknown kind.
         let unknown_kind = json!({
@@ -730,11 +705,11 @@ mod tests {
         let ctx = PromptRenderContext::new(&[], None);
 
         // Single-branch AnyOf merges transparently at the current level.
-        let single = CapabilityExpr::any_of(
+        let single = CapabilityTree::any_of(
             "action",
-            [CapabilityBranch::new(
+            [CapabilityTree::named_set(
                 "only",
-                CapabilityExpr::leaf(LlmCapability::TextMessage),
+                [CapabilityTree::leaf(LlmCapability::TextMessage)],
             )],
         );
         let single_schema = capability_expr_schema(&single, &ctx);
@@ -747,30 +722,30 @@ mod tests {
         );
 
         // Nested AnyOf descends through outer `action` and inner `sub_action`.
-        let nested = CapabilityExpr::set([
-            CapabilityExpr::leaf(LlmCapability::TextMessage),
-            CapabilityExpr::any_of(
+        let nested = CapabilityTree::root([
+            CapabilityTree::leaf(LlmCapability::TextMessage),
+            CapabilityTree::any_of(
                 "action",
                 [
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "plan",
-                        CapabilityExpr::leaf(LlmCapability::PlanCreation),
+                        [CapabilityTree::leaf(LlmCapability::PlanCreation)],
                     ),
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "nested",
-                        CapabilityExpr::any_of(
+                        [CapabilityTree::any_of(
                             "sub_action",
                             [
-                                CapabilityBranch::new(
+                                CapabilityTree::named_set(
                                     "search",
-                                    CapabilityExpr::leaf(LlmCapability::RepoSearch),
+                                    [CapabilityTree::leaf(LlmCapability::RepoSearch)],
                                 ),
-                                CapabilityBranch::new(
+                                CapabilityTree::named_set(
                                     "edit",
-                                    CapabilityExpr::leaf(LlmCapability::EditCreate),
+                                    [CapabilityTree::leaf(LlmCapability::EditCreate)],
                                 ),
                             ],
-                        ),
+                        )],
                     ),
                 ],
             ),
@@ -808,7 +783,7 @@ mod tests {
     #[test]
     fn deduplicates_protocol_errors_for_shared_fields_in_set() {
         let ctx = PromptRenderContext::new(&[], None);
-        let edits = CapabilityExpr::from_leaves([
+        let edits = CapabilityTree::from_leaves([
             LlmCapability::EditReplace,
             LlmCapability::EditCreate,
             LlmCapability::EditDelete,

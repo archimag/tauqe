@@ -12,7 +12,7 @@ pub struct GitConfig {
     /// and must not stall on user hooks. Set to `false` to let project hooks
     /// run on every Tauqe commit.
     #[serde(default = "default_bypass_hooks")]
-    pub bypass_hooks: bool,
+    pub(crate) bypass_hooks: bool,
     /// Wall-clock budget, in seconds, of every Git command the harness runs
     /// against this repository.
     ///
@@ -23,7 +23,7 @@ pub struct GitConfig {
     /// wedged hook cannot occupy a turn indefinitely. Defaults to 300 seconds,
     /// the substrate budget of a Git invocation that names none of its own.
     #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
 }
 
 impl Default for GitConfig {

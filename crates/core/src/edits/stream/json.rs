@@ -17,8 +17,8 @@ use crate::providers::StreamEvent;
 pub mod decode;
 pub mod field;
 
+pub(crate) use decode::extract_streamed_string_field;
 use decode::StringFieldCursor;
-pub use decode::{extract_streamed_string_field, find_string_field_value_start};
 pub use field::JsonFieldStreamFilter;
 
 /// Bytes of an element header that the early preview may inspect.
@@ -82,7 +82,7 @@ pub struct JsonStreamFilter {
 }
 
 impl JsonStreamFilter {
-    pub fn new(editable_paths: Vec<String>, repo_root: PathBuf) -> Self {
+    pub(crate) fn new(editable_paths: Vec<String>, repo_root: PathBuf) -> Self {
         Self {
             passthrough: None,
             buffer: String::new(),
@@ -101,7 +101,7 @@ impl JsonStreamFilter {
         }
     }
 
-    pub fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
+    pub(crate) fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
         self.staging.set_staged_contents(staged_contents);
         self
     }

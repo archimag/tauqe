@@ -28,6 +28,10 @@ pub enum HistoryEntryStatus {
     /// to the model context.
     #[default]
     Committed,
+    /// The turn was interrupted after at least one completed round: the rounds
+    /// it finished stay recorded as durable attempts while no final answer
+    /// exists.
+    Interrupted,
     /// The turn rolled back: the record stays in the chronicle as a failed
     /// attempt but never reached the model context.
     RolledBack,
@@ -44,6 +48,26 @@ impl HistoryEntryStatus {
     }
 }
 
+/// One intermediate round of a bounded turn, as the model produced it.
+///
+/// A turn that discovers material, retries a rejected patch, or heals a
+/// compiler error answers several times before its final answer. Only those
+/// intermediate rounds travel here: the final answer stays the ordinary
+/// assistant record of the same turn, so the chronicle never shows one answer
+/// twice. The message is the cleaned assistant text — never the raw protocol
+/// payload — and `feedback` is the compact summary of what the harness returned
+/// to open the round that follows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoundRecord {
+    /// One-based position of the round inside the turn.
+    pub index: u32,
+    /// Cleaned assistant message the round produced.
+    pub message: String,
+    /// Compact summary of the feedback that opened the following round.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub feedback: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiHistoryItem {
     pub id: u64,
@@ -55,6 +79,13 @@ pub struct UiHistoryItem {
     pub commit_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<HistoryFileChange>,
+    /// Intermediate rounds the recorded turn ran before its final answer.
+    ///
+    /// Only a turn record carries them, and only the rounds that never became
+    /// the recorded answer. The property is additive: a client that knows
+    /// nothing about rounds reads every existing payload unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rounds: Vec<TurnRoundRecord>,
     /// Lifecycle state of the record, see [`HistoryEntryStatus`].
     #[serde(default, skip_serializing_if = "HistoryEntryStatus::is_committed")]
     pub status: HistoryEntryStatus,
@@ -230,6 +261,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            rounds: Vec::new(),
             status: HistoryEntryStatus::Committed,
         }
     }
@@ -241,6 +273,9 @@ mod tests {
 
         let json = serde_json::to_value(HistoryEntryStatus::Committed).unwrap();
         assert_eq!(json, serde_json::json!("committed"));
+
+        let json = serde_json::to_value(HistoryEntryStatus::Interrupted).unwrap();
+        assert_eq!(json, serde_json::json!("interrupted"));
 
         let json = serde_json::to_value(HistoryEntryStatus::RolledBack).unwrap();
         assert_eq!(json, serde_json::json!("rolledBack"));
@@ -255,6 +290,7 @@ mod tests {
         assert_eq!(HistoryEntryStatus::default(), HistoryEntryStatus::Committed);
         assert!(HistoryEntryStatus::Committed.is_committed());
         assert!(!HistoryEntryStatus::Active.is_committed());
+        assert!(!HistoryEntryStatus::Interrupted.is_committed());
         assert!(!HistoryEntryStatus::RolledBack.is_committed());
     }
 
@@ -487,5 +523,57 @@ mod tests {
         assert_eq!(json["tail_ids"], serde_json::json!([]));
         assert_eq!(json["total_count"], 1);
         assert_eq!(json["estimated_tokens"], 0);
+    }
+    #[test]
+    fn test_ui_history_item_carries_turn_rounds() {
+        let mut item = committed_item(4, UiHistoryKind::User, "Implement the step");
+        item.rounds = vec![
+            TurnRoundRecord {
+                index: 1,
+                message: "Inspected the parser.".to_string(),
+                feedback: "2 matches in src/parser.rs".to_string(),
+            },
+            TurnRoundRecord {
+                index: 2,
+                message: "Staged the change.".to_string(),
+                feedback: String::new(),
+            },
+        ];
+
+        // The rounds travel nested inside the record they belong to, and a round
+        // that carried no feedback omits the property instead of sending an
+        // empty string.
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            json["rounds"],
+            serde_json::json!([
+                {
+                    "index": 1,
+                    "message": "Inspected the parser.",
+                    "feedback": "2 matches in src/parser.rs"
+                },
+                { "index": 2, "message": "Staged the change." }
+            ])
+        );
+
+        let parsed: UiHistoryItem = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, item);
+    }
+
+    #[test]
+    fn test_ui_history_item_without_rounds_keeps_the_existing_payload() {
+        let parsed: UiHistoryItem = serde_json::from_value(serde_json::json!({
+            "id": 11,
+            "kind": "user",
+            "text": "Older record",
+        }))
+        .unwrap();
+        assert!(parsed.rounds.is_empty());
+
+        let json = serde_json::to_value(committed_item(12, UiHistoryKind::User, "Bare")).unwrap();
+        assert!(
+            json.get("rounds").is_none(),
+            "a record without rounds must not add the property"
+        );
     }
 }

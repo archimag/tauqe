@@ -16,6 +16,7 @@ use tauqe_core::control::plan::sequence::{
 use tauqe_core::control::plan::step::PlanStepLoopConfig;
 use tauqe_core::control::prompt::PromptBuilder;
 use tauqe_core::control::turn::{run_turn_loop, TurnArtifact, TurnLoopConfig};
+use tauqe_core::git::checkpoint::RecoveryOutcome;
 use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::TurnBrief;
@@ -26,7 +27,7 @@ use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::research::journal::TurnResearchJournal;
 use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
-    events, CapabilityExpr, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent,
+    events, CapabilityTree, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent,
     EditFileStartedEvent, EditHunkEvent, EditOutcome, Event, GitCommitCreatedEvent,
     ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
     ResponseError, ReviewItem, ReviewSession, ReviewUpdatedEvent,
@@ -121,9 +122,7 @@ struct PreparedTurn {
     ///
     /// The tree belongs to the contour that started the turn, so the rendered
     /// rules, the response schema, and the decoder observe one declaration.
-    capabilities: CapabilityExpr,
-    /// Whether the turn executes one isolated plan step.
-    is_isolated_step: bool,
+    capabilities: CapabilityTree,
     /// Dialogue branch the turn is anchored on, if any.
     focus: Option<DiscussionTarget>,
     /// Whether the turn runs as a member of a batch supervisor. Recorded so the
@@ -235,6 +234,67 @@ pub(crate) fn build_apply_policy(
     }
 }
 
+/// Compacts the session journal before a turn reads it.
+///
+/// The journal a turn is about to extend is the one a later turn reasons over,
+/// so a session that outgrew the configured budget is compacted first: the
+/// Scribe summarizes the prefix, the retained tail keeps the cards a turn
+/// recorded on both sides of its attempts, and the budget and the retained turn
+/// count come from the project configuration instead of a compile-time
+/// constant.
+///
+/// The caller owns the operation slot while this runs — a dialogue turn and a
+/// batch step alike — so no other writer mutates the journal: the manager is
+/// cloned, compacted on the clone, and adopted back only when the compaction
+/// really rewrote the journal. A Scribe provider that cannot be built, or a
+/// compaction whose stream fails, leaves the journal untouched instead of
+/// failing the turn that asked for it.
+pub(crate) async fn compact_session_journal(
+    state: &Arc<AppState>,
+    app_config: &tauqe_core::config::AppConfig,
+    cancel_rx: watch::Receiver<bool>,
+) {
+    let budget_tokens = app_config.history.budget_tokens;
+    let mut history = state.history.lock().await.clone();
+    if !history.needs_compaction(budget_tokens) {
+        return;
+    }
+    let scribe = app_config.history_model();
+    let provider = match build_configured_provider(app_config, scribe.provider) {
+        Ok(provider) => provider,
+        Err(err) => {
+            tracing::warn!(
+                error = %err.message,
+                "session journal stayed over budget: the Scribe provider is unavailable"
+            );
+            return;
+        }
+    };
+    let before = history.estimated_tokens();
+    if let Err(err) = tauqe_core::control::history::compact_history_if_needed_with_budget(
+        &mut history,
+        provider.as_ref(),
+        &scribe,
+        cancel_rx,
+        budget_tokens,
+        app_config.history.tail_turns,
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "session journal compaction failed");
+        return;
+    }
+    let after = history.estimated_tokens();
+    if after == before {
+        return;
+    }
+    tracing::info!(
+        before_tokens = before,
+        after_tokens = after,
+        "compacted the session journal before the turn"
+    );
+    state.adopt_history(history).await;
+}
 /// Resolves the provider and model for a turn, emits `model/started`, and
 /// registers the cancellable active operation. `is_batch` marks turns that run
 /// as members of a batch supervisor so clients can suppress per-step signals.
@@ -247,7 +307,7 @@ pub(crate) fn build_apply_policy(
 #[allow(clippy::too_many_arguments)]
 async fn prepare_turn(
     state: &Arc<AppState>,
-    capabilities: CapabilityExpr,
+    capabilities: CapabilityTree,
     is_isolated_step: bool,
     focus: Option<DiscussionTarget>,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
@@ -360,7 +420,6 @@ async fn prepare_turn(
         reasoning_effort: effort,
         op_id,
         capabilities,
-        is_isolated_step,
         focus,
         is_batch,
         work_context,
@@ -388,7 +447,7 @@ async fn prepare_turn(
 /// that permits file edits composes the registry edit schema, where
 /// `plan_update` is already declared, so a plan discussion shares the composite
 /// schema instead of a separate read-only discussion schema.
-pub(super) fn resolve_turn_protocol(capabilities: CapabilityExpr) -> Box<dyn PromptProtocol> {
+pub(super) fn resolve_turn_protocol(capabilities: CapabilityTree) -> Box<dyn PromptProtocol> {
     let base_protocol: Box<dyn PromptProtocol> = Box::new(JsonPromptProtocol::edits());
     base_protocol.with_capability_expr(capabilities)
 }
@@ -439,7 +498,6 @@ async fn run_prepared_turn_control_loops(
         app_config,
         op_id,
         capabilities,
-        is_isolated_step,
         focus,
         is_batch,
         work_context,
@@ -467,6 +525,11 @@ async fn run_prepared_turn_control_loops(
     // highest insertion watermark it carries is what a chronological transcript
     // uses to place a file discovered later, so the turn records it together
     // with the prompt instead of leaving the arrival signal permanently absent.
+    // The dialogue is about to read the journal it extends, so a session that
+    // outgrew the configured budget is compacted first: the turn then reasons
+    // over the compacted session instead of a budget-exhausted one.
+    compact_session_journal(state, &app_config, cancel_rx.clone()).await;
+
     let (context_files, context_watermark) = {
         let context = state.context.read().await;
         let watermark = context
@@ -493,11 +556,10 @@ async fn run_prepared_turn_control_loops(
         (turn_id, snapshot)
     };
 
-    let loop_config = {
-        let mut cfg = ReplLoopConfig::from_app_config(&app_config);
-        cfg.turn.edit.staging.reasoning_effort = reasoning_effort;
-        cfg
-    };
+    // The turn configuration carries the material budgets of the turn only: the
+    // reasoning depth travels through the prompt builder, so the loop needs no
+    // per-contour override.
+    let loop_config = ReplLoopConfig::from_app_config(&app_config);
     let history_snapshot_clone = history_snapshot.clone();
     let app_config_clone = app_config.clone();
     let loop_task = tokio::spawn(async move {
@@ -522,9 +584,6 @@ async fn run_prepared_turn_control_loops(
             app_config_clone.context.repomap_token_budget,
         )
         .with_patch_strategy(app_config_clone.repl.patch_strategy)
-        .with_prompt_layout(Some(
-            app_config_clone.resolve_prompt_layout(!is_isolated_step),
-        ))
         .with_workflow(app_config_clone.repl.workflow.to_string())
         .with_outer_docs(app_config_clone.outer_docs.clone())
         .with_reasoning_effort(reasoning_effort);
@@ -777,6 +836,12 @@ async fn run_prepared_turn_control_loops(
     let (loop_res, local_context) = match joined {
         Ok(res) => (res.0, res.1),
         Err(join_err) => {
+            // The task was force-aborted or panicked, so the rollback its edit
+            // loop owns never ran and the checkpoint and step commits it captured
+            // are still in the repository. Resolve that residue before the turn
+            // reports its ending instead of leaving the working tree dirty until
+            // the next daemon start.
+            unwind_abandoned_transaction(state, &op_id).await;
             let cancelled = is_cancelled || *cancel_rx.borrow();
             let text = if cancelled {
                 "Operation cancelled".to_string()
@@ -1015,7 +1080,7 @@ async fn run_prepared_turn_control_loops(
                     outcome,
                 }
             } else {
-                edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+                edit_cycle.close_answered();
                 {
                     let mut history = state.history.lock().await;
                     let _ = history.record_response(&text, None, None, Vec::new());
@@ -1031,7 +1096,11 @@ async fn run_prepared_turn_control_loops(
                     .clone()
                     .unwrap_or_else(|| "Operation failed".to_string())
             };
-            edit_cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
+            close_failed(
+                &edit_cycle,
+                EditTermination::StagingRefused,
+                error_msg.clone().unwrap_or_default(),
+            );
             {
                 let mut history = state.history.lock().await;
                 let _ = history.record_response(&text, None, None, Vec::new());
@@ -1278,6 +1347,49 @@ async fn publish_review_decisions(
     }
 }
 
+/// Unwinds the Git transaction of a turn that could not settle it itself.
+///
+/// A turn that is force-aborted or panics drops its control loop mid-flight, so
+/// the rollback the edit loop owns never runs and the checkpoint and step
+/// commits it captured stay in the repository. The checkpoint recovery pass
+/// resolves exactly that residue, so the working tree returns to its pre-turn
+/// revision at the moment the turn ends instead of waiting for the next daemon
+/// start.
+///
+/// The pass is best effort. A recovery that refuses because it cannot prove the
+/// transaction abandoned reports its reason and leaves the residue to the
+/// startup pass, which runs with no turn in flight; the turn's own ending is
+/// never replaced by a recovery failure.
+async fn unwind_abandoned_transaction(state: &Arc<AppState>, op_id: &str) {
+    let repo_root = state.repo_root().await;
+    let recovered =
+        offload(move || tauqe_core::git::checkpoint::recover_interrupted_workflow(&repo_root))
+            .await;
+    match recovered {
+        Ok(Ok(RecoveryOutcome::NothingToDo)) => {}
+        Ok(Ok(outcome)) => {
+            tracing::warn!(
+                operation_id = %op_id,
+                "Unwound the transaction of an interrupted turn: {}",
+                outcome,
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                operation_id = %op_id,
+                "Failed to unwind the transaction of an interrupted turn: {:#}",
+                error,
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                operation_id = %op_id,
+                "Failed to schedule the transaction unwind of an interrupted turn: {error}",
+            );
+        }
+    }
+}
+
 /// Initiates an asynchronous model turn in the background and immediately returns its operation ID.
 ///
 /// Designed as a lightweight non-blocking wrapper for interactive single-prompt RPC requests.
@@ -1343,7 +1455,7 @@ pub async fn start_model_turn(
 #[allow(dead_code)]
 pub struct StepTurnOptions {
     /// Capability surface the turn advertises and accepts.
-    pub capabilities: CapabilityExpr,
+    pub capabilities: CapabilityTree,
     /// Whether the turn executes one isolated plan step.
     pub is_isolated_step: bool,
     pub custom_selection: Option<tauqe_protocol::ModelSelection>,
@@ -1631,7 +1743,6 @@ pub(crate) async fn run_step_loop(
             config.context.repomap_token_budget,
         )
         .with_patch_strategy(config.repl.patch_strategy)
-        .with_prompt_layout(Some(config.resolve_prompt_layout(false)))
         .with_workflow(config.repl.workflow.to_string())
         .with_outer_docs(config.outer_docs.clone())
         .with_turn_brief(Some(TurnBrief::step()))
@@ -1677,6 +1788,10 @@ pub(crate) async fn run_step_loop(
     let (report, context_manager) = match joined {
         Ok(joined) => joined,
         Err(join_err) => {
+            // The task was force-aborted or panicked, so the rollback its edit
+            // loop owns never ran and the checkpoint and step commits it captured
+            // are still in the repository.
+            unwind_abandoned_transaction(state, &op_id).await;
             // A task force-aborted through the operation slot never reports its own
             // outcome, so the authoritative cancel signal classifies the ending: a
             // raised cancel stays a cancellation, while a task that died without it

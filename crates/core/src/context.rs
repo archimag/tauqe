@@ -145,7 +145,8 @@ impl ContextManager {
         cm
     }
 
-    pub fn with_pinned(repo_root: PathBuf, pinned_patterns: &[String]) -> Self {
+    #[cfg(test)]
+    fn with_pinned(repo_root: PathBuf, pinned_patterns: &[String]) -> Self {
         let mut cm = Self {
             repo_root,
             revision: 1,
@@ -164,7 +165,7 @@ impl ContextManager {
         &self.repo_root
     }
 
-    pub fn pinned_patterns(&self) -> &[String] {
+    pub(crate) fn pinned_patterns(&self) -> &[String] {
         &self.pinned_patterns
     }
 
@@ -175,7 +176,7 @@ impl ContextManager {
 
     /// Resolves access across all layers.
     /// Invariant: `Editable` always takes absolute priority over `ReadOnly`.
-    pub fn effective_access_for(&self, clean_path: &str) -> Option<ContextAccess> {
+    pub(crate) fn effective_access_for(&self, clean_path: &str) -> Option<ContextAccess> {
         let mut found = false;
         for layer in [&self.user, &self.auto, &self.pinned] {
             if let Some(it) = layer.get(clean_path) {
@@ -297,7 +298,8 @@ impl ContextManager {
     /// places it. The sort is stable, so equal watermarks — concurrent additions
     /// folded in by `merge_turn_context` — keep the semantic layer order and the
     /// result stays deterministic.
-    pub fn read_context_files_by_insertion(&self) -> Vec<ContextFileContent> {
+    #[cfg(test)]
+    fn read_context_files_by_insertion(&self) -> Vec<ContextFileContent> {
         let mut files = self.read_context_files_with_seq();
         files.sort_by_key(|file| file.insertion_seq);
         files
@@ -311,7 +313,8 @@ impl ContextManager {
             || self.auto.contains_key(&clean_path))
     }
 
-    pub fn is_editable(&self, relative_path: &str) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) fn is_editable(&self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         Ok(self.effective_access_for(&clean_path) == Some(ContextAccess::Editable))
     }
@@ -417,6 +420,8 @@ impl ContextManager {
     /// arrived. Allocating a fresh one on every add would move the file to the
     /// tail of the chronological timeline, and it would make an otherwise
     /// identical re-add look like a change that bumps the revision on its own.
+    /// [`Self::move_files_to_tail`] is the one sanctioned re-issuer of a watermark:
+    /// a change set that rewrote the file is a position event, not a repeated arrival.
     fn resolve_insertion_seq(&mut self, clean_path: &str) -> u64 {
         if let Some(seq) = self.existing_insertion_seq(clean_path) {
             return seq;
@@ -424,7 +429,60 @@ impl ContextManager {
         self.insertion_counter += 1;
         self.insertion_counter
     }
-
+    /// Relocates the named context paths to the tail of their context layers.
+    ///
+    /// A change set that converged or was refused in virtual staging changes
+    /// what the model must read next, so the working set it touched travels to
+    /// the tail of the transcript: every named path a context layer holds is
+    /// re-issued a fresh arrival watermark — in the order the caller named
+    /// the groups, the converged members before the refused ones — and its
+    /// entry moves to the tail of the layer that holds it. The chronological
+    /// layout is a pure function of the watermark, so the next assembly
+    /// renders the relocated group behind the last recorded turn instead of
+    /// where the files first arrived, and the repair or healing round
+    /// addresses the bytes it is about to change.
+    ///
+    /// The relocation is the sanctioned exception to the stable arrival slot
+    /// (§9.6 of `crates/core/Conventions.md`): an arrival keeps its position
+    /// while nothing changes it, and a rewrite is a position event. A path no
+    /// layer holds — a file the change set creates outside the context — is
+    /// skipped without consuming a watermark, and a call that names no path
+    /// the layers know leaves the revision untouched.
+    ///
+    /// Returns `true` only when at least one named path was found and moved.
+    pub(crate) fn move_files_to_tail(&mut self, paths: &[String]) -> bool {
+        let mut moved = false;
+        for raw in paths {
+            let Ok(clean) = self.normalize_path(raw) else {
+                continue;
+            };
+            let present = self.pinned.contains_key(&clean)
+                || self.outer_docs.contains_key(&clean)
+                || self.user.contains_key(&clean)
+                || self.auto.contains_key(&clean);
+            if !present {
+                continue;
+            }
+            self.insertion_counter += 1;
+            let fresh = self.insertion_counter;
+            for layer in [
+                &mut self.pinned,
+                &mut self.outer_docs,
+                &mut self.user,
+                &mut self.auto,
+            ] {
+                if let Some(mut item) = layer.shift_remove(&clean) {
+                    item.insertion_seq = fresh;
+                    layer.insert(clean.clone(), item);
+                }
+            }
+            moved = true;
+        }
+        if moved {
+            self.revision += 1;
+        }
+        moved
+    }
     pub fn add_file(&mut self, relative_path: &str, access: ContextAccess) -> Result<ContextItem> {
         self.add_file_to_layer(relative_path, access, ContextLayer::User)
     }
@@ -594,7 +652,8 @@ impl ContextManager {
 
     /// Drops a file strictly from the auto context layer.
     /// Files present in `user` or `pinned` layers are never removed and return `Ok(false)`.
-    pub fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
+    #[cfg(test)]
+    fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         if self.auto.shift_remove(&clean_path).is_some() {
             self.recompute_pinned();
@@ -718,7 +777,7 @@ impl ContextManager {
             })
         })
     }
-    pub fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
+    pub(crate) fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
         // The metadata read is blocking filesystem work, so it runs off the
         // async executor thread.
         crate::blocking::run_blocking(|| {
@@ -767,61 +826,6 @@ impl ContextManager {
         } else {
             Ok(false)
         }
-    }
-
-    /// Renames a file in context, preserving its layer, access level, and metadata.
-    pub fn rename_file(&mut self, from_relative: &str, to_relative: &str) -> Result<()> {
-        // The destination metadata read is blocking filesystem work, so it runs
-        // off the async executor thread.
-        crate::blocking::run_blocking(|| {
-            let clean_from = self.normalize_path(from_relative)?;
-            let clean_to = self.normalize_path(to_relative)?;
-            if clean_from == clean_to {
-                bail!("Source and destination paths are identical: {}", clean_from);
-            }
-
-            let mut found_item = None;
-            let mut found_layer = None;
-
-            if let Some(item) = self.user.shift_remove(&clean_from) {
-                found_item = Some(item);
-                found_layer = Some(ContextLayer::User);
-            } else if let Some(item) = self.auto.shift_remove(&clean_from) {
-                found_item = Some(item);
-                found_layer = Some(ContextLayer::Auto);
-            } else if self.pinned.contains_key(&clean_from) {
-                bail!("Pinned file '{}' cannot be renamed or moved", clean_from);
-            } else if self.outer_docs.contains_key(&clean_from) {
-                bail!(
-                    "External document '{}' cannot be renamed or moved",
-                    clean_from
-                );
-            }
-
-            if let (Some(mut item), Some(layer)) = (found_item, found_layer) {
-                item.path = clean_to.clone();
-                let full_to = self.repo_root.join(&clean_to);
-                if let Ok(meta) = std::fs::metadata(&full_to) {
-                    item.size_bytes = meta.len();
-                    item.estimated_tokens = estimate_tokens_from_bytes(item.size_bytes);
-                }
-                match layer {
-                    ContextLayer::User => {
-                        self.user.insert(clean_to, item);
-                    }
-                    ContextLayer::Auto => {
-                        self.auto.insert(clean_to, item);
-                    }
-                    // Neither layer can reach this point: pinned and external
-                    // documents are rejected before the rename begins.
-                    ContextLayer::Pinned | ContextLayer::OuterDocs => {}
-                }
-                self.recompute_pinned();
-                self.revision += 1;
-            }
-
-            Ok(())
-        })
     }
 
     pub fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
@@ -883,7 +887,7 @@ impl ContextManager {
     }
 
     /// Prunes files from context that no longer exist on disk (e.g. after undoing AI creation).
-    pub fn prune_missing_files(&mut self) -> Vec<String> {
+    pub(crate) fn prune_missing_files(&mut self) -> Vec<String> {
         // Existence checks against every context path are blocking filesystem
         // work, so the prune runs off the async executor thread.
         crate::blocking::run_blocking(|| {
@@ -2036,5 +2040,53 @@ mod tests {
             vec!["a.md".to_string(), "b.md".to_string()]
         );
         assert!(outer_docs_tokens(&primary) > 0);
+    }
+
+    #[test]
+    fn test_move_files_to_tail_relocates_named_paths_in_the_given_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+        cm.add_file("b.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_file("c.rs", ContextAccess::ReadOnly).unwrap();
+        let opening_a = watermark_of(&cm, "a.rs");
+        let rev_before = cm.get_state().revision;
+
+        // The converged member is named first, the refused member second, so
+        // the relocation keeps exactly that order while the untouched neighbor
+        // keeps its position.
+        assert!(cm.move_files_to_tail(&["c.rs".to_string(), "a.rs".to_string()]));
+
+        let state = cm.get_state();
+        let paths: Vec<&str> = state.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["b.rs", "c.rs", "a.rs"]);
+        assert!(cm.get_state().revision > rev_before);
+        // A re-issued watermark exceeds every watermark the session recorded
+        // before it, so the chronological layout moves the file to the tail.
+        let seq_c = watermark_of(&cm, "c.rs");
+        let seq_a = watermark_of(&cm, "a.rs");
+        assert!(seq_c > opening_a);
+        assert!(seq_a > seq_c);
+    }
+
+    #[test]
+    fn test_move_files_to_tail_skips_unknown_paths_without_a_revision_bump() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "fn f() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
+        let rev_before = cm.get_state().revision;
+
+        assert!(!cm.move_files_to_tail(&["missing.rs".to_string()]));
+        assert_eq!(cm.get_state().revision, rev_before);
+        assert!(!cm.move_files_to_tail(&[]));
+        assert_eq!(cm.get_state().revision, rev_before);
     }
 }

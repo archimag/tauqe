@@ -8,7 +8,7 @@ use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
 use super::ContextManager;
 
 impl ContextManager {
-    pub fn load_pinned_from_repo(&mut self) {
+    pub(crate) fn load_pinned_from_repo(&mut self) {
         // Reading `tauqe.toml` and resolving the pinned ancestors is blocking
         // filesystem work, so it runs off the async executor thread.
         crate::blocking::run_blocking(|| {

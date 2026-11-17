@@ -45,7 +45,9 @@ use crate::handlers::common::{
     cleanup_transient_context, emit, preload_declared_files, preload_declared_outer_docs,
     OuterDocsRefusal,
 };
-use crate::handlers::model::turn::{run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport};
+use crate::handlers::model::turn::{
+    compact_session_journal, run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport,
+};
 use crate::handlers::offload;
 use crate::handlers::review::publish_review;
 use crate::state::{AppState, OperationGuard};
@@ -268,7 +270,10 @@ impl ImplementationHost for ServerImplementationHost {
             session_id,
             cancel_rx,
         } = request;
-
+        // A batch executes many steps against one journal, so the run keeps it
+        // within the configured budget before the step assembles its context.
+        // The two-sided cards the executed steps recorded stay authoritative.
+        compact_session_journal(&self.state, &self.config, cancel_rx.clone()).await;
         // Every attempt starts from a clean transient context: the files a
         // previous step discovered and the documents it mounted describe work
         // that is already finished.

@@ -1,239 +1,148 @@
-//! Virtual staging loop: in-memory patch application with a localized retry.
+//! Virtual staging of one change set: in-memory patch application with a localized retry.
 //!
-//! [`run_staging_loop`] owns exactly one responsibility of the turn: it takes the
-//! change set a model round proposed, applies it to the virtual staging state, and
-//! repairs the members the substrate refused through a bounded patch-retry loop.
-//! It never touches Git, the toolchain, or the working tree, and it interprets no
-//! semantic outcome of the model: a round that carries no change set leaves the
-//! loop as [`LoopResult::Diverged`] with its envelope intact, so the contour that
-//! owns the answer reads it.
+//! [`execute_staging_step`] owns exactly one responsibility of the turn: it takes the
+//! change set a model round proposed and applies it to the virtual staging state. The
+//! retry rounds a refusal opens belong to
+//! [`crate::control::turn::run_turn_loop`], so a refused member can never terminate the
+//! turn on a local counter: it is repaired from the same round budget the whole turn
+//! draws on. The step never touches Git, the toolchain, or the working tree, and it
+//! interprets no semantic outcome of the model: a round that carries no change set is
+//! reported as unaddressed and its envelope stays intact for the contour that owns the
+//! answer.
 //!
 //! A structural protocol defect is not a staging failure (`crates/core/Conventions.md`
-//! §13.6): repairing malformed output belongs to the protocol sanitizer, so this
-//! loop only retries members the substrate refused for a semantic reason and keeps
-//! the protocol surface out of its budget.
+//! §13.6): repairing malformed output belongs to the protocol sanitizer, so the step
+//! only retries members the substrate refused for a semantic reason and keeps the
+//! protocol surface out of the turn's budget.
 
 use std::collections::{HashMap, HashSet};
 
-use tauqe_protocol::{EditOperation, LlmCommand, PatchStrategy, ReasoningEffort, TurnPhase};
+use tauqe_protocol::{EditOperation, LlmCommand, PatchStrategy};
 
 use crate::control::context::LoopContext;
-use crate::control::outcome::{
-    FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError,
-};
+use crate::control::outcome::ResponseEnvelope;
 use crate::edits::{stage_and_validate_edits, EditError, StagedEditsState};
-use crate::providers::StreamEvent;
 use crate::workflow::retry::{
-    build_patch_retry_prompt, format_patch_retry_reason, prepare_staged_for_retry,
-    retain_retried_failed_files,
+    format_patch_retry_reason, prepare_staged_for_retry, retain_retried_failed_files,
 };
-
-/// Flat configuration of one virtual-staging contour.
+/// Cumulative virtual staging state of one turn.
 ///
-/// The contour reads nothing but these values, so whatever narrows them — a
-/// workflow default today, a ladder entry per model tomorrow — stays with the
-/// caller that owns that decision.
-#[derive(Debug, Clone)]
-pub struct StagingLoopConfig {
-    /// Patch-retry rounds granted to a change set the substrate refused.
-    pub max_retries: usize,
-    /// Strategy that decides how a change set addresses the lines it replaces.
-    pub patch_strategy: PatchStrategy,
-    /// Reasoning effort requested for the repair rounds.
-    pub reasoning_effort: Option<ReasoningEffort>,
-}
-
-impl StagingLoopConfig {
-    /// Creates staging configuration from project REPL configuration.
-    pub fn from_repl_config(config: &crate::config::ReplConfig) -> Self {
-        Self {
-            max_retries: config.max_retries,
-            patch_strategy: config.patch_strategy,
-            reasoning_effort: None,
-        }
-    }
-}
-
-impl Default for StagingLoopConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            patch_strategy: PatchStrategy::SearchReplace,
-            reasoning_effort: None,
-        }
-    }
-}
-/// In-memory change set that converged in virtual staging.
-#[derive(Debug, Clone)]
-pub struct StagingArtifact {
-    /// Cumulative virtual state of the attempt, including earlier rounds.
-    pub staged_state: StagedEditsState,
+/// A turn stages its change set in as many attempts as the repair rounds it
+/// spends, so the virtual state it converges on belongs to the turn rather than to
+/// a single attempt. The loop that drives the turn owns the value and hands every
+/// attempt a mutable reference to it.
+#[derive(Debug, Default)]
+pub struct StagingState {
+    /// Virtual state the attempts converged on.
+    pub(crate) staged_state: Option<StagedEditsState>,
     /// Operations that converged, in change-set order.
-    pub cumulative_edits: Vec<EditOperation>,
-    /// Files the model stopped retrying, paired with their rendered reason.
-    pub abandoned_failures: Vec<(String, String)>,
+    pub(crate) cumulative_edits: Vec<EditOperation>,
+    /// Paths whose edit reached the virtual state.
+    pub(crate) succeeded: HashSet<String>,
+    /// Paths the substrate refused in the latest attempt that addressed them.
+    pub(crate) failed: HashMap<String, EditError>,
+    /// Paths the model stopped retrying, paired with the error that refused them.
+    pub(crate) abandoned: HashMap<String, EditError>,
+    /// Number of staging attempts the turn spent.
+    pub(crate) attempts: usize,
 }
 
-/// Applies a change set to the virtual staging state and repairs its refusals.
+/// What one executed staging attempt produced.
+#[derive(Debug, Default)]
+pub struct StagingStep {
+    /// Whether the envelope carried a change set the attempt could stage.
+    pub(crate) addressed: bool,
+    /// Refusals of the attempt, rendered by the patch strategy of the turn and
+    /// sorted by path.
+    pub(crate) refusals: Vec<(String, String)>,
+}
+
+/// Executes exactly one staging attempt against the virtual state of the turn.
 ///
-/// The opening envelope is drained of [`tauqe_protocol::LlmCapability::FileEdits`]
-/// and travels upward with the artifact, so companion commands of the same round
-/// stay available to the contours above. Every attempt contributes its converged
-/// members to the cumulative state, and the residual refusals drive one repair
-/// round each until the budget is spent.
-pub async fn run_staging_loop(
+/// The step drains the change set of the envelope, prepares a corrected set
+/// against the refusals of the previous attempt, applies it to the virtual state,
+/// and records the churn the attempt produced. It never requests a round of its
+/// own: the repair rounds and their budget belong to the loop that drives the turn.
+pub(crate) fn execute_staging_step(
     ctx: &mut LoopContext<'_>,
-    mut first_envelope: ResponseEnvelope,
-    config: &StagingLoopConfig,
-) -> Result<LoopResult<StagingArtifact>, SystemError> {
-    ctx.check_cancelled()?;
-
-    let mut current_edits = extract_file_edits(&mut first_envelope);
-    if current_edits.is_empty() {
-        return Ok(LoopResult::Diverged(first_envelope));
+    envelope: &mut ResponseEnvelope,
+    state: &mut StagingState,
+) -> StagingStep {
+    let edits = extract_file_edits(envelope);
+    if edits.is_empty() {
+        return StagingStep::default();
     }
 
-    let mut staged_state: Option<StagedEditsState> = None;
-    let mut cumulative_edits: Vec<EditOperation> = Vec::new();
-    let mut succeeded: HashSet<String> = HashSet::new();
-    let mut failed: HashMap<String, EditError> = HashMap::new();
-    let mut abandoned: HashMap<String, EditError> = HashMap::new();
-    let mut attempt = 0usize;
-
-    loop {
-        ctx.check_cancelled()?;
-
-        let result = stage_and_validate_edits(
-            ctx.repo_root,
+    // A corrected change set is prepared before it is staged: the paths it
+    // re-edits leave the virtual state so they are staged again against their
+    // clean base, and a refusal the model left out of its corrected set is
+    // carried into the abandoned record instead of vanishing with the entry.
+    let unretried = retain_retried_failed_files(&mut state.failed, ctx.context_manager, &edits);
+    for (path, error) in unretried {
+        state.abandoned.entry(path).or_insert(error);
+    }
+    if let Some(staged) = state.staged_state.as_mut() {
+        prepare_staged_for_retry(
+            staged,
+            &mut state.cumulative_edits,
+            &mut state.succeeded,
             ctx.context_manager,
-            &current_edits,
-            staged_state.as_ref(),
-        );
-        let converged = result.successful_paths.len();
-        staged_state = Some(result.staged_state);
-        // Only a path that converged in this attempt answers its earlier refusal.
-        // Clearing by the cumulative set would also erase the failure of a path
-        // that succeeded earlier and then failed again outside this attempt.
-        for path in &result.successful_paths {
-            failed.remove(path);
-            abandoned.remove(path);
-        }
-        succeeded.extend(result.successful_paths);
-        cumulative_edits.extend(result.successful_edits);
-        for failure in result.failed_files {
-            abandoned.remove(&failure.path);
-            failed.insert(failure.path, failure.error);
-        }
-        tracing::info!(
-            repo_root = %ctx.repo_root.display(),
-            attempt,
-            converged,
-            refused = failed.len(),
-            "virtual staging attempt completed"
-        );
-
-        if failed.is_empty() {
-            break;
-        }
-
-        if attempt >= config.max_retries {
-            let diagnostics: Vec<String> = render_failures(&failed, config.patch_strategy)
-                .into_iter()
-                .map(|(path, reason)| format!("- `{path}`: {reason}"))
-                .collect();
-            tracing::warn!(
-                repo_root = %ctx.repo_root.display(),
-                attempt,
-                refused = diagnostics.len(),
-                "virtual staging exhausted its patch-retry budget"
-            );
-            return Ok(LoopResult::Exhausted(FailureReport::new(
-                "the change set did not converge in virtual staging",
-                attempt,
-                diagnostics,
-            )));
-        }
-        attempt += 1;
-
-        ctx.events.emit(StreamEvent::TurnPhase {
-            phase: TurnPhase::Staging,
-            round: Some(attempt),
-            max_rounds: Some(config.max_retries),
-            detail: Some(format!("Patch retry {attempt}/{}", config.max_retries)),
-        });
-        let rendered = render_failures(&failed, config.patch_strategy);
-        for (path, reason) in &rendered {
-            tracing::warn!(
-                repo_root = %ctx.repo_root.display(),
-                attempt,
-                path = path.as_str(),
-                reason = reason.as_str(),
-                "patch retry requested"
-            );
-            ctx.events.emit(StreamEvent::EditFileRetrying {
-                path: path.clone(),
-                attempt,
-                max_retries: config.max_retries,
-                reason: reason.clone(),
-            });
-        }
-        let repair_prompt =
-            build_patch_retry_prompt(&succeeded, &failed, &[], config.patch_strategy);
-        let mut reply = ctx
-            .request_repair(&repair_prompt, staged_state.as_ref())
-            .await?;
-        let corrected = extract_file_edits(&mut reply);
-        if corrected.is_empty() {
-            // The repair round answered with something other than a change set.
-            // Its answer is not staging's to interpret, so the envelope travels
-            // upward untouched, exactly as the opening round's would.
-            return Ok(LoopResult::Diverged(reply));
-        }
-
-        // A path the corrected set does not touch was not retried: the loop stops
-        // asking for it, but its edit never reached the change set, so the record
-        // is carried into the artifact instead of vanishing with the entry.
-        let unretried = retain_retried_failed_files(&mut failed, ctx.context_manager, &corrected);
-        for (path, error) in unretried {
-            abandoned.entry(path).or_insert(error);
-        }
-        if let Some(staged) = staged_state.as_mut() {
-            prepare_staged_for_retry(
-                staged,
-                &mut cumulative_edits,
-                &mut succeeded,
-                ctx.context_manager,
-                &corrected,
-            );
-        }
-        current_edits = corrected;
-    }
-
-    let abandoned_failures = render_failures(&abandoned, config.patch_strategy);
-    for (path, reason) in &abandoned_failures {
-        tracing::warn!(
-            repo_root = %ctx.repo_root.display(),
-            path = path.as_str(),
-            reason = reason.as_str(),
-            "a refused file was not retried and stays out of the change set"
+            &edits,
         );
     }
 
-    Ok(LoopResult::Success(LoopSuccess::new(
-        StagingArtifact {
-            staged_state: staged_state.unwrap_or_default(),
-            cumulative_edits,
-            abandoned_failures,
-        },
-        first_envelope,
-    )))
+    state.attempts += 1;
+    let result = stage_and_validate_edits(
+        ctx.repo_root,
+        ctx.context_manager,
+        &edits,
+        state.staged_state.as_ref(),
+    );
+    let converged = result.successful_paths.len();
+    state.staged_state = Some(result.staged_state);
+    // Only a path that converged in this attempt answers its earlier refusal.
+    // Clearing by the cumulative set would also erase the failure of a path
+    // that succeeded earlier and then failed again outside this attempt.
+    for path in &result.successful_paths {
+        state.failed.remove(path);
+        state.abandoned.remove(path);
+    }
+    let converged_paths = result.successful_paths.clone();
+    state.succeeded.extend(result.successful_paths);
+    state.cumulative_edits.extend(result.successful_edits);
+    for failure in result.failed_files {
+        state.abandoned.remove(&failure.path);
+        state.failed.insert(failure.path, failure.error);
+    }
+
+    // The change set this attempt produced is the churn of the working set the
+    // model must read next: the members that converged relocate first, the
+    // members the substrate refused follow them, and the mark stales the rendered
+    // prefix so the repair or healing round re-reads the bytes it is about to
+    // address instead of the bytes the turn opened with.
+    let mut refused_paths: Vec<String> = state.failed.keys().cloned().collect();
+    refused_paths.sort();
+    ctx.note_context_churn(&converged_paths, &refused_paths);
+
+    tracing::info!(
+        repo_root = %ctx.repo_root.display(),
+        attempt = state.attempts,
+        converged,
+        refused = state.failed.len(),
+        "virtual staging attempt completed"
+    );
+
+    StagingStep {
+        addressed: true,
+        refusals: render_failures(&state.failed, ctx.prompt_builder.patch_strategy),
+    }
 }
 
 /// Renders the refusals of one attempt as a path-sorted diagnostic list.
 ///
 /// The wording comes from the active patch strategy, so a retry round is never
 /// taught the vocabulary of a contour the turn does not speak.
-fn render_failures(
+pub(super) fn render_failures(
     failed: &HashMap<String, EditError>,
     patch_strategy: PatchStrategy,
 ) -> Vec<(String, String)> {
@@ -265,35 +174,15 @@ mod tests {
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
     use crate::prompt::json::JsonPromptProtocol;
-    use crate::providers::mock::{MockLlmProvider, MockResponse};
+    use crate::providers::mock::MockLlmProvider;
     use tauqe_protocol::{
-        CapabilityExpr, ContextAccess, EditReplace, LlmCapability, LlmCommand, ModelRef,
+        CapabilityTree, ContextAccess, EditReplace, LlmCapability, LlmCommand, ModelRef,
         TextCommand,
     };
 
     const TARGET: &str = "pub fn compute() -> i32 { 0 }\n";
     const CORRECTED: &str = "pub fn compute() -> i32 { 42 }\n";
 
-    /// Builds an XML change set for `a.rs` in the dialect the tests speak.
-    fn edit_block(search: &str, replace: &str) -> String {
-        serde_json::json!({
-            "message": "Edit",
-            "changes": [{
-                "op": "replace",
-                "path": "a.rs",
-                "to": "",
-                "start": "",
-                "end": "",
-                "content": "",
-                "old_text": search,
-                "new_text": replace
-            }],
-            "commit_message": "Edit",
-            "reason": ""
-        })
-        .to_string()
-    }
-    /// Owns the whole operating environment one staging contour observes.
     struct Fixture {
         dir: tempfile::TempDir,
         context: ContextManager,
@@ -308,11 +197,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(
-            files: &[(&str, &str)],
-            context_files: &[&str],
-            responses: Vec<MockResponse>,
-        ) -> Self {
+        fn new(files: &[(&str, &str)], context_files: &[&str]) -> Self {
             let dir = tempfile::tempdir().expect("scratch directory");
             let root = dir.path().to_path_buf();
             crate::git::init_repository(Some(&root), true).expect("repository");
@@ -332,24 +217,24 @@ mod tests {
             Self {
                 dir,
                 context,
-                provider: MockLlmProvider::scripted(responses),
+                journal: crate::workflow::research::journal::TurnResearchJournal::default(),
+                provider: MockLlmProvider::scripted(Vec::new()),
                 model: ModelRef::openrouter("mock/model"),
                 protocol: JsonPromptProtocol::edits(),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
-                journal: crate::workflow::research::journal::TurnResearchJournal::default(),
                 policy: crate::workflow::policy::DirectApplyPolicy::new(),
             }
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityExpr::set(
+            let caps = CapabilityTree::set(
                 crate::control::turn::EDIT_CAPABILITIES
                     .iter()
                     .copied()
                     .chain([LlmCapability::TextMessage])
-                    .map(CapabilityExpr::leaf),
+                    .map(CapabilityTree::leaf),
             );
             let prompt_builder = crate::control::prompt::PromptBuilder::new(
                 &self.provider,
@@ -370,134 +255,93 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_round_without_a_change_set_diverges_with_its_envelope() {
-        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand {
+    /// Builds the change set of a replacement of `a.rs`.
+    fn replace(search: &str, replacement: &str) -> ResponseEnvelope {
+        ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
+            path: "a.rs".to_string(),
+            old_text: search.to_string(),
+            new_text: replacement.to_string(),
+        })])
+    }
+
+    #[test]
+    fn a_round_without_a_change_set_is_unaddressed() {
+        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"]);
+        let mut envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand {
             content: "no change set".to_string(),
         })]);
-
         let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
-            .await
-            .expect("staging completes");
+        let mut state = StagingState::default();
 
-        assert!(outcome.is_diverged());
-        assert!(
-            fixture.provider.requests().is_empty(),
-            "a round without a change set costs no provider round trip"
+        let step = execute_staging_step(&mut ctx, &mut envelope, &mut state);
+        assert!(!step.addressed);
+        assert_eq!(state.attempts, 0, "an unaddressed round spends no attempt");
+        assert_eq!(
+            envelope.len(),
+            1,
+            "the envelope of an unaddressed round stays intact"
         );
     }
 
-    #[tokio::test]
-    async fn a_converging_change_set_returns_its_virtual_state() {
-        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
-            path: "a.rs".to_string(),
-            old_text: "pub fn compute() -> i32 { 0 }".to_string(),
-            new_text: "pub fn compute() -> i32 { 42 }".to_string(),
-        })]);
-
+    #[test]
+    fn a_converging_change_set_reaches_the_virtual_state() {
+        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"]);
+        let mut envelope = replace(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
         let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
-            .await
-            .expect("staging completes");
-        let success = outcome.into_success().expect("the change set converges");
+        let mut state = StagingState::default();
 
-        assert_eq!(success.value.cumulative_edits.len(), 1);
+        let step = execute_staging_step(&mut ctx, &mut envelope, &mut state);
+        assert!(step.addressed);
+        assert!(step.refusals.is_empty());
+        assert!(
+            envelope.is_empty(),
+            "the change set is drained from the envelope"
+        );
         assert_eq!(
-            success
-                .value
+            state
                 .staged_state
+                .as_ref()
+                .expect("the change set converged")
                 .staged_text_files()
                 .get("a.rs")
                 .map(String::as_str),
             Some(CORRECTED)
         );
-        assert!(success.value.abandoned_failures.is_empty());
-        assert!(
-            success.response.is_empty(),
-            "the change set is drained from the envelope that travels upward"
-        );
-        assert!(fixture.provider.requests().is_empty());
     }
 
-    #[tokio::test]
-    async fn a_refused_member_is_repaired_by_one_patch_retry_round() {
-        let responses = vec![MockResponse::text(edit_block(
+    #[test]
+    fn a_refused_member_is_repaired_by_a_later_attempt() {
+        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"]);
+        let mut ctx = fixture.context();
+        let mut state = StagingState::default();
+
+        let mut refused = replace("nonexistent text", "irrelevant");
+        execute_staging_step(&mut ctx, &mut refused, &mut state);
+        assert_eq!(state.failed.len(), 1, "the member is refused");
+
+        let mut repaired = replace(
             "pub fn compute() -> i32 { 0 }",
             "pub fn compute() -> i32 { 42 }",
-        ))];
-        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], responses);
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
-            path: "a.rs".to_string(),
-            old_text: "nonexistent text".to_string(),
-            new_text: "irrelevant".to_string(),
-        })]);
-
-        let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
-            .await
-            .expect("staging completes");
-        let success = outcome
-            .into_success()
-            .expect("the repaired change set converges");
-
-        assert_eq!(
-            success
-                .value
-                .staged_state
-                .staged_text_files()
-                .get("a.rs")
-                .map(String::as_str),
-            Some(CORRECTED)
         );
-        assert_eq!(fixture.provider.requests().len(), 1);
+        let step = execute_staging_step(&mut ctx, &mut repaired, &mut state);
+        assert!(step.refusals.is_empty());
+        assert!(state.failed.is_empty(), "the repair answers the refusal");
+        assert_eq!(state.attempts, 2);
     }
 
-    #[tokio::test]
-    async fn an_unrepairable_change_set_exhausts_its_retry_budget() {
-        let responses = vec![MockResponse::text(edit_block(
-            "nonexistent text",
-            "irrelevant",
-        ))];
-        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], responses);
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
-            path: "a.rs".to_string(),
-            old_text: "nonexistent text".to_string(),
-            new_text: "irrelevant".to_string(),
-        })]);
-        let config = StagingLoopConfig {
-            max_retries: 1,
-            ..StagingLoopConfig::default()
-        };
-
-        let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &config)
-            .await
-            .expect("staging completes");
-        let report = match outcome {
-            LoopResult::Exhausted(report) => report,
-            other => panic!("expected an exhausted staging budget, got {other:?}"),
-        };
-
-        assert_eq!(report.attempts, 1);
-        assert!(!report.diagnostics.is_empty());
-        assert!(report.diagnostics[0].contains("a.rs"));
-    }
-
-    #[tokio::test]
-    async fn staging_loop_records_unretried_file_in_abandoned_failures() {
-        let responses = vec![MockResponse::text(edit_block(
-            "pub fn compute() -> i32 { 0 }",
-            "pub fn compute() -> i32 { 42 }",
-        ))];
+    #[test]
+    fn an_unretried_member_is_recorded_as_abandoned() {
         let mut fixture = Fixture::new(
-            &[("a.rs", TARGET), ("b.rs", "pub fn b() {}")],
+            &[("a.rs", TARGET), ("b.rs", "pub fn b() {}\n")],
             &["a.rs", "b.rs"],
-            responses,
         );
-        let envelope = ResponseEnvelope::from_commands(&[
+        let mut ctx = fixture.context();
+        let mut state = StagingState::default();
+
+        let mut both = ResponseEnvelope::from_commands(&[
             LlmCommand::EditReplace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "nonexistent in a".to_string(),
@@ -509,41 +353,34 @@ mod tests {
                 new_text: "irrelevant".to_string(),
             }),
         ]);
+        execute_staging_step(&mut ctx, &mut both, &mut state);
 
-        let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
-            .await
-            .expect("staging completes");
-        let success = outcome.into_success().expect("success");
-
-        assert_eq!(success.value.abandoned_failures.len(), 1);
-        assert_eq!(success.value.abandoned_failures[0].0, "b.rs");
+        // The corrected set names `a.rs` only, so `b.rs` is abandoned instead of
+        // vanishing with the entry it left behind.
+        let mut corrected = replace(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
+        execute_staging_step(&mut ctx, &mut corrected, &mut state);
+        assert_eq!(state.abandoned.len(), 1);
+        assert!(state.abandoned.contains_key("b.rs"));
     }
 
-    #[tokio::test]
-    async fn a_concrete_edit_command_converges_through_into_edit_operation() {
-        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"], Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::EditReplace(EditReplace {
-            path: "a.rs".to_string(),
-            old_text: "pub fn compute() -> i32 { 0 }".to_string(),
-            new_text: "pub fn compute() -> i32 { 42 }".to_string(),
-        })]);
-
+    #[test]
+    fn an_attempt_marks_the_context_churn_of_its_change_set() {
+        let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"]);
+        let mut envelope = replace(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
         let mut ctx = fixture.context();
-        let outcome = run_staging_loop(&mut ctx, envelope, &StagingLoopConfig::default())
-            .await
-            .expect("staging completes");
-        let success = outcome.into_success().expect("concrete edit converges");
+        assert!(!ctx.transcript().prefix_is_stale());
+        let mut state = StagingState::default();
 
-        assert_eq!(success.value.cumulative_edits.len(), 1);
-        assert_eq!(
-            success
-                .value
-                .staged_state
-                .staged_text_files()
-                .get("a.rs")
-                .map(String::as_str),
-            Some(CORRECTED)
+        execute_staging_step(&mut ctx, &mut envelope, &mut state);
+        assert!(
+            ctx.transcript().prefix_is_stale(),
+            "the change set stales the rendered prefix"
         );
     }
 }

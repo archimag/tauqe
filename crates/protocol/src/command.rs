@@ -22,9 +22,7 @@ use crate::edit::{
 pub mod capability;
 pub mod topic;
 
-pub use capability::{
-    CapabilityBranch, CapabilityDelivery, CapabilityExpr, CapabilityPhase, LlmCapability,
-};
+pub use capability::{CapabilityDelivery, CapabilityPhase, CapabilityTree, LlmCapability};
 pub use topic::DocTopic;
 
 /// A request to add a file to the context at a given access level.
@@ -110,25 +108,6 @@ pub struct TextCommand {
     pub content: String,
 }
 
-/// Concise technical explanation accompanying code edits in turn or step execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ShortDescriptionCommand {
-    /// Concise 1-3 sentence explanation of what changed, why, and how the edits
-    /// achieve the goal.
-    pub content: String,
-}
-
-/// Deterministic toolchain verification request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct VerifyCommand {
-    #[schemars(schema_with = "inline_verify_target_schema")]
-    pub target: VerifyTarget,
-    #[schemars(schema_with = "inline_verify_on_success_schema")]
-    pub on_success: VerifyOnSuccess,
-}
-
 /// Semantic blocker emitted when a precondition or assumption fails.
 ///
 /// `details` is an obligatory string: a blocker that carries no expansion
@@ -207,8 +186,6 @@ pub struct CustomToolCommand {
 pub enum LlmCommand {
     /// Conversational text emitted to the user interface.
     Text(TextCommand),
-    /// Concise explanation accompanying code modifications in turn/step execution.
-    ShortDescription(ShortDescriptionCommand),
     /// Replace text in an existing file.
     EditReplace(EditReplace),
     /// Create a new file.
@@ -280,8 +257,6 @@ pub enum LlmCommand {
     /// chapters it exposes, and the material it delivers enters the context as
     /// read-only reference.
     OuterDocRequest(OuterDocRequestCommand),
-    /// A request to run deterministic toolchain verification.
-    Verify(VerifyCommand),
     /// A plan creation or modification payload.
     Plan { update: DiscussionPlanUpdate },
     /// A decision recorded for one finding of a review session.
@@ -322,7 +297,6 @@ impl LlmCommand {
     pub fn capability(&self) -> Option<LlmCapability> {
         match self {
             Self::Text(_) => Some(LlmCapability::TextMessage),
-            Self::ShortDescription(_) => Some(LlmCapability::ShortDescription),
             Self::EditReplace(_) | Self::EditLineAnchor(_) => Some(LlmCapability::EditReplace),
             Self::EditCreate(_) => Some(LlmCapability::EditCreate),
             Self::EditDelete(_) => Some(LlmCapability::EditDelete),
@@ -336,7 +310,6 @@ impl LlmCommand {
             Self::DirList(_) => Some(LlmCapability::DirList),
             Self::DocRequest(_) => Some(LlmCapability::DocRequest),
             Self::OuterDocRequest(_) => Some(LlmCapability::OuterDocRequest),
-            Self::Verify(_) => Some(LlmCapability::ToolchainVerify),
             Self::Plan { update } => Some(match update.action {
                 DiscussionPlanAction::Save => LlmCapability::PlanCreation,
                 DiscussionPlanAction::Update => LlmCapability::PlanUpdate,
@@ -374,30 +347,6 @@ impl LlmCommand {
     }
 }
 
-/// Deterministic toolchain verification target requested by the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VerifyTarget {
-    /// Run every configured verification command.
-    All,
-    /// Compile and type-check only.
-    Check,
-    /// Run the test suite only.
-    Test,
-    /// Run the linter only.
-    Clippy,
-}
-
-/// Desired behavior when toolchain verification succeeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VerifyOnSuccess {
-    /// Report only a concise confirmation.
-    Silent,
-    /// Surface the full command output.
-    Report,
-}
-
 /// Renders the schema of one plain string property in place.
 ///
 /// A property whose wire form is produced by a serde adapter module is a string
@@ -424,20 +373,6 @@ fn inline_context_access_schema(
 /// Renders the documentation topic enumeration in place.
 fn inline_doc_topic_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
     flat_string_enum_schema(<DocTopic as schemars::JsonSchema>::json_schema(gen))
-}
-
-/// Renders the verification target enumeration in place.
-fn inline_verify_target_schema(
-    gen: &mut schemars::gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    flat_string_enum_schema(<VerifyTarget as schemars::JsonSchema>::json_schema(gen))
-}
-
-/// Renders the verification success behavior enumeration in place.
-fn inline_verify_on_success_schema(
-    gen: &mut schemars::gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    flat_string_enum_schema(<VerifyOnSuccess as schemars::JsonSchema>::json_schema(gen))
 }
 
 /// Reduces a derived enumeration schema to one flat string enumeration.
@@ -803,28 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_command_verify_serde_roundtrip() {
-        let verify = LlmCommand::Verify(VerifyCommand {
-            target: VerifyTarget::Clippy,
-            on_success: VerifyOnSuccess::Silent,
-        });
-        let json = serde_json::to_string(&verify).unwrap();
-        assert!(json.contains("\"type\":\"verify\""));
-        assert!(json.contains("\"target\":\"clippy\""));
-        assert!(json.contains("\"on_success\":\"silent\""));
-        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), verify);
-
-        assert_eq!(
-            serde_json::to_string(&VerifyTarget::All).unwrap(),
-            "\"all\""
-        );
-        assert_eq!(
-            serde_json::to_string(&VerifyOnSuccess::Report).unwrap(),
-            "\"report\""
-        );
-    }
-
-    #[test]
     fn test_llm_command_plan_scratchpad_serde_roundtrip() {
         let plan = LlmCommand::Plan {
             update: DiscussionPlanUpdate::default(),
@@ -931,12 +844,6 @@ mod tests {
         assert_eq!(text.capability(), Some(LlmCapability::TextMessage));
         assert_eq!(text.phase(), Some(CapabilityPhase::Execution));
 
-        let desc = LlmCommand::ShortDescription(ShortDescriptionCommand {
-            content: "summary".to_string(),
-        });
-        assert_eq!(desc.capability(), Some(LlmCapability::ShortDescription));
-        assert_eq!(desc.phase(), Some(CapabilityPhase::Execution));
-
         let edit = LlmCommand::EditReplace(EditReplace {
             path: "src/lib.rs".to_string(),
             old_text: "a".to_string(),
@@ -986,13 +893,6 @@ mod tests {
         });
         assert_eq!(outer_doc.capability(), Some(LlmCapability::OuterDocRequest));
         assert_eq!(outer_doc.phase(), Some(CapabilityPhase::Research));
-
-        let verify = LlmCommand::Verify(VerifyCommand {
-            target: VerifyTarget::All,
-            on_success: VerifyOnSuccess::Silent,
-        });
-        assert_eq!(verify.capability(), Some(LlmCapability::ToolchainVerify));
-        assert_eq!(verify.phase(), Some(CapabilityPhase::Verification));
 
         let scratchpad = LlmCommand::Scratchpad(ScratchpadCommand {
             notes: "notes".to_string(),
@@ -1274,7 +1174,6 @@ mod tests {
     #[test]
     fn test_every_flat_structure_derives_a_strict_self_contained_schema() {
         assert_strict_flat_schema::<TextCommand>("TextCommand", &[]);
-        assert_strict_flat_schema::<ShortDescriptionCommand>("ShortDescriptionCommand", &[]);
         assert_strict_flat_schema::<ContextRequestCommand>("ContextRequestCommand", &[]);
         assert_strict_flat_schema::<RepoSearchCommand>("RepoSearchCommand", &[]);
         assert_strict_flat_schema::<RepoDirsCommand>("RepoDirsCommand", &[]);
@@ -1282,7 +1181,6 @@ mod tests {
         assert_strict_flat_schema::<DirListCommand>("DirListCommand", &[]);
         assert_strict_flat_schema::<DocRequestCommand>("DocRequestCommand", &["topic"]);
         assert_strict_flat_schema::<OuterDocRequestCommand>("OuterDocRequestCommand", &[]);
-        assert_strict_flat_schema::<VerifyCommand>("VerifyCommand", &[]);
         assert_strict_flat_schema::<ScratchpadCommand>("ScratchpadCommand", &[]);
         assert_strict_flat_schema::<CommitMessageCommand>("CommitMessageCommand", &[]);
         assert_strict_flat_schema::<TurnErrorCommand>("TurnErrorCommand", &["error_message"]);

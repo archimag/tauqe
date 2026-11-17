@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{PatchStrategy, PromptLayoutKind, WorkflowKind};
+use tauqe_protocol::{PatchStrategy, WorkflowKind};
+
+/// Default budget of LLM rounds granted to a single turn.
+pub const DEFAULT_MAX_TURN_ROUNDS: usize = 16;
 
 /// Turn profile of a project: workflow engine, patch strategy,
 /// and the retry and replanning budgets of a turn.
@@ -13,37 +16,18 @@ pub struct ReplConfig {
     #[serde(default)]
     pub workflow: WorkflowKind,
     /// Strategy that decides how a change set addresses the lines it replaces.
-    ///
-    /// It is orthogonal to protocol: the transport decides how an edit is
-    /// encoded, while the strategy decides whether it addresses a line range
-    /// through the text it echoes or through the opaque anchors rendered in
-    /// context.
     #[serde(default)]
     pub patch_strategy: PatchStrategy,
-    /// Prompt layout override for every turn of this project.
-    ///
-    /// The key is absent by default, because the layout then follows the turn
-    /// intent: an interactive REPL turn builds a chronological prompt, while a
-    /// read-only discussion and an isolated step keep the semantic order. A
-    /// declared value pins one policy for every turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_layout: Option<PromptLayoutKind>,
-    /// Retry budget of one turn: failed edit staging and verification healing.
-    ///
-    /// It bounds how often a single attempt may repair its own change set, and
-    /// says nothing about how many attempts a model tier receives: that is the
-    /// separate budget declared on each model entry under `[models]`.
-    #[serde(default = "default_max_retries")]
-    pub max_retries: usize,
+    /// Total budget of LLM rounds granted to a single turn: research, staging retries,
+    /// verification healing, and empty response retries all spend from this pool.
+    #[serde(default = "default_max_turn_rounds")]
+    pub(crate) max_turn_rounds: usize,
     #[serde(default = "default_max_replans")]
     pub max_replans: usize,
 }
 
-/// Backwards-compatible alias for the legacy `[edit]` configuration section.
-pub type EditConfig = ReplConfig;
-
-fn default_max_retries() -> usize {
-    3
+fn default_max_turn_rounds() -> usize {
+    DEFAULT_MAX_TURN_ROUNDS
 }
 
 fn default_max_replans() -> usize {
@@ -55,8 +39,7 @@ impl Default for ReplConfig {
         Self {
             workflow: WorkflowKind::default(),
             patch_strategy: PatchStrategy::default(),
-            prompt_layout: None,
-            max_retries: default_max_retries(),
+            max_turn_rounds: default_max_turn_rounds(),
             max_replans: default_max_replans(),
         }
     }
@@ -69,29 +52,16 @@ mod tests {
 
     #[test]
     fn test_structured_protocol_config() {
-        let toml_str = r#"
-[repl]
-workflow = "git"
-"#;
+        let toml_str = "[repl]\nworkflow = \"git\"\n";
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
-        assert_eq!(config.repl.max_retries, 3);
+        assert_eq!(config.repl.max_turn_rounds, DEFAULT_MAX_TURN_ROUNDS);
     }
+
     #[test]
-    fn test_edit_alias_compatibility() {
-        let toml_str = r#"
-[edit]
-workflow = "naive"
-max_retries = 1
-"#;
-        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.repl.workflow, WorkflowKind::Naive);
-        assert_eq!(config.repl.max_retries, 1);
-    }
-    #[test]
-    fn test_repl_max_retries_override() {
-        let config: AppConfig = toml::from_str("[repl]\nmax_retries = 0\n").unwrap();
-        assert_eq!(config.repl.max_retries, 0);
+    fn test_repl_max_turn_rounds_override() {
+        let config: AppConfig = toml::from_str("[repl]\nmax_turn_rounds = 42\n").unwrap();
+        assert_eq!(config.repl.max_turn_rounds, 42);
     }
 
     #[test]
@@ -114,24 +84,5 @@ max_retries = 1
         assert_eq!(config.repl.patch_strategy, PatchStrategy::LineAnchor);
 
         assert!(toml::from_str::<AppConfig>("[repl]\npatch_strategy = \"anchors\"\n").is_err());
-    }
-
-    #[test]
-    fn test_repl_prompt_layout_key_override() {
-        let config: AppConfig = toml::from_str("[repl]\n").expect("parse config");
-        assert_eq!(config.repl.prompt_layout, None);
-
-        let config: AppConfig =
-            toml::from_str("[repl]\nprompt_layout = \"semantic\"\n").expect("parse config");
-        assert_eq!(config.repl.prompt_layout, Some(PromptLayoutKind::Semantic));
-
-        let config: AppConfig =
-            toml::from_str("[repl]\nprompt_layout = \"chronological\"\n").expect("parse config");
-        assert_eq!(
-            config.repl.prompt_layout,
-            Some(PromptLayoutKind::Chronological)
-        );
-
-        assert!(toml::from_str::<AppConfig>("[repl]\nprompt_layout = \"auto\"\n").is_err());
     }
 }

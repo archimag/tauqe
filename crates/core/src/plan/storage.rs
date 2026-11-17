@@ -11,7 +11,7 @@ mod apply;
 mod horizon;
 mod immutability;
 
-pub use horizon::merge_subplan;
+pub(crate) use horizon::merge_subplan;
 
 /// Execution mode governing plan mutation permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,7 +588,8 @@ impl PlanStorage {
     }
 
     /// Updates an architectural concept item recursively.
-    pub fn update_concept_item(
+    #[cfg(test)]
+    fn update_concept_item(
         repo_root: &Path,
         plan_id: &str,
         concept_id: &str,
@@ -602,6 +603,7 @@ impl PlanStorage {
     }
 
     /// Lock-free core of [`Self::update_concept_item`]; the caller must hold the storage lock.
+    #[cfg(test)]
     fn update_concept_item_unlocked(
         repo_root: &Path,
         plan_id: &str,
@@ -760,19 +762,19 @@ impl PlanStorage {
 /// Result of applying plan operations from model output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApplicationOutcome {
-    pub applied: Vec<Plan>,
+    pub(crate) applied: Vec<Plan>,
     /// Mutations the storage barrier rejected; a rejected mutation leaves the
     /// stored plan untouched.
     ///
     /// Every entry is classified where the refusal was produced, so a caller
     /// reads the category from the typed field and never from the wording.
-    pub errors: Vec<PlanRejection>,
+    pub(crate) errors: Vec<PlanRejection>,
     /// Repairs the lifecycle barrier applied to an otherwise valid mutation.
     ///
     /// A repaired mutation is applied, so its reports never share the rejection
     /// channel: a caller that treats `errors` as failures stays accurate while
     /// the repair remains visible.
-    pub warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[cfg(test)]

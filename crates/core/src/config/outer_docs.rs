@@ -30,14 +30,14 @@ pub struct OuterDocEntry {
     ///
     /// The id names the root itself; a request for `{id}/{relative}` addresses a
     /// document below the directory that holds it.
-    pub id: String,
+    pub(crate) id: String,
     /// Human-readable label rendered in the catalog the model reads.
-    pub title: String,
+    pub(crate) title: String,
     /// Optional note describing what the document covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Where the root document comes from: an `http(s)` address or a local path.
-    pub source: String,
+    pub(crate) source: String,
 }
 
 /// Where the content of one declared document comes from.
@@ -56,7 +56,7 @@ impl OuterDocEntry {
     /// network, and every other value names a local path. A value carrying a
     /// scheme the registry cannot fetch is rejected here, while the entry is still
     /// being resolved, instead of failing later at a turn boundary.
-    pub fn source(&self) -> Result<OuterDocSource, String> {
+    pub(crate) fn source(&self) -> Result<OuterDocSource, String> {
         let id = self.id.trim();
         let source = self.source.trim();
         if source.is_empty() {

@@ -38,13 +38,13 @@ const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct ModelWire {
     /// Provider identifier of the model, e.g. `openai/gpt-4`.
     #[serde(default)]
-    pub id: String,
+    pub(crate) id: String,
     /// Maximum context length in tokens the model declares, if any.
     #[serde(default)]
-    pub context_length: Option<u64>,
+    pub(crate) context_length: Option<u64>,
     /// Request parameters the model declares support for.
     #[serde(default)]
-    pub supported_parameters: Vec<String>,
+    pub(crate) supported_parameters: Vec<String>,
 }
 
 /// The OpenRouter `GET /models` response body.
@@ -52,18 +52,18 @@ pub struct ModelWire {
 pub struct ModelsListWire {
     /// The model rows the response carries.
     #[serde(default)]
-    pub data: Vec<ModelWire>,
+    pub(crate) data: Vec<ModelWire>,
 }
 
 /// The catalog-declared capabilities of one model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilities {
     /// Provider identifier of the model, e.g. `openai/gpt-4`.
-    pub id: String,
+    pub(crate) id: String,
     /// Maximum context length in tokens the model declares, if any.
-    pub context_length: Option<u64>,
+    pub(crate) context_length: Option<u64>,
     /// Request parameters the model declares support for.
-    pub supported_parameters: Vec<String>,
+    pub(crate) supported_parameters: Vec<String>,
 }
 
 impl ModelCapabilities {
@@ -72,7 +72,7 @@ impl ModelCapabilities {
     /// The catalog gates on the `structured_outputs` parameter: a model that
     /// only accepts `response_format` declares the JSON-object form, not the
     /// schema-constrained form the structured contour relies on.
-    pub fn supports_structured_outputs(&self) -> bool {
+    pub(crate) fn supports_structured_outputs(&self) -> bool {
         self.supported_parameters
             .iter()
             .any(|parameter| parameter == "structured_outputs")
@@ -83,7 +83,7 @@ impl ModelCapabilities {
     /// `reasoning` is the canonical gateway parameter: the effort spellings
     /// (`reasoning_effort`, `include_reasoning`) are accepted by individual
     /// gateways but are not the declaration the catalog standardizes on.
-    pub fn supports_reasoning(&self) -> bool {
+    pub(crate) fn supports_reasoning(&self) -> bool {
         self.supported_parameters
             .iter()
             .any(|parameter| parameter == "reasoning")
@@ -117,7 +117,7 @@ impl CatalogSnapshot {
     ///
     /// Provider order is preserved, so identical responses produce identical
     /// snapshots and a repeated lookup answers the same record.
-    pub fn from_wire(rows: Vec<ModelWire>) -> Self {
+    pub(crate) fn from_wire(rows: Vec<ModelWire>) -> Self {
         Self {
             models: rows
                 .into_iter()
@@ -130,12 +130,12 @@ impl CatalogSnapshot {
     ///
     /// The lookup is exact: a family sibling or a prefix of another
     /// identifier never substitutes for the requested model.
-    pub fn get(&self, id: &str) -> Option<&ModelCapabilities> {
+    pub(crate) fn get(&self, id: &str) -> Option<&ModelCapabilities> {
         self.models.iter().find(|model| model.id == id)
     }
 
     /// Reports whether the snapshot holds no model.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.models.is_empty()
     }
 }
@@ -151,12 +151,12 @@ pub struct CatalogCache {
 
 impl CatalogCache {
     /// An empty cache that has fetched nothing.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Wraps a snapshot fetched at Unix second `fetched_at`.
-    pub fn from_snapshot(snapshot: CatalogSnapshot, fetched_at: u64) -> Self {
+    pub(crate) fn from_snapshot(snapshot: CatalogSnapshot, fetched_at: u64) -> Self {
         Self {
             fetched_at,
             snapshot,
@@ -164,12 +164,12 @@ impl CatalogCache {
     }
 
     /// The catalog records the cache holds.
-    pub fn snapshot(&self) -> &CatalogSnapshot {
+    pub(crate) fn snapshot(&self) -> &CatalogSnapshot {
         &self.snapshot
     }
 
     /// The Unix second at which the snapshot was fetched.
-    pub fn fetched_at(&self) -> u64 {
+    pub(crate) fn fetched_at(&self) -> u64 {
         self.fetched_at
     }
 
@@ -179,7 +179,7 @@ impl CatalogCache {
     /// the TTL is fresh, the boundary itself and everything past it are
     /// expired. The subtraction saturates, so a cache fetched after `now` (a
     /// skewed clock) reads as fresh instead of wrapping around.
-    pub fn is_fresh(&self, now: u64) -> bool {
+    pub(crate) fn is_fresh(&self, now: u64) -> bool {
         now.saturating_sub(self.fetched_at) < CATALOG_TTL.as_secs()
     }
 
@@ -188,7 +188,7 @@ impl CatalogCache {
     /// The `.tauqe/cache` directory is created when missing, and the payload
     /// is staged and renamed into place through the shared atomic writer, so
     /// a crash leaves either the previous complete catalog or the new one.
-    pub fn save(&self, repo_root: &Path) -> Result<(), ModelCatalogError> {
+    pub(crate) fn save(&self, repo_root: &Path) -> Result<(), ModelCatalogError> {
         let target = repo_root.join(CATALOG_CACHE_PATH);
         let payload = serde_json::to_vec(self).map_err(|error| {
             ModelCatalogError::CacheWrite(format!(
@@ -223,7 +223,7 @@ impl CatalogCache {
     /// A cache that cannot be read — absent, unreadable, or not the JSON the
     /// harness wrote — reads as an empty cache: a damaged file never fails a
     /// turn, it only costs the refetch that repopulates it.
-    pub fn load(repo_root: &Path) -> Self {
+    pub(crate) fn load(repo_root: &Path) -> Self {
         let target = repo_root.join(CATALOG_CACHE_PATH);
 
         crate::blocking::run_blocking(move || match std::fs::read(&target) {

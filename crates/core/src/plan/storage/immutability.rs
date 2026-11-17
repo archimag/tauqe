@@ -8,7 +8,7 @@ impl PlanStorage {
     /// - Cannot be removed or deleted.
     /// - Cannot regress status (must remain `Done`).
     /// - Cannot modify `title`, `details`, or target `files`.
-    pub fn validate_done_immutability(existing: &Plan, updated: &Plan) -> Result<()> {
+    pub(crate) fn validate_done_immutability(existing: &Plan, updated: &Plan) -> Result<()> {
         fn collect_done_items<'a>(items: &'a [PlanItem], out: &mut Vec<&'a PlanItem>) {
             for item in items {
                 if item.status == PlanItemStatus::Done {

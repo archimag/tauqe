@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::HistoryFileChange;
+use tauqe_protocol::{HistoryFileChange, TurnRoundRecord};
 
 /// A semantic record in the interaction history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,15 @@ pub enum HistoryEntry {
         /// field existed decode it as `None` without a migration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_watermark: Option<u64>,
+        /// Intermediate rounds the turn ran before its final answer.
+        ///
+        /// The rounds are nested inside the turn record instead of becoming
+        /// sibling records, so a rollback or a compaction drops them together
+        /// with the attempt they belong to, and the final answer stays the
+        /// ordinary response record of the same turn. Sessions recorded before
+        /// the field existed decode it as an empty list without a migration.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rounds: Vec<TurnRoundRecord>,
     },
     Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,11 +64,64 @@ pub enum HistoryEntry {
     },
 }
 
-/// One persisted file entry of a [`HistoryEntry::Response`].
+#[cfg(test)]
+/// Tag that opens the turn-local working-memory channel inside an answer.
+const SCRATCHPAD_OPEN: &str = "<scratchpad>";
+#[cfg(test)]
+/// Tag that closes the turn-local working-memory channel.
+const SCRATCHPAD_CLOSE: &str = "</scratchpad>";
+
+#[cfg(test)]
+/// Removes the working-memory channel from text about to be recorded.
 ///
-/// The typed form is the only form the engine writes: the turn knows
-/// deterministically which operation it performed on a path, so the operation
-/// is authored once by the producer instead of being flattened into display
+/// The scratchpad is turn-local by contract: it is memory, never part of what a
+/// turn durably did. A round message is cleaned before it reaches
+/// `history.jsonl`, so the journal and everything rebuilt from it — the
+/// chronicle, the compact replay, the compaction summary — never presents an
+/// intermediate hypothesis as a recorded finding (Conventions §3.5).
+///
+/// Everything outside the tags is preserved verbatim, markdown and fenced code
+/// included, and the surrounding whitespace is trimmed so the recorded message
+/// does not begin or end with an empty line. An unterminated channel belongs to
+/// a truncated answer, so the text from its opening tag onward is dropped.
+fn sanitize_round_message(raw: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find(SCRATCHPAD_OPEN) {
+        cleaned.push_str(&rest[..open]);
+        let after_open = &rest[open + SCRATCHPAD_OPEN.len()..];
+        match after_open.find(SCRATCHPAD_CLOSE) {
+            Some(close) => rest = &after_open[close + SCRATCHPAD_CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned.trim().to_string()
+}
+
+#[cfg(test)]
+#[cfg(test)]
+/// Builds the durable record of one intermediate round of a turn.
+///
+/// The constructor is the single place a round enters the journal, so the
+/// cleaning of the recorded payload cannot be forgotten by a caller: the raw
+/// answer is sanitized here and the caller states only the round position and
+/// the compact summary of the feedback that opened the next round.
+pub(crate) fn round_record(
+    index: u32,
+    raw_message: &str,
+    feedback: impl Into<String>,
+) -> TurnRoundRecord {
+    TurnRoundRecord {
+        index,
+        message: sanitize_round_message(raw_message),
+        feedback: feedback.into(),
+    }
+}
+
 /// text that every client would have to re-parse (Conventions §1.5).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -104,11 +166,11 @@ impl HistoryEntry {
         }
     }
 
-    pub fn to_jsonl_line(&self) -> Result<String> {
+    pub(crate) fn to_jsonl_line(&self) -> Result<String> {
         serde_json::to_string(self).context("Failed to serialize history entry to JSONL line")
     }
 
-    pub fn from_jsonl_line(line: &str) -> Result<Self> {
+    pub(crate) fn from_jsonl_line(line: &str) -> Result<Self> {
         serde_json::from_str(line).context("Failed to deserialize history entry from JSONL line")
     }
 }
@@ -118,7 +180,7 @@ impl HistoryEntry {
 /// The record occupies its serialized line plus the newline that terminates it,
 /// so the journal size on disk and the in-memory footprint of the same record
 /// share one definition instead of each path adding its own terminator.
-pub fn line_bytes(line: &str) -> u64 {
+pub(crate) fn line_bytes(line: &str) -> u64 {
     (line.len() + 1) as u64
 }
 
@@ -126,7 +188,7 @@ pub fn line_bytes(line: &str) -> u64 {
 ///
 /// A record that cannot be serialized contributes nothing, exactly as it
 /// contributes no line to the journal.
-pub fn record_bytes(entry: &HistoryEntry) -> u64 {
+pub(crate) fn record_bytes(entry: &HistoryEntry) -> u64 {
     match entry.to_jsonl_line() {
         Ok(line) => line_bytes(&line),
         Err(_) => 0,
@@ -157,6 +219,7 @@ mod tests {
             prompt: "Refactor storage".to_string(),
             context: vec!["src/history.rs".to_string()],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         let json = entry.to_jsonl_line().unwrap();
         assert_eq!(
@@ -175,6 +238,7 @@ mod tests {
             prompt: "Add the parser".to_string(),
             context: vec!["src/parser.rs".to_string()],
             context_watermark: Some(12),
+            rounds: Vec::new(),
         };
         let json = entry.to_jsonl_line().unwrap();
         assert_eq!(
@@ -316,5 +380,86 @@ mod tests {
 
         let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
         assert_eq!(parsed, entry);
+    }
+    #[test]
+    fn test_turn_records_nested_rounds() {
+        let entry = HistoryEntry::Turn {
+            id: Some(6),
+            prompt: "Discover the parser".to_string(),
+            context: vec!["src/parser.rs".to_string()],
+            context_watermark: Some(3),
+            rounds: vec![
+                TurnRoundRecord {
+                    index: 1,
+                    message: "Searching for the parser entry point.".to_string(),
+                    feedback: "2 matches in src/parser.rs".to_string(),
+                },
+                TurnRoundRecord {
+                    index: 2,
+                    message: "Applying the discovered file.".to_string(),
+                    feedback: String::new(),
+                },
+            ],
+        };
+        let json = entry.to_jsonl_line().unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"turn","id":6,"prompt":"Discover the parser","context":["src/parser.rs"],"context_watermark":3,"rounds":[{"index":1,"message":"Searching for the parser entry point.","feedback":"2 matches in src/parser.rs"},{"index":2,"message":"Applying the discovered file."}]}"#
+        );
+
+        let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn test_turn_without_rounds_decodes_to_an_empty_round_list() {
+        // A session written before the rounds existed keeps loading, reporting
+        // an empty list instead of a fabricated round.
+        let legacy = r#"{"type":"turn","id":2,"prompt":"Legacy turn","context":["src/lib.rs"]}"#;
+        match HistoryEntry::from_jsonl_line(legacy).unwrap() {
+            HistoryEntry::Turn { rounds, .. } => assert!(rounds.is_empty()),
+            other => panic!("expected a turn entry, got {:?}", other),
+        }
+
+        // A turn that recorded no round keeps the bytes the journal already
+        // carries, so the field never appears as an empty array.
+        let bare = HistoryEntry::Turn {
+            id: Some(3),
+            prompt: "Short turn".to_string(),
+            context: Vec::new(),
+            context_watermark: None,
+            rounds: Vec::new(),
+        };
+        assert_eq!(
+            bare.to_jsonl_line().unwrap(),
+            r#"{"type":"turn","id":3,"prompt":"Short turn"}"#
+        );
+    }
+
+    #[test]
+    fn test_recorded_round_strips_the_scratchpad_channel() {
+        let raw = "Inspecting the parser.\n\n<scratchpad>\nHypothesis: the symbol cache is stale.\n</scratchpad>\n\n```rust\nfn main() {}\n```";
+        let round = round_record(2, raw, "verification failed: E0308");
+
+        assert_eq!(round.index, 2);
+        assert_eq!(round.feedback, "verification failed: E0308");
+        assert!(!round.message.contains("scratchpad"));
+        assert!(!round.message.contains("Hypothesis"));
+        assert!(round.message.starts_with("Inspecting the parser."));
+        assert!(round.message.ends_with("```"));
+        assert!(round.message.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn test_recorded_round_drops_an_unterminated_channel() {
+        // A truncated answer ends inside its own working memory, so the channel
+        // and everything after it belong to the attempt and never to the record.
+        let truncated = round_record(1, "Answer\n<scratchpad>\nunterminated note", "");
+        assert_eq!(truncated.message, "Answer");
+        assert!(truncated.feedback.is_empty());
+
+        // An answer that carried no channel is recorded verbatim.
+        let plain = round_record(3, "  No channel here.  ", "none");
+        assert_eq!(plain.message, "No channel here.");
     }
 }

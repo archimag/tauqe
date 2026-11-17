@@ -20,7 +20,7 @@ use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::workflow::git_policy::GitTransactionPolicy;
 use tauqe_core::workflow::policy::DirectApplyPolicy;
 use tauqe_core::workflow::research::journal::TurnResearchJournal;
-use tauqe_protocol::{CapabilityExpr, ContextAccess, LlmCapability, ModelRef};
+use tauqe_protocol::{CapabilityTree, ContextAccess, LlmCapability, ModelRef};
 
 /// Writes an instrumented `just` stub into `bin_dir` and returns its counter.
 ///
@@ -270,10 +270,10 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     let mut cache = TurnInputCache::default();
     let mut journal = TurnResearchJournal::default();
     let mut policy = DirectApplyPolicy::new();
-    let caps = CapabilityExpr::set([
-        CapabilityExpr::leaf(LlmCapability::TextMessage),
-        CapabilityExpr::leaf(LlmCapability::EditReplace),
-        CapabilityExpr::leaf(LlmCapability::ContextRequest),
+    let caps = CapabilityTree::set([
+        CapabilityTree::leaf(LlmCapability::TextMessage),
+        CapabilityTree::leaf(LlmCapability::EditReplace),
+        CapabilityTree::leaf(LlmCapability::ContextRequest),
     ]);
     let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
     let mut ctx = LoopContext::new(

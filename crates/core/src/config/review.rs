@@ -24,7 +24,7 @@ impl ReviewConfig {
     /// one group, and every group must name at least one repository path: a
     /// session that audits nothing would spend a full run and report no
     /// finding.
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         let mut seen: Vec<&str> = Vec::new();
         for preset in &self.presets {
             let name = preset.name.trim();
@@ -102,5 +102,5 @@ pub struct ReviewGroupConfig {
     pub paths: Vec<String>,
     /// Instructions that apply to this group only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
+    pub(crate) prompt: Option<String>,
 }

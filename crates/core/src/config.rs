@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauqe_protocol::{
     ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig,
-    PromptLayoutKind, ReasoningEffort,
+    ReasoningEffort,
 };
 
 mod context;
@@ -17,34 +17,37 @@ mod providers;
 mod repl;
 mod review;
 
-pub use context::{
-    ContextConfig, DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_DIR_LIST_ENTRIES,
-    DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
-    DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND, DEFAULT_MAX_RESEARCH_ROUNDS,
-    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND, DEFAULT_TOKEN_BUDGET,
+pub use context::ContextConfig;
+pub(crate) use context::{
+    DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_SCRATCHPAD_CHARS,
+    DEFAULT_TOKEN_BUDGET,
+};
+#[cfg(test)]
+pub(crate) use context::{
+    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
+    DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
 };
 pub use credentials::default_credentials_path;
 pub use git::GitConfig;
 pub use history::HistoryConfig;
-pub use models::{
-    serialize_model_ref_opt, ModelsConfig, BUILTIN_DEFAULT_ARCHITECT_MODEL,
-    BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_REPL_MODEL,
-    BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
-};
+pub use models::ModelsConfig;
+#[cfg(test)]
+pub(crate) use models::BUILTIN_DEFAULT_REPL_MODEL;
+pub(crate) use models::BUILTIN_DEFAULT_SCRIBE_MODEL;
 pub use modules::{ensure_no_module_conflict, module_owners, ModuleOwners};
 pub use outer_docs::{OuterDocEntry, OuterDocSource};
-pub use repl::{EditConfig, ReplConfig};
+pub use repl::ReplConfig;
+pub(crate) use repl::DEFAULT_MAX_TURN_ROUNDS;
 
 use models::ModelsConfigRaw;
 pub use paths::{
-    cli_arg_value_from, config_candidates, default_config_path, find_config_file,
-    is_repo_config_path, is_repo_module_path, write_default_config, write_default_conventions,
+    cli_arg_value_from, default_config_path, find_config_file, write_default_config,
     DEFAULT_CONFIG_TEMPLATE,
 };
+pub(crate) use paths::{is_repo_config_path, is_repo_module_path};
 pub use providers::{
-    credentials_candidates, find_credentials_file, has_openrouter_key, load_credentials,
-    read_credentials_file, write_credentials_file, write_credentials_stub, Credentials,
-    OpenRouterConfig, OpenRouterCredentials, ProvidersConfig,
+    find_credentials_file, has_openrouter_key, write_credentials_file, write_credentials_stub,
+    OpenRouterConfig, ProvidersConfig,
 };
 pub use review::{ReviewConfig, ReviewGroupConfig, ReviewPreset};
 
@@ -56,9 +59,9 @@ pub struct AppConfig {
     /// The `[repl]` section: the profile every bounded turn of this project runs
     /// under.
     ///
-    /// The section declares the workflow engine, the edit protocol, the patch
-    /// strategy, the prompt layout override, and the retry and replanning
-    /// budgets, so an isolated step and a discussion read exactly what an
+    /// The section declares the workflow engine, the patch strategy, and the
+    /// retry and replanning budgets, so an isolated step and a discussion read
+    /// exactly what an
     /// interactive REPL turn reads. The legacy `[develop]` and `[edit]`
     /// spellings stay permanent deserialization aliases of the section, while
     /// serialization emits only the canonical `[repl]` name.
@@ -193,7 +196,8 @@ impl AppConfig {
     /// The reference is either a registered catalog alias or a provider model
     /// specification, so a role can name a model the way the project does
     /// without restating a display name.
-    pub fn resolve_model_spec(&self, spec: &str) -> Result<ModelRef, String> {
+    #[cfg(test)]
+    fn resolve_model_spec(&self, spec: &str) -> Result<ModelRef, String> {
         ModelsConfig::resolve_model_spec(self.model_catalog(), spec)
     }
 
@@ -203,7 +207,7 @@ impl AppConfig {
     }
 
     /// Models registered in the provider catalog, de-duplicated.
-    pub fn configured_models(&self) -> Vec<ModelRef> {
+    fn configured_models(&self) -> Vec<ModelRef> {
         let mut models = Vec::new();
         for entry in self.model_catalog() {
             if !models.contains(&entry.model) {
@@ -246,7 +250,8 @@ impl AppConfig {
     }
 
     /// The default active model based on `Primary` role.
-    pub fn active_model(&self) -> ModelRef {
+    #[cfg(test)]
+    fn active_model(&self) -> ModelRef {
         self.resolve_role(ModelRole::REPL)
     }
 
@@ -292,7 +297,7 @@ impl AppConfig {
     /// is valid and runs no verification step — so what remains rejected is a
     /// declaration the harness could not run predictably. An invalid
     /// configuration is rejected as a whole instead of degrading silently.
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         self.models.validate()?;
         self.project
             .validate()
@@ -302,32 +307,6 @@ impl AppConfig {
             .validate()
             .map_err(|err| format!("[review] {}", err))?;
         Ok(())
-    }
-
-    /// Resolves the prompt layout policy for a bounded turn.
-    ///
-    /// This is the single typed point that decides the layout: an explicitly
-    /// configured [`PromptLayoutKind`] wins, otherwise the caller's typed
-    /// argument decides.
-    ///
-    /// - A contour that carries a growing session history — an interactive REPL
-    ///   turn, a plan discussion, and a review discussion — shares one
-    ///   byte-stable head and builds the chronological transcript: its
-    ///   append-only growth keeps the provider prefix cache warm across
-    ///   dialogue focus switches.
-    /// - A contour that carries no growing dialogue history to interleave — an
-    ///   isolated step and an Architect synthesis — keeps the semantic block
-    ///   order.
-    pub fn resolve_prompt_layout(&self, carries_session_history: bool) -> PromptLayoutKind {
-        if let Some(explicit) = self.repl.prompt_layout {
-            return explicit;
-        }
-
-        if carries_session_history {
-            PromptLayoutKind::Chronological
-        } else {
-            PromptLayoutKind::Semantic
-        }
     }
 }
 
@@ -395,7 +374,8 @@ pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
 ///
 /// Callers that must honor explicit `--config` / `--credentials` paths build a
 /// [`ConfigLoadOptions`] themselves and call [`load_config_with_options`].
-pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
+#[cfg(test)]
+pub(crate) fn load_config(repo_root: Option<&Path>) -> AppConfig {
     load_config_with_options(ConfigLoadOptions {
         repo_root,
         explicit_config: None,
@@ -412,7 +392,7 @@ pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
 ///
 /// Returns the default value if the repository declares no configuration, the
 /// document cannot be read or merged, or the section cannot be parsed.
-pub fn load_section<T: for<'de> Deserialize<'de> + Default>(
+pub(crate) fn load_section<T: for<'de> Deserialize<'de> + Default>(
     repo_root: &Path,
     section_key: &str,
 ) -> T {
@@ -442,14 +422,14 @@ pub fn load_section<T: for<'de> Deserialize<'de> + Default>(
 ///
 /// Only the `[git]` table is parsed without paying for credential resolution or
 /// unrelated configuration sections.
-pub fn load_git_config(repo_root: &Path) -> GitConfig {
+pub(crate) fn load_git_config(repo_root: &Path) -> GitConfig {
     load_section(repo_root, "git")
 }
 
 /// Resolves repository-local `[context]` settings for a repository root.
 ///
 /// Mirrors [`load_git_config`]: only the `[context]` table is parsed.
-pub fn load_context_config(repo_root: &Path) -> ContextConfig {
+pub(crate) fn load_context_config(repo_root: &Path) -> ContextConfig {
     load_section(repo_root, "context")
 }
 
@@ -492,7 +472,7 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use tauqe_protocol::review::PostAnalysisMode;
-    use tauqe_protocol::{PromptLayoutKind, WorkflowKind};
+    use tauqe_protocol::WorkflowKind;
     #[test]
     fn test_models_config_and_roles_resolution() {
         let toml_str = r#"
@@ -781,15 +761,12 @@ repomap_token_budget = 6000
     fn test_context_research_config() {
         let toml_str = r#"
 [context]
-max_research_rounds = 8
 token_budget = 150000
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.context.max_research_rounds, 8);
         assert_eq!(config.context.token_budget, 150000);
 
         let default_cfg = ContextConfig::default();
-        assert_eq!(default_cfg.max_research_rounds, 5);
         assert_eq!(default_cfg.token_budget, 300_000);
     }
 
@@ -946,8 +923,7 @@ repl = ["anthropc:claude"]
             ModelRef::openrouter(BUILTIN_DEFAULT_REPL_MODEL)
         );
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
-        assert_eq!(config.repl.max_retries, 3);
-        assert!(config.providers.openrouter.is_none());
+        assert_eq!(config.repl.max_turn_rounds, DEFAULT_MAX_TURN_ROUNDS);
     }
 
     #[test]
@@ -1055,7 +1031,7 @@ repl = ["anthropc:claude"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[context]\npinned = [\"Conventions.md\", \"README.md\"]\nmax_research_rounds = 9\n",
+            "[context]\npinned = [\"Conventions.md\", \"README.md\"]\n",
         )
         .unwrap();
 
@@ -1064,7 +1040,6 @@ repl = ["anthropc:claude"]
             cfg.pinned,
             vec!["Conventions.md".to_string(), "README.md".to_string()]
         );
-        assert_eq!(cfg.max_research_rounds, 9);
     }
 
     #[test]
@@ -1237,36 +1212,6 @@ args = ["check", "--all-targets"]
                 ..Default::default()
             }
         );
-    }
-
-    #[test]
-    fn test_resolve_prompt_layout_follows_the_session_history_and_configuration() {
-        // Without an explicit override the caller's typed argument decides.
-        let default_cfg = AppConfig::default();
-        assert_eq!(
-            default_cfg.resolve_prompt_layout(true),
-            PromptLayoutKind::Chronological
-        );
-        assert_eq!(
-            default_cfg.resolve_prompt_layout(false),
-            PromptLayoutKind::Semantic
-        );
-
-        // A declared value overrides the resolution for every contour.
-        for (declared, expected) in [
-            ("semantic", PromptLayoutKind::Semantic),
-            ("chronological", PromptLayoutKind::Chronological),
-        ] {
-            let toml_str = format!("[repl]\nprompt_layout = \"{declared}\"\n");
-            let config: AppConfig = toml::from_str(&toml_str).expect("parse config");
-            for carries_session_history in [true, false] {
-                assert_eq!(
-                    config.resolve_prompt_layout(carries_session_history),
-                    expected,
-                    "declared {declared} must apply to a turn with history = {carries_session_history}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1579,7 +1524,7 @@ paths = ["crates/core/src"]
     fn test_module_layers_merge_sections_with_the_base_document() {
         let dir = layered_repo(
             "[models]\nrepl = [\"openrouter:a/b\"]\n\n[context]\nrepomap_token_budget = 6000\n",
-            &[("10-research.toml", "[context]\nmax_research_rounds = 9\n")],
+            &[("10-research.toml", "[context]\ntoken_budget = 99999\n")],
         );
 
         let config = load_config(Some(dir.path()));
@@ -1592,7 +1537,7 @@ paths = ["crates/core/src"]
         // The base document keeps its own key ...
         assert_eq!(config.context.repomap_token_budget, 6000);
         // ... and the module contributes the key it owns.
-        assert_eq!(config.context.max_research_rounds, 9);
+        assert_eq!(config.context.token_budget, 99999);
     }
 
     #[test]
@@ -1680,20 +1625,20 @@ paths = ["crates/core/src"]
     fn test_load_section_observes_the_merged_module_layers() {
         let dir = layered_repo(
             "[context]\nrepomap_token_budget = 6000\n",
-            &[("10-research.toml", "[context]\nmax_research_rounds = 9\n")],
+            &[("10-research.toml", "[context]\ntoken_budget = 99999\n")],
         );
 
         let cfg = load_context_config(dir.path());
 
         assert_eq!(cfg.repomap_token_budget, 6000);
-        assert_eq!(cfg.max_research_rounds, 9);
+        assert_eq!(cfg.token_budget, 99999);
     }
 
     #[test]
     fn test_modules_resolve_from_the_repository_root_not_the_explicit_config() {
         let dir = layered_repo(
             "[models]\nrepl = [\"openrouter:a/b\"]\n",
-            &[("10-context.toml", "[context]\nmax_research_rounds = 11\n")],
+            &[("10-context.toml", "[context]\ntoken_budget = 111111\n")],
         );
         let external = dir.path().join("external.toml");
         std::fs::write(&external, "[models]\nrepl = [\"openrouter:c/d\"]\n").unwrap();
@@ -1712,7 +1657,7 @@ paths = ["crates/core/src"]
         // The explicit document anchors the configuration ...
         assert_eq!(config.active_model(), ModelRef::openrouter("c/d"));
         // ... while the module directory stays the one of the repository.
-        assert_eq!(config.context.max_research_rounds, 11);
+        assert_eq!(config.context.token_budget, 111111);
     }
 
     #[test]

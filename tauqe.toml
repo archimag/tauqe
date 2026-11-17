@@ -17,10 +17,10 @@
 [providers.openrouter]
 models = [
   { model = "google/gemini-3.8-flash", alias = "Gemini Flash" },
+  { model = "google/gemini-4-carbon", alias = "Gemini Carbon" },  
   { model = "~anthropic/claude-sonnet-latest", alias = "Claude Sonnet" },
   { model = "~anthropic/claude-haiku-latest", alias = "Claude Haiku" },
   { model = "~deepseek/deepseek-flash-latest", alias = "DeepSeek Flash" },
-  { model = "tencent/hy4", alias = "Hy4" },
   { model = "~z-ai/glm-latest", alias = "GLM"  },
   { model = "meta/muse-spark-1.3-contributor", alias = "Muse Spark"}
 ]
@@ -30,14 +30,13 @@ scribe = "Claude Haiku"
 
 repl = [
   "DeepSeek Flash",
-  "Hy4",
   "GLM",
   "Gemini Flash",
+  "Gemini Carbon"
 ]
 
 coder = [
   { model = "DeepSeek Flash", attempts = 2 },
-  { model = "GLM", attempts = 2 },
   { model = "Gemini Flash", level_up = false },
   { model = "Claude Sonnet", level_up = false }
 ]
@@ -54,8 +53,7 @@ reviewer = [
 
 auto_level_up = true
 [repl]
-max_retries = 20
-use_control_loops = true
+max_turn_rounds = 30
 
 [project]
 runner = "just"
@@ -72,7 +70,6 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 # tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
-max_research_rounds = 12  # maximum rounds for autonomous context research
 token_budget = 1000000  # aggregate context token budget: repository files and external documents (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)

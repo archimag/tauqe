@@ -205,7 +205,7 @@ pub mod checkpoint {
     pub use tauqe_tools::git::checkpoint::{
         cleanup_orphaned_staging_files, ensure_tauqe_ignored, is_tauqe_commit,
         recover_interrupted_workflow, unwind_checkpoint_if_present, CheckpointInfo,
-        CHECKPOINT_PREFIX, STEP_PREFIX, TAUQE_CO_AUTHOR_TRAILER,
+        RecoveryOutcome, CHECKPOINT_PREFIX, STEP_PREFIX, TAUQE_CO_AUTHOR_TRAILER,
     };
 
     /// Creates a safe checkpoint of uncommitted changes before any AI modification.
@@ -216,7 +216,7 @@ pub mod checkpoint {
     /// the developer cancels. `None` keeps the capture cancel-blind, which is what a
     /// caller outside a bounded turn expects. A locked repository index is
     /// waited out by the index gate before the capture starts.
-    pub fn create_checkpoint(
+    pub(crate) fn create_checkpoint(
         dir: &Path,
         cancel: Option<&watch::Receiver<bool>>,
     ) -> anyhow::Result<CheckpointInfo> {
@@ -238,7 +238,7 @@ pub mod checkpoint {
     /// after the turn was cancelled is refused, and the signal bounds every Git
     /// child the commit runs. A locked repository index is waited out by the
     /// index gate before the commit starts.
-    pub fn create_step_commit(
+    pub(crate) fn create_step_commit(
         dir: &Path,
         changed_files: &[String],
         step_name: &str,
@@ -258,8 +258,7 @@ pub mod checkpoint {
         )
     }
 
-    /// Squashes the intermediate step commits into one AI commit.
-    pub fn finalize_ai_commit(
+    pub(crate) fn finalize_ai_commit(
         dir: &Path,
         checkpoint: &CheckpointInfo,
         changed_files: &[String],
@@ -276,8 +275,7 @@ pub mod checkpoint {
         )
     }
 
-    /// Creates an isolated AI commit for a turn that opened no checkpoint.
-    pub fn create_ai_commit(
+    pub(crate) fn create_ai_commit(
         dir: &Path,
         changed_files: &[String],
         commit_message: &str,
@@ -292,8 +290,10 @@ pub mod checkpoint {
         )
     }
 
-    /// Restores the working tree to its pre-turn state.
-    pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> anyhow::Result<()> {
+    pub(crate) fn restore_checkpoint(
+        dir: &Path,
+        checkpoint: &CheckpointInfo,
+    ) -> anyhow::Result<()> {
         let policy = super::GitPolicy::resolve(dir, None);
         tauqe_tools::git::checkpoint::restore_checkpoint_with_deadline(
             dir,
@@ -376,9 +376,12 @@ pub mod state {
     }
 }
 
+pub(crate) use checkpoint::{
+    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit, restore_checkpoint,
+};
 pub use checkpoint::{
-    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit, is_tauqe_commit,
-    restore_checkpoint, CheckpointInfo, CHECKPOINT_PREFIX, STEP_PREFIX, TAUQE_CO_AUTHOR_TRAILER,
+    is_tauqe_commit, CheckpointInfo, RecoveryOutcome, CHECKPOINT_PREFIX, STEP_PREFIX,
+    TAUQE_CO_AUTHOR_TRAILER,
 };
 pub use cmd::run_git;
 pub use diff::{

@@ -12,7 +12,10 @@
 //! `plan_update` performs `update`. The plan branch of a composed surface wraps
 //! them in one discriminated union, so the two properties never share a level and
 //! never become simultaneously required; the discussion wire is composed from the
-//! capability tree this crate declares, never from a second flat schema.
+//! capability tree this crate declares, never from a second flat schema. The
+//! unrolled tree travels as shared definitions a composed surface inlines, so
+//! the wire schema states the whole tree where it is used and carries no
+//! `$defs` section and no `$ref` for a provider to resolve.
 //!
 //! Every schema is assembled once into a process-wide cache and served by shared
 //! reference, so a caller composes or serializes through the value the cache
@@ -103,24 +106,15 @@ fn plan_payload_schema(action: &str, action_description: &str) -> serde_json::Va
                 "description": action_description
             },
             "id": {
-                "anyOf": [
-                    { "type": "string" },
-                    { "type": "null" }
-                ],
+                "type": ["string", "null"],
                 "description": "Target plan identifier"
             },
             "title": {
-                "anyOf": [
-                    { "type": "string" },
-                    { "type": "null" }
-                ],
+                "type": ["string", "null"],
                 "description": "Plan title"
             },
             "description": {
-                "anyOf": [
-                    { "type": "string" },
-                    { "type": "null" }
-                ],
+                "type": ["string", "null"],
                 "description": "Plan description and architectural rationale"
             },
             "concept": {
@@ -302,9 +296,11 @@ fn plan_item_definition(level: usize) -> serde_json::Value {
 /// `children` array of each level chains to the next, deeper definition of
 /// the same kind. The reference graph is an acyclic chain that terminates at
 /// the deepest level, where `children` is sealed to an empty array and admits
-/// no node below it. The definitions travel beside the payload, and a
-/// consumer lifts them to the root of its composed schema, which is where
-/// the `#/$defs/<Name>` references resolve.
+/// no node below it. The definitions are the inlining source of a composed
+/// schema: a consumer resolves every `#/$defs/<Name>` reference of a payload
+/// against them and substitutes the definition body in place, so the wire
+/// schema states the whole tree where it is used and carries no definitions
+/// section and no reference for a provider to resolve.
 ///
 /// Every level of one kind declares exactly the fields of the Rust struct it
 /// mirrors (`ConceptItem` or `PlanItem`) and requires all of them, so a node
@@ -345,56 +341,47 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
 ///
 /// The property admits `null` because a turn that records no decision carries no
 /// payload at all, which is the idle representation of a property the strict
-/// schema requires.
+/// schema requires. That nullability is stated as one `type` array on the payload
+/// itself, so the object schema and its fields stay at one level and no `anyOf`
+/// stands between the property and the object it declares.
 ///
 /// The payload is assembled once and served by a shared reference, so a caller
 /// that composes or serializes it pays no per-call deep copy of the tree.
 pub fn review_update_schema() -> &'static serde_json::Value {
     REVIEW_UPDATE_SCHEMA.get_or_init(|| {
         serde_json::json!({
-            "anyOf": [
-                {
-                    "type": "object",
-                    "description": "Decision recorded for one finding of the discussed review session. Null unless the discussion is anchored on a review session and the engineer has reached a final decision.",
-                    "properties": {
-                        "item_id": {
-                            "type": "integer",
-                            "minimum": ReviewUpdateProposal::ITEM_ID_MINIMUM,
-                            "maximum": ReviewUpdateProposal::ITEM_ID_MAXIMUM,
-                            "description": "Identifier of the finding inside the discussed review session, an unsigned 32-bit integer"
-                        },
-                        "group_id": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Identifier of the review group the decision is recorded for; null when the decision addresses the finding alone"
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": review_decision_status_enum(),
-                            "description": "Status the finding moves to: 'todo' queues it for execution, 'skipped' records that the finding is not reproducible, and 'rejected' records a false positive or an accepted trade-off"
-                        },
-                        "note": {
-                            "type": "string",
-                            "description": "The decision itself, in the engineer's words: the recorded resolution of the finding"
-                        },
-                        "recommendations": {
-                            "type": "array",
-                            "description": "Additional remediation recommendations agreed in the discussion; empty when the decision adds none",
-                            "items": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "required": ["item_id", "group_id", "status", "note", "recommendations"],
-                    "additionalProperties": false
+            "type": ["object", "null"],
+            "description": "Optional decision recorded for one review finding at the end of the turn. Null unless the discussion is anchored on a review session and the engineer has reached a final decision.",
+            "properties": {
+                "item_id": {
+                    "type": "integer",
+                    "minimum": ReviewUpdateProposal::ITEM_ID_MINIMUM,
+                    "maximum": ReviewUpdateProposal::ITEM_ID_MAXIMUM,
+                    "description": "Identifier of the finding inside the discussed review session, an unsigned 32-bit integer"
                 },
-                {
-                    "type": "null"
+                "group_id": {
+                    "type": ["string", "null"],
+                    "description": "Identifier of the review group the decision is recorded for; null when the decision addresses the finding alone"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": review_decision_status_enum(),
+                    "description": "Status the finding moves to: 'todo' queues it for execution, 'skipped' records that the finding is not reproducible, and 'rejected' records a false positive or an accepted trade-off"
+                },
+                "note": {
+                    "type": "string",
+                    "description": "The decision itself, in the engineer's words: the recorded resolution of the finding"
+                },
+                "recommendations": {
+                    "type": "array",
+                    "description": "Additional remediation recommendations agreed in the discussion; empty when the decision adds none",
+                    "items": {
+                        "type": "string"
+                    }
                 }
-            ],
-            "description": "Optional decision recorded for one review finding at the end of the turn"
+            },
+            "required": ["item_id", "group_id", "status", "note", "recommendations"],
+            "additionalProperties": false
         })
     })
 }
@@ -737,6 +724,21 @@ mod tests {
                 serde_json::json!([action]),
                 "{label} owns its own action"
             );
+            // A nullable field is spelled as one type array instead of a
+            // combinator, so the strict schema states the nullability of the
+            // field beside its type.
+            for field in ["id", "title", "description"] {
+                let property = &payload["properties"][field];
+                assert_eq!(
+                    property["type"],
+                    serde_json::json!(["string", "null"]),
+                    "{label}.{field} admits null through its type array"
+                );
+                assert!(
+                    property.get("anyOf").is_none(),
+                    "{label}.{field} carries no nullable combinator"
+                );
+            }
             assert_eq!(
                 payload["properties"]["concept"]["items"]["$ref"],
                 "#/$defs/ConceptItemL1"
@@ -772,6 +774,40 @@ mod tests {
         );
     }
 
+    /// Every reference a plan payload carries resolves inside the shared
+    /// definitions, which is what lets a composed surface inline it.
+    ///
+    /// A reference the definitions do not declare could not be substituted, so
+    /// the wire schema would keep a pointer no strict mode is guaranteed to
+    /// resolve. Each payload names exactly the first level of each kind, and
+    /// the definitions chain the levels below it.
+    #[test]
+    fn test_plan_payloads_reference_the_declared_definitions_only() {
+        let definitions = plan_schema_definitions()
+            .as_object()
+            .expect("the unrolled definitions are an object");
+
+        for payload in [plan_create_schema(), plan_update_schema()] {
+            let mut targets = BTreeSet::new();
+            collect_reference_targets(payload, &mut targets);
+            assert_eq!(
+                targets,
+                BTreeSet::from([
+                    "#/$defs/ConceptItemL1".to_string(),
+                    "#/$defs/PlanItemL1".to_string(),
+                ])
+            );
+            for target in targets {
+                let name = target
+                    .strip_prefix("#/$defs/")
+                    .expect("a payload references the shared definitions");
+                assert!(
+                    definitions.contains_key(name),
+                    "the reference {target} names no declared definition"
+                );
+            }
+        }
+    }
     /// The definitions are grouped by kind — every concept level, then every
     /// step level — and each level requires exactly the fields it declares. A
     /// level above the deepest chains `children` to the next level of its own
@@ -1025,15 +1061,14 @@ mod tests {
     #[test]
     fn test_review_payload_is_declared_once() {
         let payload = review_update_schema();
-        let variants = payload["anyOf"]
-            .as_array()
-            .expect("the review payload is a nullable union");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[1]["type"], "null");
+        // The nullable shape is the canonical strict form: one object schema
+        // whose `type` array admits `null` beside `object`, so no combinator
+        // stands between the payload and the fields it declares.
+        assert_eq!(payload["type"], serde_json::json!(["object", "null"]));
+        assert!(payload.get("anyOf").is_none());
+        assert_eq!(payload["additionalProperties"], serde_json::json!(false));
 
-        let object = &variants[0];
-        assert_eq!(object["type"], "object");
-        assert_eq!(object["additionalProperties"], serde_json::json!(false));
+        let object = payload;
         assert_eq!(
             declared_fields(object),
             required_fields(object),
@@ -1045,6 +1080,13 @@ mod tests {
         assert_eq!(
             object["properties"]["recommendations"]["items"]["type"],
             "string"
+        );
+
+        // The group identifier is nullable for the same reason as the payload,
+        // and it states its nullability the same way.
+        assert_eq!(
+            object["properties"]["group_id"]["type"],
+            serde_json::json!(["string", "null"])
         );
 
         // The vocabulary is generated from the typed model, so a status owned by
@@ -1089,8 +1131,7 @@ mod tests {
     /// instead of being restated here.
     #[test]
     fn test_review_item_id_is_bounded_by_the_domain_of_its_field() {
-        let payload = review_update_schema();
-        let review_update = &payload["anyOf"][0];
+        let review_update = review_update_schema();
         let item_id = &review_update["properties"]["item_id"];
 
         assert_eq!(item_id["type"], "integer");

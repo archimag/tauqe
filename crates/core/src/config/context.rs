@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_MAX_RESEARCH_ROUNDS: usize = 5;
 /// Default aggregate token budget of the context: repository files and the
 /// external documents a project mounts are priced the same way under it.
 pub const DEFAULT_TOKEN_BUDGET: usize = 300_000;
@@ -23,10 +22,6 @@ pub const DEFAULT_MAX_FEEDBACK_CHARS: usize = 4_000;
 
 /// Default maximum characters of a turn scratchpad block kept before truncation.
 pub const DEFAULT_MAX_SCRATCHPAD_CHARS: usize = 4_000;
-
-fn default_max_research_rounds() -> usize {
-    DEFAULT_MAX_RESEARCH_ROUNDS
-}
 
 fn default_token_budget() -> usize {
     DEFAULT_TOKEN_BUDGET
@@ -67,12 +62,7 @@ fn default_max_scratchpad_chars() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     #[serde(default, deserialize_with = "deserialize_pinned")]
-    pub pinned: Vec<String>,
-    #[serde(
-        default = "default_max_research_rounds",
-        alias = "max_discovery_rounds"
-    )]
-    pub max_research_rounds: usize,
+    pub(crate) pinned: Vec<String>,
     /// Aggregate token budget of the context.
     ///
     /// Repository files and the external documents a project mounts are priced
@@ -88,29 +78,28 @@ pub struct ContextConfig {
     pub include_repo_map: bool,
     /// Repository search queries honored in one Discovery round.
     #[serde(default = "default_max_search_requests_per_round")]
-    pub max_search_requests_per_round: usize,
+    pub(crate) max_search_requests_per_round: usize,
     /// Matching files reported for a single search query.
     #[serde(default = "default_max_matched_files_per_search")]
-    pub max_matched_files_per_search: usize,
+    pub(crate) max_matched_files_per_search: usize,
     /// Entries rendered by a single directory listing.
     #[serde(default = "default_max_dir_list_entries")]
-    pub max_dir_list_entries: usize,
+    pub(crate) max_dir_list_entries: usize,
     /// Targeted repository maps rendered in one Discovery round.
     #[serde(default = "default_max_repo_map_requests_per_round")]
-    pub max_repo_map_requests_per_round: usize,
+    pub(crate) max_repo_map_requests_per_round: usize,
     /// Characters of one project command stream reported back to the model.
     #[serde(default = "default_max_feedback_chars")]
-    pub max_feedback_chars: usize,
+    pub(crate) max_feedback_chars: usize,
     /// Characters of a turn scratchpad block kept before safe truncation.
     #[serde(default = "default_max_scratchpad_chars")]
-    pub max_scratchpad_chars: usize,
+    pub(crate) max_scratchpad_chars: usize,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
-            max_research_rounds: DEFAULT_MAX_RESEARCH_ROUNDS,
             token_budget: DEFAULT_TOKEN_BUDGET,
             repomap_token_budget: default_repomap_token_budget(),
             include_repo_map: DEFAULT_INCLUDE_REPO_MAP,

@@ -23,7 +23,7 @@
 //! single source of truth: prompt rendering, the structured response schema,
 //! and command decoding all observe the same typed surface.
 
-use tauqe_protocol::{CapabilityExpr, LlmCapability};
+use tauqe_protocol::{CapabilityTree, LlmCapability};
 
 use crate::prompt::ContourKind;
 
@@ -47,7 +47,7 @@ use super::rules::{ContractContext, ContractRule, CODE_VERIFICATION_GUARANTEE};
 /// declaration other than `Xml` renders the structured spelling.
 pub fn shared_trunk_rules(
     _ctx: &ContractContext<'_>,
-    capabilities: &CapabilityExpr,
+    capabilities: &CapabilityTree,
 ) -> Vec<ContractRule> {
     let mut rules = vec![
         ContractRule::new(
@@ -105,7 +105,7 @@ pub fn shared_trunk_rules(
 
 pub fn intent_delta_rules(
     ctx: &ContractContext<'_>,
-    capabilities: &CapabilityExpr,
+    capabilities: &CapabilityTree,
 ) -> Vec<ContractRule> {
     let mut rules = Vec::new();
     // The contour is declared by the loop that owns the turn, so the rules of a
@@ -122,7 +122,7 @@ pub fn intent_delta_rules(
     if !is_step_contour && has_any_edit_capability(capabilities) {
         rules.push(ContractRule::new(
             "Action Authorization",
-            "Proactive engineering stance: when the developer asks to change code, fix a bug, or inspect a subsystem, that request is executed immediately with concrete action instead of passive commentary or manual instructions. If the relevant files are not yet in context, select the `research` branch (`repo_searches`, `context_requests`) to locate and load them in the same turn; if they are already in context, propose the minimal coherent change in the `edit` branch. Discussion is the mode for open, exploratory, analytical, and architectural questions, and for genuine ambiguity about the developer's intent: there you analyze, weigh competing trade-offs, and seek confirmation before editing files or creating a plan. An analytical or exploratory request is never closed by silence: once the files, searches, or documentation you requested are available, the same turn must carry the written analysis the developer asked for, and an empty reply is never a valid conclusion. An answer is the deliverable of such a turn, so gathering material never substitutes for it.",
+            "Proactive engineering stance: when the developer asks to change code, fix a bug, or inspect a subsystem, that request is executed immediately with concrete action instead of passive commentary or manual instructions. If the relevant files are not yet in context, select the `research` branch (`repo_searches`, `context_requests`) to locate and load them in the same turn; if they are already in context, propose the minimal coherent change in the `edit` branch. Never defer action with conversational promises: do not state what you plan to search or inspect in `message` while leaving the action branch passive or selecting `answer`. When files are not in context, you must dispatch research requests immediately rather than describing your plan. Conversely, when the required context is already present, or when answering conceptual questions, formulate your complete explanation directly in `message` and conclude the turn by selecting the `answer` branch. Discussion is the mode for open, exploratory, analytical, and architectural questions, and for genuine ambiguity about the developer's intent: there you analyze, weigh competing trade-offs, and seek confirmation before editing files or creating a plan. An analytical or exploratory request is never closed by silence: once the files, searches, or documentation you requested are available, the same turn must carry the written analysis the developer asked for, and an empty reply is never a valid conclusion. An answer is the deliverable of such a turn, so gathering material never substitutes for it.",
         ));
 
         if capabilities.contains(LlmCapability::PlanCreation) {
@@ -155,7 +155,7 @@ pub fn intent_delta_rules(
     rules
 }
 
-fn has_any_edit_capability(capabilities: &CapabilityExpr) -> bool {
+fn has_any_edit_capability(capabilities: &CapabilityTree) -> bool {
     capabilities.contains(LlmCapability::EditReplace)
         || capabilities.contains(LlmCapability::EditCreate)
         || capabilities.contains(LlmCapability::EditDelete)
@@ -170,36 +170,36 @@ mod tests {
     use tauqe_protocol::DiscussionTarget;
 
     /// Builds the capability surface of a free interactive dialogue.
-    fn repl_surface() -> CapabilityExpr {
+    fn repl_surface() -> CapabilityTree {
         crate::control::repl::repl_capability_expr(None)
     }
 
     /// Builds the capability surface of a plan-anchored dialogue.
-    fn plan_discussion_surface() -> CapabilityExpr {
+    fn plan_discussion_surface() -> CapabilityTree {
         crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
             id: "p-1".to_string(),
         }))
     }
 
     /// Builds the capability surface of a review-anchored dialogue.
-    fn review_discussion_surface() -> CapabilityExpr {
+    fn review_discussion_surface() -> CapabilityTree {
         crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Review {
             id: "r-1".to_string(),
         }))
     }
 
     /// Builds the capability surface of one isolated step.
-    fn step_surface() -> CapabilityExpr {
+    fn step_surface() -> CapabilityTree {
         crate::control::turn::turn_capability_expr()
     }
 
     /// Builds the capability surface of an Architect horizon synthesis.
-    fn architect_surface() -> CapabilityExpr {
+    fn architect_surface() -> CapabilityTree {
         crate::control::refine::architect_synthesis_capability_expr()
     }
 
     /// Builds the shared trunk for one capability surface.
-    fn shared(expr: &CapabilityExpr, marker: Option<&str>) -> Vec<ContractRule> {
+    fn shared(expr: &CapabilityTree, marker: Option<&str>) -> Vec<ContractRule> {
         let render = PromptRenderContext::new(&[], marker);
         let ctx = ContractContext::new(render);
         shared_trunk_rules(&ctx, expr)
@@ -207,7 +207,7 @@ mod tests {
 
     /// Builds the surface-specific delta of one contour and capability surface.
     fn delta(
-        expr: &CapabilityExpr,
+        expr: &CapabilityTree,
         contour: ContourKind,
         marker: Option<&str>,
     ) -> Vec<ContractRule> {
@@ -218,7 +218,7 @@ mod tests {
 
     /// Builds the trunk rules of one contour and capability surface.
     fn trunk(
-        expr: &CapabilityExpr,
+        expr: &CapabilityTree,
         contour: ContourKind,
         marker: Option<&str>,
     ) -> Vec<ContractRule> {
@@ -239,7 +239,7 @@ mod tests {
     }
 
     /// Returns the capability surfaces the trunk renders for.
-    fn regimes() -> Vec<(&'static str, CapabilityExpr, ContourKind)> {
+    fn regimes() -> Vec<(&'static str, CapabilityTree, ContourKind)> {
         [
             ("interactive_repl", repl_surface(), ContourKind::Dialogue),
             (
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn host_environment_failures_require_the_abort_capability() {
         // A surface without the abort capability never states the rule.
-        let narrowed_discussion = CapabilityExpr::from_leaves([
+        let narrowed_discussion = CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
@@ -362,7 +362,7 @@ mod tests {
         // A narrowed surface without the abort capability keeps the dense
         // numbering of its own rules and never advertises the rule.
         let narrowed_surface =
-            CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
+            CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
         let narrowed = trunk(&narrowed_surface, ContourKind::Dialogue, None);
         assert!(!titles(&narrowed).contains(&"Host Environment Failures"));
 
@@ -436,7 +436,7 @@ mod tests {
         let with_edits = trunk(&repl_surface(), ContourKind::Dialogue, None);
         assert!(titles(&with_edits).contains(&"Action Authorization"));
 
-        let without_edits_surface = CapabilityExpr::from_leaves([LlmCapability::TextMessage]);
+        let without_edits_surface = CapabilityTree::from_leaves([LlmCapability::TextMessage]);
         let without_edits = trunk(&without_edits_surface, ContourKind::Dialogue, None);
         assert!(!titles(&without_edits).contains(&"Action Authorization"));
     }
@@ -468,6 +468,24 @@ mod tests {
         assert!(authorization.contains("never closed by silence"));
         assert!(authorization.contains("same turn must carry the written analysis"));
         assert!(authorization.contains("an empty reply is never a valid conclusion"));
+    }
+
+    #[test]
+    fn action_authorization_branches_on_the_availability_of_context() {
+        let rules = trunk(&repl_surface(), ContourKind::Dialogue, None);
+        let authorization = body(&rules, "Action Authorization");
+
+        // The rule resolves the tension between acting and discussing by the
+        // presence of context: a request about code that is not in context is a
+        // research request, while a request the context already answers is an
+        // answer. Neither path may stop at a description of the work.
+        assert!(authorization.contains("If the relevant files are not yet in context"));
+        assert!(authorization.contains("select the `research` branch"));
+        assert!(authorization.contains("if they are already in context"));
+        assert!(authorization.contains("propose the minimal coherent change"));
+        assert!(authorization.contains("`answer` branch"));
+        assert!(authorization.contains("Never defer action with conversational promises"));
+        assert!(authorization.contains("dispatch research requests immediately"));
     }
 
     #[test]

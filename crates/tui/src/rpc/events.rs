@@ -1953,6 +1953,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            rounds: Vec::new(),
             status: HistoryEntryStatus::Committed,
         }
     }

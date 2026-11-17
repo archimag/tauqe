@@ -20,7 +20,7 @@ All interaction between Tauqe and large language models is governed exclusively 
   5. **History & Plan Compaction:** Context summarization, state compaction, and progress checkpoints.
 
 ### 1.2. Mutually Exclusive Operational Branches
-- **One response follows exactly one branch.** A turn surface decomposes into the invariant ambient channel — the turn scratchpad — and into mutually exclusive operational branches (`research`, `edit`, `plan`, `review`). The conversational channel belongs to the branches: every operational branch declares the single `message` field of the response, so a composed wire carries exactly one `message` property because exactly one branch is selected. The name belongs to the answer alone: the error channel is the separate `error_message` property a branch declares beside it, so a failed turn reports through `error_message` while the user-facing answer keeps its one name. A discovery or planning branch reports through a short description of the action it performs, while a branch that answers or changes the working tree carries the full explanation. The answer language is not a channel of its own: the shared trunk states it once as an unconditional rule that user-facing output follows the language of the developer's request.
+- **One response follows exactly one branch.** A turn surface decomposes into the invariant ambient channels — the turn scratchpad and the single `message` field — and into mutually exclusive operational branches (`research`, `edit`, `plan`, `review`). The conversational message is ambient: it sits at the root of the response beside the scratchpad, is present at every stage of the turn whatever branch the `action` union selects, and is never duplicated inside a branch, so a composed wire carries exactly one `message` property. The name belongs to the answer alone: the error channel is the separate `error_message` property a branch declares beside it, so a failed turn reports through `error_message` while the user-facing answer keeps its one name. The `answer` branch is a bare marker that owns no field of its own: a round with nothing to act on names the branch and writes the ambient message. The answer language is not a channel of its own: the shared trunk states it once as an unconditional rule that user-facing output follows the language of the developer's request.
 - **Grammatical Branch Enforcement:** The structured protocol expresses mutual exclusion grammatically via `action.anyOf`, where each branch is a strict object carrying a constant `kind` discriminator. A response selecting `research` contains no `changes` or `commit_message` property, and a response selecting `edit` contains no flat discovery properties (`context_requests`, `repo_searches`, `repo_dirs`, `repo_maps`, `dir_lists`, `tauqe_doc_requests`, `outer_doc_requests`) or `plan_update`. Terminal signals travel as flat fields on the branch (`commit_message`, `error_message`, `reason`), each one named by the branch that declares it.
 - **Dialogue branches carry dialogue, not step signals.** A dialogue declares neither a `blocked` nor an `abort` branch: both escape hatches answer a condition only an unattended turn has to resolve, so they belong to the autonomous step contour alone. A dialogue branch also declares no step-termination signal, and only the branch that applies a change set carries `commit_message`, so a conversation is closed by the answer it was asked for instead of the vocabulary of a batch step.
 - **Plan payloads never share one level.** A dialogue anchored on a plan advertises both plan capabilities, so its plan branch wraps them in one discriminated union (`plan_action`) whose `kind` values are `create` and `modify`. `plan_create` and `plan_update` are therefore never declared at the same level and never become simultaneously required; a free dialogue advertises plan authorship alone and carries the leaf directly.
@@ -30,10 +30,10 @@ All interaction between Tauqe and large language models is governed exclusively 
 ### 1.3. Direct Capability Functions and the Capability Expression Tree
 - **Direct mapping per atomic capability.** Each atomic `LlmCapability` maps directly in `capabilities/schema.rs`, `capabilities/decode.rs`, and `capabilities/rules.rs`: `capability_schema(cap, ctx)` projects the `schemars`-derived strict JSON schema fragment for that capability, `decode_capability_expr(expr, node, ctx)` decodes its commands, and `contract_rule` / `delta_rule` / `structured_instruction` render its prompt rules and field instructions.
 - **One tree renders and decodes.** The strict `CapabilityExpr` tree is the single source of both the response schema and the parsing of the response. `capability_expr_schema(expr, ctx)` recursively walks the tree — calling `capability_schema` for each `Leaf`, merging properties for `Set`, and building an `anyOf` discriminated union with `kind` when `AnyOf` has two or more branches — and `decode_capability_expr(expr, node, ctx)` walks the same tree synchronously with the JSON response into a flat `Vec<LlmCommand>`, descending into `node[label]` by `kind` (returning `ProtocolError` on an unknown or missing `kind`) and deserializing each `Leaf` directly from the current `node`. Parsing reads exactly the surface the schema declares, so a command outside the active branch is never extracted from a response.
-- **Branch labels are data.** The label of an operational branch is `CapabilityBranch::kind`, set by the contour that builds the tree. Sniffing leaves for a label and special-casing branch names by string are prohibited (root `Conventions.md` §1.5).
+- **Branch labels are data.** The label of an operational branch is the label of its `CapabilityTree` node, read through `CapabilityTree::label()` and declared by the contour that builds the tree. Sniffing leaves for a label and special-casing branch names by string are prohibited (root `Conventions.md` §1.5).
 - **No flat capability set.** The only flat form of a surface is the leaf projection (`CapabilityExpr::leaves`, `Vec<LlmCapability>`); a tree is never reconstructed from a flat list. Every control loop — the interactive dialogue, the bounded turn, and the architect synthesis — declares its surface as one tree, and the former `CapabilitySet` type is deleted rather than reintroduced.
 - **The control loop owns the whole tree.** Each loop function is the single declaration of its contour's surface: `repl_capability_expr` in `control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis tree in `control/refine.rs`. A protocol surface is narrowed by intersecting it with that very tree, and no contour declares a second tree.
-- **The regime is a typed parameter, never a type.** The differences between contours travel as explicit typed parameters — whether the prompt carries the `<history>` block, whether plan mutation is authorized, and which prompt layout the turn runs under — so no enumeration of turn intents exists, and no rule is composed against a remainder of a surface.
+- **The regime is a typed parameter, never a type.** The differences between contours travel as explicit typed parameters — whether the prompt carries the `<history>` block and whether plan mutation is authorized — so no enumeration of turn intents exists, and no rule is composed against a remainder of a surface.
 - **Descriptions are mandatory.** Every command and every property of every schema fragment carries a non-empty `description`, which is the control prompt of constrained decoding and the contract documentation at once. A property without a description is a defect, and a unit test walks the schema of every `LlmCapability` and composed surface to enforce it.
 - **The contour brief belongs to its governing loop.** The introductory brief of a contour — its kind, its role, the paradigm it serves, and the task it carries — is a typed `TurnBrief` that the loop function declares (`run_repl_loop`, `run_plan_step_loop`, `run_structured_refine`, and the server path of a single step), never text selected by a boolean flag. `PromptAssembly` renders the brief it receives and gates the mode-specific rules on the typed kind that brief carries; `is_isolated_step_surface` heuristics and `is_isolated_step` flags are eliminated across all loops, builders, and assemblies.
 
@@ -50,7 +50,7 @@ All interaction between Tauqe and large language models is governed exclusively 
 3. **Clean Streaming Isolation:**
    - Every protocol implementation must provide an `EditStreamFilter` that isolates the user-facing interface from protocol scaffolding.
    - The target textual response field (`message`) must be streamed on the fly via `StreamEvent::TextDelta` with real-time unescaping, while structural metadata (`action`, `changes`, `plan_update`, `error_message`, `commit_message`, `reason`) remains completely hidden from the REPL stream.
-   - The filter locates the single `message` field and the `changes` array at whatever depth the payload declares them — at the root of the response or inside `action` — because a branched wire nests them in the branch the round selected. It never models the branch envelope: uniqueness of `message` is a property of the capability tree (§1.2), so one filter serves a flat and a branched wire without knowing which it received. The error channel is metadata, not an answer: `error_message` is never streamed as the response text, so a failed turn cannot impersonate a written reply.
+   - The filter locates the single `message` field and the `changes` array at whatever depth the payload declares them — at the root of the response or, as a tolerance for the previous wire shape, inside `action`. It never models the branch envelope: uniqueness of `message` is a property of the capability tree (§1.2), so one filter serves a flat and a branched wire without knowing which it received. The error channel is metadata, not an answer: `error_message` is never streamed as the response text, so a failed turn cannot impersonate a written reply.
 4. **Declarative Prompt Composition:**
    - The system prompt is composed directly from the enabled capabilities, never from a monolithic template. `compose_contract_rules` folds the shared trunk, the rules the active contour brief selects, and every enabled capability's rule through one `ContractContext`, and `compose_structured_protocol_instructions` folds every enabled capability's instruction through one `PromptRenderContext`, both in `crates/core/src/capabilities/rules.rs`.
    - `compose_structured_protocol_instructions` is the single source of the instruction field list: every instruction derives from the capability tree of the loop, so a narrowed tree removes a property from the instructions exactly as it removes it from the schema. A protocol whose mode differs renders its own heading and folds the same composition, so it never carries a hand-written list of fields its active tree does not declare.
@@ -58,7 +58,7 @@ All interaction between Tauqe and large language models is governed exclusively 
    - **Single Source of Truth for Structure:** The strict JSON schema (derived via `schemars` and `capability_expr_schema`) is the authoritative single source of truth for response structure: field names, types, nesting, requiredness, and property descriptions. The prompt text is strictly reserved for engineering role, task semantics, and discipline invariants; it never re-enumerates schema fields or restates structural JSON schemas.
    - **Conditional Section Gating:** Specialized documentation and tooling sections are rendered only when authorized by the active capability tree: the external documentation catalog and its contract rule appear strictly when `OuterDocRequest` is present, and project custom tools strictly when `CustomTools` is enabled.
    - **Elimination of Host and Protocol Metadata:** The prompt omits ambient host file-system paths, Git transaction mechanics, and protocol implementation constants (`Project Metadata` block is eliminated); the model interacts with the codebase strictly through repository-relative paths and the provided `<context>` surface.
-   - The text rule follows the capability that declares it: a surface declaring `TextMessage` renders the conversational-response rule, and a surface declaring `ShortDescription` renders the concise-explanation rule. A dialogue that carries both in different branches states both in its contract, and the branch a round selects decides which of them its `message` obeys; neither rule widens the field, which is declared once per branch (§1.2).
+   - The text rule follows the capability that declares it: a surface declaring `TextMessage` renders the conversational-response rule, and the single ambient `message` field is the one channel the rule governs on every contour — a dialogue and an isolated step alike. No rule widens the field, which the schema declares once at the root of the response (§1.2).
    - A disabled capability contributes no rule, no instruction, and no schema property. Prompt text and decoding derive from the same `CapabilityExpr`.
    - **A rule travels with the functionality it describes.** A capability, a project declaration, or a contour that changes shape updates its rule, its instruction, and this document in the same step, so no rule outlives the behaviour it explains and no behaviour ships without the rule that states it.
    - **Contract Rule Composition:** The core system contract is assembled as an ordered sequence of typed `ContractRule { title, body }` values and rendered by one loop with monotonic numbering `1..N`. Rule numbers are never written into string literals.
@@ -180,153 +180,162 @@ kgUZ |    - A change set the substrate refuses because a path is excluded by the
 
 ---
 
-## 9. Prompt Architecture: Layout Policies and Provider Prefix Caching
+## 9. Prompt Architecture: The Chronological Transcript and Provider Prefix Caching
 
-1. **Layout Policies Are Interchangeable Implementations of One Trait:**
-   - Turning a rendered `PromptAssembly` into the message sequence of a turn is a
-     policy behind one trait (`PromptLayout`, `crates/core/src/prompt/layout.rs`),
-     never a hardcoded order inside the assembly.
-   - Two implementations exist and are strictly interchangeable: `SemanticLayout`
-     groups the material into stable sections, and `ChronologicalLayout` turns the
-     same material into an append-only transcript.
-   - A caller chooses a policy exclusively through the typed `PromptLayoutKind`
-     (`Semantic` or `Chronological`) and `layout_for`. Branching on a policy name,
-     on a rendered heading, or on any other textual property is prohibited (the
-     root `Conventions.md` §1, *Typed Intent over Textual Inference*).
-   - Both policies render context files through the same layout-agnostic
-     `ContextBlockCache`, so a `<file>` element produced by one policy is
-     reproduced byte for byte by the other.
-2. **Block Order Is a Property of the Policy:**
-   - The order in which the already-rendered blocks become messages belongs to the
-     policy; it is no longer a global constant of the assembly.
+1. **One Assembly Function, One Order:**
+   - Turning a rendered `PromptAssembly` into the message sequence of a turn is a single
+     free function, `assemble_chronological_messages`
+     (`crates/core/src/prompt/layout.rs`), reached through
+     `PromptAssembly::assemble_chat_messages` and
+     `PromptAssembly::assemble_chat_messages_with_context_cache`.
+   - No layout trait, no policy enumeration, and no selection step exists: the transcript
+     is the only sequence a turn can be composed into, so a contour never chooses an
+     assembly shape and no rule is composed against one.
+2. **Block Order Belongs to That Function:**
+   - The order in which the already-rendered blocks become messages is a property of
+     that one function, not of the assembly and not of a contour.
 
-   | Material | `SemanticLayout` | `ChronologicalLayout` |
-   | --- | --- | --- |
-   | Core system contract, protocol instructions | system head | system head |
-   | Repository outline (symbol map or directory tree, never both) | system head | system head |
-   | Context files | one `<context>` block in the system message | `<context>` groups interleaved with the history records |
-   | Session history | one `<history>` block in the system message | one message per history record |
-    | Active plan | system message tail | trailing user message |
-    | Context manifest (paths and access, no content) | absent | trailing user message |
-   | Turn scratchpad | system message tail | trailing user message |
-   | Current task | final user message | final user message |
+   | Material | Placement |
+   | --- | --- |
+   | Core system contract, protocol instructions | system head |
+   | Repository outline (symbol map or directory tree, never both) | system head |
+   | Context files | `<context>` groups interleaved with the history records |
+   | Session history | one message per history record |
+   | Active plan | trailing user message |
+   | Context manifest (paths and access, no content) | trailing user message |
+   | Turn scratchpad | trailing user message |
 
-   - Both policies keep the same three-part shape: a byte-stable head, the
-     material that legitimately grows, and an isolated volatile tail.
+   - The three-part shape stays the same in every turn: a byte-stable head, the material
+     that legitimately grows, and an isolated volatile tail.
 3. **Byte-Stable Head:**
-   - The head carries only blocks that are identical from one round of a turn to
-   - The head carries only blocks that are identical from one round of a turn to
-     the next: the introduction, the Core System Contract, the protocol
-     instructions, and the repository outline.
-     instructions, the project metadata, and the repository outline.
-   - The repository outline stays in the head under both policies. The dominant
-     regime of a turn is exploration and planning, where the outline hardly
-     changes, while the outline is also the largest block: placing it in the tail
-     would pay a full reprocessing pass on every round instead of only on the
-     turns that regenerate it.
-   - The accepted price is explicit. A regenerated outline changes the head itself
-     and therefore invalidates the whole tail, because a later turn renders an
-     outline that excludes the files which entered the context. That divergence is
-     a documented property of the outline, not an accident of the layout.
-   - Within a turn the outline is frozen (`TurnInputCache`), so no later round of
-     the same turn rewrites it even after discovery widened the context.
-4. **Contract Vocabulary Follows the Active Layout:**
-   - The Core System Contract describes the context surface in the dictionary of
-     the active policy, exactly as it selects the dictionary of the active contour
-     (§2.4). `SemanticLayout` names the `<context>` block; `ChronologicalLayout`
-     names the interleaved transcript and the tail manifest.
-   - A rule never mixes the two dictionaries. The prompt-side description of the
-     `<file>` element and of the `access` attribute is shared, because it describes
-     payload the model reads rather than a command channel it emits.
+   - The head carries only blocks that are identical from one round of a turn to the
+     next: the introduction, the Core System Contract, the protocol instructions, and the
+     repository outline.
+   - The repository outline stays in the head. The dominant regime of a turn is
+     exploration and planning, where the outline hardly changes, while the outline is
+     also the largest block: placing it in the tail would pay a full reprocessing pass on
+     every round instead of only on the turns that regenerate it.
+   - The accepted price is explicit. A regenerated outline changes the head itself and
+     therefore invalidates the whole tail, because a later turn renders an outline that
+     excludes the files which entered the context. That divergence is a documented
+     property of the outline, not an accident of the assembly.
+   - Within a turn the outline is frozen (`TurnInputCache`), so no later round of the
+     same turn rewrites it even after discovery widened the context.
+4. **Contract Vocabulary Follows the Transcript:**
+   - The Core System Contract describes the context surface in the dictionary of the
+     transcript: the interleaved `<context>` groups and the trailing manifest.
+   - The prompt-side description of the `<file>` element and of the `access` attribute is
+     shared, because it describes payload the model reads rather than a command channel
+     it emits.
 5. **Deterministic Rendering:**
-   - The prompt carries no runtime-varying content: no timestamps, no dates, no
-     random or per-request identifiers, no context revision counters, no counters
-     or latencies, and no toolchain output.
-   - Every collection rendered into a policy keeps a deterministic order (context
-     files by insertion order or by insertion watermark, symbols and directories
-     in their generated order), so identical state produces identical bytes.
+   - The prompt carries no runtime-varying content: no timestamps, no dates, no random or
+     per-request identifiers, no context revision counters, no counters or latencies, and
+     no toolchain output.
+   - Every collection rendered into the transcript keeps a deterministic order (context
+     files by insertion watermark, symbols and directories in their generated order), so
+     identical state produces identical bytes.
+   - Context files travel through one layout-agnostic `ContextBlockCache`, so an element
+     rendered once is reproduced byte for byte.
 6. **Append-Only Growth:**
-   - Research widens the context by appending newly discovered files. Under
-     `SemanticLayout` it is appended at the tail; under `ChronologicalLayout` it
-     is appended after the records already in
-     the transcript. Previously rendered elements keep their exact bytes.
-   - Promoting a file from read-only to editable rewrites only that file's own
-     `access` attribute in place; it never relocates the element or reflows its
-     neighbors.
-   - The chronological transcript is ordered by the insertion watermark every
-     context entry carries (`ContextItem::insertion_seq`). A file is placed after
-     the prompt record of the turn during which its watermark was allocated: the
-     policy compares the file's `insertion_seq` against the `context_watermark`
-     each `HistoryEntry::Turn` persisted and selects the last turn that started
-     before the file arrived. That slot is stable on every later turn, so a turn
-     adopting a mid-turn arrival appends its own records behind it instead of
-     moving it. A file no watermark-bearing turn bounds keeps the recorded
-     starting context of the first turn that listed it, and a file that carries no
-     watermark at all closes the transcript.
+   - Research widens the context by appending newly discovered files after the records
+     already in the transcript. Previously rendered elements keep their exact bytes.
+   - Promoting a file from read-only to editable rewrites only that file's own `access`
+     attribute in place; it never relocates the element or reflows its neighbors.
+   - The transcript is ordered by the insertion watermark every context entry carries
+     (`ContextItem::insertion_seq`). A file is placed after the prompt record of the turn
+     during which its watermark was allocated: the assembly compares the file's
+     `insertion_seq` against the `context_watermark` each `HistoryEntry::Turn` persisted
+     and selects the last turn that started before the file arrived. That slot is stable
+     on every later turn, so a turn adopting a mid-turn arrival appends its own records
+     behind it instead of moving it. A file no watermark-bearing turn bounds keeps the
+     recorded starting context of the first turn that listed it, and a file that carries
+     no watermark at all closes the transcript.
+   - **A content change is a position event.** A file keeps the watermark it
+     received while nothing changed it, but a change set that converged or was
+     refused in virtual staging changes what the model must read next:
+     `ContextManager::move_files_to_tail` re-issues the watermarks of the named
+     paths and moves their entries to the tail of their context layers, so the
+     chronological layout renders the hot group — the converged members first,
+     the refused members after them — behind the last recorded turn instead of
+     at the arrival slot. The relocation is the documented exception to the
+     stable slot above, and the `merge_turn_context` max-watermark rule carries
+     the re-issued position back into the primary state.
 7. **Isolated Volatile Tail:**
-   - All genuinely round-varying content is confined to the end of the message
-     sequence: the active plan, the context manifest of the chronological policy,
-     and the turn scratchpad; round-specific diagnostics (patch retry reports,
-     verification failures) travel as append-only extensions of the user message.
-   - The context manifest carries paths and effective access only, never content.
-     It compensates for the lost semantic grouping: the model keeps a complete view
-     of what is in context while no content byte moves into the tail.
-   - Nothing volatile is ever injected into an earlier block, because an early
-     insertion invalidates every cached token that follows it.
+   - All genuinely round-varying content is confined to the end of the message sequence:
+     the active plan, the context manifest, and the turn scratchpad; round-specific
+     diagnostics (patch retry reports, verification failures) travel as append-only
+     extensions of the user message.
+   - The context manifest carries paths and effective access only, never content. It keeps
+     a complete view of what is in context while no content byte moves into the tail.
+   - Nothing volatile is ever injected into an earlier block, because an early insertion
+     invalidates every cached token that follows it.
 8. **Documented Structural Invalidation Points:**
-   - Appending grows the sequence at its tail and therefore preserves the cached
-     prefix.
-   - The structural mutations that legitimately move an earlier byte are named
-     rather than discovered, and each of them bounds the invariant:
+   - Appending grows the sequence at its tail and therefore preserves the cached prefix.
+   - The structural mutations that legitimately move an earlier byte are named rather
+     than discovered, and each of them bounds the invariant:
      1. Repository outline regeneration between turns, which rewrites the head.
      2. Access promotion, which rewrites one attribute of one element in place.
-     3. Prune and rollback, which remove an element and shift every message after
-        it; the removal is the purpose of the operation.
-     4. History compaction, which replaces the opening of the transcript and
-        rotates the dialogue session identifier together with the prefix it
-        rewrites (rule 9), because the provider must not be asked to reuse a node
-        cache whose prefix the dialogue no longer sends.
+     3. Prune and rollback, which remove an element and shift every message after it;
+        the removal is the purpose of the operation.
+     4. History compaction, which replaces the opening of the transcript and rotates the
+        dialogue session identifier together with the prefix it rewrites (rule 9),
+        because the provider must not be asked to reuse a node cache whose prefix the
+         dialogue no longer sends.
+      5. Context churn relocation, which re-issues the arrival watermark of
+         every path a change set converged on or was refused, so the reseeded
+         prefix renders the rewritten files — with the anchors of their
+         current bytes — behind the last recorded turn. The relocation is
+         bounded by the named paths: every element the churn did not name keeps
+         its exact bytes and its exact position, so the cache loss is confined
+         to the stretch between the earliest relocated element and the tail.
 9. **Dialogue Session Boundary:**
-   - An interactive turn binds its provider requests to a dialogue session
-     identifier, which is what a provider uses to route consecutive requests to
-     the same cache-warm node.
-   - While the context block stays byte-for-byte identical and the target model
-     remains unchanged, the identifier stays too: a series of REPL answers that
-     only reads context keeps one session, so every round reuses the prefix
-     cache warmed by its predecessor.
-   - Session invalidation and rotation occur at exactly two deterministic
-     boundaries:
-     1. When shrinking or clearing the context block: the post-turn release of
-        the transient context (`AppState::clear_transient_context`, backed by
+   - An interactive turn binds its provider requests to a dialogue session identifier,
+     which is what a provider uses to route consecutive requests to the same cache-warm
+     node.
+   - While the context block stays byte-for-byte identical and the target model remains
+     unchanged, the identifier stays too: a series of REPL answers that only reads context
+     keeps one session, so every round reuses the prefix cache warmed by its predecessor.
+   - Session invalidation and rotation occur at exactly two deterministic boundaries:
+     1. When shrinking or clearing the context block: the post-turn release of the
+        transient context (`AppState::clear_transient_context`, backed by
         `ContextManager::clear_transient`), an explicit clear of the Auto or the
-        OuterDocs layer, or a full reset through `AppState::clear_all_context`.
-        A fresh session opens a prefix no earlier request warmed; keeping the
-        old identifier would address a node whose cached prefix the dialogue no
-        longer sends. The rotation follows the boolean the underlying clear
-        reports, so a no-op clear preserves the warm session.
+        OuterDocs layer, or a full reset through `AppState::clear_all_context`. A fresh
+        session opens a prefix no earlier request warmed; keeping the old identifier
+        would address a node whose cached prefix the dialogue no longer sends. The
+        rotation follows the boolean the underlying clear reports, so a no-op clear
+        preserves the warm session.
      2. When the effective model changes (`maybe_rotate_session_on_model_change`).
-        Provider KV caches and routing affinities are physically model-specific.
-        Reusing a session identifier across different models produces guaranteed
-        cache misses or affinity routing conflicts. Changing only reasoning
-        effort or reselecting the identical model preserves session affinity.
-   - Focus transitions never rotate the identifier. Rotation reads exactly two boundaries — the context block and the target model — and a focus moves neither, so setting a focus, replacing it, switching between a plan and a review target, starting a dialogue from the Plans or Review view, or clearing the focus keeps the provider session warm. The head states the capability surface the dialogue loop declares, so a focus that authorizes a capability the previous surface did not carry rewrites the head once, exactly as any other change of surface does.
+        Provider KV caches and routing affinities are physically model-specific. Reusing
+        a session identifier across different models produces guaranteed cache misses or
+        affinity routing conflicts. Changing only reasoning effort or reselecting the
+        identical model preserves session affinity.
+   - Focus transitions never rotate the identifier. Rotation reads exactly two
+     boundaries — the context block and the target model — and a focus moves neither, so
+     setting a focus, replacing it, switching between a plan and a review target,
+     starting a dialogue from the Plans or Review view, or clearing the focus keeps the
+     provider session warm. The head states the capability surface the dialogue loop
+     declares, so a focus that authorizes a capability the previous surface did not carry
+     rewrites the head once, exactly as any other change of surface does.
 10. **Rationale (Why):**
-    - A bounded turn issues several requests per turn: discovery rounds, the
-      proposal, staging retries, and verification healing. Reusing the provider's
-      cached prefix across those requests removes the dominant repeated cost and
-      keeps multi-round turns economically viable.
+    - A bounded turn issues several requests per turn: discovery rounds, the proposal,
+      staging retries, and verification healing. Reusing the provider's cached prefix
+      across those requests removes the dominant repeated cost and keeps multi-round
+      turns economically viable.
     - The invariant is only effective when it holds byte-for-byte, so any dynamic
-      content, reordering, or unexpected relocation of a block silently defeats
-      it. A policy makes the order explicit and reviewable instead of implicit in
-      the assembly.
-    - The chronological policy exchanges the semantic grouping for a transcript
-      that grows at its tail, which is why the lost grouping is compensated by the
-      compact context manifest instead of by reloading file bodies.
-    - A session identifier that outlives its prefix or target model is worse than
-      a cold one: it asks the provider to reuse a node cache the next request can
-      never match, which is why rotation is bound strictly to context shrinking
-      and model changes rather than to a timer or a round counter.
-    - A focus transition is a non-event for the session for the same reason. The context block and the target model are what the identifier is bound to, and a focus moves neither, so the dialogue keeps the node cache its next request can still match; a head a newly declared intent rewrites is reprocessed once by the provider, which costs less than a cold session for every later round.
+      content, reordering, or unexpected relocation of a block silently defeats it. One
+      function makes the order explicit and reviewable instead of implicit in the
+      assembly.
+    - The transcript grows at its tail, which is why the lost semantic grouping is
+      compensated by the compact context manifest instead of by reloading file bodies.
+    - A session identifier that outlives its prefix or target model is worse than a cold
+      one: it asks the provider to reuse a node cache the next request can never match,
+      which is why rotation is bound strictly to context shrinking and model changes
+      rather than to a timer or a round counter.
+    - A focus transition is a non-event for the session for the same reason. The context
+      block and the target model are what the identifier is bound to, and a focus moves
+      neither, so the dialogue keeps the node cache its next request can still match; a
+      head a newly declared intent rewrites is reprocessed once by the provider, which
+      costs less than a cold session for every later round.
 ---
 
 ## 10. Model Catalog as the Single Source of Truth for Model Names
@@ -463,21 +472,25 @@ the lifecycle those mechanisms share.
 
 ## 13. Functional Control Loops Architecture (`crates/core/src/control`)
 
-1. **Functional Decomposition over Single-Method Traits:**
-   - Execution flows are implemented strictly as nested, composable plain `async` functions adhering to the canonical naming standard: `run_<domain>_loop` (`run_sequence_loop` -> `run_step_loop` -> `run_edit_loop` -> `run_staging_loop`).
+1. **One Turn Loop plus Step Functions:**
+   - A turn has exactly one loop: `run_turn_loop` in `crates/core/src/control/turn.rs`. The phases of the turn are plain step functions it calls in sequence — `execute_research_step`, `execute_staging_step`, and `execute_edit_step` — and each of them executes exactly one iteration and requests no model round of its own.
+   - A step function never terminates the turn. A refused patch, a failed verification, and a dead-end discovery round all return a typed result to `run_turn_loop`, which alone decides whether to request another round, to conclude, or to surface the outcome.
+   - The `run_<domain>_loop` naming standard stays reserved for the functions that own a whole lifecycle: `run_repl_loop`, `run_plan_sequence_loop`, `run_plan_step_loop`, `run_turn_loop`, and `run_structured_refine`. A phase of a turn declares no loop of its own, so `run_research_loop`, `run_edit_loop`, and `run_staging_loop` no longer exist as entry points.
    - Single-method execution traits (e.g. `ExecutionLoop`) and dynamic trait dispatch (`Box<dyn ...>`) are strictly forbidden. Control flow is composed functionally through direct asynchronous function calls.
 
-2. **Canonical Execution Context (`LoopContext`):**
+2. **Execution Context (`LoopContext`):**
    - Ambient operational infrastructure is encapsulated in a lightweight `LoopContext` passed by mutable reborrow:
      - `cancel: &CancellationToken` — cooperative cancellation token raced across network and toolchain futures via `tokio::select!`.
      - `events: &EventSink` — typed domain event emitter isolating the domain engine from TUI, sockets, and transport channels.
-      - `capabilities: CapabilityExpr` — active model capability surface for the current execution branch.
      - `repo_root: &Path` — root of the working tree every loop addresses.
-     - `context_manager: &mut ContextManager` — live context a loop mutates (e.g. during research context expansion) and snapshots through.
-      - `journal: &mut TurnResearchJournal` — turn-scoped cumulative epistemic journal collecting findings and scratchpad notes.
-      - `policy: &mut dyn ApplyPolicy` — transactional apply policy governing checkpointing, staging, step commits, and rollback.
-      - `capabilities: CapabilityExpr` — active model capability surface for the current execution branch.
-      - `prompt_builder: PromptBuilder` — model round assembly and execution builder.
+     - `context_manager: &mut ContextManager` — live context a loop mutates (e.g. during a research round) and snapshots through.
+     - `journal: &mut TurnResearchJournal` — turn-scoped cumulative epistemic journal collecting findings and scratchpad notes.
+     - `policy: &mut dyn ApplyPolicy` — transactional apply policy governing checkpointing, staging, step commits, and rollback.
+     - `capabilities: CapabilityExpr` — active model capability surface for the current execution branch.
+     - `prompt_builder: PromptBuilder` — model round assembly and execution builder.
+     - `transcript: Arc<Mutex<TurnTransscript>>` — round transcript of the turn, shared with every reborrowed child context (§14).
+     - `rounds_spent: Arc<AtomicUsize>` — monotonic count of physical provider calls, shared with every reborrowed child context (§14).
+   - **A value the whole turn observes travels behind `Arc`.** `reborrow_with_capabilities` copies every field by value, so a counter held directly in the context would be incremented inside the child and lost to the parent. The transcript and the round counter are therefore cloned through `Arc` by the reborrow, and the counter is incremented atomically.
    - **Prohibition of `Clone` on `LoopContext`:** `LoopContext` must NEVER derive or implement `Clone`. It holds exclusive mutable references to execution state (`context_manager`, `journal`). Subordinate loops obtain narrowed or extended contexts exclusively via explicit reborrowing (`ctx.reborrow_with_capabilities(...)`, `ctx.reborrow_extending_capabilities(...)`).
 
 3. **Principle of Least-Privilege Configuration Cascading:**
@@ -497,8 +510,8 @@ the lifecycle those mechanisms share.
      - `Ok(LoopResult::Exhausted(FailureReport))` — The model attempted the target task, but local iterations (e.g. patch-retries or verification healing) exceeded their budget. Signals the caller to decrement the coder tier attempt and escalate.
     - **Drainable Envelope Pattern (Consumable `ResponseEnvelope`):**
       - Rather than a monolithic "God-struct" with static fields for every conceivable command, `ResponseEnvelope` is an envelope of semantic commands indexed by `LlmCapability` (`cmd.capability()`).
-     - Control loops consume only the capabilities in their domain via `envelope.take(LlmCapability)` or `envelope.take_any(&[...])`. As the envelope travels upward through the loop hierarchy, it shrinks ("худеет").
-      - `run_staging_loop` drains the file-edit capabilities (`EditReplace`, `EditCreate`, `EditDelete`, `EditMove`, `EditMoveDir`, `EditOverwrite`); `run_edit_loop` drains `LlmCapability::ToolchainVerify`; `run_step_loop` drains the terminal outcome capabilities (`CommitMessage`, `TurnError`, `TurnSkip`); `run_repl_loop` drains `LlmCapability::TextMessage`, `PlanCreation`, and `PlanUpdate`.
+     - Control loops consume only the capabilities in their domain via `envelope.take(LlmCapability)` or `envelope.take_any(&[...])`. As the envelope travels upward through the loop hierarchy, it shrinks.
+     - `execute_staging_step` drains the file-edit capabilities (`EditReplace`, `EditCreate`, `EditDelete`, `EditMove`, `EditMoveDir`, `EditOverwrite`); `execute_research_step` drains the discovery capabilities; `run_turn_loop` drains the terminal outcome capabilities (`CommitMessage`, `TurnError`, `TurnSkip`); `run_repl_loop` drains `LlmCapability::TextMessage`, `PlanCreation`, and `PlanUpdate`.
       - **Prohibition of Ad-hoc Convenience Extractors:** `ResponseEnvelope` provides strictly generic capability-based draining (`take` and `take_any`). Adding typed helper methods for specific capabilities (such as `take_edits`, `take_text`, `take_outcome`, `take_blocked`, etc.) to `ResponseEnvelope` is strictly forbidden. Each loop or subsystem knows exactly which `LlmCapability` variants belong to its domain, calls `take(...)`, and pattern-matches the resulting `LlmCommand` items locally.
    - **Top-Level Anti-Leak Invariant:**
      - At the top-level turn completion boundary, `envelope.is_empty()` MUST be true. Any remaining commands (`envelope.remaining_capabilities()`) indicate commands emitted by the model that no level of the control hierarchy handled, triggering structured diagnostic logging.
@@ -508,7 +521,109 @@ the lifecycle those mechanisms share.
    - Loops intercept protocol violations locally via dedicated sanitizers (`heal_protocol_violation`), requesting format repair without leaking raw defects into domain logic.
 
 7. **Strictly Localized Transaction and Error Boundaries:**
-   - Virtual patch-application and anchor-matching retries are confined to `run_staging_loop`.
-   - Compiler verification and self-healing iterations are confined to `run_edit_loop`.
-   - Git checkpoints, coder ladder attempt accounting, gatekeeper acceptance, and commit squashing are confined to `run_step_loop`.
-   - Task ordering, dependency evaluation, and architect replanning triggers are confined to `run_sequence_loop`.
+   - Virtual patch application and anchor matching are confined to `execute_staging_step`, and the retry rounds a refusal opens are requested by `run_turn_loop`.
+   - Compiler verification, the declared post-hook, and the healing round a failure opens are confined to `execute_edit_step` and the turn loop that requests it.
+   - Git checkpoints, coder ladder attempt accounting, gatekeeper acceptance, and commit squashing are confined to `run_plan_step_loop`.
+   - Task ordering, dependency evaluation, and architect replanning triggers are confined to `run_plan_sequence_loop`.
+
+---
+
+## 14. Two-Tier History and the Turn Transcript
+
+1. **Two tiers, two lifetimes:**
+   - The session keeps two histories, and neither stands in for the other. The
+     **turn transcript** (`TurnTranscript`, `crates/core/src/control/context.rs`) is the
+     local message sequence of one bounded turn; the **session journal**
+     (`HistoryManager`, `.tauqe/history.jsonl`) is the durable record a later turn reads.
+   - `LoopContext` owns the transcript behind `Arc<Mutex<TurnTranscript>>`, so the rounds
+     a `reborrow_with_capabilities` or `reborrow_extending_capabilities` child appends
+     stay visible to the context it came from. The transcript is dropped with the turn.
+   - The journal is written through `HistoryEntry`: a turn card, an answer record, and the
+     rounds nested inside the card. `HistoryManager` never writes the transcript, and the
+     transcript never writes the journal.
+2. **Append-only growth inside a phase:**
+   - `TurnTranscript` stores five values and nothing else: the rendered head
+     of the assembly up to the task (`prefix`), the frozen task message
+     (`task`), the assistant/feedback pairs already exchanged (`rounds`), the
+     serialized capability tree the head was seeded with (`seed_signature`),
+     and the churn epochs that mark the rendered prefix stale (`seed_churn`,
+     `context_churn`).
+   - `seed` freezes the first round, `push_assistant` and `push_feedback` append exactly
+     one pair per round, `take_pending_feedback` hands the next round its user message,
+     and `messages` returns a sequence that only grows.
+   - Two boundaries reseed the prefix: the capability tree and a marked
+     context churn. `advertises` compares the seed signature with the tree the
+     loop now declares, and `prefix_is_stale` compares the epoch the prefix
+     was rendered at with the epoch the context reached, so `reseed_prefix`
+     re-renders the head once while the task and every exchanged round keep
+     their exact bytes.
+   - Rationale (Why): a provider caches the longest unchanged token prefix. A round that
+     reassembled the whole request paid a reprocessing pass per round; a transcript pays
+      one reseed per phase boundary, and a change set that churned the context
+      pays one more, because a healing round that reads stale bytes pays for
+      it in retry rounds.
+3. **One feedback slot:**
+   - `set_pending_feedback` is the only channel through which a producer reaches the next
+     round, and the round that appends a pair drains it exactly once, so feedback never
+     reaches the provider twice and blank feedback never occupies the slot.
+   - Every producer of an extra round writes that one slot: the research journal
+     (`LoopContext::publish_round_feedback`), verification healing
+     (`LoopContext::request_healing`), patch retry (`LoopContext::request_repair`), and the
+     corrective reminder of an empty round.
+   - A finding is therefore delivered once, by the round it opened, and stays readable
+     afterwards inside the assistant answer and the user feedback the transcript replays.
+     No contour concatenates the findings of a turn onto the task body on every round.
+4. **The scratchpad travels through the transcript, never through the head:**
+   - The turn scratchpad is not re-injected into the system message between rounds. The
+     model reads its own notes back from the assistant answers the transcript replays, so
+     the head stays byte-stable inside a phase.
+   - `StructuredEditProtocol::parse_scratchpad` and `drain_scratchpad` remain: the first
+     extracts the channel from a payload, the second owns the buffer of a contour that
+     assembles its own request (§13).
+   - Persisting a turn strips the scratchpad from the recorded payload, because the
+     channel is turn-local memory rather than a durable result (§3.5).
+5. **Intermediate rounds are nested, never siblings:**
+   - A turn that discovered material, retried a rejected patch, or healed a compiler error
+     answered several times. Those attempts live inside the turn record itself
+     (`HistoryEntry::Turn { rounds }`) and are constructed through `round_record`, so a
+     rollback or a compaction drops them together with the attempt they belong to.
+   - Only the intermediate rounds `1..N-1` are persisted. The final answer stays the
+     ordinary `HistoryEntry::Response` of the same turn, so one answer is never recorded
+     twice.
+   - A recorded round carries the cleaned assistant text and the compact summary of the
+     feedback that opened the next round: never raw protocol JSON, never a file body.
+     `round_record` performs that cleaning, so no caller can record a raw payload.
+   - `TurnRoundRecord` and the `rounds` field are additive: `#[serde(default)]` decodes a
+     session written before either existed as a turn without rounds, so the layout evolves
+     without a migration (§3.2).
+6. **Two consumers, two projections:**
+   - A later turn replays the rounds into its own transcript as one developer-side message
+     per round, `[Round N] <message>` (`crate::history::compaction::round_replay`, reached
+     through `assemble_chronological_messages`). The recorded feedback and the raw payload
+     stay out of the prompt.
+   - Compaction replays the same rounds into the source the Scribe reads
+     (`build_compaction_request`), so a summary states what each turn verified and what it
+     corrected instead of flattening the attempts.
+   - `HistoryManager::estimated_tokens` and `needs_compaction` price a turn with the bytes
+     the journal reported for it, which already include its rounds.
+7. **An interrupted turn keeps what it finished:**
+   - A turn interrupted after at least one completed round records those rounds and
+     publishes the record under `HistoryEntryStatus::Interrupted` (`"interrupted"` on the
+     wire): the finished rounds stay durable attempts while no final answer exists.
+   - A partially streamed answer is never captured, because a fragment is not a round; a
+     turn that produced nothing leaves the journal through `rollback_entry`, as §3 states.
+   - The journal and the working tree are independent: the interruption restores the tree
+     through the Git transaction and records the attempts through the journal, and neither
+     operation is ordered against the other.
+8. **The Architect synthesis stays outside the transcript:**
+   - `run_structured_refine` keeps its own reassembly through `execute_rebuilt_round` and
+     its own scratchpad injection. Its rounds answer with a synthesized horizon, an
+     exceeded context budget, or an abort rather than a patch, so they do not cross the
+     switched `execute_round` path.
+   - Routing the synthesis through the transcript is a separate decision; until that
+     decision is taken, no rule of this section governs that contour.
+9. **The transcript outlives an attempt; the budget is authoritative at the call boundary:**
+   - One `LoopContext` drives every rung of the coder ladder, so the transcript survives an attempt: a step re-asked on the same rung appends its retry round to the sequence its predecessor produced instead of reseeding it.
+   - The round budget is consumed at the single point where the provider is actually called, `execute_round_inner`. Every physical call increments the shared counter, including each pass of the internal empty-answer loop, so one unit of the budget equals exactly one network call.
+   - The boundary rejects a call that exceeds the pool with a typed stop (`SystemError::RoundBudgetExhausted`) rather than with a domain outcome. Only `run_turn_loop` maps that stop to the outcome its contour declares: an `Exhausted` report for a plan step, and the last answer the model wrote beside the notice of the limit for a dialogue.
+   - The last permitted round receives the limit directive through the single feedback slot, so the model can close the turn with an answer instead of being cut off mid-investigation.

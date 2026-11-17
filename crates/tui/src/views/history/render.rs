@@ -42,6 +42,7 @@ pub fn render_history_view(
         Some(content_width),
         Some(state.history_view.selected_item_index),
         Some(&state.history_view.expanded_items),
+        Some(&state.history_view.rounds_expanded),
         flash_target,
         theme_mode,
         &mut state.history_view.body_cache,
@@ -189,6 +190,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            rounds: Vec::new(),
             status: HistoryEntryStatus::Committed,
         }
     }

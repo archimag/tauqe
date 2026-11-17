@@ -22,7 +22,8 @@ use crate::mockups::is_mockups_path;
 /// frozen snapshot. A bounded turn applies its change set through
 /// [`apply_edit_proposal_with_config`], so the configuration it froze is the one
 /// the formatter and the staged validation observe.
-pub async fn apply_edit_proposal(
+#[cfg(test)]
+pub(crate) async fn apply_edit_proposal(
     repo_root: &Path,
     context_manager: &mut ContextManager,
     proposal: &EditProposal,

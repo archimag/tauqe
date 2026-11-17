@@ -1,19 +1,26 @@
 use std::borrow::Cow;
 
 use tauqe_protocol::{
-    CapabilityExpr, EditCreate, EditDelete, EditFileOp, EditLineAnchor, EditMove, EditMoveDir,
-    EditOperation, EditOutcome, EditOverwrite, EditReplace, LlmCapability, LlmCommand, ModelResult,
-    ModelResultProposal, PatchStrategy, StructuredChangeProposal,
+    CapabilityTree, EditDelete, EditLineAnchor, EditMove, EditOperation, EditOverwrite,
+    EditReplace, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
+};
+#[cfg(test)]
+use tauqe_protocol::{
+    EditCreate, EditFileOp, EditMoveDir, EditOutcome, ModelResult, ModelResultProposal,
+    StructuredChangeProposal,
 };
 
+#[cfg(test)]
+use crate::capabilities::decode_capability_expr;
 use crate::capabilities::{
-    capability_expr_schema, compose_structured_protocol_instructions, decode_capability_expr,
-    PromptRenderContext,
+    capability_expr_schema, compose_structured_protocol_instructions, PromptRenderContext,
 };
 use crate::edits::strategy::StrategyProfile;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
-use super::utils::{normalize_content, resolve_target_path_for_op};
+#[cfg(test)]
+use super::utils::normalize_content;
+use super::utils::resolve_target_path_for_op;
 
 /// Structured Output JSON-schema edit protocol
 #[derive(Debug, Default, Clone)]
@@ -24,7 +31,8 @@ impl StructuredEditProtocol {
     ///
     /// The default surface is intent-oriented, never transport-specific, so the
     /// The default surface is the shared dialogue profile, never transport-specific, so the
-    pub fn schema(ctx: &PromptRenderContext<'_>) -> serde_json::Value {
+    #[cfg(test)]
+    fn schema(ctx: &PromptRenderContext<'_>) -> serde_json::Value {
         Self::schema_for(
             &crate::control::repl::dialogue_capability_expr(false, false),
             ctx,
@@ -43,13 +51,14 @@ impl StructuredEditProtocol {
     /// The render context carries the patch strategy and the project command
     /// declaration the composed schema must observe, so a caller that renders
     /// the prompt and composes the schema hands over one identical value.
-    pub fn schema_for(
-        capabilities: &CapabilityExpr,
+    fn schema_for(
+        capabilities: &CapabilityTree,
         ctx: &PromptRenderContext<'_>,
     ) -> serde_json::Value {
         capability_expr_schema(capabilities, ctx)
     }
 
+    #[cfg(test)]
     fn proposal_to_model_result(
         &self,
         proposal: ModelResultProposal,
@@ -103,7 +112,8 @@ impl StructuredEditProtocol {
     }
 
     /// Returns system prompt instructions for the structured-output protocol.
-    pub fn system_instructions(
+    #[cfg(test)]
+    fn system_instructions(
         &self,
         editable_paths: &[String],
         patch_strategy: PatchStrategy,
@@ -112,21 +122,23 @@ impl StructuredEditProtocol {
             &crate::control::repl::dialogue_capability_expr(false, false),
             editable_paths,
             patch_strategy,
+            None,
         )
     }
-
-    /// Returns system prompt instructions for an explicit capability set.
-    ///
     /// The field reference is composed from the capability registry, so a
-    /// narrowed set never advertises a field for a disabled capability.
-    pub fn system_instructions_for(
+    /// narrowed set never advertises a field for a disabled capability. The
+    /// project declaration reaches the same render context, so a surface that
+    /// advertises `custom_tools` publishes the commands the project declares.
+    pub(crate) fn system_instructions_for(
         &self,
-        capabilities: &CapabilityExpr,
+        capabilities: &CapabilityTree,
         editable_paths: &[String],
         patch_strategy: PatchStrategy,
+        project: Option<&ProjectConfig>,
     ) -> String {
-        let ctx =
-            PromptRenderContext::new(editable_paths, None).with_patch_strategy(patch_strategy);
+        let ctx = PromptRenderContext::new(editable_paths, None)
+            .with_project(project)
+            .with_patch_strategy(patch_strategy);
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
         prompt.push_str(
@@ -188,22 +200,14 @@ impl StructuredEditProtocol {
         prompt
     }
 
-    /// Returns the JSON-schema response format used to constrain generation.
-    pub fn response_format(&self, ctx: &PromptRenderContext<'_>) -> Option<ResponseFormat> {
-        self.response_format_for(
-            &crate::control::repl::dialogue_capability_expr(false, false),
-            ctx,
-        )
-    }
-
     /// Returns the JSON-schema response format for an explicit capability set,
     /// so the wire schema matches the advertised capability surface.
     /// The render context is handed to the composed schema unchanged, so the
     /// format a caller constrains generation with is the very projection the
     /// rendered instruction described.
-    pub fn response_format_for(
+    pub(crate) fn response_format_for(
         &self,
-        capabilities: &CapabilityExpr,
+        capabilities: &CapabilityTree,
         ctx: &PromptRenderContext<'_>,
     ) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
@@ -218,10 +222,11 @@ impl StructuredEditProtocol {
 
     /// Extracts ephemeral scratchpad notes from a structured response,
     /// reporting nothing while the field is absent or blank.
-    pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+    #[cfg(test)]
+    pub(crate) fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let payload = StructuredPayload::parse(raw_text);
         let root = payload.root()?;
-        let expr = CapabilityExpr::leaf(LlmCapability::Scratchpad);
+        let expr = CapabilityTree::leaf(LlmCapability::Scratchpad);
         let ctx = PromptRenderContext::new(&[], None);
         decode_capability_expr(&expr, root, &ctx)
             .into_iter()
@@ -239,12 +244,17 @@ impl StructuredEditProtocol {
     /// produced is read exactly where the tree declares it and a command of
     /// a capability the tree omits never surfaces. The tree arrives from
     /// the calling protocol: it is the declaration the response was
-    /// constrained against, never a reconstruction from the payload.
-    pub fn parse_output(
+    /// constrained against, never a reconstruction from the payload. The
+    /// project declaration reaches the same render context, so a `custom_tools`
+    /// command is decoded only when the declaration the round observed admits
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn parse_output(
         &self,
-        expr: &CapabilityExpr,
+        expr: &CapabilityTree,
         raw_text: &str,
         editable_paths: &[String],
+        project: Option<&ProjectConfig>,
     ) -> ModelResult {
         let payload = StructuredPayload::parse(raw_text);
         let Some(root) = payload.root() else {
@@ -254,7 +264,7 @@ impl StructuredEditProtocol {
         };
         let mut edits: Vec<EditOperation> = Vec::new();
         let mut defect: Option<String> = None;
-        let ctx = PromptRenderContext::new(editable_paths, None);
+        let ctx = PromptRenderContext::new(editable_paths, None).with_project(project);
         for command in decode_capability_expr(expr, root, &ctx) {
             if let LlmCommand::ProtocolError { message } = command {
                 if defect.is_none() {
@@ -311,7 +321,7 @@ impl StructuredEditProtocol {
 ///
 /// A response that did not parse as JSON carries no field any module could
 /// read, so it yields no command instead of failing the round.
-fn has_any_edit(capabilities: &CapabilityExpr) -> bool {
+fn has_any_edit(capabilities: &CapabilityTree) -> bool {
     capabilities.contains(LlmCapability::EditReplace)
         || capabilities.contains(LlmCapability::EditCreate)
         || capabilities.contains(LlmCapability::EditDelete)
@@ -320,7 +330,7 @@ fn has_any_edit(capabilities: &CapabilityExpr) -> bool {
         || capabilities.contains(LlmCapability::EditOverwrite)
 }
 
-fn has_any_research(capabilities: &CapabilityExpr) -> bool {
+fn has_any_research(capabilities: &CapabilityTree) -> bool {
     capabilities.contains(LlmCapability::ContextRequest)
         || capabilities.contains(LlmCapability::RepoSearch)
         || capabilities.contains(LlmCapability::RepoDirs)
@@ -348,7 +358,7 @@ pub struct StructuredPayload {
 }
 
 impl StructuredPayload {
-    pub fn parse(raw_text: &str) -> Self {
+    pub(crate) fn parse(raw_text: &str) -> Self {
         let trimmed = raw_text.trim();
         let parsed = if let Some(obj_str) =
             crate::edits::stream::json::decode::first_json_object_str(trimmed)
@@ -363,7 +373,8 @@ impl StructuredPayload {
         }
     }
 
-    pub fn field(&self, name: &str) -> Option<&serde_json::Value> {
+    #[cfg(test)]
+    fn field(&self, name: &str) -> Option<&serde_json::Value> {
         let val = self.parsed.as_ref()?;
         if let Some(f) = val.get(name) {
             return Some(f);
@@ -381,10 +392,11 @@ impl StructuredPayload {
     /// Module decoders receive this root, so they read the same object the
     /// strict schema constrained; a payload that is not JSON owns no field
     /// and decodes to no command.
-    pub fn root(&self) -> Option<&serde_json::Value> {
+    pub(crate) fn root(&self) -> Option<&serde_json::Value> {
         self.parsed.as_ref()
     }
-    pub fn to_proposal(&self) -> Option<ModelResultProposal> {
+    #[cfg(test)]
+    fn to_proposal(&self) -> Option<ModelResultProposal> {
         let val = self.parsed.as_ref()?;
         let mut proposal = ModelResultProposal::default();
         if let Some(message) = conversational_message(val) {
@@ -400,7 +412,7 @@ impl StructuredPayload {
         Some(proposal)
     }
 
-    pub fn clean_text(&self) -> String {
+    pub(crate) fn clean_text(&self) -> String {
         let trimmed = self.raw_text.trim();
         let mut messages = Vec::new();
         let mut rest = trimmed;
@@ -444,9 +456,9 @@ impl StructuredPayload {
 
 /// Reads the conversational channel a single response object declares.
 ///
-/// The text channel is declared inside the operational branch a round selects,
-/// so the branch field is read first and the response root second, which keeps
-/// a payload written against the previous wire shape readable.
+/// The message channel is ambient at the root of the response, so the root
+/// field is read first and the operational branch second, which keeps a
+/// payload written against the previous branch-nested wire shape readable.
 fn message_channel(node: &serde_json::Value) -> Option<&str> {
     node.get("message")
         .and_then(serde_json::Value::as_str)
@@ -454,15 +466,11 @@ fn message_channel(node: &serde_json::Value) -> Option<&str> {
 }
 
 fn conversational_message(value: &serde_json::Value) -> Option<&str> {
-    value
-        .get("action")
-        .and_then(message_channel)
-        .or_else(|| message_channel(value))
+    message_channel(value).or_else(|| value.get("action").and_then(message_channel))
 }
 
 /// Resolves one structured change into a concrete, validated edit operation.
 ///
-/// The target path is resolved against the permitted files, the payload is
 /// normalized, and a move destination is resolved exactly like its source. Both
 /// wire vehicles — the structured `changes` field and the anchored change-set
 /// tag of the XML contour — travel through this routine, so a change is
@@ -472,6 +480,7 @@ fn conversational_message(value: &serde_json::Value) -> Option<&str> {
 /// directory is never rendered as one, so its source is only normalized here
 /// and the collisions of the subtree it fans out into are decided while the
 /// change set is staged.
+#[cfg(test)]
 fn change_to_operation(
     change: &StructuredChangeProposal,
     editable_paths: &[String],
@@ -511,7 +520,7 @@ fn change_to_operation(
 /// the decoded commands here: every edit command receives the target
 /// resolution and the context-membership check, while every other command
 /// passes through unchanged, so a protocol diagnostic survives resolution.
-pub fn resolve_decoded_edits(
+pub(crate) fn resolve_decoded_edits(
     commands: Vec<LlmCommand>,
     editable_paths: &[String],
 ) -> Result<Vec<LlmCommand>, String> {
@@ -610,10 +619,8 @@ fn resolve_context_target(candidate: &str, editable_paths: &[String]) -> Result<
 /// validated like a structured change, so a file outside the permitted set or an
 /// operation missing its payload is reported as a diagnostic instead of reaching
 /// the staging engine.
-pub fn parse_anchor_edits(
-    body: &str,
-    editable_paths: &[String],
-) -> Result<Vec<EditOperation>, String> {
+#[cfg(test)]
+fn parse_anchor_edits(body: &str, editable_paths: &[String]) -> Result<Vec<EditOperation>, String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -632,7 +639,7 @@ pub fn parse_anchor_edits(
 /// payload that is itself one structured response collapses to its `message`
 /// channel, so neither XML control tags nor JSON scaffolding can leak into
 /// conversational text, session history, or the streamed interface.
-pub fn clean_raw_json_or_text(raw: &str) -> String {
+pub(crate) fn clean_raw_json_or_text(raw: &str) -> String {
     StructuredPayload::parse(raw).clean_text()
 }
 
@@ -648,7 +655,7 @@ mod tests {
 
     /// Builds the capability tree of the interactive REPL profile: the tree
     /// every test below decodes a response against.
-    fn repl_expr() -> CapabilityExpr {
+    fn repl_expr() -> CapabilityTree {
         crate::control::repl::dialogue_capability_expr(false, false)
     }
 
@@ -712,7 +719,7 @@ mod tests {
                 ]
             }
         }"#;
-        let res = proto.parse_output(&repl_expr(), json, &editable);
+        let res = proto.parse_output(&repl_expr(), json, &editable, None);
         match res {
             ModelResult::Edit {
                 summary,
@@ -762,7 +769,7 @@ mod tests {
             }
         })
         .to_string();
-        let res = proto.parse_output(&repl_expr(), &json, &editable);
+        let res = proto.parse_output(&repl_expr(), &json, &editable, None);
         match res {
             ModelResult::Edit { summary, .. } => {
                 assert!(summary.ends_with("..."));
@@ -813,7 +820,7 @@ mod tests {
                 ]
             }
         }"#;
-        let res = proto.parse_output(&repl_expr(), json, &editable);
+        let res = proto.parse_output(&repl_expr(), json, &editable, None);
         match res {
             ModelResult::Edit { edits, .. } => match &edits[0] {
                 EditOperation::Create(EditCreate { path, content }) => {
@@ -831,7 +838,7 @@ mod tests {
         let proto = StructuredEditProtocol;
         let editable = vec!["src/lib.rs".to_string()];
         let raw = "Here you go:\n{\"action\":{\"kind\":\"edit\",\"changes\":[{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"old_text\":\"a {\",\"new_text\":\"b {\",\"content\":\"\"}]},\"message\":\"Swap a for b\"}\nThanks!";
-        let res = proto.parse_output(&repl_expr(), raw, &editable);
+        let res = proto.parse_output(&repl_expr(), raw, &editable, None);
         match res {
             ModelResult::Edit { summary, edits, .. } => {
                 assert_eq!(summary, "Swap a for b");
@@ -849,7 +856,7 @@ mod tests {
             "message": "Hello there! How can I help you?",
             "action": {"kind": "answer"}
         }"#;
-        let res = proto.parse_output(&repl_expr(), json, &editable);
+        let res = proto.parse_output(&repl_expr(), json, &editable, None);
         match res {
             ModelResult::Answer { text } => {
                 assert_eq!(text, "Hello there! How can I help you?");
@@ -865,9 +872,10 @@ mod tests {
         assert!(full.contains("overwrite"));
 
         let narrowed = StructuredEditProtocol.system_instructions_for(
-            &CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]),
+            &CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]),
             &[],
             PatchStrategy::SearchReplace,
+            None,
         );
         assert!(narrowed.contains("changes"));
         assert!(!narrowed.contains("context_requests"));
@@ -892,7 +900,7 @@ mod tests {
                 }]
             }
         }"#;
-        match proto.parse_output(&repl_expr(), json, &editable) {
+        match proto.parse_output(&repl_expr(), json, &editable, None) {
             ModelResult::Edit { edits, outcome, .. } => {
                 assert!(outcome.error.is_none(), "{:?}", outcome.error);
                 match edits.as_slice() {
@@ -930,7 +938,7 @@ mod tests {
         }"#;
         // A directory is never a file of the context block, so the move is
         // resolved as two directory paths instead of a context membership.
-        match proto.parse_output(&repl_expr(), json, &editable) {
+        match proto.parse_output(&repl_expr(), json, &editable, None) {
             ModelResult::Edit { edits, outcome, .. } => {
                 assert!(outcome.error.is_none(), "{:?}", outcome.error);
                 assert_eq!(
@@ -1016,7 +1024,7 @@ mod tests {
         // Surrounding text contains multi-byte Cyrillic, emoji, and escaped characters
         // directly adjacent to the JSON structure boundaries.
         let raw = "Привет, мир! 🚀 Тестируем UTF-8 границы: {\"message\":\"Всё отлично! ✨\",\"action\":{\"kind\":\"edit\",\"changes\":[{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"old_text\":\"старый\",\"new_text\":\"новый\",\"to\":\"\",\"content\":\"\"}]}} Конец сообщения. 🦀";
-        let res = proto.parse_output(&repl_expr(), raw, &editable);
+        let res = proto.parse_output(&repl_expr(), raw, &editable, None);
         match res {
             ModelResult::Edit { summary, edits, .. } => {
                 assert_eq!(summary, "Всё отлично! ✨");
@@ -1220,19 +1228,6 @@ mod tests {
     }
 
     #[test]
-    fn test_structured_schema_declares_verify() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .filter_map(|field| field.as_str())
-            .collect();
-        assert!(required.contains(&"verify"));
-    }
-    #[test]
     fn test_structured_schema_reflects_the_capability_set() {
         let full = flattened_surface(&StructuredEditProtocol::schema(&render_context(
             PatchStrategy::SearchReplace,
@@ -1253,7 +1248,6 @@ mod tests {
             "reason",
             "blocked",
             "abort",
-            "verify",
         ] {
             assert!(
                 full_properties.contains_key(field),
@@ -1271,7 +1265,7 @@ mod tests {
         );
 
         let narrowed = StructuredEditProtocol::schema_for(
-            &CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]),
+            &CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]),
             &render_context(PatchStrategy::SearchReplace),
         );
         let properties = narrowed["properties"]
@@ -1318,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_structured_response_format_follows_the_capability_set() {
-        let narrowed = CapabilityExpr::from_leaves([LlmCapability::TextMessage]);
+        let narrowed = CapabilityTree::from_leaves([LlmCapability::TextMessage]);
         match StructuredEditProtocol
             .response_format_for(&narrowed, &render_context(PatchStrategy::SearchReplace))
         {
@@ -1390,11 +1384,11 @@ mod tests {
         assert!(plan["properties"].get("changes").is_none());
         assert!(plan["properties"].get("context_requests").is_none());
 
-        // The answer branch carries the conversational channel and no other
-        // command, so a conversational round names the branch it follows and
-        // declares its message inside it.
-        assert_eq!(answer["required"], serde_json::json!(["kind", "message"]));
-
+        // The answer branch is a bare marker: it declares no field of its own,
+        // because the conversational message is ambient and every operational
+        // command belongs to a branch that acts.
+        assert_eq!(answer["required"], serde_json::json!(["kind"]));
+        assert!(answer["properties"].get("message").is_none());
         // The terminal signals own their branches instead of riding beside a
         // change set or a plan payload.
         assert!(blocked["properties"].get("blocked").is_some());
@@ -1410,7 +1404,6 @@ mod tests {
         // signals that end the turn live in branches of their own.
         for acting in [edit, plan] {
             assert!(acting["properties"].get("commit_message").is_some());
-            assert!(acting["properties"].get("message").is_some());
             assert!(acting["properties"].get("reason").is_some());
             assert!(acting["properties"].get("blocked").is_none());
             assert!(acting["properties"].get("abort").is_none());

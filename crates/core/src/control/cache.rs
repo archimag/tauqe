@@ -485,11 +485,12 @@ mod tests {
     }
 
     /// The context memo is scoped to the turn: it reproduces an unchanged file
-    /// byte for byte and extends the block only at its tail when a discovery
-    /// round appends a file.
+    /// byte for byte and appends a discovered file to the transcript without
+    /// moving a byte the provider already cached.
     #[test]
     fn context_cache_is_turn_scoped_and_extends_at_the_tail() {
         use crate::context::ContextFileContent;
+        use crate::prompt::json::JsonPromptProtocol;
         use crate::prompt::PromptAssembly;
         use tauqe_protocol::{ContextAccess, EditProtocolKind, PatchStrategy};
 
@@ -502,6 +503,7 @@ mod tests {
             insertion_seq: 0,
         };
 
+        let protocol = JsonPromptProtocol::default();
         let mut cache = TurnInputCache::default();
         let mut assembly = PromptAssembly::new(
             None,
@@ -514,22 +516,33 @@ mod tests {
         )
         .with_patch_strategy(PatchStrategy::LineAnchor);
 
-        let first = assembly
-            .format_context_block_with(cache.context_cache())
-            .expect("the first round renders the block");
-        let second = assembly
-            .format_context_block_with(cache.context_cache())
-            .expect("the memo reproduces the block");
+        let first = assembly.assemble_chat_messages_with_context_cache(
+            "Task",
+            &protocol,
+            cache.context_cache(),
+        );
+        let second = assembly.assemble_chat_messages_with_context_cache(
+            "Task",
+            &protocol,
+            cache.context_cache(),
+        );
         assert_eq!(second, first);
+        assert!(first
+            .iter()
+            .any(|message| message.content.contains(r#"path="a.rs""#)));
 
-        // A research round appends a file: the previous element keeps its exact
-        // bytes and the new one lands at the tail.
+        // A research round appends a file: the head keeps its exact bytes and the
+        // new element lands in the context message of the transcript.
         assembly.context_files.push(file("b.rs", "beta\n"));
-        let third = assembly
-            .format_context_block_with(cache.context_cache())
-            .expect("the widened round renders the block");
-        assert!(third.starts_with(&first[..first.len() - "</context>".len()]));
-        assert!(third.contains("b.rs"));
+        let third = assembly.assemble_chat_messages_with_context_cache(
+            "Task",
+            &protocol,
+            cache.context_cache(),
+        );
+        assert_eq!(third[0], first[0]);
+        assert!(third
+            .iter()
+            .any(|message| message.content.contains(r#"path="b.rs""#)));
     }
 
     /// Creates a git repository with two tracked Rust files so the tracked-file
@@ -624,7 +637,8 @@ mod tests {
             .expect("first round resolves history");
         // The frozen records render exactly the block the live history would
         // have produced at that moment.
-        let block = first.render_block().expect("the frozen records render");
+        let block = crate::history::render_history_block(first.entries())
+            .expect("the frozen records render");
         assert_eq!(block, history_manager.format_history_tag().unwrap());
         assert!(block.contains("Original prompt"));
 
@@ -638,8 +652,7 @@ mod tests {
             .await
             .expect("second round reuses frozen history");
         assert_eq!(second, first);
-        assert!(!second
-            .render_block()
+        assert!(!crate::history::render_history_block(second.entries())
             .expect("the frozen records render")
             .contains("Subsequent prompt"));
     }
@@ -687,6 +700,7 @@ mod tests {
                 prompt: "Original prompt".to_string(),
                 context: vec![],
                 context_watermark: Some(12),
+                rounds: Vec::new(),
             })
             .unwrap();
         let history_manager = HistoryManager::new(root);
@@ -710,6 +724,7 @@ mod tests {
                 prompt: "Later prompt".to_string(),
                 context: vec![],
                 context_watermark: Some(20),
+                rounds: Vec::new(),
             })
             .unwrap();
         let again = cache

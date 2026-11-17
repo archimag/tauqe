@@ -12,8 +12,21 @@
 //! Verification Healing. New knowledge is only ever appended, and an identical
 //! repeated block is not appended twice, so re-requesting the same outline never
 //! inflates the tail.
+//! inflates the tail.
+//!
+//! A round is also the unit of feedback. [`TurnResearchJournal::begin_round`]
+//! marks its boundary and [`TurnResearchJournal::render_round_feedback`]
+//! renders only the records the open round produced, so the model is told what
+//! its own round delivered instead of receiving the whole turn's investigation
+//! again. The files a round added to the context travel in that feedback as
+//! their own `<file>` elements, rendered by the very cache the prompt renders
+//! them with, so a delivered file carries the anchors of the context block.
 
-use super::ResearchRoundOutcome;
+use crate::context::ContextFileContent;
+use crate::prompt::ContextBlockCache;
+use tauqe_protocol::PatchStrategy;
+
+use super::{AddedFileContent, ResearchRoundOutcome};
 
 /// Opening marker of the epistemic tail.
 const JOURNAL_OPEN: &str = "<research_journal>";
@@ -24,9 +37,54 @@ const JOURNAL_CLOSE: &str = "</research_journal>";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnResearchJournal {
     entries: Vec<String>,
+    round: RoundSection,
+    patch_strategy: PatchStrategy,
+}
+
+/// Records produced by the research round currently open.
+///
+/// A round is the unit of feedback: the results, listings, and diagnostics one
+/// investigation round reported, together with the files it delivered to the
+/// context. The section is replaced at every round boundary, so rendering it
+/// never repeats what an earlier round already told the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RoundSection {
+    /// Ordinal the loop gave the round, absent before the first boundary.
+    index: Option<usize>,
+    /// Feedback blocks recorded since the boundary.
+    blocks: Vec<String>,
+    /// Files the round added to the context.
+    files: Vec<AddedFileContent>,
 }
 
 impl TurnResearchJournal {
+    /// Marks the boundary of the research round the loop just opened.
+    ///
+    /// Everything recorded after this call belongs to the new round, and
+    /// [`Self::render_round_feedback`] renders that round alone. The cumulative
+    /// tail keeps the whole turn's investigation, so the boundary narrows what a
+    /// round reports without losing what an earlier round learned.
+    pub fn begin_round(&mut self, index: usize) {
+        self.round = RoundSection {
+            index: Some(index),
+            ..RoundSection::default()
+        };
+    }
+
+    /// Returns the ordinal of the round currently open, `0` before the first.
+    pub fn round_index(&self) -> usize {
+        self.round.index.unwrap_or(0)
+    }
+
+    /// Declares how a rendered file element addresses the lines of its file.
+    ///
+    /// Under [`PatchStrategy::LineAnchor`] an element carries the opaque anchor
+    /// of every line, exactly as the context block of the round does, so the
+    /// feedback of a round addresses the bytes it delivered.
+    pub fn set_patch_strategy(&mut self, patch_strategy: PatchStrategy) {
+        self.patch_strategy = patch_strategy;
+    }
+
     /// Appends one feedback block.
     ///
     /// Blank blocks carry no knowledge and are dropped. A block identical to one
@@ -42,16 +100,77 @@ impl TurnResearchJournal {
             return;
         }
         self.entries.push(block.to_string());
+        self.round.blocks.push(block.to_string());
     }
 
-    /// Appends every feedback block produced by one research round.
+    /// Appends every feedback block and delivered file produced by one round.
     ///
     /// The round outcome is read-only here: the journal observes what the round
-    /// learned and never rewrites the context the round already applied.
+    /// learned and never rewrites the context the round already applied. The
+    /// delivered files travel beside the blocks, because the feedback of the
+    /// round is where the model reads the bytes it just gained.
     pub fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
             self.push_block(block.as_str());
         }
+        for file in &outcome.added_file_contents {
+            self.record_round_file(file);
+        }
+    }
+
+    /// Records one file the open round added to the context.
+    ///
+    /// A path recorded twice keeps its first entry: one round delivers a file
+    /// once, whatever the number of requests that named it.
+    fn record_round_file(&mut self, file: &AddedFileContent) {
+        if self
+            .round
+            .files
+            .iter()
+            .any(|existing| existing.path == file.path)
+        {
+            return;
+        }
+        self.round.files.push(file.clone());
+    }
+
+    /// Renders the feedback of the round currently open.
+    ///
+    /// Only the records the open round produced are rendered: the results,
+    /// listings, and diagnostics it reported, followed by the `<file>` elements
+    /// of the files it added to the context. Rendering is a pure function of
+    /// those records, so rendering the same round twice produces the very same
+    /// bytes and never moves a token the provider already cached.
+    pub fn render_round_feedback(&self) -> String {
+        let mut parts = self.round.blocks.clone();
+        if let Some(files) = self.render_round_files() {
+            parts.push(files);
+        }
+        parts.join("\n\n")
+    }
+
+    /// Renders the files the open round delivered as one `<context>` block.
+    ///
+    /// The elements come from the cache the prompt renders them with, so an
+    /// element carries the same anchors, the same bytes, and the same `access`
+    /// attribute the `<context>` block of the round renders.
+    fn render_round_files(&self) -> Option<String> {
+        if self.round.files.is_empty() {
+            return None;
+        }
+        let mut cache = ContextBlockCache::default();
+        let mut out = String::from("<context>\n");
+        for file in &self.round.files {
+            let content = ContextFileContent {
+                path: file.path.clone(),
+                access: file.access,
+                content: file.content.clone(),
+                insertion_seq: 0,
+            };
+            out.push_str(cache.element(&content, file.access, self.patch_strategy));
+        }
+        out.push_str("</context>");
+        Some(out)
     }
 
     /// Reports whether the journal holds no findings.
@@ -78,36 +197,6 @@ impl TurnResearchJournal {
         out.push('\n');
         out.push_str(JOURNAL_CLOSE);
         Some(out)
-    }
-
-    /// Composes the user message of a turn round.
-    ///
-    /// The order is fixed: the original task first, the accumulated epistemic
-    /// tail next, the diagnostics of the current phase last. Nothing is inserted
-    /// before the task, so the stable part of the message keeps its bytes and the
-    /// provider prefix cache stays valid.
-    pub fn compose_user_prompt(
-        &self,
-        base_prompt: &str,
-        phase_diagnostics: Option<&str>,
-    ) -> String {
-        let mut out = String::new();
-        out.push_str(base_prompt.trim_end());
-
-        if let Some(tail) = self.rendered() {
-            out.push_str("\n\n");
-            out.push_str(&tail);
-        }
-
-        if let Some(diagnostics) = phase_diagnostics {
-            let diagnostics = diagnostics.trim();
-            if !diagnostics.is_empty() {
-                out.push_str("\n\n");
-                out.push_str(diagnostics);
-            }
-        }
-
-        out
     }
 }
 
@@ -185,46 +274,89 @@ mod tests {
         assert!(rendered.contains("<context_feedback>"));
     }
 
+    /// A round renders only the records it produced, so the feedback of round
+    /// N never repeats the results of round N-1.
     #[test]
-    fn test_compose_user_prompt_orders_task_tail_and_diagnostics() {
+    fn test_round_feedback_covers_only_the_open_round() {
         let mut journal = TurnResearchJournal::default();
-        journal.push_block("<repomap_feedback path=\"src\">\npub fn alpha\n</repomap_feedback>");
+        journal.begin_round(1);
+        journal.record_outcome(&outcome_with(&[
+            "<search_feedback path=\".\" regex=\"alpha\">\n1 match\n</search_feedback>",
+        ]));
+        let first = journal.render_round_feedback();
+        assert!(first.contains("regex=\"alpha\""), "{first}");
 
-        let composed = journal.compose_user_prompt(
-            "Implement the journal.\n",
-            Some("  compiler error: unresolved import  "),
+        journal.begin_round(2);
+        journal.record_outcome(&outcome_with(&[
+            "<dir_list_feedback path=\"src\" recursive=\"false\">\nmain.rs\n</dir_list_feedback>",
+        ]));
+        let second = journal.render_round_feedback();
+        assert!(second.contains("<dir_list_feedback"), "{second}");
+        assert!(
+            !second.contains("regex=\"alpha\""),
+            "the feedback of round 2 must not repeat round 1: {second}"
         );
 
-        let task_at = composed.find("Implement the journal.").expect("task");
-        let tail_at = composed.find(JOURNAL_OPEN).expect("tail");
-        let diagnostics_at = composed.find("compiler error").expect("diagnostics");
-
-        assert!(task_at < tail_at);
-        assert!(tail_at < diagnostics_at);
-        // Trailing whitespace of the task is trimmed, the task keeps its text.
-        assert!(!composed.contains("journal.\n\n\n"));
+        // The cumulative tail keeps the whole turn's investigation, so a
+        // boundary narrows the round without losing an earlier finding.
+        let tail = journal.rendered().expect("the tail renders");
+        assert!(tail.contains("regex=\"alpha\""), "{tail}");
+        assert!(tail.contains("<dir_list_feedback"), "{tail}");
     }
 
+    /// A round renders the files it delivered as their own `<file>` elements,
+    /// carrying the line anchors the patch strategy addresses.
     #[test]
-    fn test_compose_user_prompt_without_journal_or_diagnostics() {
-        let journal = TurnResearchJournal::default();
-        assert_eq!(
-            journal.compose_user_prompt("Base task.", None),
-            "Base task."
+    fn test_round_feedback_renders_the_delivered_files() {
+        use crate::edits::anchor::encode_anchor;
+
+        let mut journal = TurnResearchJournal::default();
+        journal.set_patch_strategy(PatchStrategy::LineAnchor);
+        journal.begin_round(1);
+        let mut outcome = ResearchRoundOutcome::default();
+        outcome.added_file_contents.push(AddedFileContent {
+            path: "src/a.rs".to_string(),
+            access: tauqe_protocol::ContextAccess::ReadOnly,
+            content: "alpha\nbeta\n".to_string(),
+        });
+        journal.record_outcome(&outcome);
+
+        let feedback = journal.render_round_feedback();
+        assert!(feedback.starts_with("<context>\n"), "{feedback}");
+        assert!(
+            feedback.contains(r#"path="src/a.rs" access="read_only""#),
+            "{feedback}"
         );
-        assert_eq!(
-            journal.compose_user_prompt("Base task.", Some("   ")),
-            "Base task."
+        assert!(
+            feedback.contains(&format!("{} | alpha", encode_anchor("src/a.rs", 0))),
+            "{feedback}"
         );
+        assert!(
+            feedback.contains(&format!("{} | beta", encode_anchor("src/a.rs", 1))),
+            "{feedback}"
+        );
+        assert!(feedback.ends_with("</context>"), "{feedback}");
     }
 
+    /// Rendering the same round twice produces the very same bytes, so a
+    /// repeated assembly never moves a token the provider already cached.
     #[test]
-    fn test_compose_user_prompt_with_journal_only() {
+    fn test_round_feedback_is_byte_identical_when_rendered_again() {
         let mut journal = TurnResearchJournal::default();
-        journal.push_block("<system_documentation>\ncontext\n</system_documentation>");
+        journal.set_patch_strategy(PatchStrategy::LineAnchor);
+        journal.begin_round(1);
+        journal.push_block("<repo_dirs_feedback>\nsrc\n</repo_dirs_feedback>");
+        let mut outcome = ResearchRoundOutcome::default();
+        outcome.added_file_contents.push(AddedFileContent {
+            path: "src/a.rs".to_string(),
+            access: tauqe_protocol::ContextAccess::Editable,
+            content: "alpha\n".to_string(),
+        });
+        journal.record_outcome(&outcome);
 
-        let composed = journal.compose_user_prompt("Base task.", None);
-        assert!(composed.starts_with("Base task.\n\n"));
-        assert!(composed.ends_with(JOURNAL_CLOSE));
+        assert_eq!(
+            journal.render_round_feedback(),
+            journal.render_round_feedback()
+        );
     }
 }

@@ -1,4 +1,4 @@
-pub mod compaction;
+pub(crate) mod compaction;
 pub mod entry;
 pub mod storage;
 
@@ -10,7 +10,7 @@ use tauqe_tools::tokens::estimate_tokens_from_bytes;
 
 use self::entry::record_bytes;
 
-pub use compaction::{
+pub(crate) use compaction::{
     build_compacted_history, partition_head_tail, DEFAULT_HISTORY_BUDGET_TOKENS,
     DEFAULT_TAIL_TURNS_COUNT,
 };
@@ -40,7 +40,7 @@ pub enum HistoryMutation {
 }
 
 #[derive(Clone)]
-pub struct HistoryEntryListener(pub Arc<dyn Fn(HistoryMutation) + Send + Sync>);
+pub struct HistoryEntryListener(Arc<dyn Fn(HistoryMutation) + Send + Sync>);
 
 impl std::fmt::Debug for HistoryEntryListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,13 +49,11 @@ impl std::fmt::Debug for HistoryEntryListener {
 }
 /// Interaction records frozen at the start of a bounded turn.
 ///
-/// The freeze keeps the records themselves rather than the rendered
-/// `<history>` block. The semantic layout renders that block from them through
-/// [`HistorySnapshot::render_block`], which is the same definition the live
-/// manager renders through, so the frozen block and the live block are byte
-/// for byte identical. The chronological layout reads the recorded context
-/// watermarks from the identical structure to place the context files between
-/// the turns that introduced them.
+/// The freeze keeps the records themselves rather than a rendered block, so the
+/// chronological assembly reads the recorded context watermarks from the
+/// identical structure to place the context files between the turns that
+/// introduced them, and the live manager keeps rendering its own block through
+/// [`render_history_block`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistorySnapshot {
     entries: Vec<HistoryEntry>,
@@ -63,17 +61,17 @@ pub struct HistorySnapshot {
 
 impl HistorySnapshot {
     /// Freezes `entries` into a turn-scoped snapshot.
-    pub fn new(entries: Vec<HistoryEntry>) -> Self {
+    pub(crate) fn new(entries: Vec<HistoryEntry>) -> Self {
         Self { entries }
     }
 
     /// Frozen records, in recording order.
-    pub fn entries(&self) -> &[HistoryEntry] {
+    pub(crate) fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
 
     /// Reports whether the snapshot carries no record at all.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -82,7 +80,8 @@ impl HistorySnapshot {
     /// A record written before the watermark existed carries none, so a
     /// session whose turns never captured one stays distinguishable from a
     /// session whose turns observed an empty context.
-    pub fn watermark(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn watermark(&self) -> Option<u64> {
         self.entries
             .iter()
             .filter_map(|entry| match entry {
@@ -92,11 +91,6 @@ impl HistorySnapshot {
                 _ => None,
             })
             .max()
-    }
-
-    /// Renders the `<history>` block, or `None` when the snapshot is empty.
-    pub fn render_block(&self) -> Option<String> {
-        render_history_block(&self.entries)
     }
 }
 
@@ -108,7 +102,8 @@ impl HistorySnapshot {
 ///
 /// A record that cannot be serialized is skipped with a diagnostic instead of
 /// failing the whole block: the records around it still describe the session.
-pub fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
@@ -178,7 +173,7 @@ impl HistoryManager {
         self.listener = Some(HistoryEntryListener(Arc::new(listener)));
     }
 
-    pub fn entry_to_ui_item(id: u64, entry: &HistoryEntry) -> UiHistoryItem {
+    fn entry_to_ui_item(id: u64, entry: &HistoryEntry) -> UiHistoryItem {
         let final_id = entry.id().unwrap_or(id);
         match entry {
             HistoryEntry::Summary { text, .. } => UiHistoryItem {
@@ -188,10 +183,14 @@ impl HistoryManager {
                 summary: None,
                 commit_hash: None,
                 files: Vec::new(),
+                rounds: Vec::new(),
                 status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Turn {
-                prompt, context, ..
+                prompt,
+                context,
+                rounds,
+                ..
             } => UiHistoryItem {
                 id: final_id,
                 kind: UiHistoryKind::User,
@@ -203,6 +202,7 @@ impl HistoryManager {
                     .cloned()
                     .map(HistoryFileChange::plain)
                     .collect(),
+                rounds: rounds.clone(),
                 status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Response {
@@ -221,6 +221,7 @@ impl HistoryManager {
                 // the producer's knowledge reaches every client unchanged and is
                 // never re-inferred from rendered text (Conventions §1.5).
                 files: files.clone(),
+                rounds: Vec::new(),
                 status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Review {
@@ -257,6 +258,7 @@ impl HistoryManager {
                         .cloned()
                         .map(HistoryFileChange::plain)
                         .collect(),
+                    rounds: Vec::new(),
                     status: HistoryEntryStatus::Committed,
                 }
             }
@@ -315,6 +317,7 @@ impl HistoryManager {
             prompt: prompt.into(),
             context: context_files,
             context_watermark,
+            rounds: Vec::new(),
         };
         let written = self.storage.append_entry(&entry)?;
         self.journal_bytes = self.journal_bytes.saturating_add(written);
@@ -411,23 +414,31 @@ impl HistoryManager {
     /// mutation holds. A forwarding task can therefore price every mutation it
     /// publishes while a page read and a finishing turn's adoption proceed
     /// concurrently.
+    ///
+    /// Nested turn rounds belong to the record they were written with, so the
+    /// value prices them with no separate accounting rule: the bytes the journal
+    /// reported for that turn already include them, and a compaction that reads
+    /// the same value therefore sees the attempts a turn really made.
     pub fn estimated_tokens(&self) -> u64 {
         estimate_tokens_from_bytes(self.journal_bytes)
     }
 
     /// Reports whether the session outgrew `budget_tokens`.
+    ///
+    /// The check reads the maintained estimate, so a session whose turns
+    /// recorded nested rounds reaches the budget exactly as its journal did.
     pub fn needs_compaction(&self, budget_tokens: u64) -> bool {
         self.estimated_tokens() > budget_tokens
     }
 
-    /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
     /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
     ///
     /// The block comes from the same renderer a turn-scoped
     /// [`HistorySnapshot`] renders through, so a frozen snapshot reproduces the
     /// block the live history would produce at that moment byte for byte.
     /// Returns an empty string if there are no history entries.
-    pub fn format_history_tag(&self) -> Result<String> {
+    #[cfg(test)]
+    pub(crate) fn format_history_tag(&self) -> Result<String> {
         let entries = self.get_entries()?;
         Ok(render_history_block(&entries).unwrap_or_default())
     }
@@ -516,6 +527,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tauqe_protocol::edit::EditFileOp;
+    use tauqe_protocol::TurnRoundRecord;
     use tempfile::tempdir;
 
     #[test]
@@ -668,12 +680,21 @@ mod tests {
             prompt: "Write tests".to_string(),
             context: vec!["test.rs".to_string()],
             context_watermark: None,
+            rounds: vec![entry::round_record(
+                1,
+                "Drafted the tests.",
+                "verification passed",
+            )],
         };
         let item2 = HistoryManager::entry_to_ui_item(2, &entry2);
         assert_eq!(item2.id, 2);
         assert_eq!(item2.kind, UiHistoryKind::User);
         assert_eq!(item2.text, "Write tests");
         assert_eq!(item2.files, vec![HistoryFileChange::plain("test.rs")]);
+        assert_eq!(item2.rounds.len(), 1, "the turn carries its rounds");
+        assert_eq!(item2.rounds[0].index, 1);
+        assert_eq!(item2.rounds[0].message, "Drafted the tests.");
+        assert_eq!(item2.rounds[0].feedback, "verification passed");
 
         let entry3 = HistoryEntry::Response {
             id: Some(3),
@@ -773,12 +794,14 @@ mod tests {
             prompt: "Prompt 10".to_string(),
             context: vec![],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         let entry2 = HistoryEntry::Turn {
             id: Some(20),
             prompt: "Prompt 20".to_string(),
             context: vec![],
             context_watermark: None,
+            rounds: Vec::new(),
         };
 
         storage.append_entry(&entry1).unwrap();
@@ -905,5 +928,110 @@ mod tests {
         hm.clear().unwrap();
         assert_eq!(hm.estimated_tokens(), 0);
         assert_eq!(hm.estimated_tokens(), fresh());
+    }
+    /// One turn record that recorded `rounds` intermediate attempts.
+    fn turn_with_rounds(rounds: Vec<TurnRoundRecord>) -> HistoryEntry {
+        HistoryEntry::Turn {
+            id: Some(1),
+            prompt: "Implement the parser step".to_string(),
+            context: vec!["src/parser.rs".to_string()],
+            context_watermark: None,
+            rounds,
+        }
+    }
+
+    /// One recorded round with a payload large enough to move the estimate.
+    fn round(index: u32) -> TurnRoundRecord {
+        TurnRoundRecord {
+            index,
+            message: format!("Round {index}: inspected the parser and staged the change."),
+            feedback: format!("Round {index} feedback: two search results and one added file."),
+        }
+    }
+
+    /// Nested rounds are part of the record they were written with, so the
+    /// journal footprint the manager maintains prices them with no separate
+    /// accounting rule.
+    #[test]
+    fn test_estimated_tokens_include_nested_turn_rounds() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(root.clone());
+
+        storage.append_entry(&turn_with_rounds(Vec::new())).unwrap();
+        let without_rounds = HistoryManager::new(root.clone()).estimated_tokens();
+        storage.clear().unwrap();
+
+        storage
+            .append_entry(&turn_with_rounds(vec![round(1), round(2), round(3)]))
+            .unwrap();
+        let with_rounds = HistoryManager::new(root).estimated_tokens();
+
+        assert!(
+            with_rounds > without_rounds,
+            "a turn that recorded rounds costs more than the bare turn: {with_rounds} <= {without_rounds}"
+        );
+    }
+
+    /// The compaction trigger reads the same estimate, so a turn that recorded
+    /// its rounds reaches the budget the bare turn stays below.
+    #[test]
+    fn test_nested_turn_rounds_trigger_compaction_earlier() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(root.clone());
+
+        storage.append_entry(&turn_with_rounds(Vec::new())).unwrap();
+        let bare_budget = HistoryManager::new(root.clone()).estimated_tokens();
+        storage.clear().unwrap();
+        storage
+            .append_entry(&turn_with_rounds(vec![round(1), round(2), round(3)]))
+            .unwrap();
+
+        let mut manager = HistoryManager::new(root.clone());
+        assert!(
+            manager.needs_compaction(bare_budget),
+            "the recorded rounds must count toward the budget"
+        );
+
+        manager.clear().unwrap();
+        assert!(
+            !manager.needs_compaction(bare_budget),
+            "an empty journal is never over budget"
+        );
+    }
+
+    /// A rollback rewrites the journal without the record, so the rounds it
+    /// carried leave the file together with the turn.
+    #[test]
+    fn test_rollback_removes_the_turn_with_its_rounds() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(root.clone());
+        storage
+            .append_entry(&turn_with_rounds(vec![round(1), round(2)]))
+            .unwrap();
+
+        let mut manager = HistoryManager::new(root.clone());
+        let id = manager
+            .get_entries()
+            .unwrap()
+            .first()
+            .and_then(HistoryEntry::id)
+            .expect("the recorded turn carries an id");
+        manager
+            .rollback_entry(id, "Turn interrupted by the developer")
+            .unwrap();
+
+        assert!(
+            manager.get_entries().unwrap().is_empty(),
+            "the rounds leave with the turn they belong to"
+        );
+        assert_eq!(manager.estimated_tokens(), 0);
+        assert_eq!(
+            HistoryManager::new(root).estimated_tokens(),
+            0,
+            "the rewritten journal no longer carries the rounds"
+        );
     }
 }

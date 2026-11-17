@@ -423,6 +423,7 @@ pub fn build_verification_retry_prompt(report: &str) -> String {
 }
 
 /// Constructs a prompt reminding the model that it must provide code edits when fixing verification failures.
+#[allow(dead_code)]
 pub fn build_verification_missing_edits_prompt(report: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str("Your previous response contained explanations but did not include any code edits that follow the edit protocol defined in your system instructions.\n\nCode verification is still failing with the following errors:\n\n```\n");

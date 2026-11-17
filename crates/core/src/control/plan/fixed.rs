@@ -4,7 +4,7 @@
 //! by collecting all executable `Todo` leaf steps in preorder (DFS),
 //! executing them via [`run_plan_sequence_loop`], and refreshing
 //! container statuses upon completion.
-
+#![cfg(test)]
 use tokio::sync::watch;
 
 use tauqe_protocol::{PlanItem, PlanItemStatus};
@@ -20,7 +20,7 @@ use crate::plan::storage::PlanStorage;
 #[derive(Debug, Clone)]
 pub struct FixedPlanLoopConfig {
     /// Configuration passed to the underlying sequence loop.
-    pub sequence: PlanSequenceLoopConfig,
+    sequence: PlanSequenceLoopConfig,
 }
 
 impl From<PlanSequenceLoopConfig> for FixedPlanLoopConfig {
@@ -33,7 +33,7 @@ impl From<PlanSequenceLoopConfig> for FixedPlanLoopConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedPlanArtifact {
     /// Sequence artifact capturing executed steps and stop reason.
-    pub sequence: PlanSequenceArtifact,
+    sequence: PlanSequenceArtifact,
 }
 
 /// Traverses plan items in preorder (DFS) and collects IDs of executable `Todo` leaves.
@@ -55,7 +55,7 @@ fn collect_todo_leaves(items: &[PlanItem], leaves: &mut Vec<String>) {
 /// 2. Performs a preorder (DFS) walk of the plan items to extract leaf steps with status `Todo`.
 /// 3. Executes the sequence via [`run_plan_sequence_loop`], respecting soft-stop and cancellation signals.
 /// 4. Re-reads and refreshes aggregated container statuses via `refresh_parent_statuses()` in [`PlanStorage`].
-pub async fn run_fixed_plan_loop(
+pub(crate) async fn run_fixed_plan_loop(
     ctx: &mut LoopContext<'_>,
     plan_id: &str,
     config: &FixedPlanLoopConfig,
@@ -114,7 +114,7 @@ mod tests {
     use std::path::Path;
 
     use tauqe_protocol::{
-        CapabilityExpr, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan, PlanItem,
+        CapabilityTree, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan, PlanItem,
         PlanItemStatus,
     };
 
@@ -174,7 +174,7 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]);
+            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
             let prompt_builder =
                 PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
             LoopContext::new(

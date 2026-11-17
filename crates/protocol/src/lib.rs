@@ -55,15 +55,15 @@ pub mod review;
 // exceptions, so a helper is never lifted to the root and a contract name is
 // never left behind at its module.
 pub use command::{
-    AbortCommand, BlockedCommand, CapabilityBranch, CapabilityDelivery, CapabilityExpr,
-    CapabilityPhase, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
-    DirListCommand, DocRequestCommand, DocTopic, LlmCapability, LlmCommand, OuterDocRequestCommand,
-    RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand, ShortDescriptionCommand,
-    TextCommand, TurnErrorCommand, TurnSkipCommand, VerifyCommand, VerifyOnSuccess, VerifyTarget,
+    AbortCommand, BlockedCommand, CapabilityDelivery, CapabilityPhase, CapabilityTree,
+    CommitMessageCommand, ContextRequestCommand, CustomToolCommand, DirListCommand,
+    DocRequestCommand, DocTopic, LlmCapability, LlmCommand, OuterDocRequestCommand,
+    RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand, TextCommand,
+    TurnErrorCommand, TurnSkipCommand,
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
-    PatchStrategy, PromptLayoutKind, ReviewPresetSummary, SystemStatusResult, WorkflowKind,
+    PatchStrategy, ReviewPresetSummary, SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -127,7 +127,8 @@ pub use git::{
 pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryEntryRolledBackEvent, HistoryEntryStatus,
-    HistoryFileChange, HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
+    HistoryFileChange, HistoryGetParams, HistoryGetResult, TurnRoundRecord, UiHistoryItem,
+    UiHistoryKind,
 };
 pub use lifecycle::{CLIENT_SHUTDOWN_WAIT, SHUTDOWN_DRAIN_BUDGET};
 pub use locale::{LocaleCatalogItem, LocaleGenerateParams, LocaleGenerateResult};

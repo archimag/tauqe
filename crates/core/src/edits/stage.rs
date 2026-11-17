@@ -113,7 +113,8 @@ pub fn stage_and_validate_edits(
 /// configuration it froze on its first proposal round and calls
 /// [`prepare_staged_edits_with_config`], so the dump runs once for the whole turn
 /// instead of once per staging attempt.
-pub async fn prepare_staged_edits(
+#[cfg(test)]
+pub(crate) async fn prepare_staged_edits(
     repo_root: &Path,
     context_manager: &ContextManager,
     edits: &[EditOperation],

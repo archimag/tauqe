@@ -122,16 +122,7 @@ pub(crate) fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub fn config_candidates(repo_root: Option<&Path>, explicit_config: Option<&Path>) -> Vec<PathBuf> {
-    config_candidates_internal(
-        repo_root,
-        dirs_home().as_deref(),
-        dirs_config().as_deref(),
-        explicit_config,
-    )
-}
-
-pub(crate) fn config_candidates_internal(
+fn config_candidates_internal(
     repo_root: Option<&Path>,
     home: Option<&Path>,
     config_dir: Option<&Path>,
@@ -186,7 +177,7 @@ pub fn find_config_file(
     )
 }
 
-pub(crate) fn find_config_file_internal(
+fn find_config_file_internal(
     repo_root: Option<&Path>,
     home: Option<&Path>,
     config_dir: Option<&Path>,

@@ -14,19 +14,19 @@ pub struct SessionStorage {
 }
 
 impl SessionStorage {
-    pub fn new(repo_root: PathBuf) -> Self {
+    pub(crate) fn new(repo_root: PathBuf) -> Self {
         Self { repo_root }
     }
 
-    pub fn repo_root(&self) -> &Path {
+    pub(crate) fn repo_root(&self) -> &Path {
         &self.repo_root
     }
 
-    pub fn tauqe_dir(&self) -> PathBuf {
+    fn tauqe_dir(&self) -> PathBuf {
         self.repo_root.join(".tauqe")
     }
 
-    pub fn history_path(&self) -> PathBuf {
+    pub(crate) fn history_path(&self) -> PathBuf {
         self.tauqe_dir().join("history.jsonl")
     }
 
@@ -35,7 +35,7 @@ impl SessionStorage {
     /// The reported size is the space the record occupies on disk, newline
     /// included, so the caller carries the journal footprint forward without
     /// re-reading the file it just grew.
-    pub fn append_entry(&self, entry: &HistoryEntry) -> Result<u64> {
+    pub(crate) fn append_entry(&self, entry: &HistoryEntry) -> Result<u64> {
         let line = entry.to_jsonl_line()?;
         let written = line_bytes(&line);
         let dir = self.tauqe_dir();
@@ -67,7 +67,7 @@ impl SessionStorage {
         Ok(written)
     }
 
-    pub fn read_entries(&self) -> Result<Vec<HistoryEntry>> {
+    pub(crate) fn read_entries(&self) -> Result<Vec<HistoryEntry>> {
         let file_path = self.history_path();
 
         // The metadata probe, the open, and the line-by-line JSONL streaming
@@ -121,7 +121,7 @@ impl SessionStorage {
     ///
     /// Returns the size of the payload it published, so the caller adopts the
     /// new journal footprint instead of re-deriving it from the file.
-    pub fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<u64> {
+    pub(crate) fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<u64> {
         let mut payload = String::new();
         for entry in entries {
             let line = entry.to_jsonl_line()?;
@@ -146,7 +146,7 @@ impl SessionStorage {
         Ok(written)
     }
 
-    pub fn clear(&self) -> Result<()> {
+    pub(crate) fn clear(&self) -> Result<()> {
         let file_path = self.history_path();
 
         // The existence probe and the deletion run off the async executor
@@ -181,6 +181,7 @@ mod tests {
             prompt: "Implement auth".to_string(),
             context: vec!["auth.rs".to_string()],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         let entry2 = HistoryEntry::Response {
             id: Some(2),
@@ -225,12 +226,14 @@ mod tests {
             prompt: "First turn".to_string(),
             context: vec![],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         let entry2 = HistoryEntry::Turn {
             id: Some(2),
             prompt: "Second turn".to_string(),
             context: vec![],
             context_watermark: None,
+            rounds: Vec::new(),
         };
 
         storage.append_entry(&entry1).unwrap();
@@ -264,6 +267,7 @@ mod tests {
             prompt: "Read history off the executor".to_string(),
             context: vec!["history/storage.rs".to_string()],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         storage.append_entry(&entry).unwrap();
 
@@ -285,6 +289,7 @@ mod tests {
             prompt: "Discover the parser".to_string(),
             context: vec!["src/parser.rs".to_string()],
             context_watermark: Some(42),
+            rounds: Vec::new(),
         };
         storage.append_entry(&entry).unwrap();
 
@@ -306,6 +311,7 @@ mod tests {
             prompt: "Restricted prompt".to_string(),
             context: vec![],
             context_watermark: None,
+            rounds: Vec::new(),
         };
         storage.append_entry(&entry).unwrap();
 

@@ -212,7 +212,7 @@ impl PlanImplementationStepExecutor<'_> {
         let mut tier_attempts = 0u32;
         let mut max_tier_attempts = models.resolve_selection_attempts(ModelRole::Coder, &selection);
 
-        let mut prompt = match format_plan_step_execution_prompt(
+        let base_prompt = match format_plan_step_execution_prompt(
             &frame.plan,
             &leaf.id,
             self.config.protocol,
@@ -224,6 +224,7 @@ impl PlanImplementationStepExecutor<'_> {
                 return BatchStepOutcome::failed(err);
             }
         };
+        let mut prompt = base_prompt.clone();
 
         loop {
             // Phase boundary: every attempt is a whole bounded turn, so a
@@ -416,6 +417,7 @@ impl PlanImplementationStepExecutor<'_> {
                     }
 
                     prompt = format_plan_step_retry_prompt(
+                        &base_prompt,
                         "",
                         Some(failure.reason()),
                         self.config.protocol,
@@ -1092,6 +1094,7 @@ mod tests {
             }
         );
         assert!(requests[1].prompt.contains("Correction Required"));
+        assert!(requests[1].prompt.contains("Target Plan Step Execution"));
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();

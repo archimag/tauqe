@@ -40,18 +40,18 @@ use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
 /// Total attempts made for one request, including the first one.
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 4;
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 4;
 /// Pause before the second attempt; every later pause doubles it.
-pub const DEFAULT_BASE_DELAY_MS: u64 = 500;
+pub(crate) const DEFAULT_BASE_DELAY_MS: u64 = 500;
 /// Upper bound of a single backoff pause.
-pub const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
+pub(crate) const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
 /// Cumulative model output tolerated for a single request attempt.
 ///
 /// A model caught in a reasoning loop keeps streaming deltas forever: the relay
 /// forwards them, the client keeps appending, and the process grows until the
 /// system kills it. The ceiling turns that into a deterministic, terminal
 /// failure while the transport itself is still healthy.
-pub const DEFAULT_MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
 
 /// Marker embedded in the transport error raised when a provider cuts a
 /// structured JSON generation short at its token limit.
@@ -61,7 +61,7 @@ pub const DEFAULT_MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
 /// complete document. [`RetryingProvider`] therefore classifies this marker as
 /// a transient failure and tells the client to drop the fragments with
 /// [`StreamEvent::ResetStream`].
-pub const JSON_TRUNCATION_MARKER: &str = "truncated by finish_reason: length";
+pub(crate) const JSON_TRUNCATION_MARKER: &str = "truncated by finish_reason: length";
 
 /// Largest exponent the doubling is allowed to reach before it is clamped.
 const MAX_BACKOFF_EXPONENT: u32 = 16;
@@ -137,7 +137,8 @@ impl RetryingProvider {
     }
 
     /// Overrides the cumulative output ceiling of a single attempt.
-    pub fn with_max_stream_bytes(mut self, max_stream_bytes: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_max_stream_bytes(mut self, max_stream_bytes: usize) -> Self {
         self.max_stream_bytes = max_stream_bytes.max(1);
         self
     }

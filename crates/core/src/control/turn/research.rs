@@ -1,8 +1,11 @@
-//! Context research and investigation control loops.
+//! Discovery step of the bounded turn.
 //!
 //! This module provides [`handle_research_commands`] for draining and executing
 //! discovery commands against [`crate::context::ContextManager`] and declared project
-//! tools, and [`run_research_loop`] for autonomous multi-round context enrichment.
+//! tools, and [`execute_research_step`] for executing exactly one discovery round and
+//! classifying what it delivered. The rounds themselves belong to
+//! [`crate::control::turn::run_turn_loop`]: the phase owns no loop of its own, so a
+//! discovery round can never terminate the turn.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,11 +14,12 @@ use serde_json::Value;
 use tauqe_protocol::{ContextAccess, ContextRequestCommand, LlmCapability, LlmCommand, TurnPhase};
 
 use crate::control::context::LoopContext;
-use crate::control::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
+use crate::control::outcome::{ResponseEnvelope, SystemError};
 use crate::providers::StreamEvent;
 use crate::workflow::research::{execute_research_commands, ResearchLimits};
+
 /// Capabilities processed by the research and investigation contour.
-pub const RESEARCH_CAPABILITIES: &[LlmCapability] = &[
+pub(crate) const RESEARCH_CAPABILITIES: &[LlmCapability] = &[
     LlmCapability::ContextRequest,
     LlmCapability::RepoSearch,
     LlmCapability::RepoDirs,
@@ -27,69 +31,58 @@ pub const RESEARCH_CAPABILITIES: &[LlmCapability] = &[
 ];
 
 /// Maximum consecutive rounds granted to deliver an already-satisfied files explanation.
-const MAX_SATISFIED_RESEARCH_ROUNDS: usize = 1;
+pub(super) const MAX_SATISFIED_RESEARCH_ROUNDS: usize = 1;
 
-/// Maximum consecutive empty research rounds allowed before terminating the phase.
-const MAX_EMPTY_RESEARCH_ROUNDS: usize = 1;
+/// Maximum consecutive rounds a discovery round may widen nothing before the turn stops asking.
+pub(super) const MAX_EMPTY_RESEARCH_ROUNDS: usize = 1;
 
 /// Directive appended to the journal when a discovery round widened nothing.
 ///
-/// The trigger is [`ResearchFeedback::is_empty`]: the round added no file,
+/// The trigger is that the round widened nothing: the round added no file,
 /// reported no missing path, ran no search, rendered no outline, listing, or
 /// targeted map, loaded no document, and explained nothing already loaded.
 /// The working tree could not be inspected, the context budget refused the
-/// material, or the requests carried nothing the harness could resolve, so
-/// the directive names exactly those causes and forbids repeating them.
+/// material, or the requests carried nothing the harness could resolve, so the
+/// directive names exactly those causes and forbids repeating them.
 const EMPTY_RESEARCH_DIRECTIVE: &str = "<response_directive>\nYour discovery round did not widen the context: either the working tree could not be inspected, the declared context budget refused the requested material, or the requests carried nothing the harness could resolve into a file, a search, a listing, an outline, or a document. Repeating the same requests would produce the same result, so do not repeat them. Close the round with one of the branches the schema declares: request material that exists in the working tree (take exact paths from <repo_map> and <repo_dirs>), answer the task through the 'answer' branch, or deliver the code changes through the 'edit' branch.\n</response_directive>";
 
 /// Directive appended to the journal when a round only repeated requests the context already satisfied.
 const ALREADY_SATISFIED_DIRECTIVE: &str = "<response_directive>\nEvery file you requested is already loaded in <context>. Do not request those paths again: answer the task from the material you already hold. Write the analysis or the conclusion in plain conversational text, and emit file edits only when the code itself must change.\n</response_directive>";
 
-/// Directive appended to the journal when the research round limit is exhausted.
-const RESEARCH_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe research round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
-
 /// Feedback and outcomes aggregated from executing research commands.
 #[derive(Debug, Clone, Default)]
 pub struct ResearchFeedback {
     /// Repository files added to the auto context layer.
-    pub added_files: Vec<String>,
+    /// Repository files added to the auto context layer.
+    added_files: Vec<String>,
     /// Repository files requested that were missing from disk.
-    pub missing_files: Vec<String>,
+    missing_files: Vec<String>,
     /// Repository files requested that were already present in context.
-    pub already_satisfied_files: Vec<String>,
+    already_satisfied_files: Vec<String>,
     /// Rendered feedback blocks from regex searches, directory outlines, or system documentation.
-    pub feedback_blocks: Vec<String>,
+    feedback_blocks: Vec<String>,
     /// Whether turn scratchpad notes were recorded into the journal.
-    pub scratchpad_recorded: bool,
+    scratchpad_recorded: bool,
     /// Whether the round widened repository knowledge (added files, missing files, searches, docs, tools).
-    pub widened: bool,
-}
-
-impl ResearchFeedback {
-    /// Returns true if the round produced no research progress or hint.
-    pub fn is_empty(&self) -> bool {
-        !self.widened && self.already_satisfied_files.is_empty()
-    }
+    widened: bool,
 }
 
 /// Flat configuration of the research loop.
 #[derive(Debug, Clone)]
 pub struct ResearchLoopConfig {
-    /// Maximum consecutive research rounds granted.
-    pub max_rounds: usize,
     /// Aggregate token budget of the context a round may widen.
-    pub token_budget: usize,
+    /// Aggregate token budget of the context a round may widen.
+    token_budget: usize,
     /// Token budget of a targeted repository map rendered by the round.
-    pub repomap_token_budget: usize,
+    repomap_token_budget: usize,
     /// Operational caps applied to one research round.
-    pub research_limits: ResearchLimits,
+    research_limits: ResearchLimits,
 }
 
 impl ResearchLoopConfig {
     /// Creates research loop configuration from project context configuration.
-    pub fn from_context(config: &crate::config::ContextConfig) -> Self {
+    pub(crate) fn from_context(config: &crate::config::ContextConfig) -> Self {
         Self {
-            max_rounds: config.max_research_rounds,
             token_budget: config.token_budget,
             repomap_token_budget: config.repomap_token_budget,
             research_limits: ResearchLimits::from_context_config(config),
@@ -103,25 +96,15 @@ impl Default for ResearchLoopConfig {
     }
 }
 
-/// Artifact produced by a successful research phase.
-#[derive(Debug, Clone, Default)]
-pub struct ResearchArtifact {
-    /// Number of research rounds executed.
-    pub rounds_spent: usize,
-    /// Files added to the context manager during research.
-    pub files_added: Vec<String>,
-}
-
 /// Drains research commands from the envelope and executes them.
 ///
 /// Returns `Ok(None)` if no research commands were present in the envelope.
-pub fn drain_scratchpad(ctx: &mut LoopContext<'_>, envelope: &mut ResponseEnvelope) -> bool {
+fn drain_scratchpad(ctx: &mut LoopContext<'_>, envelope: &mut ResponseEnvelope) -> bool {
     let mut recorded = false;
     for cmd in envelope.take(LlmCapability::Scratchpad) {
         if let LlmCommand::Scratchpad(command) = cmd {
             let notes = command.notes;
             if !notes.trim().is_empty() {
-                ctx.set_scratchpad(Some(notes.trim().to_string()));
                 ctx.journal
                     .push_block(format!("<scratchpad>\n{}\n</scratchpad>", notes.trim()));
                 recorded = true;
@@ -131,7 +114,7 @@ pub fn drain_scratchpad(ctx: &mut LoopContext<'_>, envelope: &mut ResponseEnvelo
     recorded
 }
 
-pub async fn handle_research_commands(
+pub(crate) async fn handle_research_commands(
     ctx: &mut LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
@@ -144,6 +127,11 @@ pub async fn handle_research_commands(
     if commands.is_empty() {
         return Ok(None);
     }
+
+    // The round marks its own boundary: the feedback published below covers the
+    // records that follow it, so the model is told what this round delivered
+    // instead of receiving the whole turn's investigation again.
+    ctx.begin_research_round();
 
     let mut feedback = ResearchFeedback {
         scratchpad_recorded,
@@ -255,6 +243,7 @@ pub async fn handle_research_commands(
         ctx.journal.record_outcome(&outcome);
 
         if !outcome.added_files.is_empty() {
+            ctx.mark_context_churn();
             ctx.events
                 .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
         }
@@ -282,156 +271,113 @@ pub async fn handle_research_commands(
         }
     }
 
+    // The round's feedback enters the transcript slot the next round appends as
+    // its user message, so the model reads what its own round delivered.
+    ctx.publish_round_feedback();
+
     Ok(Some(feedback))
 }
 
-/// Autonomous multi-round context research loop.
-///
-/// The phase ends on exactly three boundaries:
-///
-/// 1. A round carried no discovery command, so the phase has nothing left to
-///    spend.
-/// 2. A round carried a command a higher contour owns — a change set, a plan
-///    operation, a review decision, an outcome — so the round was more than one
-///    discovery step and its envelope travels upward untouched.
-/// 3. A round carried the discovery commands and nothing else, which is the
-///    ordinary opening of an investigation: the round was spent exactly once
-///    more and the model is asked again against the context it widened.
-///
-/// Narration is not a boundary. A round that asks for material and describes
-/// what it is looking for is a preamble, not the answer, so the loop keeps
-/// going while the envelope holds nothing but the narration; the answer arrives
-/// in the round that has the material in front of it.
-pub async fn run_research_loop(
-    ctx: &mut LoopContext<'_>,
-    mut current_envelope: ResponseEnvelope,
-    config: &ResearchLoopConfig,
-) -> Result<LoopResult<ResearchArtifact>, SystemError> {
-    ctx.check_cancelled()?;
-
-    let mut rounds_spent = 0;
-    let mut files_added = Vec::new();
-    let mut satisfied_rounds = 0usize;
-    let mut empty_rounds = 0usize;
-    let mut has_model_prose = envelope_has_text(&current_envelope);
-
-    loop {
-        ctx.check_cancelled()?;
-
-        if rounds_spent >= config.max_rounds && envelope_has_research_commands(&current_envelope) {
-            let warn = format!(
-                "\n\n---\n⚠️ **[Research Limit Reached]** Maximum research rounds ({}) reached. No further repository material will be loaded in this turn.\n\n",
-                config.max_rounds
-            );
-            ctx.events.emit(StreamEvent::TextDelta(warn));
-            ctx.journal.push_block(RESEARCH_LIMIT_DIRECTIVE);
-            let _ = current_envelope.take_any(RESEARCH_CAPABILITIES);
-            current_envelope = ctx.request_round().await?;
-            return Ok(LoopResult::Success(LoopSuccess::new(
-                ResearchArtifact {
-                    rounds_spent,
-                    files_added,
-                },
-                current_envelope,
-            )));
-        }
-
-        let research = handle_research_commands(ctx, &mut current_envelope, config).await?;
-        let Some(feedback) = research else {
-            return Ok(LoopResult::Success(LoopSuccess::new(
-                ResearchArtifact {
-                    rounds_spent,
-                    files_added,
-                },
-                current_envelope,
-            )));
-        };
-        if feedback.is_empty() {
-            if empty_rounds >= MAX_EMPTY_RESEARCH_ROUNDS {
-                return Ok(LoopResult::Success(LoopSuccess::new(
-                    ResearchArtifact {
-                        rounds_spent,
-                        files_added,
-                    },
-                    current_envelope,
-                )));
-            }
-            empty_rounds += 1;
-            ctx.journal.push_block(EMPTY_RESEARCH_DIRECTIVE);
-            current_envelope = ctx.request_round().await?;
-            has_model_prose |= envelope_has_text(&current_envelope);
-            continue;
-        }
-
-        let hint_only = !feedback.widened
-            && !feedback.already_satisfied_files.is_empty()
-            && !envelope_has_text(&current_envelope)
-            && !has_model_prose;
-
-        if !feedback.widened && !hint_only {
-            return Ok(LoopResult::Success(LoopSuccess::new(
-                ResearchArtifact {
-                    rounds_spent,
-                    files_added,
-                },
-                current_envelope,
-            )));
-        }
-
-        if hint_only {
-            if satisfied_rounds >= MAX_SATISFIED_RESEARCH_ROUNDS {
-                return Ok(LoopResult::Success(LoopSuccess::new(
-                    ResearchArtifact {
-                        rounds_spent,
-                        files_added,
-                    },
-                    current_envelope,
-                )));
-            }
-            satisfied_rounds += 1;
-            ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
-        } else {
-            rounds_spent += 1;
-        }
-
-        files_added.extend(feedback.added_files.clone());
-
-        let banner_summary = format_round_summary(&feedback);
-        let banner = format!(
-            "\n\n---\n**[Round {}]** {}\n\n",
-            if hint_only {
-                rounds_spent + 1
-            } else {
-                rounds_spent
-            },
-            banner_summary
-        );
-        ctx.events.emit(StreamEvent::TextDelta(banner));
-
-        ctx.events.emit(StreamEvent::TurnPhase {
-            phase: TurnPhase::Research,
-            round: Some(rounds_spent),
-            max_rounds: Some(config.max_rounds),
-            detail: Some(format!(
-                "Research round {}/{}",
-                rounds_spent, config.max_rounds
-            )),
-        });
-
-        if holds_a_higher_contour_command(&current_envelope) {
-            return Ok(LoopResult::Success(LoopSuccess::new(
-                ResearchArtifact {
-                    rounds_spent,
-                    files_added,
-                },
-                current_envelope,
-            )));
-        }
-
-        current_envelope = ctx.request_round().await?;
-        has_model_prose |= envelope_has_text(&current_envelope);
-    }
+/// Classification of one executed discovery round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResearchStepKind {
+    /// The round carried no discovery command, so the phase has nothing left to spend.
+    #[default]
+    Idle,
+    /// The round widened what the context holds, so the turn continues against it.
+    Widened,
+    /// The round asked only for material the context already holds, so the phase
+    /// explains that and asks once more.
+    AlreadySatisfied,
+    /// The round widened nothing, so the phase explains the dead end and asks once more.
+    DeadEnd,
 }
+
+/// What one executed discovery round delivered.
+#[derive(Debug, Default)]
+pub struct ResearchStep {
+    /// Classification of the round.
+    pub(crate) kind: ResearchStepKind,
+    /// Feedback the round produced, empty when it carried no discovery command.
+    #[cfg(test)]
+    feedback: ResearchFeedback,
+}
+
+/// Executes exactly one discovery round and classifies what it delivered.
+///
+/// The step drains the discovery commands of the envelope, records the findings
+/// into the journal of the turn, and announces the round it spent. It never
+/// requests a round of its own: the budget of the turn and the request that spends
+/// it belong to [`crate::control::turn::run_turn_loop`].
+pub(crate) async fn execute_research_step(
+    ctx: &mut LoopContext<'_>,
+    envelope: &mut ResponseEnvelope,
+    config: &ResearchLoopConfig,
+) -> Result<ResearchStep, SystemError> {
+    let Some(feedback) = handle_research_commands(ctx, envelope, config).await? else {
+        return Ok(ResearchStep::default());
+    };
+
+    let kind = classify_research_round(&feedback);
+    match kind {
+        ResearchStepKind::DeadEnd => {
+            // The round delivered nothing, so the harness names the causes and
+            // forbids repeating them. The directive is recorded here and reaches
+            // the model through the corrective round the turn requests next.
+            ctx.journal.push_block(EMPTY_RESEARCH_DIRECTIVE);
+        }
+        ResearchStepKind::AlreadySatisfied => {
+            ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
+            announce_research_round(ctx, &feedback);
+        }
+        ResearchStepKind::Widened => announce_research_round(ctx, &feedback),
+        ResearchStepKind::Idle => {}
+    }
+
+    Ok(ResearchStep {
+        kind,
+        #[cfg(test)]
+        feedback,
+    })
+}
+
+/// Classifies the round the step just executed.
+///
+/// The classification reads what the round delivered and nothing about the prose it
+/// carried: the branch grammar already states what the round did, so a round that
+/// asked only for material the context holds is a satisfied request whether or not
+/// it narrated the request.
+fn classify_research_round(feedback: &ResearchFeedback) -> ResearchStepKind {
+    if feedback.widened {
+        return ResearchStepKind::Widened;
+    }
+    if feedback.already_satisfied_files.is_empty() {
+        return ResearchStepKind::DeadEnd;
+    }
+    ResearchStepKind::AlreadySatisfied
+}
+
+/// Announces the round a step spent on the interface and in the journal.
+///
+/// The ordinal is the one the round boundary of the journal carries, so the label
+/// names the investigation round the step executed rather than a counter a contour
+/// keeps of its own.
+fn announce_research_round(ctx: &LoopContext<'_>, feedback: &ResearchFeedback) {
+    let round = ctx.journal.round_index();
+    ctx.events.emit(StreamEvent::TextDelta(format!(
+        "\n\n---\n**[Round {}]** {}\n\n",
+        round,
+        format_round_summary(feedback)
+    )));
+    super::announce_turn_phase(
+        ctx,
+        TurnPhase::Research,
+        round,
+        None,
+        format!("Research round {round}"),
+    );
+}
+
 fn format_round_summary(feedback: &ResearchFeedback) -> String {
     let mut parts = Vec::new();
     if !feedback.added_files.is_empty() {
@@ -461,25 +407,19 @@ fn format_round_summary(feedback: &ResearchFeedback) -> String {
         format!("{}.", parts.join(", "))
     }
 }
+
 /// Returns whether the residual of a discovery round belongs to a contour above.
-fn holds_a_higher_contour_command(envelope: &ResponseEnvelope) -> bool {
+pub(super) fn holds_a_higher_contour_command(envelope: &ResponseEnvelope) -> bool {
     envelope
         .remaining_capabilities()
         .into_iter()
-        .any(|capability| {
-            capability != LlmCapability::TextMessage
-                && capability != LlmCapability::ShortDescription
-        })
+        .any(|capability| capability != LlmCapability::TextMessage)
 }
 
-fn envelope_has_research_commands(envelope: &ResponseEnvelope) -> bool {
-    RESEARCH_CAPABILITIES.iter().any(|cap| envelope.has(*cap))
-}
-
-fn envelope_has_text(envelope: &ResponseEnvelope) -> bool {
+/// Reports whether the round carried a written answer.
+pub(super) fn envelope_has_text(envelope: &ResponseEnvelope) -> bool {
     envelope.commands().iter().any(|cmd| match cmd {
         LlmCommand::Text(command) => !command.content.trim().is_empty(),
-        LlmCommand::ShortDescription(command) => !command.content.trim().is_empty(),
         _ => false,
     })
 }
@@ -569,8 +509,8 @@ mod tests {
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
     use tauqe_protocol::{
-        CapabilityExpr, DocRequestCommand, DocTopic, EditReplace, ModelRef, ScratchpadCommand,
-        TextCommand,
+        CapabilityTree, ContextAccess, ContextRequestCommand, DocRequestCommand, DocTopic,
+        ModelRef, ScratchpadCommand, TextCommand,
     };
 
     struct Fixture {
@@ -606,12 +546,12 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityExpr::set(
+            let caps = CapabilityTree::set(
                 RESEARCH_CAPABILITIES
                     .iter()
                     .copied()
                     .chain([LlmCapability::TextMessage])
-                    .map(CapabilityExpr::leaf),
+                    .map(CapabilityTree::leaf),
             );
             let prompt_builder = crate::control::prompt::PromptBuilder::new(
                 &self.provider,
@@ -629,6 +569,14 @@ mod tests {
                 caps,
                 prompt_builder,
             )
+        }
+
+        /// Commits `path` with `content` so the working tree holds it.
+        fn commit(&self, path: &str, content: &str) {
+            let root = self.dir.path();
+            std::fs::write(root.join(path), content).expect("fixture file");
+            crate::git::cmd::stage_files(root, &[path.to_string()]).expect("stage");
+            crate::git::cmd::commit_with_developer_author(root, "initial", false).expect("commit");
         }
     }
 
@@ -669,105 +617,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_research_loop_completes_immediately_when_no_research_commands() {
-        let mut fixture = Fixture::new(Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand {
-            content: "direct answer".to_string(),
-        })]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        assert!(outcome.is_success());
-        let success = outcome.into_success().expect("success");
-        assert_eq!(success.value.rounds_spent, 0);
-        assert_eq!(success.response.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn run_research_loop_executes_round_and_returns_success() {
-        let responses = vec![MockResponse::text("Here is the plan analysis.")];
-        let mut fixture = Fixture::new(responses);
-        let envelope =
-            ResponseEnvelope::from_commands(&[LlmCommand::DocRequest(DocRequestCommand {
-                topic: DocTopic::Workflow,
-            })]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        assert!(outcome.is_success());
-        let success = outcome.into_success().expect("success");
-        assert_eq!(success.value.rounds_spent, 1);
-        assert!(!success.response.is_empty());
-    }
-
-    #[tokio::test]
-    async fn run_research_loop_continues_past_a_round_that_only_narrates() {
-        let responses = vec![MockResponse::text("The workflow chapter is loaded.")];
-        let mut fixture = Fixture::new(responses);
-        let envelope = ResponseEnvelope::from_commands(&[
-            LlmCommand::Text(TextCommand {
-                content: "Let me read the workflow chapter first.".to_string(),
-            }),
-            LlmCommand::DocRequest(DocRequestCommand {
-                topic: DocTopic::Workflow,
-            }),
-        ]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        let success = outcome.into_success().expect("success");
-        assert_eq!(success.value.rounds_spent, 1);
-        assert_eq!(
-            fixture.provider.requests().len(),
-            1,
-            "the narration of a discovery round does not end the phase"
-        );
-        let texts: Vec<&str> = success
-            .response
-            .commands()
-            .iter()
-            .filter_map(|command| match command {
-                LlmCommand::Text(command) => Some(command.content.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["The workflow chapter is loaded."]);
-    }
-
-    #[tokio::test]
-    async fn run_research_loop_hands_a_change_set_up_without_another_round() {
-        let mut fixture = Fixture::new(Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[
-            LlmCommand::DocRequest(DocRequestCommand {
-                topic: DocTopic::Workflow,
-            }),
-            LlmCommand::EditReplace(EditReplace {
-                path: "a.rs".to_string(),
-                old_text: "pub fn compute() -> i32 { 0 }".to_string(),
-                new_text: "pub fn compute() -> i32 { 42 }".to_string(),
-            }),
-        ]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        let success = outcome.into_success().expect("success");
-        assert_eq!(success.value.rounds_spent, 1);
-        assert!(success.response.has(LlmCapability::EditReplace));
-    }
-
-    #[tokio::test]
     async fn handle_research_commands_absorbs_scratchpad() {
         let mut fixture = Fixture::new(Vec::new());
         let mut envelope =
@@ -785,120 +634,129 @@ mod tests {
         assert!(!fixture.journal.is_empty());
     }
 
-    /// A round that carries only conversational text and a scratchpad note
-    /// carries no discovery commands, so the research phase exits immediately
-    /// without sending an extra round.
     #[tokio::test]
-    async fn run_research_loop_terminates_after_a_scratchpad_only_round() {
+    async fn execute_research_step_reports_a_widened_round() {
         let mut fixture = Fixture::new(Vec::new());
-        let envelope = ResponseEnvelope::from_commands(&[
-            LlmCommand::Text(TextCommand {
-                content: "The function already returns 42.".to_string(),
-            }),
-            LlmCommand::Scratchpad(ScratchpadCommand {
-                notes: "checked the call site".to_string(),
-            }),
-        ]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        let success = outcome.into_success().expect("success");
-        assert_eq!(
-            success.value.rounds_spent, 0,
-            "a scratchpad note is not research progress"
-        );
-        assert!(
-            success.response.has(LlmCapability::TextMessage),
-            "the conversational answer travels upward untouched"
-        );
-        assert!(
-            !fixture.journal.is_empty(),
-            "the note is recorded into the turn journal"
-        );
-        assert_eq!(
-            fixture.provider.requests().len(),
-            0,
-            "no extra round is sent when the envelope already has an answer"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_research_loop_completes_when_max_rounds_reached() {
-        let responses = vec![MockResponse::text("Continued without loop")];
-        let mut fixture = Fixture::new(responses);
-        let envelope =
-            ResponseEnvelope::from_commands(&[LlmCommand::DocRequest(DocRequestCommand {
-                topic: DocTopic::Workflow,
-            })]);
-        let mut ctx = fixture.context();
-        let config = ResearchLoopConfig {
-            max_rounds: 1,
-            ..ResearchLoopConfig::default()
-        };
-
-        let outcome = run_research_loop(&mut ctx, envelope, &config)
-            .await
-            .expect("runs loop");
-
-        assert!(outcome.is_success());
-        let success = outcome.into_success().expect("success");
-        assert_eq!(success.value.rounds_spent, 1);
-    }
-
-    #[tokio::test]
-    async fn run_research_loop_explains_a_request_the_context_already_satisfies() {
-        let responses = vec![MockResponse::text(
-            "The helper is already loaded; here is the answer.",
-        )];
-        let mut fixture = Fixture::new(responses);
-        let root = fixture.dir.path();
-        crate::git::init_repository(Some(root), true).expect("repository");
-        std::fs::write(root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n").unwrap();
-        crate::git::cmd::stage_files(root, &["helper.rs".to_string()]).unwrap();
-        crate::git::cmd::commit_with_developer_author(root, "initial", false).unwrap();
-        fixture
-            .context
-            .add_file("helper.rs", tauqe_protocol::ContextAccess::ReadOnly)
-            .unwrap();
-        let envelope =
+        crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
+        fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
+        let mut envelope =
             ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(ContextRequestCommand {
                 path: "helper.rs".to_string(),
-                access: tauqe_protocol::ContextAccess::ReadOnly,
+                access: ContextAccess::ReadOnly,
             })]);
         let mut ctx = fixture.context();
 
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
+        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
             .await
-            .expect("runs loop");
-
-        assert!(outcome.is_success());
-        let success = outcome.into_success().expect("success");
-        assert_eq!(
-            success.value.rounds_spent, 0,
-            "hint round does not increment rounds_spent"
+            .expect("executes");
+        assert_eq!(step.kind, ResearchStepKind::Widened);
+        assert!(
+            ctx.context_manager
+                .contains("helper.rs")
+                .expect("the path resolves"),
+            "the delivered file joins the context"
         );
+        assert!(
+            ctx.transcript().prefix_is_stale(),
+            "the widened context marks the transcript prefix stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_research_step_explains_a_request_the_context_already_satisfies() {
+        let mut fixture = Fixture::new(Vec::new());
+        crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
+        fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
+        fixture
+            .context
+            .add_file("helper.rs", ContextAccess::ReadOnly)
+            .expect("the helper is already loaded");
+        let mut envelope =
+            ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(ContextRequestCommand {
+                path: "helper.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            })]);
+        let mut ctx = fixture.context();
+
+        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
+            .await
+            .expect("executes");
+        assert_eq!(step.kind, ResearchStepKind::AlreadySatisfied);
         assert!(
             fixture
                 .journal
                 .entries()
                 .iter()
-                .any(|block| block
-                    .contains("Every file you requested is already loaded in <context>")),
-            "directive must enter the journal"
+                .any(|block| block.contains(ALREADY_SATISFIED_DIRECTIVE)),
+            "the directive explains that the material is already loaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_research_step_explains_a_round_that_widened_nothing() {
+        let mut fixture = Fixture::new(Vec::new());
+        crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
+        fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
+        let mut envelope =
+            ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(ContextRequestCommand {
+                path: "helper.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            })]);
+        let mut ctx = fixture.context();
+        let config = ResearchLoopConfig {
+            token_budget: 1,
+            ..ResearchLoopConfig::default()
+        };
+
+        let step = execute_research_step(&mut ctx, &mut envelope, &config)
+            .await
+            .expect("executes");
+        assert_eq!(step.kind, ResearchStepKind::DeadEnd);
+        assert!(
+            fixture
+                .journal
+                .entries()
+                .iter()
+                .any(|block| block.contains(EMPTY_RESEARCH_DIRECTIVE)),
+            "the dead end is explained in the journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_research_step_reports_a_missing_file_as_progress() {
+        let mut fixture = Fixture::new(Vec::new());
+        crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
+        fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
+        let mut envelope =
+            ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(ContextRequestCommand {
+                path: "missing.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            })]);
+        let mut ctx = fixture.context();
+
+        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
+            .await
+            .expect("executes");
+        assert_eq!(step.kind, ResearchStepKind::Widened);
+        assert_eq!(step.feedback.missing_files, vec!["missing.rs".to_string()]);
+        assert!(
+            !fixture
+                .journal
+                .entries()
+                .iter()
+                .any(|block| block.contains(EMPTY_RESEARCH_DIRECTIVE)),
+            "a round that reported a missing path is never an empty round"
         );
     }
 
     #[test]
-    fn research_loop_config_from_context_inherits_max_rounds() {
+    fn research_loop_config_from_context_preserves_token_budget() {
         let context_config = crate::config::ContextConfig {
-            max_research_rounds: 10,
+            token_budget: 123456,
             ..Default::default()
         };
         let config = ResearchLoopConfig::from_context(&context_config);
-        assert_eq!(config.max_rounds, 10);
+        assert_eq!(config.token_budget, 123456);
     }
 
     /// The directive names the condition that actually triggers it, so the model
@@ -910,94 +768,5 @@ mod tests {
         assert!(EMPTY_RESEARCH_DIRECTIVE.contains("'edit' branch"));
         assert!(!EMPTY_RESEARCH_DIRECTIVE.contains("all request arrays"));
         assert!(!EMPTY_RESEARCH_DIRECTIVE.contains("were empty"));
-    }
-
-    /// A round whose request the context budget refuses widens nothing, so the
-    /// loop explains the dead end instead of resending the same request.
-    #[tokio::test]
-    async fn run_research_loop_explains_a_round_that_widened_nothing() {
-        let responses = vec![MockResponse::text(
-            "Nothing further to load; here is the answer.",
-        )];
-        let mut fixture = Fixture::new(responses);
-        let root = fixture.dir.path();
-        crate::git::init_repository(Some(root), true).expect("repository");
-        std::fs::write(root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n").unwrap();
-        crate::git::cmd::stage_files(root, &["helper.rs".to_string()]).unwrap();
-        crate::git::cmd::commit_with_developer_author(root, "initial", false).unwrap();
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(
-            tauqe_protocol::ContextRequestCommand {
-                path: "helper.rs".to_string(),
-                access: tauqe_protocol::ContextAccess::ReadOnly,
-            },
-        )]);
-        let mut ctx = fixture.context();
-        let config = ResearchLoopConfig {
-            token_budget: 1,
-            ..ResearchLoopConfig::default()
-        };
-
-        let outcome = run_research_loop(&mut ctx, envelope, &config)
-            .await
-            .expect("runs loop");
-
-        let success = outcome.into_success().expect("success");
-        assert_eq!(
-            success.value.rounds_spent, 0,
-            "a round that widened nothing spends no research round"
-        );
-        assert!(
-            fixture
-                .journal
-                .entries()
-                .iter()
-                .any(|block| block.contains(EMPTY_RESEARCH_DIRECTIVE)),
-            "the dead end is explained in the journal"
-        );
-        assert_eq!(
-            fixture.provider.requests().len(),
-            1,
-            "the model is asked again against the explained dead end"
-        );
-    }
-
-    /// A request for a path the working tree does not hold is progress, not a
-    /// dead end: the missing path carries its own feedback block, so the
-    /// empty-research directive never fires for it.
-    #[tokio::test]
-    async fn run_research_loop_reports_a_missing_file_instead_of_the_empty_directive() {
-        let responses = vec![MockResponse::text("Here is the answer.")];
-        let mut fixture = Fixture::new(responses);
-        let root = fixture.dir.path();
-        crate::git::init_repository(Some(root), true).expect("repository");
-        std::fs::write(root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n").unwrap();
-        crate::git::cmd::stage_files(root, &["helper.rs".to_string()]).unwrap();
-        crate::git::cmd::commit_with_developer_author(root, "initial", false).unwrap();
-        let envelope = ResponseEnvelope::from_commands(&[LlmCommand::ContextRequest(
-            tauqe_protocol::ContextRequestCommand {
-                path: "missing.rs".to_string(),
-                access: tauqe_protocol::ContextAccess::ReadOnly,
-            },
-        )]);
-        let mut ctx = fixture.context();
-
-        let outcome = run_research_loop(&mut ctx, envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("runs loop");
-
-        let success = outcome.into_success().expect("success");
-        assert_eq!(
-            success.value.rounds_spent, 1,
-            "a missing path widens the round, so the phase spends it and asks again"
-        );
-        assert!(
-            !fixture
-                .journal
-                .entries()
-                .iter()
-                .any(|block| block.contains(EMPTY_RESEARCH_DIRECTIVE)),
-            "a round that reported a missing path is never an empty round"
-        );
-        assert_eq!(fixture.provider.requests().len(), 1);
     }
 }

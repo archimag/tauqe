@@ -15,8 +15,7 @@ use tauqe_protocol::{IssueStatus, Plan, PlanItemStatus};
 use crate::control::context::LoopContext;
 use crate::control::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
 use crate::control::plan::step::{
-    run_plan_step_loop_with, PlanDocumentPersistence, PlanStepArtifact, PlanStepLoopConfig,
-    StepPersistence,
+    run_plan_step_loop_with, PlanStepArtifact, PlanStepLoopConfig, StepPersistence,
 };
 use crate::review::ReviewStorage;
 use crate::workflow::implementation::ExecutionScope;
@@ -44,13 +43,8 @@ pub enum PlanSequenceStop {
 
 impl PlanSequenceStop {
     /// Returns `true` if all scheduled steps completed.
-    pub fn is_completed(&self) -> bool {
+    fn is_completed(&self) -> bool {
         matches!(self, Self::Completed)
-    }
-
-    /// Returns `true` if the sequence was halted by a soft stop.
-    pub fn is_stopped(&self) -> bool {
-        matches!(self, Self::Stopped)
     }
 }
 
@@ -60,7 +54,7 @@ pub struct PlanSequenceArtifact {
     /// Artifacts of the individual steps that ran and succeeded.
     pub executed_steps: Vec<PlanStepArtifact>,
     /// Reason the sequence finished.
-    pub stop: PlanSequenceStop,
+    pub(crate) stop: PlanSequenceStop,
 }
 
 impl PlanSequenceArtifact {
@@ -80,14 +74,14 @@ impl PlanSequenceArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewGroupPersistence {
     /// Identifier of the review session that owns the group.
-    pub review_id: String,
+    review_id: String,
     /// Identifier of the group whose horizon is executed.
-    pub group_id: String,
+    group_id: String,
 }
 
 impl ReviewGroupPersistence {
     /// Addresses the horizon of one review group.
-    pub fn new(review_id: impl Into<String>, group_id: impl Into<String>) -> Self {
+    fn new(review_id: impl Into<String>, group_id: impl Into<String>) -> Self {
         Self {
             review_id: review_id.into(),
             group_id: group_id.into(),
@@ -160,14 +154,14 @@ impl StepPersistence for ReviewGroupPersistence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewFindingPersistence {
     /// Identifier of the review session that owns the finding.
-    pub review_id: String,
+    review_id: String,
     /// Audit ordinal of the executed finding.
-    pub item_id: u32,
+    item_id: u32,
 }
 
 impl ReviewFindingPersistence {
     /// Addresses the degenerate horizon of one review finding.
-    pub fn new(review_id: impl Into<String>, item_id: u32) -> Self {
+    fn new(review_id: impl Into<String>, item_id: u32) -> Self {
         Self {
             review_id: review_id.into(),
             item_id,
@@ -300,14 +294,15 @@ impl StepPersistence for ReviewMemberPersistence {
 ///   [`PlanSequenceStop::Stopped`], leaving the completed steps intact.
 /// - If a step diverges (e.g. `<blocked>`) or exhausts its coder ladder, execution halts
 ///   and propagates the [`LoopResult::Diverged`] or [`LoopResult::Exhausted`] outcome.
-pub async fn run_plan_sequence_loop<S: AsRef<str>>(
+#[cfg(test)]
+pub(crate) async fn run_plan_sequence_loop<S: AsRef<str>>(
     ctx: &mut LoopContext<'_>,
     plan_id: &str,
     step_ids: &[S],
     config: &PlanSequenceLoopConfig,
     soft_stop_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<LoopResult<PlanSequenceArtifact>, SystemError> {
-    let persistence = PlanDocumentPersistence::new(plan_id);
+    let persistence = super::step::PlanDocumentPersistence::new(plan_id);
     run_plan_sequence_loop_with(ctx, &persistence, step_ids, config, soft_stop_rx).await
 }
 
@@ -336,6 +331,12 @@ pub async fn run_plan_sequence_loop_with<S: AsRef<str>, P: StepPersistence>(
         // 2. Soft stop observed strictly between steps (Conventions.md §6.2).
         if let Some(rx) = soft_stop_rx {
             if *rx.borrow() {
+                tracing::info!(
+                    repo_root = %ctx.repo_root.display(),
+                    executed = executed_steps.len(),
+                    remaining = step_ids.len().saturating_sub(executed_steps.len()),
+                    "plan sequence stopped between steps"
+                );
                 return Ok(LoopResult::Success(LoopSuccess::new(
                     PlanSequenceArtifact {
                         executed_steps,
@@ -353,14 +354,31 @@ pub async fn run_plan_sequence_loop_with<S: AsRef<str>, P: StepPersistence>(
                 executed_steps.push(success.value);
             }
             LoopResult::Diverged(envelope) => {
+                tracing::warn!(
+                    repo_root = %ctx.repo_root.display(),
+                    step_id,
+                    "plan sequence diverged on a step"
+                );
                 return Ok(LoopResult::Diverged(envelope));
             }
             LoopResult::Exhausted(report) => {
+                tracing::warn!(
+                    repo_root = %ctx.repo_root.display(),
+                    step_id,
+                    attempts = report.attempts,
+                    reason = %report.reason,
+                    "plan sequence exhausted the retry budget of a step"
+                );
                 return Ok(LoopResult::Exhausted(report));
             }
         }
     }
 
+    tracing::info!(
+        repo_root = %ctx.repo_root.display(),
+        steps = executed_steps.len(),
+        "plan sequence completed"
+    );
     Ok(LoopResult::Success(LoopSuccess::new(
         PlanSequenceArtifact {
             executed_steps,
@@ -379,7 +397,7 @@ mod tests {
     use crate::review::ReviewStorage;
 
     use tauqe_protocol::{
-        CapabilityExpr, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan,
+        CapabilityTree, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan,
         PlanImplementation, PlanItem, PlanItemStatus, ReviewGroup, ReviewSession,
     };
 
@@ -438,7 +456,7 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]);
+            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
             let prompt_builder =
                 PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
             LoopContext::new(

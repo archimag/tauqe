@@ -1,5 +1,4 @@
 pub mod batch;
-pub mod common;
 pub mod git_policy;
 pub mod implementation;
 pub mod policy;
@@ -19,15 +18,13 @@ pub use policy::{ApplyPolicy, DirectApplyPolicy};
 
 use crate::workflow::research::ResearchLimits;
 use tauqe_protocol::{
-    ModelRef, ModelResult, PatchStrategy, PlanRejection, PromptLayoutKind, ReasoningEffort,
-    WorkflowKind,
+    ModelRef, ModelResult, PatchStrategy, PlanRejection, ReasoningEffort, WorkflowKind,
 };
 
 /// Execution options and token budgets for edit workflows.
 #[derive(Debug, Clone)]
 pub struct WorkflowOptions {
-    pub max_retries: usize,
-    pub max_research_rounds: usize,
+    pub max_turn_rounds: usize,
     pub token_budget: usize,
     pub history_budget_tokens: u64,
     pub history_tail_turns: usize,
@@ -68,8 +65,7 @@ pub struct WorkflowOptions {
 impl Default for WorkflowOptions {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            max_research_rounds: crate::config::DEFAULT_MAX_RESEARCH_ROUNDS,
+            max_turn_rounds: crate::config::DEFAULT_MAX_TURN_ROUNDS,
             token_budget: crate::config::DEFAULT_TOKEN_BUDGET,
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
@@ -90,10 +86,8 @@ impl Default for WorkflowOptions {
 impl WorkflowOptions {
     /// Constructs workflow options from the unified application configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
-        let max_retries = config.repl.max_retries;
         Self {
-            max_retries,
-            max_research_rounds: config.context.max_research_rounds,
+            max_turn_rounds: config.repl.max_turn_rounds,
             token_budget: config.context.token_budget,
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
@@ -121,21 +115,6 @@ impl WorkflowOptions {
             .as_ref()
             .map(|config| config.repl.patch_strategy)
             .unwrap_or_default()
-    }
-
-    /// Returns the prompt layout policy that composes this turn's messages.
-    ///
-    /// The declared `[repl]` key of the governing project configuration wins
-    /// for every turn; without one the caller's typed argument decides: a turn
-    /// that carries a growing session history builds the chronological
-    /// transcript, while a turn that carries none keeps the semantic block
-    /// order. Options that carry no governing configuration keep the semantic
-    /// policy, which every contour renders correctly.
-    pub fn prompt_layout(&self, carries_session_history: bool) -> PromptLayoutKind {
-        self.app_config
-            .as_ref()
-            .map(|config| config.resolve_prompt_layout(carries_session_history))
-            .unwrap_or(PromptLayoutKind::Semantic)
     }
 }
 

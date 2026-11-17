@@ -1,7 +1,7 @@
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
-pub const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
+pub(crate) const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
 
 /// Joins identifiers or paths into a single escaped, comma-separated line.
 fn join_escaped(items: &[String]) -> String {
@@ -181,7 +181,7 @@ pub fn format_plan_discussion_prompt(
 }
 
 /// Formats the plan, its concept tree, and implementation items into a prompt block for LLM context.
-pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
+pub(crate) fn format_active_plan_context(plan: &Plan) -> Option<String> {
     if plan.concept.is_empty() && plan.implementation.items.is_empty() {
         return None;
     }

@@ -4,9 +4,7 @@
 //! structured instruction without a `CapabilityModule` trait or `CapabilityRegistry`
 //! indirection.
 
-use tauqe_protocol::{
-    CapabilityExpr, LlmCapability, ProjectConfig, ProjectParameterSpec, PromptLayoutKind,
-};
+use tauqe_protocol::{CapabilityTree, LlmCapability, ProjectConfig, ProjectParameterSpec};
 
 use crate::edits::strategy::StrategyProfile;
 use crate::prompt::ContourKind;
@@ -24,18 +22,17 @@ const PLAN_STRUCTURED_REPL_DELTA: &str = "In REPL mode, you may ONLY propose new
 const PLAN_STRUCTURED_DISCUSSION_DELTA: &str = "In plan discussion mode, populate the structured `plan_update` field with `action: \"save\"|\"update\"`. Plan Action Semantics: use `action: \"save\"` to create or completely overwrite the whole plan, and `action: \"update\"` strictly to modify specific nodes or items in place by ID without touching unmentioned ones. Code modifications requested directly by the developer are permitted alongside the discussion, and they travel the ordinary transactional path. Reins Invariant: never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it; questions, analysis, trade-off reviews, and critique are answered strictly in conversational text in `message`.";
 /// Guarantee the harness states about every proposed change set.
 ///
-/// The trunk rule of a turn that advertises [`LlmCapability::ToolchainVerify`]
-/// and the rule an isolated step receives render this one sentence, so both
-/// contours promise the same deterministic verification instead of drifting
-/// apart.
+/// The rule an isolated step receives renders this sentence, so every
+/// contour that verifies a change set promises the same deterministic
+/// verification instead of drifting apart.
 pub(crate) const CODE_VERIFICATION_GUARANTEE: &str = "After every change set you propose, the harness verifies it automatically and deterministically with the checks the project declares, such as compilation, linters, and tests. A change set that fails a check is rejected and never reaches the repository: you receive the clean diagnostics and fix only the lines they name.";
 pub struct ContractRule {
-    pub title: String,
-    pub body: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
 }
 
 impl ContractRule {
-    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+    pub(crate) fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             title: title.into(),
             body: body.into(),
@@ -57,51 +54,35 @@ pub fn render_contract_rules(rules: &[ContractRule]) -> String {
 }
 
 pub struct ContractContext<'a> {
-    pub render: PromptRenderContext<'a>,
-    pub prompt_layout: PromptLayoutKind,
-    pub has_eager_repo_map: bool,
+    render: PromptRenderContext<'a>,
+    has_eager_repo_map: bool,
     /// Typed kind of the contour that drives the turn.
     ///
     /// The contour is declared by the loop that owns the turn, so the rules of a
     /// regime follow that declaration instead of a composition of leaves.
-    pub contour: ContourKind,
+    pub(crate) contour: ContourKind,
 }
 
 impl<'a> ContractContext<'a> {
-    pub fn new(render: PromptRenderContext<'a>) -> Self {
+    pub(crate) fn new(render: PromptRenderContext<'a>) -> Self {
         let has_eager_repo_map = render.has_eager_repo_map;
         Self {
             render,
-            prompt_layout: PromptLayoutKind::Semantic,
             has_eager_repo_map,
             contour: ContourKind::Dialogue,
         }
     }
 
-    pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
-        self.has_eager_repo_map = has_eager_repo_map;
-        self.render.has_eager_repo_map = has_eager_repo_map;
-        self
-    }
-
-    pub fn with_prompt_layout(mut self, prompt_layout: PromptLayoutKind) -> Self {
-        self.prompt_layout = prompt_layout;
-        self
-    }
-
     /// Declares the contour that drives the turn.
-    pub fn with_contour(mut self, contour: ContourKind) -> Self {
+    pub(crate) fn with_contour(mut self, contour: ContourKind) -> Self {
         self.contour = contour;
         self
     }
 }
 
 /// Builds the rule describing how the context material reaches the model.
-pub(crate) fn context_surface_rule(ctx: &ContractContext<'_>) -> ContractRule {
-    let container = match ctx.prompt_layout {
-        PromptLayoutKind::Semantic => "The project state arrives as one `<context>` block inside the system prompt: the `<file>` elements follow one another in insertion order, and a file that entered the context in a later round is appended at the end of the same block.",
-        PromptLayoutKind::Chronological => "The project state arrives as a transcript: `<file>` elements are appended as their own messages in the order they entered the context, each one after the interaction record that observed it, while a `<context_manifest>` tail lists the path and access of every file currently in context without repeating its content.",
-    };
+fn context_surface_rule() -> ContractRule {
+    let container = "The project state arrives as a transcript: `<file>` elements are appended as their own messages in the order they entered the context, each one after the interaction record that observed it, while a `<context_manifest>` tail lists the path and access of every file currently in context without repeating its content.";
     ContractRule::new(
         "Context Surface",
         format!("{container} {FILE_ELEMENT_CONTRACT}"),
@@ -202,13 +183,13 @@ fn render_custom_tool_list(project: &ProjectConfig) -> String {
 
 /// Closing sentence of the research rule: it states how one round of discovery is
 /// dispatched, and both variants of the rule end with it.
-const RESEARCH_ROUND_DISCIPLINE: &str = "Send every request of a round in one response instead of spreading one round of discovery across several answers, and when asked to inspect or modify code that is not in context, dispatch those requests rather than asking the developer for paths or answering with passive advice.";
+const RESEARCH_ROUND_DISCIPLINE: &str = "A turn proceeds across autonomous rounds: choosing `research` executes your requests and immediately starts the next round of the same turn with the loaded context; choosing `answer`, `edit`, or `plan` concludes the turn. Operational Action Contract: `message` carries your conversational voice, while `action` dictates the turn state. The `answer` branch carries no payload because it is the completion marker: choose `answer` when your response in `message` is final and completely answers the developer without further context. Zero Promissory Prose Invariant: Never promise in `message` to inspect, search, or read files in the future. If you need context, you MUST populate `context_requests` or `repo_searches` with concrete items in this exact response. Stating that you are loading or searching for files while leaving research arrays empty or selecting `answer` is strictly prohibited. Send every request of a round in one response instead of spreading discovery across multiple turns, and when asked to inspect or modify code that is not in context, dispatch those requests rather than asking the developer for paths or answering with passive advice.";
 
 pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Option<ContractRule> {
     match capability {
         LlmCapability::TextMessage => Some(ContractRule::new(
             "Conversational Response",
-            "Answer in the language of the developer's request and format the answer as readable Markdown: short paragraphs, bullet lists for enumerations, fenced code blocks for code or commands, and headings only for an answer long enough to need them. An analytical or exploratory request is answered in prose and never deferred: once the files, searches, or documentation you requested are available, the same turn carries the written analysis the developer asked for. An empty answer is never a valid conclusion, and no terminal signal stands in for an answer you have not written.",
+            "Answer in the language of the developer's request. Speak naturally like an experienced engineer explaining architecture to a peer: prefer plain, connected explanations over robotic bureaucracy or compressed shorthand. Organize answers around what the developer needs to understand, not the chronological order of your investigation; synthesize findings into a coherent explanation rather than presenting working notes or exploration logs. State the core conclusion before diving into code details. Assume general programming expertise, but do not assume familiarity with repository-specific implementation: briefly explain the architectural role and relevance of referenced code, as identifiers and paths alone are insufficient. Include specific symbols only when they clarify cause and effect or help locate code. Be concise by eliminating praise, filler, and repetitive statements, never by cutting out necessary explanations. Format the answer as clean, readable Markdown that aids comprehension without visual clutter: short paragraphs, bullet lists for enumerations, fenced code blocks for code or commands, and headings only when structure demands them. An analytical or exploratory request is answered in prose and never deferred: once the files, searches, or documentation you requested are available, the same turn carries the written analysis the developer asked for. An empty answer is never a valid conclusion, and no terminal signal stands in for an answer you have not written.",
         )),
         LlmCapability::EditReplace => {
             let mut body = String::from(
@@ -239,10 +220,6 @@ pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Op
             );
             Some(ContractRule::new("Self-Knowledge", body))
         }
-        LlmCapability::ToolchainVerify => Some(ContractRule::new(
-            "Code Verification",
-            CODE_VERIFICATION_GUARANTEE,
-        )),
         LlmCapability::PlanCreation => Some(ContractRule::new(
             "Local Engineering Plans",
             PLAN_STRUCTURED_CORE_BODY.to_string(),
@@ -268,8 +245,7 @@ pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Op
                 ),
             ))
         }
-        LlmCapability::ShortDescription
-        | LlmCapability::Scratchpad
+        LlmCapability::Scratchpad
         | LlmCapability::CommitMessage
         | LlmCapability::EditCreate
         | LlmCapability::EditDelete
@@ -288,7 +264,7 @@ pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Op
     }
 }
 
-pub fn delta_rule(capability: LlmCapability, expr: &CapabilityExpr) -> Option<ContractRule> {
+pub fn delta_rule(capability: LlmCapability, expr: &CapabilityTree) -> Option<ContractRule> {
     match capability {
         LlmCapability::PlanCreation => {
             let body = if expr.contains(LlmCapability::PlanUpdate) {
@@ -322,16 +298,16 @@ pub fn structured_instruction(
     }
 }
 
-fn enabled_capabilities<'a>(expr: &'a CapabilityExpr) -> impl Iterator<Item = LlmCapability> + 'a {
+fn enabled_capabilities<'a>(expr: &'a CapabilityTree) -> impl Iterator<Item = LlmCapability> + 'a {
     LlmCapability::ALL
         .iter()
         .copied()
         .filter(move |cap| expr.contains(*cap))
 }
 
-pub fn compose_contract_rules(expr: &CapabilityExpr, ctx: &ContractContext<'_>) -> String {
+pub fn compose_contract_rules(expr: &CapabilityTree, ctx: &ContractContext<'_>) -> String {
     let mut rules = regime::shared_trunk_rules(ctx, expr);
-    rules.insert(rules.len().min(1), context_surface_rule(ctx));
+    rules.insert(rules.len().min(1), context_surface_rule());
     for capability in enabled_capabilities(expr) {
         if let Some(rule) = contract_rule(capability, ctx) {
             rules.push(rule);
@@ -352,7 +328,7 @@ pub fn compose_contract_rules(expr: &CapabilityExpr, ctx: &ContractContext<'_>) 
 }
 
 pub fn compose_structured_protocol_instructions(
-    expr: &CapabilityExpr,
+    expr: &CapabilityTree,
     ctx: &PromptRenderContext<'_>,
 ) -> String {
     compose(expr, ctx, |capability, render_ctx| {
@@ -361,7 +337,7 @@ pub fn compose_structured_protocol_instructions(
 }
 
 fn compose(
-    expr: &CapabilityExpr,
+    expr: &CapabilityTree,
     ctx: &PromptRenderContext<'_>,
     render: impl Fn(LlmCapability, &PromptRenderContext<'_>) -> Option<String>,
 ) -> String {
@@ -377,7 +353,6 @@ fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::CapabilityBranch;
 
     fn plain_context() -> ContractContext<'static> {
         ContractContext::new(PromptRenderContext::new(&[], None))
@@ -411,6 +386,49 @@ mod tests {
         assert!(rule.body.contains("one response"));
     }
 
+    #[test]
+    fn the_research_rule_states_the_action_contract_and_the_promissory_invariant() {
+        let ctx = plain_context();
+        let rule = contract_rule(LlmCapability::ContextRequest, &ctx).expect("rule rendered");
+
+        // A model that reads only the discovery rule still learns where its answer
+        // text lives and that the bare `answer` branch is the marker closing the
+        // turn, so the paragraph states the contract before the prohibition.
+        assert!(rule.body.contains("Operational Action Contract"));
+        assert!(rule
+            .body
+            .contains("`message` carries your conversational voice"));
+        assert!(rule.body.contains("`action` dictates the turn state"));
+        assert!(rule.body.contains("carries no payload"));
+        assert!(rule.body.contains("completion marker"));
+        assert!(rule
+            .body
+            .contains("choosing `answer`, `edit`, or `plan` concludes the turn"));
+
+        // Promissory prose is the failure the paragraph exists to forbid: a promise
+        // to read a file is a research request, so it must arrive with the arrays
+        // that carry it in the same response.
+        assert!(rule.body.contains("Zero Promissory Prose Invariant"));
+        assert!(rule.body.contains("Never promise in `message`"));
+        assert!(rule
+            .body
+            .contains("MUST populate `context_requests` or `repo_searches`"));
+        assert!(rule.body.contains("strictly prohibited"));
+
+        let contract = rule
+            .body
+            .find("Operational Action Contract")
+            .expect("contract");
+        let invariant = rule
+            .body
+            .find("Zero Promissory Prose Invariant")
+            .expect("invariant");
+        assert!(
+            contract < invariant,
+            "the contract precedes the invariant it governs"
+        );
+    }
+
     fn project(source: &str) -> ProjectConfig {
         serde_json::from_str(source).expect("the project section parses")
     }
@@ -418,24 +436,24 @@ mod tests {
     #[test]
     fn structured_schema_is_composed_from_the_capability_tree() {
         let render = PromptRenderContext::new(&[], None);
-        let expr = CapabilityExpr::set([
-            CapabilityExpr::leaf(LlmCapability::TextMessage),
-            CapabilityExpr::any_of(
+        let expr = CapabilityTree::root([
+            CapabilityTree::leaf(LlmCapability::TextMessage),
+            CapabilityTree::any_of(
                 "action",
                 [
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "research",
-                        CapabilityExpr::set([
-                            CapabilityExpr::leaf(LlmCapability::ContextRequest),
-                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                        ]),
+                        [
+                            CapabilityTree::leaf(LlmCapability::ContextRequest),
+                            CapabilityTree::leaf(LlmCapability::CommitMessage),
+                        ],
                     ),
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "edit",
-                        CapabilityExpr::set([
-                            CapabilityExpr::leaf(LlmCapability::EditReplace),
-                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                        ]),
+                        [
+                            CapabilityTree::leaf(LlmCapability::EditReplace),
+                            CapabilityTree::leaf(LlmCapability::CommitMessage),
+                        ],
                     ),
                 ],
             ),
@@ -534,7 +552,7 @@ mod tests {
         // A surface that cannot invoke a project command advertises neither the
         // principle of the allowlist nor a command it declares.
         let without =
-            CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
+            CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
         let composed = compose_contract_rules(&without, &ctx);
         assert!(!composed.contains("Project Custom Tools"));
         assert!(!composed.contains("`check`"));
@@ -542,7 +560,7 @@ mod tests {
         // The declared capability renders the static principle beside the dynamic
         // command list of the project.
         let with =
-            CapabilityExpr::from_leaves([LlmCapability::TextMessage, LlmCapability::CustomTools]);
+            CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::CustomTools]);
         let composed = compose_contract_rules(&with, &ctx);
         assert!(composed.contains("Project Custom Tools"));
         assert!(composed.contains("closed allowlist"));
@@ -555,6 +573,8 @@ mod tests {
         assert_eq!(rule.title, "Conversational Response");
         assert!(rule.body.contains("language of the developer's request"));
         assert!(rule.body.contains("readable Markdown"));
+        assert!(rule.body.contains("programming expertise"));
+        assert!(rule.body.contains("eliminating praise, filler"));
         assert!(rule.body.contains("same turn carries the written analysis"));
         assert!(rule
             .body
@@ -567,11 +587,7 @@ mod tests {
     #[test]
     fn the_removed_capabilities_contribute_no_contract_rule() {
         let ctx = plain_context();
-        for capability in [
-            LlmCapability::ShortDescription,
-            LlmCapability::Scratchpad,
-            LlmCapability::CommitMessage,
-        ] {
+        for capability in [LlmCapability::Scratchpad, LlmCapability::CommitMessage] {
             assert!(
                 contract_rule(capability, &ctx).is_none(),
                 "{capability} states its semantics through the schema, not through a rule"

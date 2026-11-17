@@ -12,13 +12,18 @@ enum MutationCommit {
     /// The mutation is written to storage.
     Persist,
     /// The mutation is validated and recorded in the batch snapshot only.
+    #[cfg(test)]
     Probe,
 }
 
 impl MutationCommit {
     /// Reports whether this contract writes the mutation to storage.
     fn persists(self) -> bool {
-        matches!(self, Self::Persist)
+        match self {
+            Self::Persist => true,
+            #[cfg(test)]
+            Self::Probe => false,
+        }
     }
 
     /// Applies one validated plan under this contract and returns the document
@@ -31,6 +36,7 @@ impl MutationCommit {
     ) -> anyhow::Result<Plan> {
         match self {
             Self::Persist => PlanStorage::save_plan_in_snapshot_unlocked(repo_root, snapshot, plan),
+            #[cfg(test)]
             Self::Probe => {
                 let prepared = PlanStorage::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
                 snapshot.remember(prepared.plan.clone(), prepared.target_file);
@@ -462,7 +468,8 @@ impl PlanStorage {
     }
 
     /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage.
-    pub fn apply_discussion_plan_update(
+    #[cfg(test)]
+    pub(crate) fn apply_discussion_plan_update(
         repo_root: &Path,
         update: &DiscussionPlanUpdate,
     ) -> PlanApplicationOutcome {
@@ -474,7 +481,7 @@ impl PlanStorage {
     }
 
     /// Applies a batch of structured discussion updates as one storage transaction.
-    pub fn apply_discussion_plan_updates_with_mode(
+    pub(crate) fn apply_discussion_plan_updates_with_mode(
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],
         mode: PlanMutationMode,
@@ -529,7 +536,8 @@ impl PlanStorage {
         outcomes
     }
 
-    pub fn apply_discussion_plan_update_with_mode(
+    #[cfg(test)]
+    fn apply_discussion_plan_update_with_mode(
         repo_root: &Path,
         update: &DiscussionPlanUpdate,
         mode: PlanMutationMode,
@@ -539,7 +547,8 @@ impl PlanStorage {
             .unwrap_or_default()
     }
 
-    pub fn validate_discussion_plan_updates(
+    #[cfg(test)]
+    fn validate_discussion_plan_updates(
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],
         mode: PlanMutationMode,
@@ -550,6 +559,7 @@ impl PlanStorage {
         })
     }
 
+    #[cfg(test)]
     fn probe_discussion_plan_updates_unlocked(
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],

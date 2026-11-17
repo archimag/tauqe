@@ -31,12 +31,13 @@ impl Default for DiscussionStreamFilter {
 }
 
 impl DiscussionStreamFilter {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    fn new() -> Self {
         Self::default()
     }
 
     /// Creates a filter streaming the specified top-level JSON string field.
-    pub fn with_target_field(target_field: impl Into<String>) -> Self {
+    pub(crate) fn with_target_field(target_field: impl Into<String>) -> Self {
         Self {
             target_field: target_field.into(),
             passthrough: None,
@@ -67,7 +68,7 @@ impl DiscussionStreamFilter {
     }
 
     /// Pushes a delta chunk and yields any unescaped `TextDelta` stream events.
-    pub fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
+    fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
@@ -108,7 +109,7 @@ impl DiscussionStreamFilter {
     }
 
     /// Flushes any remaining streamed content and deserializes the structured response.
-    pub fn finish_internal(&mut self) -> Vec<StreamEvent> {
+    fn finish_internal(&mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         if self.passthrough == Some(true) {
             self.response = Some(Self::parse_response(&self.buffer));
@@ -151,7 +152,8 @@ impl DiscussionStreamFilter {
     }
 
     /// Consumes the filter, flushing remaining text deltas and returning the parsed response.
-    pub fn finish_with_response(mut self) -> (Vec<StreamEvent>, DiscussionResponse) {
+    #[cfg(test)]
+    fn finish_with_response(mut self) -> (Vec<StreamEvent>, DiscussionResponse) {
         let events = self.finish_internal();
         let resp = self
             .response
@@ -160,13 +162,13 @@ impl DiscussionStreamFilter {
         (events, resp)
     }
 
-    /// Returns the parsed structured response if available.
-    pub fn response(&self) -> Option<&DiscussionResponse> {
+    #[cfg(test)]
+    fn response(&self) -> Option<&DiscussionResponse> {
         self.response.as_ref()
     }
 
     /// Robustly parses a raw model output into `DiscussionResponse` with resilient fallbacks.
-    pub fn parse_response(raw: &str) -> DiscussionResponse {
+    fn parse_response(raw: &str) -> DiscussionResponse {
         let clean = raw.trim();
         if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(clean) {
             Self::sanitize_plan_update(&mut resp);

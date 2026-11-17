@@ -9,9 +9,8 @@
 //! The advertised surface is the synthesis tree of the Architect control loop:
 //! the Architect reads context, searches the repository, requests symbol contours,
 //! consults the documentation, records working notes, and reports a terminal
-//! status. It never edits a file and never runs the toolchain, so neither
-//! [`LlmCapability::FileEdits`] nor [`LlmCapability::ToolchainVerify`] belongs
-//! to it. A synthesis runs unattended exactly as an isolated step does, so the
+//! status. It never edits a file, so no file-edit capability belongs to it. A
+//! synthesis runs unattended exactly as an isolated step does, so the
 //! surface keeps the abort escape hatch: a condition that only the developer
 //! can repair on the host is reported through [`LlmCapability::Abort`] instead
 //! of an improvised surrogate or a misreported blocker.
@@ -29,7 +28,7 @@
 use std::borrow::Cow;
 
 use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityExpr, CommitMessageCommand, ContextAccess,
+    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextAccess,
     ContextRequestCommand, EditProtocolKind, LlmCommand, PatchStrategy, ProjectConfig,
     RepoMapCommand, RepoSearchCommand, TextCommand,
 };
@@ -48,7 +47,7 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRefinePromptProtocol {
     /// Strict capability tree this protocol advertises.
-    capabilities: CapabilityExpr,
+    capabilities: CapabilityTree,
 }
 
 impl Default for PlanRefinePromptProtocol {
@@ -59,7 +58,7 @@ impl Default for PlanRefinePromptProtocol {
 
 impl PlanRefinePromptProtocol {
     /// Creates the protocol bound to the architect research surface.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             capabilities: crate::control::refine::architect_synthesis_capability_expr(),
         }
@@ -69,7 +68,7 @@ impl PlanRefinePromptProtocol {
     ///
     /// The envelope is read from the declarative definition of the contour, so
     /// the provider format restates neither the schema name nor its strictness.
-    pub fn response_schema_format(&self) -> ResponseFormat {
+    fn response_schema_format(&self) -> ResponseFormat {
         let definition = plan_refine_response_schema_definition();
         let name = definition
             .get("name")
@@ -105,7 +104,7 @@ impl PlanRefinePromptProtocol {
     /// fragment of the user message, so one protocol serves the initial
     /// synthesis, a replanning wave, and a review decomposition without
     /// restating any of them here.
-    pub fn instructions(&self) -> String {
+    fn instructions(&self) -> String {
         refinement_output_contract()
     }
 }
@@ -167,7 +166,7 @@ fn contract_values(schema: &serde_json::Value, pointer: &str) -> Vec<String> {
 /// Detection reads the very object the payload parser reads, so a fenced or
 /// prose-wrapped payload is inspected identically. A `null` field is the idle
 /// representation of an untouched plan and is not a defect.
-pub fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
+pub(crate) fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(raw_text.trim())
         .ok()
         .or_else(|| {
@@ -213,11 +212,11 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         EditProtocolKind::Structured
     }
 
-    fn capability_expr(&self) -> CapabilityExpr {
+    fn capability_expr(&self) -> CapabilityTree {
         self.capabilities.clone()
     }
 
-    fn with_capability_expr(&self, expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
+    fn with_capability_expr(&self, expr: CapabilityTree) -> Box<dyn PromptProtocol> {
         Box::new(Self { capabilities: expr })
     }
 
@@ -372,7 +371,6 @@ mod tests {
         // surface keeps the escape hatch that demands a host action instead of
         // improvising a surrogate change or misreporting a blocker.
         assert!(protocol.supports(LlmCapability::Abort));
-        assert!(!protocol.supports(LlmCapability::ToolchainVerify));
     }
 
     #[test]

@@ -1,8 +1,15 @@
-# 3. The Autonomous Bounded Turn FSM
+# 3. The Autonomous Bounded Turn
 
-A turn is not a conversation with a model. It is a finite-state machine that
-carries one stated objective through research, proposal, staging, verification, and
-healing, and then either commits the result or restores the repository.
+A turn is not a conversation with a model. It is a set of deterministic control
+loops that carry one stated objective through research, proposal, staging,
+verification, and healing, and then either commit the result or restore the
+repository.
+
+The loops live in `crates/core/src/control/` and compose by direct call:
+`run_repl_loop` and the plan executors drive `run_turn_loop`, and `run_turn_loop`
+drives the step functions of its phases — `execute_research_step`,
+`execute_staging_step`, and `execute_edit_step`. No stage asks the model which
+stage runs next.
 
 ---
 
@@ -27,12 +34,14 @@ known recovery path.
 3. **A turn is transactional.** It ends as one commit that carries the explicit
    verdict of its verification run, or the working tree returns to its pre-turn
    state.
-4. **Every phase is bounded.** Research rounds, patch retries, healing rounds, and
-   replanning cycles all have finite budgets.
+4. **The turn is bounded.** Every provider call — a discovery round, a patch retry,
+   a healing round, the correction of an empty answer, and the proposal itself —
+   spends one unit of the same `repl.max_turn_rounds` pool, and replanning has its
+   own finite budget on top of it.
 5. **The process is deterministic; the content is generative.** The model chooses
    what to write, never which stage runs next.
 6. **Volatile data never moves the cached prefix of the prompt.** Which is what
-  keeps a multi-round turn economically viable.
+   keeps a multi-round turn economically viable.
 7. **Silence is not an action.** A round the harness cannot act upon is a
    non-answer, whatever status it declares. It is re-asked, and a budget that
    runs out ends the turn with a visible error instead of a validated silence.
@@ -41,65 +50,91 @@ known recovery path.
 
 ## 3.2 Mental Model & Ontology ("What")
 
-### 3.2.1 The capability tree of a control loop
+### 3.2.1 The control loops and the capability tree
 
-Every turn runs in exactly one regime, and the regime is declared by the loop function
-that runs it rather than by a value handed in from outside:
+Every turn runs in exactly one regime, and the regime is declared by the loop
+function that runs it rather than by a value handed in from outside:
 
-- `run_repl_loop` — free interactive dialogue started from the REPL, including a
-  dialogue anchored on a plan or on a review finding;
-- `run_turn_loop` — execution of one plan step or one review finding;
-- the architect refinement contour — the Architect projects the unfinished horizon of
-  a plan from repository evidence.
+- `run_repl_loop` (`control/repl.rs`) — interactive dialogue started from the REPL,
+  including a dialogue anchored on a plan or on a review finding;
+- `run_turn_loop` (`control/turn.rs`) — the body of one turn: the opening round, the
+  research rounds, and the edit phase;
+The phases inside `run_turn_loop` are step functions rather than loops:
+`execute_research_step` (`control/turn/research.rs`) executes one discovery round,
+`execute_staging_step` (`control/turn/staging.rs`) applies one change set to the
+virtual tree, and `execute_edit_step` (`control/turn/edit.rs`) runs one application
+and verification pass. Each of them returns a typed result to the turn loop, which
+alone decides whether the turn asks again or concludes.
+- `run_plan_step_loop` (`control/plan/step.rs`) — one leaf of a plan driven through
+  the coder ladder until it reaches a terminal state;
+- `run_plan_sequence_loop` (`control/plan/sequence.rs`) — an ordered sequence of
+  leaves observing the soft-stop boundary between them;
+- `run_fixed_plan_loop` (`control/plan/fixed.rs`) — every `Todo` leaf of one plan
+  collected in preorder, executed as a sequence, followed by the container refresh;
+- `run_structured_refine` (`control/refine.rs`) — the Architect reprojects the
+  unfinished horizon of a plan from repository evidence.
 
 Each of those functions owns the tree of its own surface and hands it to the shared
-kernel through `LoopContext::capabilities`. `repl_capability_expr` in
-`control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis tree
-in `control/refine.rs` are the only declarations of a capability surface: nothing else
-constructs one, and no enumeration of turn intents exists to be consulted instead.
+execution context through `LoopContext::capabilities`. `repl_capability_expr` in
+`control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis
+tree in `control/refine.rs` are the only declarations of a capability surface:
+nothing else constructs one, and no enumeration of turn intents exists to be
+consulted instead.
+
+The dialogue tree is two ambient channels beside one union of branches. The turn
+scratchpad and the single conversational message accompany every round, so they
+belong to no branch; the `action` union
+names the branch a round follows, and a round follows exactly one of them. Plan
+authoring stays available in every dialogue, because asking for a plan is not a
+mutation, while plan mutation is added only when the dialogue is anchored on a
+plan — and then both payloads are wrapped in one `plan_action` union whose `kind`
+values are `create` and `modify`, so the two never share one level. A dialogue
+anchored on a review session adds the branch that carries the typed decision.
 
 The tree is composed from typed request parameters, never from prompt text, and it
-decides everything the regime implies — which capabilities narrow the protocol, whether
-plan mutation is authorized, whether the assembled prompt carries the `<history>` block,
-and which prompt layout the turn runs under. Narrowing is a typed intersection:
-whatever a protocol advertises is cut down to the tree the loop declares, so the prompt
-and the decoder observe one surface — a capability is never advertised while remaining
-undecodable, nor decoded while hidden from the instructions. The interactive dialogue
-loop carries the dialogue head without plan mutation, and the bounded turn carries no
-plan permission at all. Plan mutation reaches a turn exclusively through the dialogue
-loop, which adds it when the dialogue is anchored on a plan. Plan creation is not
-mutation: it stays in the dialogue head, so a developer may request a plan at any
-moment of a dialogue. Every turn uses the strict structured output protocol
-(`response_format: json_schema`), so all operational commands are typed properties
-within the strict schema, guaranteeing deterministic constrained decoding without
-protocol discrepancies.
+decides everything the regime implies — which capabilities narrow the protocol,
+whether plan mutation is authorized, and whether the assembled prompt carries the
+`<history>` block. Narrowing is a typed intersection: whatever a protocol
+advertises is cut down to the tree the loop declares, so the prompt and the
+decoder observe one surface — a capability is never advertised while remaining
+undecodable, nor decoded while hidden from the instructions. Every turn uses the
+strict structured output protocol (`response_format: json_schema`), so all
+operational commands are typed properties within the strict schema, guaranteeing
+deterministic constrained decoding without protocol discrepancies.
 
-An Architect synthesis declares its own tree in `control/refine.rs`. Its surface is
-the architect research profile — research, plan creation, plan update, the
+The step contour declares the same ambient channels instead of a second head:
+`turn_capability_expr` keeps the scratchpad and the conversational message,
+withholds plan authoring and internal documentation requests, and offers no
+`answer` branch, because a step's regime obliges it to change the tree rather
+than close on prose. A step therefore reasons about one objective, edits the
+tree, discovers material, and reports its change set through the ambient
+message; it never writes a plan document.
+
+The Architect synthesis declares its own tree in `control/refine.rs`. Its surface
+is the architect research profile — research, plan creation, plan update, the
 scratchpad, and the abort escape hatch — with no file-edit capability and no
-toolchain verification, because a synthesis produces a horizon rather than a
-patch. The escape hatch travels with the profile because a synthesis runs
-unattended exactly as an isolated step does: a condition that only the
-developer can resolve on the host system cannot be improvised or downgraded into a
-blocked answer. It renders no session history,
-exactly as an isolated step does: neither loop continues the developer's
-dialogue, so neither prompt carries the `<history>` block. Rendering is not
-recording: a step journals the two-sided card of its own event (§3.2.8), and a
-synthesis is recorded by the caller that started it, because only that caller
-knows the projection it produced. The loop is what puts the synthesis on the
-machine as every other turn: the structured Architect contour is a policy layer
-over the shared turn kernel (§3.3.9), so it inherits the rounds, the prompt
-head, the discovery journal, the corrective budget of an empty answer, and the
-transport retries instead of re-implementing them.
+toolchain gate, because a synthesis produces a horizon rather than a patch. The
+escape hatch travels with the profile because a synthesis runs unattended exactly
+as an isolated step does: a condition that only the developer can resolve on the
+host system cannot be improvised or downgraded into a blocked answer. It renders
+no session history, exactly as an isolated step does: neither loop continues the
+developer's dialogue, so neither prompt carries the `<history>` block. Rendering
+is not recording: a step journals the two-sided card of its own event (§3.2.8),
+and a synthesis is recorded by the caller that started it, because only that
+caller knows the projection it produced. The loop is what puts the synthesis on
+the machine as every other turn: the structured Architect contour is a policy
+layer over the same round machinery every contour uses, so it inherits the
+rounds, the prompt head, the discovery journal, the corrective budget of an empty
+answer, and the transport retries instead of re-implementing them.
 
 The loop also owns the brief of its contour. It hands the assembly a typed
 `TurnBrief` — the kind of the contour, the role the model fills, a short
 statement of the paradigm, and the task — so the prompt renders what the loop
 declared instead of selecting a text by a boolean flag. The flag survives only
-where it governs behaviour the prompt does not own: hiding the active plan, the
-dialogue session identifier, and the layout choice. The mode-specific rules of
-the prompt are gated on the typed kind the brief carries, never on a heuristic
-that infers a regime from the shape of a surface.
+where it governs behaviour the prompt does not own: hiding the active plan and the
+dialogue session identifier. The mode-specific rules of the prompt are gated on
+the typed kind the brief carries, never on a heuristic that infers a regime from
+the shape of a surface.
 
 ### 3.2.2 TurnPhase
 
@@ -121,29 +156,31 @@ per applied proposal.
 
 A protocol declares what it supports as a set of capabilities — text message, file
 edits, research, internal documentation requests, external project documentation
-requests, toolchain verification, plan creation, plan update, scratchpad, terminal
-signals (`commit_message`, `error_message`, `reason`), blocked, abort, project custom
-tools. A capability expression is a typed tree of those capabilities. A control loop
-declares its tree through its own `run_*_loop` function, and intersecting a protocol
-surface with that tree is the only sanctioned way to narrow a protocol. The same tree
-renders the response schema and decodes the round, so a capability is advertised
-exactly when it is decoded, and the label of an operational branch is data the
-contour sets rather than a value sniffed from the leaves.
+requests, project custom tools, plan creation, plan update, review decisions,
+scratchpad, terminal signals (`commit_message`, `error_message`, `reason`),
+blocked, abort. A capability expression is a typed tree of those capabilities. A
+control loop declares its tree through its own `run_*_loop` function, and
+intersecting a protocol surface with that tree is the only sanctioned way to
+narrow a protocol. The same tree renders the response schema and decodes the
+round, so a capability is advertised exactly when it is decoded, and the label of
+an operational branch is data the contour sets rather than a value sniffed from
+the leaves.
 
 The `abort` capability closes a turn unconditionally when the remaining work
 needs an action only the developer can perform on the host system, such as
 installing a package or starting a service. The coder ladder never retries such a
-turn, because no stronger tier can supply a capability the host lacks. Both
-escape hatches are the property of the autonomous step contour: a dialogue
-declares neither `blocked` nor `abort` and carries no step-termination signal in
-any of its branches, because an unattended step is the only contour that has to
-report a condition its own turn cannot resolve.
+turn, because no stronger tier can supply a capability the host lacks. The
+`blocked` outcome is its semantic sibling: the step's preconditions cannot be
+satisfied as stated, so no retry on the same prompt can help. Both escape hatches
+are declared by the step contour and by the dialogue contour alike, because an
+interactive round meets the same two conditions; unit tests fix both declarations,
+and no contour advertises a capability it does not decode.
 
 All commands described in this chapter are typed operations within the strict JSON Schema,
 guaranteeing that the capability surface is enforced at the grammar sampling level.
 Each capability belongs to a phase (`Research`, `Execution`, `Verification`,
 `Outcome`). Model output is decoded into a normalized command list — text, edit,
-context request, repository search, documentation request, verification, plan,
+context request, repository search, documentation request, plan, review decision,
 scratchpad, a terminal signal, blocked, protocol error — so no consumer ever
 inspects raw markup.
 
@@ -153,37 +190,41 @@ Each capability also declares how its output reaches the harness. `LiveStreaming
 marks the contours consumed while tokens arrive — conversational text and file
 edits, which the interface renders as the model generates. `RoundDeferred` marks
 everything that only becomes meaningful once the round finishes — research,
-documentation, verification, plans, scratchpad, outcome, blockers, and project tool payloads.
-declared property instead of matching capability names, so delivery stays
-orthogonal to phase: the execution phase carries both.
+documentation, plans, review decisions, scratchpad, outcome, blockers, and project
+tool payloads. Delivery is read from that declared property instead of matching
+capability names, so delivery stays orthogonal to phase: the execution phase
+carries both.
 
-A capability surface splits into one invariant ambient channel and mutually
-exclusive operational branches (`research`, `edit`, `plan`, `review`). The turn scratchpad
-accompanies every round, so it belongs to no branch. The conversational channel belongs to
-the branches instead: every branch declares the single `message` field of the response, so a
-wire carries exactly one `message` property because exactly one branch is selected. A
-discovery or planning round reports through a short description of the action it performs,
-while a round that answers or changes the tree carries the full explanation. The language of
-the answer is not a channel either: the shared contract states it once, as an unconditional
-rule that user-facing output follows the language of the request.
-The discovery commands form the `research` branch, code modifications form the `edit` branch,
-and plan mutations form the `plan` branch, while a dialogue anchored on a plan wraps both
-plan capabilities in one `plan_action` union whose `kind` values are `create` and `modify`,
-so `plan_create` and `plan_update` never share one level. One round follows exactly one
-branch: it discovers, patches, or plans, never multiple in the same round.
+A capability surface splits into its invariant ambient channels and mutually
+exclusive operational branches (`research`, `edit`, `plan`, `answer`, `blocked`,
+`abort`, and — in a review-anchored dialogue — `review`). The turn scratchpad and
+the single conversational message accompany every round, so they belong to no
+branch: the wire declares `message` once, at the root of the response, and a
+round carries it whatever branch its `action` selects. The `answer` branch is a
+bare marker that owns no field of its own — a round with nothing to act on names
+the branch and writes the ambient message. The language of the answer is not a
+channel either: the shared contract states it once, as an unconditional rule that
+user-facing output follows the language of the request.
 
-The split is enforced grammatically via the `action` union envelope whose constant `kind`
-discriminator names the branch a response follows, so a research round contains no `changes`
-field at all, and an edit round contains no research requests.
+The discovery commands form the `research` branch, code modifications form the
+`edit` branch, and plan mutations form the `plan` branch. One round follows
+exactly one branch: it discovers, patches, or plans, never multiple in the same
+round. The split is enforced grammatically via the `action` union envelope whose
+constant `kind` discriminator names the branch a response follows, so a research
+round contains no `changes` field at all, and an edit round contains no research
+requests.
+
 ### 3.2.4 Tool Categories: Terminal vs. Diagnostic Inspection
 
 Tools and operations accessible to the model are partitioned into three distinct
 functional categories that govern their lifecycle within the bounded turn:
+
 | Tool Category | Operations / Fields | Lifecycle Effect | Terminates Turn? |
 | --- | --- | --- | --- |
 | **Perception (Research)** | `context_requests`, `repo_searches`, `dir_lists`, `repo_dirs`, `repo_maps`, `tauqe_doc_requests`, `outer_doc_requests` | Widens context or provides authoritative reference | **No.** Triggers next Research round. |
 | **Inspection (Diagnostic Execution)** | Declared project commands (`custom_tools`, e.g. integration tests, linters, benchmarks) | Executes isolated CLI process; streams stdout/stderr back into the turn journal | **No.** Triggers next Proposal round for model reasoning. |
-| **Mutation (Terminal Outcome)** | `changes`, flat terminal fields (`commit_message`, `message`, `error_message`, `reason`), `blocked`, `abort` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
+| **Mutation (Terminal Outcome)** | `changes`, flat terminal fields (`commit_message`, `error_message`, `reason`), `blocked`, `abort` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
+
 ### 3.2.5 Terminal outcomes
 
 Four terminal outcomes close a turn, carried as flat fields on the response or its active branch:
@@ -196,9 +237,10 @@ Four terminal outcomes close a turn, carried as flat fields on the response or i
 - skip — the finding was already addressed or is not reproducible.
 
 The branch a round selects decides which payload its status carries: the branch
-that applied a change set closes with `commit_message`, while a dialogue closes
-with the `message` of its own branch, while a failure reports through `error_message`,
-so no status names a field the selected branch does not declare.
+that applied a change set closes with `commit_message`, and a failure reports
+through `error_message`, so no status names a field the selected branch does
+not declare. The conversational answer itself is ambient, so a round writes it
+at the root of the response whatever branch it selected.
 A blocked outcome is not a failure to retry: the transaction is rolled back, no
 patch retry or healing cycle runs, and the owning supervisor may replan instead of
 repeating.
@@ -229,7 +271,7 @@ wrote. One classification decides it:
 
 | Channel | Elements | Advances the turn? |
 | --- | --- | --- |
-| Result-bearing | conversational text, file edits, research requests, plan updates, a verification request, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
+| Result-bearing | conversational text, file edits, research requests, plan updates, review decisions, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
 | Auxiliary | scratchpad notes | no |
 
 An auxiliary channel is memory, not work: it records what the model is thinking.
@@ -278,8 +320,9 @@ it produced, the files it changed, and the first line of the reason or summary
 it reported. The full reply of the model is never recorded for a step: the
 chronicle needs the outcome of the step, not a transcript of it. Because a batch
 may execute many steps, a step turn passes through the same budgeted compaction
-as a dialogue (`history.budget_tokens`), so the journal is bounded by the
-configured budget rather than by the length of the batch.
+as a dialogue (`compact_history_if_needed_with_budget` in `control/history.rs`,
+bound by `history.budget_tokens`), so the journal is bounded by the configured
+budget rather than by the length of the batch.
 
 Every journal record also carries a typed lifecycle status, and the status is
 never inferred from the text of a message:
@@ -288,10 +331,18 @@ never inferred from the text of a message:
 | --- | --- | --- |
 | `Active` | the turn is running; the record is visible but not yet authoritative | `"active"` |
 | `Committed` | the turn's result is durable and belongs to the model context | omitted |
+| `Interrupted` | the turn was interrupted after at least one completed round: the finished rounds stay durable while no final answer exists | `"interrupted"` |
 | `RolledBack` | the turn ended without a result, so the record left the journal | `"rolledBack"` |
 
 The committed state is the default and adds no field, so a record written before
 the status existed still deserializes as committed.
+
+A turn record also nests the intermediate rounds it ran before its final answer
+(`HistoryEntry::Turn { rounds }`), built through `round_record`, and the `rounds` field
+is additive for the same reason: a session written before it existed decodes as a turn
+without rounds. Only the rounds `1..N-1` are nested — the final answer stays the
+ordinary answer record of the same turn, so one answer is never shown twice — and a
+rollback or a compaction drops the rounds together with the attempt they belong to.
 
 ---
 
@@ -300,20 +351,23 @@ the status existed still deserializes as committed.
 ```text
       objective
           |
-   [Research] --requests--> context, search, docs, outlines
+   run_turn_loop — one pool of provider calls: repl.max_turn_rounds
+          |
+          |  every iteration is one physical model call
+          v
+   [Research step] --requests--> context, search, docs, outlines
           |
    [Proposal]  --edits-----> virtual tree
           |
-   [Staging] --mismatch----> [Patch Retry] --bounded-->
+   [Staging step] --mismatch--> [Patch Retry] --one round-->
           |                        |
           |                     converged
           v                        v
-      apply to disk --> [Verification] --errors--> [Healing] --bounded-->
-                              |                          |
-                           clean                    escalated coder
-                              v                          v
-                        finalize commit  <--or-->  roll back to checkpoint
-```
+     apply to disk --> [Verification] --errors--> [Healing] --one round-->
+                             |                          |
+                          clean                    escalated coder
+                             v                          v
+                       finalize commit  <--or-->  roll back to checkpoint
 
 ### 3.3.1 Research
 
@@ -332,9 +386,11 @@ never widened.
 Two details make the loop cheap. Files preloaded for a step bypass the budget,
 because the caller already decided they are required. And findings that are not
 repository files — search reports, listings, outlines, documentation — never enter
-the context block: they accumulate in a turn-scoped research journal that extends
-the user message and survives the whole turn, so a staging retry or a healing round
-keeps the knowledge research already paid for.
+the context block: they land in a turn-scoped research journal and are delivered once,
+as the feedback message of the round that follows the boundary which produced them.
+The journal is therefore not concatenated onto the task body: the model reads what its
+own round delivered, and the answer that round produced keeps the finding readable for
+every later round of the same turn.
 
 A step arrives with more than its files. The external documents its leaf declares in
 `outer_docs` are materialized and mounted into the read-only OuterDocs layer before the
@@ -345,7 +401,7 @@ may request the same document again in a later round.
 
 A round reports whether it made progress. That single question lets the machine
 distinguish a productive round from a dead end without inspecting individual request
-types, and it is bounded by `context.max_research_rounds`.
+types, and it is bounded by the round pool of the turn, `repl.max_turn_rounds`.
 
 ### 3.3.2 Proposal
 
@@ -370,9 +426,10 @@ because a proposal that mutated storage would settle a question the developer ha
 not answered yet. The round still closes with its terminal success tag, so an
 accepted or declined offer is a completed turn rather than an unfinished one, and
 the plan itself is written only after explicit confirmation (*Local Plans*).
+
 A round that violates the branch exclusion — a change set together with a
-discovery request — is a protocol defect rather than a command, and the kernel
-resolves it without losing work. The change set proceeds to staging, because file
+discovery request — is a protocol defect rather than a command, and the control
+loops resolve it without losing work. The change set proceeds to staging, because file
 content the model already produced is work the turn already paid for, while the
 discovery half is reported back as the defect to correct in a later round.
 Precedence belongs to the change set: a proposal about file content is checked by
@@ -399,7 +456,7 @@ the coder ladder may escalate to a stronger tier, and a batch supervisor records
 a failed step. Three properties follow.
 
 1. **A written answer is required.** Any result-bearing element advances the turn:
-   text, an edit, a discovery request, a plan update, a verification request, a
+   text, an edit, a discovery request, a plan update, a review decision, a
    project command invocation, a blocked report, an abort, or a terminal outcome
    that carries its payload.
 2. **A status tag is a claim, not a result.** A `success` without a stated
@@ -427,9 +484,9 @@ diagnostic investigation step rather than a terminal completion.
    answer round from the model with the updated journal. The
    model perceives the real command output, evaluates test failures or runtime
    panics, and either proposes corrective code edits, invokes another inspection tool,
-or emits an explicit terminal outcome (`success` / `blocked`).
+   or emits an explicit terminal outcome (`success` / `blocked`).
 4. **Shared Round Budget:** Diagnostic tool executions consume the turn's discovery
-   round budget (`context.max_discovery_rounds`), preventing unbounded agentic loops
+   round budget (`context.max_research_rounds`), preventing unbounded agentic loops
    while ensuring models have sufficient feedback to diagnose complex failures.
 
 ### 3.3.5 Patch retry
@@ -443,7 +500,7 @@ A staging failure never aborts the turn and never discards work. Already staged
 files stay staged, the failing files and their matching errors are formatted into a
 report, and the model is asked to re-emit only the failing hunks. The repair log is
 append-only, so attempt *n* carries the history of attempts `1..n` instead of
-replacing it, and the loop is bounded by `repl.max_retries`.
+replacing it, and each retry is one round of the pool the whole turn spends.
 
 ### 3.3.6 Verification
 
@@ -455,37 +512,40 @@ severity, message — instead of a compiler transcript, which is what lets the
 healing round reason about a location instead of paying for ANSI escapes in its
 context window.
 
-Verification is a declared capability, not a universal barrier. `[project.verify]`
-is optional, so a repository may legitimately describe no verification at all: the
-turn then runs no step, records the explicit `not_configured` verdict, and still
-commits its change set, because the project stated its own choice. No verdict is
-ever fabricated: a change set is reported as `passed`, `failed`,
-`not_configured`, or `cancelled`, and only a real run produces the first two. Only
-a declared gate that failed enters the healing loop.
+Verification is not a capability of the protocol. It runs automatically once a
+change set reached the disk, so a round never requests it and can never target it.
+A project that wants an on-demand run declares the command in `[project.commands]`,
+where it is an ordinary custom tool whose output lands in the research journal
+(§3.3.4). The declared verification command is therefore authoritative for the run
+the lifecycle owns, and nothing a model emits can weaken the gate.
 
-A verification request names its target (all, check, test, or a lint pass); the
-declared command is authoritative for every target, so a request can never weaken
-the gate the project declared. A repository that declares nothing runs nothing and
-skips the gate transparently instead of failing.
+`[project.verify]` is optional, so a repository may legitimately describe no
+verification at all: the turn then runs no step, records the explicit
+`not_configured` verdict, and still commits its change set, because the project
+stated its own choice. No verdict is ever fabricated: a change set is reported as
+`passed`, `failed`, `not_configured`, or `cancelled`, and only a real run produces
+the first two. Only a declared gate that failed enters the healing loop.
 
 ### 3.3.7 Healing and intra-role escalation
 
 A failed check enters a targeted healing round: the diagnostics are formatted into a
 clean report, missing error paths are staged into the context, and the prompt goes to
-the active role. Healing repeats while `repl.max_retries` lasts, and it stays
+active role. A healing round spends one unit of the same turn budget, so it stays
 inside one attempt of the current coder tier.
 
 When it does not converge, the turn reports its outcome and stops there. Retry and
 escalation belong to the step supervisor, not to the turn: the failed transaction is
 rolled back to the step's pre-turn checkpoint, the transient research context is
-pruned, and the step is re-asked on the same coder tier until
-`repl.max_tier_attempts` content attempts are spent. Only an exhausted tier
-advances one rung of the coder ladder — deeper reasoning on the same model first, a
-stronger coder afterwards — and that rung starts with a fresh budget of its own.
+pruned, and the step is re-asked on the same coder tier while the generation budget
+of that rung lasts — the `attempts` field of the coder entry in `[models]`, which
+every rung declares itself. Only an exhausted tier advances one rung of the coder
+ladder — deeper reasoning on the same model first, a stronger coder afterwards — and
+that rung starts with a fresh budget of its own.
 Escalation never leaves the coder role and saturates on the final rung, where the
 step ends as a reported failure; *Model Roles and the Coder Ladder* owns that
 boundary. A blocked report consumes neither an attempt nor a rung and bypasses the
-ladder entirely.
+ladder entirely, and so does an abort: no stronger tier can supply a capability the
+host lacks.
 
 ### 3.3.8 Finalize or roll back
 
@@ -499,7 +559,7 @@ Intermediate step commits exist only so healing can converge phase by phase and
 are squashed away, so history never exposes the healing noise of a recovered turn.
 
 Anything else — an unresolved failure, an exhausted ladder, a cancellation, a
-blocked report — restores the working tree to the checkpoint taken before the turn
+blocked report, an abort — restores the working tree to the checkpoint taken before the turn
 and discards the temporary commits. If the process dies mid-turn, recovery reads the
 transaction marker written when the checkpoint was opened and rewinds only when
 every commit in the recorded range carries the harness trailer; a foreign commit in
@@ -513,39 +573,38 @@ warnings the status barrier produced, while a non-qualifying result — a semant
 an abort, a terminal error, a patch failure, an edit proposal that applied nothing, an
 empty round, or an exceeded context budget — abandons the payload with a single
 `Abandoned` rejection that names the reason. A cancelled turn is the one intentional
-silence. A payload the planning contract itself refuses buys exactly one corrective
-exchange, and only the payload of that exchange is settled; a refusal the turn regime
-forbids, or a payload that already left the turn, buys none, because repeating the turn
-cannot change the verdict. The contract is documented in *Local Plans* §3.13.
-**A plan discussion validates its payload before that boundary.** Applying a
-refusal only at settlement would report it after the turn had closed, when the
-dialogue could no longer repair it. A plan discussion therefore validates its
-payload with a non-persisting probe of plan storage: the probe runs the very
-mutation cycle the application runs — identity resolution, the status barrier,
-and the structural barrier of the write path — against an in-memory snapshot of
-the stored plans, under the same storage lock and off the async executor thread,
-and it writes neither a plan document nor the active-plan marker. Because both
-contracts run one barrier, the verdict of the probe is the verdict of the
-application it predicts. A clean verdict costs nothing and leaves settlement as
-the single application; a refusal buys the corrective exchange described above,
-in which the refused mutations leave the turn state so the corrected document
-replaces them instead of being accumulated beside them; and a payload that is
-still refused when that round is spent travels to settlement, which refuses it
-and reports it through the ordinary diagnostic surfaces. A repair of the barrier
-— a status it normalized instead of refusing — never starts the round, because
-the mutation was applied. The phase belongs to the plan-discussion regime alone:
-a round that carries file edits beside a payload keeps the staging contour and
-settles its payload after verification, and the interactive, review-discussion,
-and isolated-step regimes keep their current semantics.
+silence. The contract is documented in *Local Plans* §3.13.
+
+**A defective payload is repaired inside the dialogue that produced it.** A plan
+discussion validates its payload before the settlement boundary with a
+non-persisting probe of plan storage, which runs the very mutation cycle the
+application runs — identity resolution, the status barrier, and the structural
+barrier of the write path — against an in-memory snapshot of the stored plans,
+under the same storage lock and off the async executor thread, and it writes
+neither a plan document nor the active-plan marker. Because both contracts run one
+barrier, the verdict of the probe is the verdict of the application it predicts. A
+refusal typed as a payload defect then buys a bounded corrective round: the typed
+reasons compose a directive, `run_repl_loop` asks the model for the corrected
+document through the single feedback slot of its transcript, and the corrected
+payload replaces the refused one. The budget is `repl.max_plan_corrections`, and
+once it is spent the refusal travels to the developer as a visible notice instead
+of being asked for again. A payload that already left the turn, or a regime that
+forbids mutation, buys no round at all: repeating it cannot change the verdict.
 
 **The session journal is transactional in the same way.** The prompt is appended
 to `.tauqe/history.jsonl` and published as `Active` the moment the turn starts, so
 the running task is visible before any result exists. A turn that produces a
 result appends it and publishes both records as `Committed`. The rule holds for
-every turn the kernel journals: a dialogue turn and an isolated step alike open
+every turn the control loops journal: a dialogue turn and an isolated step alike open
 their card before the first token and keep both cards only when the turn
 produced a result, so a batch of steps is a sequence of two-sided cards rather
-than an unrecorded stretch of work.
+than a transcript.
+
+An interruption sits between those two outcomes. A turn the developer stops after at
+least one completed round keeps its prompt, nests the rounds it finished inside it, and
+is published as `Interrupted`: the attempts stay durable even though no final answer
+exists, and the partial answer of the round that was still streaming is discarded with
+the attempt it belonged to.
 
 **A rolled-back record is deleted, not annotated.** When the turn ends any other
 way — a provider failure, a cancellation, an exhausted ladder, a blocked report —
@@ -569,26 +628,43 @@ The in-process publisher reports the three structurally different mutations
 explicitly — appended, compacted, and rolled back — so a rollback never
 masquerades as a trailing append and a compaction never masquerades as a message.
 
-### 3.3.9 The five pipeline layers
-The machine is decomposed so that each layer owns one reason to change, which is
-what makes it testable without a network:
+### 3.3.9 The control loops and their composition
 
-| Layer | Responsibility |
-| --- | --- |
-| Execution mode | lifecycle of one turn or of a supervised queue, role escalation, cost accounting |
-| Task and loop | the phase cycle itself, with steps that declare whether they repeat |
-| Prompt protocol | prompt assembly, capability declaration, decoding into commands |
-| Apply policy | staging, temporary commit, finalize, rollback |
-| Provider | transport, streaming, cancellation; a retrying decorator wraps every provider |
+The machine is decomposed into plain async functions, so each layer owns one reason
+to change, which is what makes it testable without a network:
 
-The cycle itself is one reusable kernel (`TurnKernel`). It carries the rounds,
-the prompt assembly of each round, the research journal, the corrective budget
-of an empty answer, and the observation of cancellation, so a contour supplies
-only the prompt protocol and the policy of its own payload. The Architect
-synthesis is exactly that: the same kernel driven by `PlanRefinePromptProtocol`
-and the structured Architect contour, which adds Schema Healing of an unparsable
-answer, escalation along the architect ladder, and typed terminal outcomes — a
-synthesized horizon, a blocker, an exceeded context budget, or a cancellation.
+| Loop | Module | Responsibility |
+| --- | --- | --- |
+| `run_repl_loop` | `control/repl.rs` | the dialogue surface, one turn, and the plan and review payloads of the round |
+| `run_fixed_plan_loop` | `control/plan/fixed.rs` | every `Todo` leaf of one plan in preorder, then the container refresh |
+| `run_plan_sequence_loop` | `control/plan/sequence.rs` | an ordered sequence of leaves, the soft-stop boundary, and cancellation precedence |
+| `run_plan_step_loop` | `control/plan/step.rs` | one leaf: its context, its lifecycle transitions, and the coder ladder |
+| `run_turn_loop` | `control/turn.rs` | the single loop of one turn: discovery, staging, application, and healing alternating under one round pool |
+| `execute_research_step` | `control/turn/research.rs` | one discovery round and the turn research journal |
+| `execute_staging_step` | `control/turn/staging.rs` | one virtual staging attempt and the retry it opens |
+| `execute_edit_step` | `control/turn/edit.rs` | one disk application, formatting, post-hook, and verification pass |
+
+The composition is call nesting over one mutable `LoopContext`: a sequence drives
+its leaves one at a time, a leaf drives one turn per coder rung, and a turn drives
+its step functions. Control flow is composed functionally through direct
+asynchronous calls, never through a single-method execution trait or a boxed
+dynamic dispatcher, and ambient state is reborrowed (`reborrow_with_capabilities`,
+`reborrow_extending_capabilities`) so a child narrows or widens the surface
+without owning the context.
+
+The lifecycle belongs to the loop that drives it. `run_plan_step_loop_with` and
+`run_plan_sequence_loop_with` take a `StepPersistence` adapter, which is why one
+implementation of the step lifecycle serves a local plan, an architectural review
+group, and the degenerate one-step horizon of a single review finding: only the
+document that records the statuses differs.
+
+The Architect synthesis is not one of those loops. `run_structured_refine` in
+`control/refine.rs` keeps its own reassembly through `execute_rebuilt_round` and
+its own scratchpad injection, adds Schema Healing of an unparsable answer,
+escalation along the architect ladder, and typed terminal outcomes — a synthesized
+horizon, a blocker, an abort, an exceeded context budget, or a cancellation.
+Routing that contour through the transcript of a turn is a separate decision; until
+it is taken, the synthesis keeps the reassembly it declares.
 
 A scripted provider satisfies this contract without a network call, so multi-round
 scenarios — discovery, a compiler failure, a successful healing patch, a
@@ -601,43 +677,55 @@ between members, letting the current turn finish its verification and commit bef
 the queue halts. Hard cancellation wins when both are pending, and the two modes
 surface as distinct terminal statuses.
 
-### 3.3.10 Prompt layout policies across rounds
-Every round re-sends the whole assembled prompt, and providers cache the longest
-unchanged token prefix. Turning that prompt into a message sequence is a policy
-behind one trait, so the same rendered material can become different sequences:
+### 3.3.10 The turn transcript across rounds
 
-- `SemanticLayout` groups the material by kind: one system message carrying the
-  contract, the outline, the whole `<context>` block, the active plan, the `<history>` block, and the scratchpad.
-- `ChronologicalLayout` turns the same material into an append-only transcript: a
-  byte-stable head, one message per history record with the context files that
-  record already observed placed right after it, and a volatile tail.
+Every round re-sends one growing message sequence, and providers cache the longest
+unchanged token prefix. The live sequence is the `TurnTranscript` the turn context
+carries behind an `Arc<Mutex<_>>`, so a reborrowed child context appends the rounds it
+exchanges to the very sequence its parent holds. The transcript stores four values and
+nothing else: the rendered head up to the task, the frozen task message, the
+assistant/feedback pairs already exchanged, and the capability tree the head was seeded
+with.
 
-Both policies place the whole contract in the byte-stable head: the shared trunk and every rule the loop's capability tree authorizes, since that tree never changes between the rounds of one turn. Round diagnostics (patch retry reports, verification failures) travel as append-only extensions of the user message instead, so a retry never cuts the cached prefix a second time.
+The first round seeds it, and every round after that appends exactly one pair — the
+answer it received and the feedback the next request carries — so the request of round
+`N + 1` is the request of round `N` plus that pair. A phase transition is the single
+sanctioned reseed: when the loop declares a different capability surface — research
+becomes a proposal, staging becomes healing — the head is rendered once more while the
+task and every exchanged round keep their exact bytes.
 
+Turning that assembly into a message sequence stays one free function,
+`assemble_chronological_messages`, so the order of the head, the records, and the tail
+is stated once instead of per contour: a byte-stable head, one message per history
+record with the context files that record already observed placed right after it, and a
+volatile tail. The transcript is local to the turn and is dropped with it; the durable
+counterpart a later turn reads is the session journal (§3.2.8).
+
+The transcript places the whole contract in the byte-stable head: the shared trunk and every rule the loop's capability tree authorizes, since that tree never changes between the rounds of one turn. Round diagnostics (research findings, patch retry reports, verification failures) travel through the single feedback slot of the transcript, and the round that appends its pair adds them as its own user message, so a retry never cuts the cached prefix a second time and no producer of an extra round re-concatenates its findings onto the task.
 The head renders the whole contract of the loop's tree — its capability list, the shared trunk, and the rules that tree alone states — so every rule and every schema property derive from the tree the loop function returns, and the head is byte-identical for every round of one turn. What a loop adds reaches that same head: a dialogue anchored on a plan declares plan mutation there, while a free dialogue and a review dialogue declare exactly the interactive tree. The invariant that a capability is advertised exactly when it is decoded survives, because the head, the schema, and the decoder are all read from that one tree — an interactive turn intersects the advertised set with its own tree and rejects plan mutation even when its protocol declares it.
 
-| Material | Semantic | Chronological |
-| --- | --- | --- |
-| Contract, instructions, metadata | system head | system head |
-| Repository outline | system head | system head |
-| Context files | one `<context>` block | `<context>` groups in the transcript |
-| History | one `<history>` block | one message per record |
-| Active plan | system tail | trailing user message |
-| Context manifest | absent | trailing user message |
-| Scratchpad | system tail | trailing user message |
+| Material | Placement |
+| --- | --- |
+| Contract, instructions, metadata | system head |
+| Repository outline | system head |
+| Context files | `<context>` groups interleaved with the history records |
+| History | one message per record |
+| Active plan | trailing user message |
+| Context manifest | trailing user message |
+| Scratchpad | trailing user message |
 
 The head carries only what is identical from round to round. The repository map is
-generated once per turn and frozen, and it stays in the head under both policies:
+generated once per turn and frozen by `TurnInputCache`, and it stays in the head:
 exploration and planning dominate a turn, and the map is the largest block, so
 moving it into the tail would pay a full reprocessing pass on every round. The price
 is documented rather than hidden — a map regenerated between turns excludes the
 files that entered the context, so the head itself changes and the whole tail is
 invalidated.
 
-Growth inside a turn stays append-only. Research appends an element at the tail of
-the context block, or appends the file after the last record of the transcript, and
-a promotion rewrites a single `access` attribute in place. The chronological order
-comes from the insertion watermark every context entry carries: the policy
+Growth inside a turn stays append-only. Research appends the discovered file after
+the last record of the transcript, and a promotion rewrites a single `access`
+attribute in place. The chronological order comes from the insertion watermark every
+context entry carries: the assembly
 compares that watermark against the `context_watermark` each turn record
 persisted and emits the file after the prompt record of the turn during which
 the watermark was allocated. That slot is stable for the whole session, so the
@@ -647,15 +735,16 @@ append-only event, never a fifth invalidation boundary beside the four documente
 ones; a file no watermark-bearing turn bounds falls back to the recorded starting
 context, and a file that carries no watermark at all closes the transcript.
 
-The tail carries everything that legitimately changes: the active plan, the context manifest of the chronological policy — paths and access, never content — and the turn scratchpad, while round feedback (research findings, patch retry reports, verification diagnostics) is appended after the user message.
+The tail carries everything that legitimately changes: the active plan, the context manifest — paths and access, never content — and, for a contour that still injects it, the turn scratchpad, while round feedback (research findings, patch retry reports, verification diagnostics) is appended after the user message.
 The user message keeps one fixed shape: task first, accumulated journal next, phase
 diagnostics last. A staging retry therefore differs from its own earlier attempt
 only in the trailing diagnostics.
 
-One typed resolution decides which policy a turn runs under: a declared layout wins,
-otherwise an interactive REPL turn takes the chronological transcript and a
-discussion or an isolated step takes the semantic order, because those turns carry
-no growing history to interleave.
+The shape is the same for every turn, so an interactive dialogue and an isolated step
+differ in the material they carry, never in the order of the sequence: a dialogue grows
+the transcript with its own records, while a discussion and a step carry no growing
+history to interleave.
+
 ### 3.3.11 Transport resilience and output ceiling
 
 Transport failures that say nothing about the request — a timeout, a reset
@@ -688,6 +777,7 @@ fetch that resolves the reported cost races the operation's cancellation signal 
 carries its own short per-request timeout. A cancelled, slow, or unreachable
 endpoint costs the turn the enrichment and nothing else, because a best-effort
 fetch can never be the reason a finished turn waits.
+
 ### 3.3.12 The process container
 
 The turn runs inside a daemon that is a child of the client. The daemon opens no
@@ -727,38 +817,46 @@ delivered: it dies at its next suspension point and releases its session lock on
 then. The raised signal classifies that termination, never the death of the task:
 the turn ends as cancelled, so the client that asked for the cancellation is not
 handed a spurious failure for the work it stopped.
+
 ### 3.3.13 Guards and budgets
 
 | Guard | Setting |
 | --- | --- |
-| Research rounds per turn | `context.max_research_rounds` |
+| Rounds per turn, every provider call included | `repl.max_turn_rounds` |
 | Context token budget | `context.token_budget` |
 | Repository outline budget | `context.repomap_token_budget` |
-| Patch retries and healing rounds | `repl.max_retries` |
-| Content attempts per coder tier | `repl.max_tier_attempts` |
+| Generation attempts per coder rung | `attempts` on the coder entry |
 | Generation attempts per architect rung | `attempts` on the architect entry (2 by default) |
+| Journal budget of a long batch | `history.budget_tokens` |
 | Automated replans | `repl.max_replans` |
 | Outlines per research round | fixed request cap |
-No operational limit is hardcoded, and no budget silently discards work: a breached
-budget halts with a diagnostic that asks for a narrower scope, so the developer
-learns what to decompose instead of watching a turn fail anonymously.
+
+No operational limit is hardcoded into a loop: every one of them is configuration
+or the default a model entry declares for its own rung, and no budget silently
+discards work: a breached budget halts with a diagnostic that asks for a narrower
+scope, so the developer learns what to decompose instead of watching a turn fail
+anonymously.
 
 ---
 
 ## 3.4 Boundaries & Anti-Patterns ("What it is NOT")
 
-- **It is not an agent loop.** The machine never asks the model what to do next; it
-  asks the model to do the current step.
+- **It is not an agent loop.** The loops never ask the model what to do next; they
+  ask the model to do the current step.
 - **It is not a single-shot completion.** Research, retry, and healing rounds are
   first-class states, not error handling bolted onto a request.
 - **It does not own project knowledge.** Formatters, post-hooks, and verification
-  commands belong to the `[project]` declaration; the machine only decides when they
+  commands belong to the `[project]` declaration; the loops only decide when they
   run.
 - **It does not retry forever.** Every loop has a configured budget and a saturated
   terminal state.
-- **It does not infer the mode from text.** The mode is a typed parameter of the loop
-  that runs the turn; a prompt that merely resembles an internal heading cannot
-  change the regime, and no boolean flag that resembles one selects the brief.
+- **It does not infer the mode from text.** The mode is a typed parameter of the
+  loop that runs the turn; a prompt that merely resembles an internal heading
+  cannot change the regime, and no boolean flag that resembles one selects the
+  brief.
+- **It does not ask for verification.** Deterministic verification is not a
+  capability: it runs once the change set staged, and an interactive run of a gate
+  is a declared project command.
 - **It does not create a plan on its own initiative.** A broad request produces an
   offer inside the answer, never a plan document; storage changes only after the
   developer confirms.
@@ -774,7 +872,7 @@ learns what to decompose instead of watching a turn fail anonymously.
 - **It does not let one round both discover and patch.** A capability surface
   splits into invariant ambient channels and mutually exclusive operational
   branches, so a round that carries a change set carries no discovery request. A
-  mixed round is a protocol defect, and the kernel resolves it in favor of the
+  mixed round is a protocol defect, and the loops resolve it in favor of the
   change set instead of discarding work the turn already paid for.
 - **It does not let the dialogue language reach the commit.** `commit_message` is
   an English Conventional Commits header whatever language the turn answered in;
@@ -790,11 +888,15 @@ learns what to decompose instead of watching a turn fail anonymously.
   lifecycle states its own choice, so the change set is reported as unverified
   instead of being dressed up as a passed gate.
 - **An attempt on a tier is not an escalation.** Re-asking the same tier is finite
-  and configured by `repl.max_tier_attempts`; only an exhausted tier advances the
-  ladder, and a saturated ladder ends the step instead of retrying it again.
+  and declared by the rung itself; only an exhausted tier advances the ladder, and
+  a saturated ladder ends the step instead of retrying it again.
 - **A broken connection does not burn a rung.** Transport failures are answered by
   the network layer and consume no content attempt, so a degraded link never promotes
   a model that has not failed on content.
+- **It does not discard a refused plan payload or retry it forever.** A payload
+  defect buys the corrective rounds `repl.max_plan_corrections` grants inside the
+  same turn, and the refusal reaches the developer once they are spent.
+
 ---
 
 ## 3.5 Related Chapters

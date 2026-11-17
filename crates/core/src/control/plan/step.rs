@@ -21,6 +21,7 @@ use crate::control::outcome::{
 };
 use crate::control::turn::{run_turn_loop, turn_capability_expr, TurnLoopConfig};
 use crate::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
+#[cfg(test)]
 use crate::plan::storage::PlanStorage;
 use crate::prompt::TurnBrief;
 use crate::providers::StreamEvent;
@@ -39,21 +40,24 @@ pub trait StepPersistence: Send + Sync {
 }
 
 /// Persistence of a step lifecycle recorded by a local plan document.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanDocumentPersistence {
+pub(crate) struct PlanDocumentPersistence {
     /// Identifier of the plan the executed steps belong to.
-    pub plan_id: String,
+    plan_id: String,
 }
 
+#[cfg(test)]
 impl PlanDocumentPersistence {
     /// Addresses the plan document identified by `plan_id`.
-    pub fn new(plan_id: impl Into<String>) -> Self {
+    pub(crate) fn new(plan_id: impl Into<String>) -> Self {
         Self {
             plan_id: plan_id.into(),
         }
     }
 }
 
+#[cfg(test)]
 impl StepPersistence for PlanDocumentPersistence {
     fn load(&self, repo_root: &Path) -> Result<Plan, SystemError> {
         load_plan(repo_root, &self.plan_id)
@@ -87,7 +91,7 @@ pub struct PlanStepLoopConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanStepArtifact {
     /// Identifier of the step that succeeded.
-    pub step_id: String,
+    pub(crate) step_id: String,
     /// Commit hash produced by the step, when its turn made one.
     pub commit: Option<String>,
     /// Repository-relative paths the step modified.
@@ -101,7 +105,8 @@ pub struct PlanStepArtifact {
 /// succeeds, blocks, or the ladder is exhausted. `Done` and `Blocked` write the
 /// durable state through [`PlanDocumentPersistence`]; every other outcome leaves
 /// the step at `Todo` so no completed turn is claimed by accident.
-pub async fn run_plan_step_loop(
+#[cfg(test)]
+pub(crate) async fn run_plan_step_loop(
     ctx: &mut LoopContext<'_>,
     plan_id: &str,
     step_id: &str,
@@ -116,7 +121,7 @@ pub async fn run_plan_step_loop(
 /// The bounded turn, the coder ladder, and the lifecycle rules are identical for
 /// every horizon of steps, so the persistence adapter owns loading and writing
 /// while this loop stays the one implementation of the lifecycle.
-pub async fn run_plan_step_loop_with<P: StepPersistence>(
+pub(crate) async fn run_plan_step_loop_with<P: StepPersistence>(
     ctx: &mut LoopContext<'_>,
     persistence: &P,
     step_id: &str,
@@ -180,13 +185,14 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
         prepare_context(ctx, leaf)?;
     }
 
-    let mut prompt = format_plan_step_execution_prompt(
+    let base_prompt = format_plan_step_execution_prompt(
         &plan,
         step_id,
         config.protocol,
         config.marker.as_deref(),
     )
     .map_err(SystemError::Other)?;
+    let mut prompt = base_prompt.clone();
 
     transition(
         ctx.repo_root,
@@ -241,6 +247,12 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         None,
                         None,
                     )?;
+                    tracing::error!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        error = %err,
+                        "plan step change set could not be committed"
+                    );
                     return Err(SystemError::Git(format!(
                         "Failed to commit the change set of step '{}': {}",
                         step_id, err
@@ -258,6 +270,13 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         None,
                         Some(commit.as_str()),
                     )?;
+                    tracing::info!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        commit = %commit,
+                        files = artifact.modified_paths.len(),
+                        "plan step completed"
+                    );
                     return Ok(LoopResult::Success(LoopSuccess::new(
                         PlanStepArtifact {
                             step_id: step_id.to_string(),
@@ -281,6 +300,12 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         Some(combined.as_str()),
                         None,
                     )?;
+                    tracing::warn!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        reason = %compact_reason(&combined),
+                        "plan step reported a blocker"
+                    );
                     let mut env = success.response;
                     let _ = env.take(LlmCapability::Blocked);
                     let _ = env.take_any(&[
@@ -303,6 +328,12 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                             None,
                             None,
                         )?;
+                        tracing::info!(
+                            repo_root = %ctx.repo_root.display(),
+                            step_id,
+                            files = artifact.modified_paths.len(),
+                            "plan step completed without a change set"
+                        );
                         return Ok(LoopResult::Success(LoopSuccess::new(
                             PlanStepArtifact {
                                 step_id: step_id.to_string(),
@@ -333,6 +364,12 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         Some(combined.as_str()),
                         None,
                     )?;
+                    tracing::warn!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        reason = %compact_reason(&combined),
+                        "plan step reported a blocker"
+                    );
                     let _ = envelope.take(LlmCapability::Blocked);
                     let _ = envelope.take_any(&[
                         LlmCapability::CommitMessage,
@@ -347,6 +384,10 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
 
         let trigger = escalation_trigger
             .unwrap_or_else(|| "The step turn did not produce a verifiable result".to_string());
+        // The corrective prompt echoes what the attempt actually answered, so a retry
+        // restates the model's own words beside the diagnosis instead of quoting an
+        // empty response.
+        let answer = last_answer(ctx);
 
         tier_attempts += 1;
         if tier_attempts >= max_tier_attempts {
@@ -361,6 +402,14 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         None,
                         None,
                     )?;
+                    tracing::warn!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        attempts = tier_attempts,
+                        model = %current_model_name,
+                        reason = %compact_reason(&trigger),
+                        "plan step exhausted the coder ladder"
+                    );
                     return Ok(LoopResult::Exhausted(FailureReport::new(
                         format!("{trigger}: escalation is exhausted on {current_model_name}"),
                         tier_attempts as usize,
@@ -374,13 +423,21 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
                         role: ModelRole::Coder,
                         effort: tier.effort,
                     });
+                    tracing::info!(
+                        repo_root = %ctx.repo_root.display(),
+                        step_id,
+                        tier = next_idx,
+                        model = %tier.model,
+                        "coder ladder escalated"
+                    );
                     ladder_idx = next_idx;
                     current_model_name = tier.model.to_string();
                     max_tier_attempts = tier.attempts();
                     reasoning_effort = tier.effort;
                     tier_attempts = 0;
                     prompt = format_plan_step_retry_prompt(
-                        "",
+                        &base_prompt,
+                        answer.as_str(),
                         Some(trigger.as_str()),
                         config.protocol,
                         config.marker.as_deref(),
@@ -389,7 +446,8 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
             }
         } else {
             prompt = format_plan_step_retry_prompt(
-                "",
+                &base_prompt,
+                answer.as_str(),
                 Some(trigger.as_str()),
                 config.protocol,
                 config.marker.as_deref(),
@@ -398,6 +456,7 @@ pub async fn run_plan_step_loop_with<P: StepPersistence>(
     }
 }
 
+#[cfg(test)]
 fn load_plan(repo_root: &Path, plan_id: &str) -> Result<Plan, SystemError> {
     PlanStorage::load_plan(repo_root, plan_id)
         .map_err(|e| SystemError::Other(format!("Failed to load plan '{}': {}", plan_id, e)))?
@@ -587,6 +646,25 @@ fn combine_blocked(reason: &str, details: &str) -> String {
     }
 }
 
+/// Renders the first reported line of a diagnosis for a compact journal record.
+///
+/// A step reports a blocker or an escalation trigger as prose, so the record keeps
+/// its opening line and stays an identifier instead of a dump.
+fn compact_reason(text: &str) -> &str {
+    text.lines().next().unwrap_or_default().trim()
+}
+/// Returns the last answer the step turn produced.
+///
+/// The corrective prompt echoes it beside the diagnosis, so a retry restates the
+/// words the attempt actually wrote instead of quoting an empty response.
+fn last_answer(ctx: &LoopContext<'_>) -> String {
+    ctx.transcript()
+        .messages()
+        .into_iter()
+        .rfind(|message| message.role == "assistant")
+        .map(|message| message.content)
+        .unwrap_or_default()
+}
 fn next_rung(config: &PlanStepLoopConfig, ladder_idx: usize) -> Option<(usize, ModelEntry)> {
     if config.models.auto_level_up {
         config.models.next_coder_tier(ladder_idx)
@@ -600,7 +678,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use tauqe_protocol::{CapabilityExpr, ConceptItem, ModelRef, Plan, PlanItem, PlanItemStatus};
+    use tauqe_protocol::{CapabilityTree, ConceptItem, ModelRef, Plan, PlanItem, PlanItemStatus};
 
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink, LoopContext};
@@ -656,7 +734,7 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]);
+            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
             let prompt_builder =
                 PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
             LoopContext::new(
@@ -727,7 +805,6 @@ mod tests {
                             "new_text": "fn hello() -> i32 { 1 }\n"
                         }],
                         "commit_message": "feat(hello): return a value",
-                        "message": "",
                         "reason": ""
                     }
                 })
@@ -849,7 +926,6 @@ mod tests {
                             "content": "fn new_file() {}\n"
                         }],
                         "commit_message": "feat(new): create new file",
-                        "message": "",
                         "reason": ""
                     }
                 })

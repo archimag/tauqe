@@ -50,7 +50,7 @@ impl ChatMessage {
         }
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub(crate) fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
             content: content.into(),

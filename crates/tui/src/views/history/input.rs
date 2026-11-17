@@ -62,6 +62,7 @@ pub async fn request_older_history(
 pub enum HistoryAction {
     Return,
     FoldToggle,
+    ToggleRounds,
     NavPrev,
     NavNext,
     Recenter,
@@ -193,6 +194,12 @@ pub static HISTORY_COMMAND_MAP: CommandMap<HistoryAction> = CommandMap::new(&[
         HistoryAction::Recenter,
         Interface,
         "cmd.history.recenter",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
+        HistoryAction::ToggleRounds,
+        Interface,
+        "cmd.history.toggle_rounds",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
@@ -327,6 +334,22 @@ pub async fn handle_history_key(
             {
                 let id = item.id;
                 st.history_view.toggle_expanded(id);
+                st.history_view
+                    .scroll_to_selected_item(view_height, Some(content_width));
+            }
+        }
+        HistoryAction::ToggleRounds => {
+            // A record whose turn never ran an intermediate round has nothing
+            // to unfold, so the chord stays quiet instead of reporting a
+            // missing surface (c-05).
+            if let Some(id) = st
+                .history_view
+                .items
+                .get(st.history_view.selected_item_index)
+                .filter(|item| !item.rounds.is_empty())
+                .map(|item| item.id)
+            {
+                st.history_view.toggle_rounds(id);
                 st.history_view
                     .scroll_to_selected_item(view_height, Some(content_width));
             }
@@ -622,5 +645,84 @@ mod tests {
             "the last record is reached through the saturated bound"
         );
         assert!(guard.history_view.auto_scroll);
+    }
+    /// A record whose turn ran two intermediate rounds before its answer.
+    fn multi_round_item(id: u64) -> tauqe_protocol::UiHistoryItem {
+        tauqe_protocol::UiHistoryItem {
+            id,
+            kind: tauqe_protocol::UiHistoryKind::Assistant,
+            text: "Final answer.".to_string(),
+            summary: None,
+            commit_hash: None,
+            files: Vec::new(),
+            rounds: vec![
+                tauqe_protocol::TurnRoundRecord {
+                    index: 1,
+                    message: "Inspected the parser.".to_string(),
+                    feedback: "3 matches in src/parser.rs".to_string(),
+                },
+                tauqe_protocol::TurnRoundRecord {
+                    index: 2,
+                    message: "Staged the change.".to_string(),
+                    feedback: String::new(),
+                },
+            ],
+            status: tauqe_protocol::HistoryEntryStatus::Committed,
+        }
+    }
+
+    /// The rounds of a record carry their own fold state: the chord unfolds the
+    /// rounds of the selected record only, leaves every other record folded, and
+    /// the vertical navigation keeps working on a multi-round record (c-05).
+    #[tokio::test]
+    async fn test_r_toggles_the_rounds_of_the_selected_record() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::History;
+        st.history_view.content_width = 60;
+        st.history_view.items = vec![multi_round_item(1), multi_round_item(2)];
+        st.history_view.selected_item_index = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let toggle = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
+
+        handle_history_key(toggle, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            assert!(guard.history_view.is_rounds_expanded(1));
+            assert!(
+                !guard.history_view.is_rounds_expanded(2),
+                "the fold state belongs to the selected record only"
+            );
+        }
+
+        let next = KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE);
+        handle_history_key(next, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        assert_eq!(state.lock().await.history_view.selected_item_index, 1);
+
+        handle_history_key(toggle, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            assert!(guard.history_view.is_rounds_expanded(2));
+            assert!(
+                guard.history_view.is_rounds_expanded(1),
+                "visiting another record never folds the first one"
+            );
+        }
+
+        handle_history_key(toggle, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            assert!(!guard.history_view.is_rounds_expanded(2));
+            assert!(guard.history_view.is_rounds_expanded(1));
+        }
     }
 }

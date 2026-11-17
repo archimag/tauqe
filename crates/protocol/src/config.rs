@@ -168,63 +168,6 @@ impl FromStr for PatchStrategy {
     }
 }
 
-/// Strategy that decides how the rendered prompt blocks are composed into a
-/// message sequence.
-///
-/// The layout is a policy over blocks that are already rendered: the semantic
-/// layout groups them by kind, while the chronological layout interleaves
-/// context additions with history entries in the order they were added. The
-/// choice is a presentation decision only and stays orthogonal to the
-/// transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", try_from = "String")]
-pub enum PromptLayoutKind {
-    /// Semantic block order (default).
-    #[default]
-    Semantic,
-    /// Chronological interleaved transcript of history and context.
-    Chronological,
-}
-
-impl std::convert::TryFrom<String> for PromptLayoutKind {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        value.parse()
-    }
-}
-
-impl PromptLayoutKind {
-    /// Canonical lower-case identifier used on the wire.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Semantic => "semantic",
-            Self::Chronological => "chronological",
-        }
-    }
-}
-
-impl fmt::Display for PromptLayoutKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for PromptLayoutKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "semantic" => Ok(Self::Semantic),
-            "chronological" => Ok(Self::Chronological),
-            other => Err(format!(
-                "Unknown prompt layout '{}'. Expected 'semantic' or 'chronological'",
-                other
-            )),
-        }
-    }
-}
-
 /// Compact identity of one review preset declared by the project.
 ///
 /// A launcher renders a preset by its name and, when the project declares
@@ -492,37 +435,6 @@ mod tests {
         );
         assert!("".parse::<PatchStrategy>().is_err());
         assert!("bogus".parse::<PatchStrategy>().is_err());
-    }
-
-    #[test]
-    fn test_prompt_layout_kind_serde_default_and_parsing() {
-        assert_eq!(PromptLayoutKind::default(), PromptLayoutKind::Semantic);
-        assert_eq!(
-            serde_json::to_string(&PromptLayoutKind::Semantic).unwrap(),
-            "\"semantic\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptLayoutKind::Chronological).unwrap(),
-            "\"chronological\""
-        );
-        assert_eq!(
-            serde_json::from_str::<PromptLayoutKind>("\"chronological\"").unwrap(),
-            PromptLayoutKind::Chronological
-        );
-        assert_eq!(
-            serde_json::from_str::<PromptLayoutKind>("\"  CHRONOLOGICAL \"").unwrap(),
-            PromptLayoutKind::Chronological
-        );
-        assert!(serde_json::from_str::<PromptLayoutKind>("\"auto\"").is_err());
-
-        assert_eq!(PromptLayoutKind::Semantic.as_str(), "semantic");
-        assert_eq!(PromptLayoutKind::Chronological.to_string(), "chronological");
-        assert_eq!(
-            "semantic".parse::<PromptLayoutKind>().unwrap(),
-            PromptLayoutKind::Semantic
-        );
-        assert!("".parse::<PromptLayoutKind>().is_err());
-        assert!("bogus".parse::<PromptLayoutKind>().is_err());
     }
 
     /// Builds a `ConfigState` carrying every mandatory field, so a test can

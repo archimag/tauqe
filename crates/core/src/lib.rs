@@ -6,7 +6,7 @@
 pub use tauqe_protocol as protocol;
 
 pub mod blocking;
-pub mod capabilities;
+pub(crate) mod capabilities;
 pub mod config;
 pub mod context;
 pub mod control;

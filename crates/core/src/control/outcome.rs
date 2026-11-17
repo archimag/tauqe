@@ -7,6 +7,8 @@ use tauqe_protocol::{LlmCapability, LlmCommand, ModelUsageInfo};
 pub enum SystemError {
     #[error("operation cancelled")]
     Cancelled,
+    #[error("turn round budget exhausted")]
+    RoundBudgetExhausted,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("provider error: {0}")]
@@ -23,23 +25,14 @@ pub struct ResponseEnvelope {
     /// Semantic commands produced by the model.
     items: Vec<LlmCommand>,
     /// Raw assistant text prior to stripping.
-    pub raw_text: String,
+    pub(crate) raw_text: String,
     /// Token usage metrics for the round.
-    pub usage: Option<ModelUsageInfo>,
+    usage: Option<ModelUsageInfo>,
 }
 
 impl ResponseEnvelope {
-    /// Constructs an envelope from a list of decoded semantic commands.
-    pub fn new(items: Vec<LlmCommand>) -> Self {
-        Self {
-            items,
-            raw_text: String::new(),
-            usage: None,
-        }
-    }
-
     /// Constructs an envelope by cloning a slice of decoded semantic commands.
-    pub fn from_commands(commands: &[LlmCommand]) -> Self {
+    pub(crate) fn from_commands(commands: &[LlmCommand]) -> Self {
         Self {
             items: commands.to_vec(),
             raw_text: String::new(),
@@ -47,14 +40,8 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Attaches token usage information.
-    pub fn with_usage(mut self, usage: Option<ModelUsageInfo>) -> Self {
-        self.usage = usage;
-        self
-    }
-
     /// Attaches raw unstripped model response text.
-    pub fn with_raw_text(mut self, raw_text: impl Into<String>) -> Self {
+    pub(crate) fn with_raw_text(mut self, raw_text: impl Into<String>) -> Self {
         self.raw_text = raw_text.into();
         self
     }
@@ -108,12 +95,14 @@ impl ResponseEnvelope {
     }
 
     /// Returns true if all commands in the envelope have been consumed.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Returns the number of commands remaining in the envelope.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
@@ -134,7 +123,7 @@ pub struct LoopSuccess<T> {
 
 impl<T> LoopSuccess<T> {
     /// Wraps an artifact with its originating model response envelope.
-    pub fn new(value: T, response: ResponseEnvelope) -> Self {
+    pub(crate) fn new(value: T, response: ResponseEnvelope) -> Self {
         Self { value, response }
     }
 }
@@ -145,14 +134,18 @@ pub struct FailureReport {
     /// Primary failure summary.
     pub reason: String,
     /// Number of local iterations attempted.
-    pub attempts: usize,
+    pub(crate) attempts: usize,
     /// Detailed diagnostics from compiler, linter, or patch engine.
-    pub diagnostics: Vec<String>,
+    diagnostics: Vec<String>,
 }
 
 impl FailureReport {
     /// Creates a new failure report.
-    pub fn new(reason: impl Into<String>, attempts: usize, diagnostics: Vec<String>) -> Self {
+    pub(crate) fn new(
+        reason: impl Into<String>,
+        attempts: usize,
+        diagnostics: Vec<String>,
+    ) -> Self {
         Self {
             reason: reason.into(),
             attempts,
@@ -171,14 +164,6 @@ pub struct AbortReport {
 }
 
 impl AbortReport {
-    /// Creates a new abort report.
-    pub fn new(reason: impl Into<String>, recommendation: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            recommendation: recommendation.into(),
-        }
-    }
-
     /// Renders the report as a developer-facing message.
     pub fn to_message(&self) -> String {
         format!(
@@ -215,12 +200,14 @@ impl<T> LoopResult<T> {
     }
 
     /// Returns true if the loop diverged.
-    pub fn is_diverged(&self) -> bool {
+    #[cfg(test)]
+    fn is_diverged(&self) -> bool {
         matches!(self, Self::Diverged(_))
     }
 
     /// Returns true if the loop exhausted its attempts.
-    pub fn is_exhausted(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_exhausted(&self) -> bool {
         matches!(self, Self::Exhausted(_))
     }
 }

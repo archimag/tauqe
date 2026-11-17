@@ -87,7 +87,8 @@ pub(crate) fn prepare_json_payload(buffer: &str) -> String {
 /// This is the one-shot form of [`FieldLocator`]: it walks a complete payload in
 /// one pass. Streaming callers hold a [`StringFieldCursor`], whose locator resumes
 /// the same walk across chunks instead of restarting it.
-pub fn find_string_field_value_start(buffer: &str, target_field: &str) -> Option<usize> {
+#[cfg(test)]
+fn find_string_field_value_start(buffer: &str, target_field: &str) -> Option<usize> {
     FieldLocator::default().locate(buffer, target_field)
 }
 
@@ -331,7 +332,7 @@ pub struct StringFieldCursor {
 
 impl StringFieldCursor {
     /// Creates a cursor positioned at the start of a fresh payload.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
@@ -370,7 +371,7 @@ pub fn extract_streamed_string_field(
 
 /// Returns the byte offset of the first unescaped `"` in a JSON string body,
 /// resuming from `from` to avoid O(n^2) rescanning across chunks.
-pub(crate) fn find_json_string_end_from(raw: &str, from: &mut usize) -> Option<usize> {
+fn find_json_string_end_from(raw: &str, from: &mut usize) -> Option<usize> {
     let bytes = raw.as_bytes();
     let mut i = *from;
     while i < bytes.len() {
@@ -415,7 +416,7 @@ fn parse_hex4(hex: &[u8]) -> Option<u32> {
 ///
 /// It mutates `raw_pos` up to the last fully decoded character or escape, withholding
 /// incomplete trailing escapes so chunks can be appended without re-decoding from zero.
-pub(crate) fn decode_json_string_body_incremental(raw: &str, raw_pos: &mut usize) -> String {
+fn decode_json_string_body_incremental(raw: &str, raw_pos: &mut usize) -> String {
     let bytes = raw.as_bytes();
     let mut decoded = String::new();
     let mut i = *raw_pos;

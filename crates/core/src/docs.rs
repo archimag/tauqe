@@ -9,7 +9,7 @@ use tauqe_protocol::DocTopic;
 const INTRO: &str = include_str!("../../../docs/src/intro.md");
 const SEMANTIC_HARNESS: &str =
     include_str!("../../../docs/src/ch01-foundations/semantic-harness.md");
-const BOUNDED_TURN: &str = include_str!("../../../docs/src/ch01-foundations/bounded-turn-fsm.md");
+const BOUNDED_TURN: &str = include_str!("../../../docs/src/ch01-foundations/bounded-turn.md");
 const MODEL_ROLES: &str = include_str!("../../../docs/src/ch01-foundations/model-roles.md");
 const SCRATCHPAD: &str = include_str!("../../../docs/src/ch01-foundations/turn-scratchpad.md");
 const CONTEXT_MODEL: &str = include_str!("../../../docs/src/ch02-perception/context-model.md");
@@ -145,7 +145,7 @@ mod tests {
         let all = get_documentation(DocTopic::All);
         for marker in [
             "Semantic Harness",
-            "Autonomous Bounded Turn FSM",
+            "Autonomous Bounded Turn",
             "Model Roles and the Coder Ladder",
             "Turn Scratchpad",
             "The Context Model",

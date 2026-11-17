@@ -10,6 +10,26 @@ use crate::git::exec::{GitDeadline, TERMINATION_GRACE};
 use crate::git::GitHooks;
 use std::fs;
 
+/// Renders the message of a recovery pass that reported a completed unwind.
+///
+/// The variant itself proves the shape the pass resolved, so a case that
+/// expects a completed recovery and receives anything else fails with the
+/// outcome it observed instead of a substring miss.
+fn recovered_message(outcome: RecoveryOutcome) -> String {
+    match outcome {
+        RecoveryOutcome::Recovered { message } => message,
+        other => panic!("expected a recovered outcome, got {other:?}"),
+    }
+}
+
+/// Renders the reason of a recovery pass that refused to rewrite the repository.
+fn skipped_reason(outcome: RecoveryOutcome) -> String {
+    match outcome {
+        RecoveryOutcome::Skipped { reason } => reason,
+        other => panic!("expected a skipped outcome, got {other:?}"),
+    }
+}
+
 /// Process id of an already reaped child, which is provably no longer running.
 ///
 /// `git` is a hard prerequisite of this crate's suite, so the dead writer a
@@ -63,7 +83,20 @@ fn test_recover_interrupted_workflow_clean_repo() {
     crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none());
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
+}
+
+/// The skip rendering keeps the prefix the journal states, because the reason
+/// inside the variant names only the failed proof.
+#[test]
+fn test_recovery_outcome_renders_the_skip_prefix() {
+    let outcome = RecoveryOutcome::Skipped {
+        reason: "the proof failed".to_string(),
+    };
+    assert_eq!(
+        outcome.to_string(),
+        "Skipped crash recovery: the proof failed."
+    );
 }
 
 #[test]
@@ -195,10 +228,7 @@ fn test_recover_interrupted_workflow_cleans_orphaned_artifacts() {
     fs::write(&tmp_file, "staged").unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_some());
-    assert!(recovery
-        .unwrap()
-        .contains("Cleaned up 1 orphaned staging artifact(s)"));
+    assert_eq!(recovery, RecoveryOutcome::Cleaned { artifacts: 1 });
     assert!(!tmp_file.exists());
 }
 
@@ -325,8 +355,7 @@ fn test_recover_interrupted_workflow_with_checkpoint_and_steps() {
     // 3. Crash recovery runs
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_some());
-    let msg = recovery.unwrap();
+    let msg = recovered_message(recovery);
     assert!(msg.contains("unwound 1 step commit(s)"));
     assert!(msg.contains("restored checkpoint: true"));
 
@@ -374,8 +403,7 @@ fn test_recover_interrupted_workflow_unwinds_multiple_steps() {
 
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_some());
-    let msg = recovery.unwrap();
+    let msg = recovered_message(recovery);
     assert!(msg.contains("unwound 2 step commit(s)"));
     assert!(msg.contains("restored checkpoint: true"));
 
@@ -413,7 +441,7 @@ fn test_recover_ignores_manual_step_commit_without_marker() {
         .to_string();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none());
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
 
     let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
         .unwrap()
@@ -447,7 +475,7 @@ fn test_recover_skips_when_no_steps_and_no_checkpoint_commit() {
     fs::write(&dirty_file, "valuable uncommitted edits").unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none());
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
     assert!(read_transaction_marker(path).is_none());
     // Uncommitted edits must remain completely untouched
     assert_eq!(
@@ -483,8 +511,10 @@ fn test_recover_refuses_when_range_contains_foreign_commit() {
 
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let msg = recovery.unwrap_or_default();
-    assert!(msg.contains("Skipped crash recovery"));
+    assert!(
+        matches!(recovery, RecoveryOutcome::Skipped { .. }),
+        "{recovery:?}"
+    );
 
     // The foreign commit is preserved and HEAD is untouched.
     let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
@@ -492,6 +522,10 @@ fn test_recover_refuses_when_range_contains_foreign_commit() {
         .trim()
         .to_string();
     assert_eq!(head_before, head_after);
+    assert!(
+        read_transaction_marker(path).is_some(),
+        "a skipped recovery must keep the marker for a later startup"
+    );
 }
 
 #[test]
@@ -538,8 +572,8 @@ fn test_recover_refuses_when_recorded_base_is_not_an_ancestor() {
     write_transaction_marker(path, &checkpoint).unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let msg = recovery.unwrap_or_default();
-    assert!(msg.contains("not an ancestor of HEAD"));
+    let reason = skipped_reason(recovery);
+    assert!(reason.contains("not an ancestor of HEAD"), "{reason}");
 
     // Resetting to a base outside the current history would discard commits
     // that were never part of the transaction, so HEAD must stay put and the
@@ -848,7 +882,7 @@ fn test_transaction_marker_rewrite_publishes_a_complete_document() {
     )
     .unwrap();
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none());
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
     assert!(read_transaction_marker(path).is_none());
 }
 
@@ -949,7 +983,7 @@ fn test_concurrent_marker_writes_never_expose_a_torn_document() {
     )
     .unwrap();
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none());
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
     assert!(read_transaction_marker(path).is_none());
 }
 
@@ -989,11 +1023,7 @@ fn test_recovery_reclaims_state_dir_staging_orphans() {
     fs::write(&backup, "draft notes").unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(
-        message.contains("Cleaned up 3 orphaned staging artifact(s)"),
-        "{message}"
-    );
+    assert_eq!(recovery, RecoveryOutcome::Cleaned { artifacts: 3 });
 
     assert!(!history_orphan.exists());
     assert!(!plan_orphan.exists());
@@ -1033,11 +1063,7 @@ fn test_crashed_atomic_write_orphans_are_ignored_by_git_and_reclaimed() {
     );
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(
-        message.contains("Cleaned up 1 orphaned staging artifact(s)"),
-        "{message}"
-    );
+    assert_eq!(recovery, RecoveryOutcome::Cleaned { artifacts: 1 });
     assert!(!orphan.exists());
 }
 
@@ -1090,7 +1116,7 @@ fn test_recovery_returns_an_unborn_branch_to_the_unborn_state() {
 
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(message.contains("unwound 1 step commit(s)"), "{message}");
     assert!(message.contains("restored checkpoint: true"), "{message}");
 
@@ -1619,7 +1645,7 @@ fn test_clean_unborn_recovery_returns_the_branch_to_unborn() {
 
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(message.contains("unwound 1 step commit(s)"), "{message}");
 
     assert!(head_is_unborn(path));
@@ -1657,6 +1683,56 @@ fn test_restore_checkpoint_on_an_unborn_base_removes_the_step_content() {
 }
 
 #[test]
+fn test_restore_checkpoint_keeps_the_marker_when_the_checkpoint_commit_cannot_be_unwound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The marker records a checkpoint commit, while HEAD names the commit the
+    // transaction started from, so the unwind of the rollback finds no commit
+    // the marker records and cannot close the transaction.
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let checkpoint = CheckpointInfo {
+        created_checkpoint_commit: true,
+        base: TransactionBase::Commit(base.clone()),
+        phase: TransactionPhase::Established,
+        writer_pid: None,
+    };
+    write_transaction_marker(path, &checkpoint).unwrap();
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+
+    restore_checkpoint(path, &checkpoint)
+        .expect("the completed reset must not be aborted by a refused unwind");
+
+    // The reset already returned the tree to the recorded base and removed the
+    // turn's own file, while the marker survives the refused unwind.
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head, base);
+    assert!(!path.join("ai_work.txt").exists());
+    assert!(
+        read_transaction_marker(path).is_some(),
+        "a refused unwind must keep the marker for a later recovery"
+    );
+
+    // The surviving marker authorizes a recovery that resolves the same state
+    // idempotently, and a further pass finds nothing left to resolve.
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovered_message(recovery);
+    assert!(message.contains("restored checkpoint: true"), "{message}");
+    assert!(read_transaction_marker(path).is_none());
+    assert_eq!(
+        recover_interrupted_workflow(path).unwrap(),
+        RecoveryOutcome::NothingToDo
+    );
+}
+
+#[test]
 fn test_unborn_recovery_refuses_when_a_foreign_commit_is_reachable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
@@ -1680,8 +1756,10 @@ fn test_unborn_recovery_refuses_when_a_foreign_commit_is_reachable() {
 
     forget_marker_writer(path);
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(
+        matches!(recovery, RecoveryOutcome::Skipped { .. }),
+        "{recovery:?}"
+    );
 
     // The repository is untouched and the marker survives for a later
     // attempt on the proof's terms.
@@ -1781,7 +1859,7 @@ fn test_capturing_recovery_before_the_checkpoint_commit_keeps_the_working_tree()
     assert!(staged.contains("user_work.txt"), "{staged}");
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(
         message.contains("no checkpoint commit was created"),
         "{message}"
@@ -1837,7 +1915,7 @@ fn test_capturing_recovery_before_the_checkpoint_commit_on_an_unborn_branch() {
     assert!(staged.contains("user_work.txt"), "{staged}");
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(
         message.contains("no checkpoint commit was created"),
         "{message}"
@@ -1910,7 +1988,7 @@ fn test_capturing_recovery_unwinds_the_checkpoint_commit() {
     );
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(
         message.contains("Recovered interrupted capture"),
         "{message}"
@@ -1970,7 +2048,7 @@ fn test_capturing_recovery_unwinds_the_root_checkpoint_commit() {
     );
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(
         message.contains("Recovered interrupted capture"),
         "{message}"
@@ -2027,8 +2105,10 @@ fn test_capturing_recovery_refuses_when_head_is_a_foreign_commit() {
         .trim()
         .to_string();
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(
+        matches!(recovery, RecoveryOutcome::Skipped { .. }),
+        "{recovery:?}"
+    );
 
     // The foreign commit is preserved, the marker survives, and the developer's
     // uncommitted work is untouched.
@@ -2089,8 +2169,10 @@ fn test_capturing_recovery_refuses_a_checkpoint_commit_of_another_base() {
         .trim()
         .to_string();
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
+    assert!(
+        matches!(recovery, RecoveryOutcome::Skipped { .. }),
+        "{recovery:?}"
+    );
 
     // A checkpoint commit of another base authorizes nothing, so history stays
     // untouched and the marker survives.
@@ -2188,7 +2270,7 @@ fn test_settled_recovery_reports_a_denied_marker_clear_and_retries() {
     let recovery = recover_interrupted_workflow(path).unwrap();
     fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(
         message.contains("transaction marker could not be cleared"),
         "{message}"
@@ -2199,7 +2281,7 @@ fn test_settled_recovery_reports_a_denied_marker_clear_and_retries() {
     // The second run finds the tree already at the recorded base, so it only
     // clears the surviving marker.
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none(), "{recovery:?}");
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
     assert!(!marker.exists());
 }
 
@@ -2227,12 +2309,12 @@ fn test_recovery_refuses_a_transaction_whose_writer_still_runs() {
         .to_string();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let reason = skipped_reason(recovery);
     let expected = format!(
         "the transaction writer (pid {}) is still running",
         std::process::id()
     );
-    assert!(message.contains(&expected), "{message}");
+    assert!(reason.contains(&expected), "{reason}");
 
     // Nothing of the live transaction was rewritten: the step commit is still
     // HEAD, its content is still on disk, and the marker survives for a later
@@ -2279,7 +2361,7 @@ fn test_recovery_of_a_dead_writer_runs_the_full_unwind() {
     .unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(message.contains("unwound 1 step commit(s)"), "{message}");
 
     let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
@@ -2327,9 +2409,9 @@ fn test_recovery_resumes_once_the_concurrent_writer_is_reaped() {
     .unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let reason = skipped_reason(recovery);
     let expected = format!("(pid {writer_pid}) is still running");
-    assert!(message.contains(&expected), "{message}");
+    assert!(reason.contains(&expected), "{reason}");
     assert!(read_transaction_marker(path).is_some());
     assert!(path.join("ai_work.txt").exists());
 
@@ -2337,7 +2419,7 @@ fn test_recovery_resumes_once_the_concurrent_writer_is_reaped() {
     let _ = child.kill();
     let _ = child.wait();
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
+    let message = recovered_message(recovery);
     assert!(message.contains("unwound 1 step commit(s)"), "{message}");
     assert!(!path.join("ai_work.txt").exists());
     assert!(read_transaction_marker(path).is_none());
@@ -2803,8 +2885,7 @@ fn test_recovery_reclaims_the_index_lock_of_a_dead_writer() {
     .unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("1 orphaned Git index lock"), "{message}");
+    assert_eq!(recovery, RecoveryOutcome::Cleaned { artifacts: 1 });
     assert!(!lock.exists());
 }
 
@@ -2822,8 +2903,8 @@ fn test_recovery_keeps_the_index_lock_of_a_writer_that_still_runs() {
     fs::write(&lock, "").unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("is still running"), "{message}");
+    let reason = skipped_reason(recovery);
+    assert!(reason.contains("is still running"), "{reason}");
     assert!(lock.exists());
 }
 
@@ -2854,7 +2935,7 @@ fn test_recovery_keeps_the_index_lock_no_marker_attributes() {
     .unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none(), "{recovery:?}");
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
     assert!(lock.exists());
 }
 
@@ -2938,7 +3019,7 @@ fn test_settled_unborn_proof_clears_the_marker_of_a_branch_still_unborn() {
     .unwrap();
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    assert!(recovery.is_none(), "{recovery:?}");
+    assert_eq!(recovery, RecoveryOutcome::NothingToDo);
 
     assert!(head_is_unborn(path));
     assert!(read_transaction_marker(path).is_none());
@@ -2986,9 +3067,8 @@ fn test_settled_proof_refuses_when_the_range_cannot_be_listed() {
     );
 
     let recovery = recover_interrupted_workflow(path).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
-    assert!(message.contains("could not be listed"), "{message}");
+    let reason = skipped_reason(recovery);
+    assert!(reason.contains("could not be listed"), "{reason}");
 
     // A proof that cannot be established authorizes nothing: the marker
     // survives for a later attempt, and neither the branch nor the working
@@ -3066,9 +3146,8 @@ fn test_settled_proof_refuses_a_born_reset_when_the_repository_advanced() {
     )
     .unwrap();
 
-    let message = refused.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
-    assert!(message.contains("HEAD moved"), "{message}");
+    let reason = skipped_reason(refused);
+    assert!(reason.contains("HEAD moved"), "{reason}");
 
     // The commit that landed survives, and no history, index entry, or
     // working-tree byte was rewritten.
@@ -3140,9 +3219,8 @@ fn test_settled_proof_refuses_the_unborn_return_when_the_repository_advanced() {
     )
     .unwrap();
 
-    let message = refused.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
-    assert!(message.contains("HEAD moved"), "{message}");
+    let reason = skipped_reason(refused);
+    assert!(reason.contains("HEAD moved"), "{reason}");
 
     // The branch keeps the commit that landed, and the paths the transaction
     // tracked stay in the working tree instead of being removed.
@@ -3217,9 +3295,8 @@ fn test_capturing_recovery_refuses_the_unstage_when_the_repository_advanced() {
     )
     .unwrap();
 
-    let message = refused.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
-    assert!(message.contains("HEAD moved"), "{message}");
+    let reason = skipped_reason(refused);
+    assert!(reason.contains("HEAD moved"), "{reason}");
 
     // The commit that landed survives, the developer's bytes stay in the
     // working tree, and the index is left exactly as the crash left it.
@@ -3306,9 +3383,8 @@ fn test_capturing_recovery_refuses_the_unwind_when_the_repository_advanced() {
     )
     .unwrap();
 
-    let message = refused.unwrap_or_default();
-    assert!(message.contains("Skipped crash recovery"), "{message}");
-    assert!(message.contains("HEAD moved"), "{message}");
+    let reason = skipped_reason(refused);
+    assert!(reason.contains("HEAD moved"), "{reason}");
 
     // The checkpoint commit and the commit that landed on top of it both stay
     // reachable, and the marker authorizes a later startup to redo the proof.
@@ -3589,13 +3665,13 @@ fn test_create_checkpoint_refuses_a_marker_a_live_writer_owns() {
 }
 
 #[test]
-fn test_create_checkpoint_replaces_the_marker_this_process_owns() {
+fn test_create_checkpoint_resolves_the_marker_this_process_owns() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
     crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
 
     // A capture this process opened earlier left its marker behind, so a later
-    // capture replaces it instead of refusing its own work.
+    // capture resolves that transaction before it writes its own marker.
     let first = create_checkpoint(path, GitHooks::Bypass).unwrap();
     assert_eq!(first.writer_pid, Some(std::process::id()));
     fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
@@ -3603,6 +3679,92 @@ fn test_create_checkpoint_replaces_the_marker_this_process_owns() {
     let second = create_checkpoint(path, GitHooks::Bypass).unwrap();
     assert!(second.created_checkpoint_commit);
     assert_eq!(read_transaction_marker(path), Some(second));
+}
+
+#[test]
+fn test_create_checkpoint_unwinds_the_transaction_this_process_left_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A turn of this process captured the developer's work and committed its
+    // verified progress, then stopped before the transaction was finalized.
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+    let first = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(first.created_checkpoint_commit);
+    assert_eq!(first.writer_pid, Some(std::process::id()));
+    fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
+    create_step_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "apply step 1",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    // A new capture resolves the marker its own process left behind before it
+    // writes a new one, so the step commit and the checkpoint commit are
+    // unwound through the proof a startup recovery runs.
+    let second = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(second.created_checkpoint_commit);
+    assert_eq!(read_transaction_marker(path), Some(second));
+
+    // The unwound progress is gone, the developer's work survived the unwind,
+    // and only the new capture commit sits above the initial commit.
+    assert!(!path.join("ai_work.txt").exists());
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+    let log = crate::git::cmd::run_git(Some(path), &["log", "--format=%s"]).unwrap();
+    assert!(!log.contains(STEP_PREFIX), "{log}");
+    let count = crate::git::cmd::run_git(Some(path), &["rev-list", "--count", "HEAD"]).unwrap();
+    assert_eq!(count.trim(), "2");
+}
+
+#[test]
+fn test_create_checkpoint_refuses_when_its_own_transaction_cannot_be_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A clean tree opens the transaction of this process without a checkpoint
+    // commit, so the proof range holds exactly the commits that follow.
+    let first = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(!first.created_checkpoint_commit);
+
+    // A developer commit without the Tauqe trailer lands inside that range, so
+    // the recorded transaction can no longer be proven.
+    fs::write(path.join("foreign.txt"), "foreign work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "foreign.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let error = create_checkpoint(path, GitHooks::Bypass)
+        .expect_err("an own transaction that cannot be proven must refuse the capture");
+    assert!(
+        error.to_string().contains("could not be resolved"),
+        "{error}"
+    );
+
+    // Nothing was rewritten and the marker survives for a later startup.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert_eq!(read_transaction_marker(path), Some(first));
+    assert!(path.join("foreign.txt").exists());
 }
 
 #[cfg(unix)]

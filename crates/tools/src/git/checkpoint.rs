@@ -149,6 +149,54 @@ pub struct CheckpointInfo {
     pub writer_pid: Option<u32>,
 }
 
+/// The typed outcome of a crash-recovery pass over the repository.
+///
+/// Recovery resolves one of several shapes, and the caller acts on each of them
+/// differently: a repository that holds no interrupted transaction is left
+/// alone, a provable transaction is unwound, an unprovable one is skipped with
+/// the reason its proof failed, and orphaned staging artifacts are reclaimed on
+/// their own. A free-form message cannot carry that distinction, so the outcome
+/// is a value the caller matches on, and a skip can never be presented as a
+/// completed recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// No transaction marker and no orphaned artifact: nothing was resolved.
+    NothingToDo,
+    /// An interrupted transaction was proven and unwound.
+    Recovered {
+        /// What the recovery did, in one line, for the journal.
+        message: String,
+    },
+    /// The repository matches no provable transaction state, so it was left
+    /// untouched and the marker survived for a later startup.
+    Skipped {
+        /// Why the proof refused the transaction.
+        reason: String,
+    },
+    /// Orphaned artifacts a crashed writer left behind were reclaimed.
+    Cleaned {
+        /// How many artifacts were reclaimed.
+        artifacts: usize,
+    },
+}
+
+impl std::fmt::Display for RecoveryOutcome {
+    /// Renders the outcome as the diagnostic the journal records.
+    ///
+    /// A skipped outcome renders the prefix the journal states, because the
+    /// reason inside the variant names only the failed proof.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryOutcome::NothingToDo => f.write_str("No interrupted workflow to resolve."),
+            RecoveryOutcome::Recovered { message } => f.write_str(message),
+            RecoveryOutcome::Skipped { reason } => write!(f, "Skipped crash recovery: {reason}."),
+            RecoveryOutcome::Cleaned { artifacts } => {
+                write!(f, "Cleaned up {artifacts} orphaned artifact(s).")
+            }
+        }
+    }
+}
+
 /// Resolves the path of the transaction marker for the given repository root.
 fn transaction_marker_path(dir: &Path) -> PathBuf {
     dir.join(TRANSACTION_MARKER_FILE)
@@ -183,18 +231,15 @@ fn commit_listing(dir: &Path, rev_range: &str, deadline: &GitDeadline) -> Result
         .collect())
 }
 
-/// Renders the refusal of a settled transaction whose proof range could not be
-/// listed.
+/// Renders the reason a settled transaction reports when its proof range could
+/// not be listed.
 ///
 /// A transient or structural `git log` failure says nothing about the commits
 /// a transaction recorded, so it never enters the trailer proof as an empty
 /// range: recovery keeps the marker, rewrites no history, and a later startup
 /// retries the proof once the range can be listed.
 fn proof_listing_refusal(rev_range: &str, error: &anyhow::Error) -> String {
-    format!(
-        "Skipped crash recovery: the proof range {rev_range} could not be listed \
-         ({error}); repository left untouched."
-    )
+    format!("the proof range {rev_range} could not be listed ({error}); repository left untouched")
 }
 
 /// Persists the checkpoint of an open transaction so crash recovery can tell a
@@ -337,15 +382,16 @@ struct HeadDrift {
 }
 
 impl HeadDrift {
-    /// Renders the drift as the skip diagnostic of crash recovery.
-    fn skip_diagnostic(&self) -> String {
-        format!(
-            "Skipped crash recovery: HEAD moved from {} to {} while the transaction was being \
-             proven; repository left untouched and the transaction marker is preserved for a \
-             later startup.",
-            describe_identity(self.pinned.as_deref()),
-            describe_identity(self.observed.as_deref()),
-        )
+    /// Renders the drift as the skipped outcome of a transaction recovery.
+    fn skip_outcome(&self) -> RecoveryOutcome {
+        RecoveryOutcome::Skipped {
+            reason: format!(
+                "HEAD moved from {} to {} while the transaction was being proven; repository \
+                 left untouched and the transaction marker is preserved for a later startup",
+                describe_identity(self.pinned.as_deref()),
+                describe_identity(self.observed.as_deref()),
+            ),
+        }
     }
 }
 
@@ -1066,9 +1112,21 @@ struct ReclaimedOrphans {
 }
 
 impl ReclaimedOrphans {
+    /// A pass that ran no sweep ahead of the proof it settles.
+    const NONE: Self = ReclaimedOrphans {
+        staging_files: 0,
+        index_lock: false,
+    };
+
     /// Reports whether the sweeps reclaimed nothing at all.
     fn is_empty(self) -> bool {
         self.staging_files == 0 && !self.index_lock
+    }
+
+    /// Counts the artifacts the sweeps reclaimed, an orphaned index lock
+    /// included.
+    fn count(self) -> usize {
+        self.staging_files + usize::from(self.index_lock)
     }
 
     /// Renders the reclaimed artifacts as the object of "cleaned up".
@@ -1126,10 +1184,10 @@ fn unstage_interrupted_capture(
     Ok(())
 }
 
-/// The diagnostic a capturing transaction reports when the repository state
+/// The reason a capturing transaction reports when the repository state
 /// matches neither recoverable shape of an interrupted capture.
 const CAPTURE_MISMATCH_REFUSAL: &str =
-    "Skipped crash recovery: the capturing transaction does not match the repository state; repository left untouched.";
+    "the capturing transaction does not match the repository state; repository left untouched";
 
 /// Recovers a transaction whose marker still records the capturing phase.
 ///
@@ -1141,7 +1199,7 @@ fn recover_capturing_transaction(
     checkpoint: &CheckpointInfo,
     reclaimed: ReclaimedOrphans,
     deadline: &GitDeadline,
-) -> Result<Option<String>> {
+) -> Result<RecoveryOutcome> {
     let pinned = resolve_head(dir, deadline);
     recover_capturing_transaction_pinned(dir, checkpoint, pinned.as_deref(), reclaimed, deadline)
 }
@@ -1161,7 +1219,8 @@ fn recover_capturing_transaction(
 /// runs, so a repository that advanced after the crash is refused instead of
 /// rewritten: the index is never unstaged over a commit that landed, and the
 /// unwind never removes a checkpoint commit a later commit already descends
-/// from. A drift refusal preserves the marker for a later startup.
+/// from. A drift refusal reports a skipped outcome and preserves the marker for
+/// a later startup.
 ///
 /// A failure to unwind the checkpoint commit or to clear the marker propagates
 /// with the marker left in place, so a later startup resolves the same state
@@ -1172,7 +1231,7 @@ fn recover_capturing_transaction_pinned(
     pinned: Option<&str>,
     reclaimed: ReclaimedOrphans,
     deadline: &GitDeadline,
-) -> Result<Option<String>> {
+) -> Result<RecoveryOutcome> {
     let subject = match pinned {
         Some(head) => commit_subject(dir, head, deadline),
         None => String::new(),
@@ -1192,14 +1251,16 @@ fn recover_capturing_transaction_pinned(
     };
     if crashed_before_commit {
         if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
-            return Ok(Some(drift.skip_diagnostic()));
+            return Ok(drift.skip_outcome());
         }
         unstage_interrupted_capture(dir, &checkpoint.base, deadline)?;
         clear_transaction_marker(dir)?;
-        return Ok(Some(with_reclaimed_orphans(
-            "Closed an interrupted capture: no checkpoint commit was created, the working tree was left untouched, and the index was returned to the recorded base",
-            reclaimed,
-        )));
+        return Ok(RecoveryOutcome::Recovered {
+            message: with_reclaimed_orphans(
+                "Closed an interrupted capture: no checkpoint commit was created, the working tree was left untouched, and the index was returned to the recorded base",
+                reclaimed,
+            ),
+        });
     }
 
     // The capture committed, but crashed before the rewrite that records it.
@@ -1213,30 +1274,38 @@ fn recover_capturing_transaction_pinned(
         };
     if crashed_after_commit {
         if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
-            return Ok(Some(drift.skip_diagnostic()));
+            return Ok(drift.skip_outcome());
         }
         match unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline) {
             Ok(true) => {}
             // The unwind resolves the identity once more before it rewrites
             // anything, so a state it cannot prove on its own terms leaves the
             // marker for a later startup instead of claiming a recovery.
-            Ok(false) => return Ok(Some(CAPTURE_MISMATCH_REFUSAL.to_string())),
+            Ok(false) => {
+                return Ok(RecoveryOutcome::Skipped {
+                    reason: CAPTURE_MISMATCH_REFUSAL.to_string(),
+                })
+            }
             Err(error) => {
                 if let Some(drift) = error.downcast_ref::<HeadDrift>() {
-                    return Ok(Some(drift.skip_diagnostic()));
+                    return Ok(drift.skip_outcome());
                 }
                 return Err(error)
                     .context("Failed to unwind the checkpoint commit of an interrupted capture");
             }
         }
         clear_transaction_marker(dir)?;
-        return Ok(Some(with_reclaimed_orphans(
-            "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
-            reclaimed,
-        )));
+        return Ok(RecoveryOutcome::Recovered {
+            message: with_reclaimed_orphans(
+                "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
+                reclaimed,
+            ),
+        });
     }
 
-    Ok(Some(CAPTURE_MISMATCH_REFUSAL.to_string()))
+    Ok(RecoveryOutcome::Skipped {
+        reason: CAPTURE_MISMATCH_REFUSAL.to_string(),
+    })
 }
 
 /// Recovers repository state from an interrupted/crashed workflow.
@@ -1277,9 +1346,17 @@ fn recover_capturing_transaction_pinned(
 ///
 /// Startup owns no turn context, so every Git command of the recovery runs
 /// under the default wall-clock budget.
-pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
+///
+/// The pass answers with a [`RecoveryOutcome`], so the shape it resolved reaches
+/// the caller as a value: a repository that holds no interrupted transaction
+/// reports that there was nothing to do, a proven transaction reports what it
+/// unwound, an unprovable one reports the reason it was skipped while keeping
+/// the marker, and a sweep that only reclaimed orphans reports how many
+/// artifacts it removed. A skip is therefore never presented as a completed
+/// recovery.
+pub fn recover_interrupted_workflow(dir: &Path) -> Result<RecoveryOutcome> {
     if !crate::git::state::is_git_repository(Some(dir)) {
-        return Ok(None);
+        return Ok(RecoveryOutcome::NothingToDo);
     }
     let deadline = GitDeadline::default();
 
@@ -1289,13 +1366,13 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     let checkpoint = match read_transaction_marker(dir) {
         Some(checkpoint) => checkpoint,
         None => {
-            if cleaned_artifacts > 0 {
-                return Ok(Some(format!(
-                    "Cleaned up {} orphaned staging artifact(s).",
-                    cleaned_artifacts
-                )));
-            }
-            return Ok(None);
+            return Ok(if cleaned_artifacts > 0 {
+                RecoveryOutcome::Cleaned {
+                    artifacts: cleaned_artifacts,
+                }
+            } else {
+                RecoveryOutcome::NothingToDo
+            });
         }
     };
 
@@ -1309,9 +1386,11 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // one written by an earlier revision — proves nothing about ownership and
     // recovers as before.
     if let Some(writer_pid) = live_writer(checkpoint.writer_pid) {
-        return Ok(Some(format!(
-            "Skipped crash recovery: the transaction writer (pid {writer_pid}) is still running; repository left untouched."
-        )));
+        return Ok(RecoveryOutcome::Skipped {
+            reason: format!(
+                "the transaction writer (pid {writer_pid}) is still running; repository left untouched"
+            ),
+        });
     }
 
     // A writer that is provably gone cannot still hold the index lock it may
@@ -1328,6 +1407,23 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         },
     };
 
+    settle_marked_transaction(dir, &checkpoint, reclaimed, &deadline)
+}
+
+/// Resolves one open transaction marker through the proof a startup recovery runs.
+///
+/// The proof is the same one the startup pass settles, so a transaction is
+/// resolved by identical terms whichever path reaches it: a capturing marker is
+/// resolved against HEAD and the recorded base, while a settled marker is proven
+/// over one pinned identity, every commit the transaction recorded is verified
+/// against the Tauqe co-author trailer, and the proof licenses the reset and the
+/// unwind only while that identity still holds.
+fn settle_marked_transaction(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    reclaimed: ReclaimedOrphans,
+    deadline: &GitDeadline,
+) -> Result<RecoveryOutcome> {
     // A capturing marker describes a crash inside the capture itself: the
     // developer's work may or may not have reached a checkpoint commit, and no
     // rewrite has recorded the outcome yet. The phase therefore selects the
@@ -1335,7 +1431,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // rewriting only for a settled transaction.
     match checkpoint.phase {
         TransactionPhase::Capturing => {
-            return recover_capturing_transaction(dir, &checkpoint, reclaimed, &deadline);
+            return recover_capturing_transaction(dir, checkpoint, reclaimed, deadline);
         }
         TransactionPhase::Established => {}
     }
@@ -1344,13 +1440,13 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // exactly once here, so every evidence step below addresses that same
     // commit and the action the proof licenses can re-assert it immediately
     // before it runs.
-    let pinned = resolve_head(dir, &deadline);
+    let pinned = resolve_head(dir, deadline);
 
     // Collect the commits the transaction recorded on top of its base. They
     // must all be Tauqe-created; anything else means this is not a dangling
     // Tauqe transaction and must be left alone. A range that cannot be listed
-    // refuses recovery instead of entering the proof as an empty one, because
-    // the absence of evidence is not the evidence of an empty transaction.
+    // refuses the proof instead of entering it as an empty one, because the
+    // absence of evidence is not the evidence of an empty transaction.
     let commits = match &checkpoint.base {
         TransactionBase::Commit(base) => {
             // The recorded base must still be part of the history of the
@@ -1358,17 +1454,23 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             // to another branch entirely, and resetting to it would discard
             // commits that were never part of the transaction.
             match pinned.as_deref() {
-                Some(pinned_commit) if is_ancestor_of(dir, base, pinned_commit, &deadline) => {
+                Some(pinned_commit) if is_ancestor_of(dir, base, pinned_commit, deadline) => {
                     let rev_range = format!("{base}..{pinned_commit}");
-                    match commit_listing(dir, &rev_range, &deadline) {
+                    match commit_listing(dir, &rev_range, deadline) {
                         Ok(commits) => commits,
-                        Err(error) => return Ok(Some(proof_listing_refusal(&rev_range, &error))),
+                        Err(error) => {
+                            return Ok(RecoveryOutcome::Skipped {
+                                reason: proof_listing_refusal(&rev_range, &error),
+                            })
+                        }
                     }
                 }
                 _ => {
-                    return Ok(Some(format!(
-                        "Skipped crash recovery: recorded transaction base {base} is not an ancestor of HEAD; repository left untouched."
-                    )));
+                    return Ok(RecoveryOutcome::Skipped {
+                        reason: format!(
+                            "recorded transaction base {base} is not an ancestor of HEAD; repository left untouched"
+                        ),
+                    });
                 }
             }
         }
@@ -1379,28 +1481,33 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         // holds commits and has to be listed like any other proof range.
         TransactionBase::Unborn => match pinned.as_deref() {
             None => Vec::new(),
-            Some(pinned_commit) => match commit_listing(dir, pinned_commit, &deadline) {
+            Some(pinned_commit) => match commit_listing(dir, pinned_commit, deadline) {
                 Ok(commits) => commits,
-                Err(error) => return Ok(Some(proof_listing_refusal(pinned_commit, &error))),
+                Err(error) => {
+                    return Ok(RecoveryOutcome::Skipped {
+                        reason: proof_listing_refusal(pinned_commit, &error),
+                    })
+                }
             },
         },
     };
     for commit in &commits {
-        if !commit_carries_tauqe_trailer(dir, commit, &deadline) {
-            return Ok(Some(format!(
-                "Skipped crash recovery: commit {} in the recorded transaction range was not created by Tauqe AI; repository left untouched.",
-                commit
-            )));
+        if !commit_carries_tauqe_trailer(dir, commit, deadline) {
+            return Ok(RecoveryOutcome::Skipped {
+                reason: format!(
+                    "commit {commit} in the recorded transaction range was not created by Tauqe AI; repository left untouched"
+                ),
+            });
         }
     }
 
     settle_proved_transaction(
         dir,
-        &checkpoint,
+        checkpoint,
         pinned.as_deref(),
         commits.len(),
         reclaimed,
-        &deadline,
+        deadline,
     )
 }
 
@@ -1411,6 +1518,14 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
 /// Every action below re-asserts that identity immediately before it runs, so a
 /// repository that advanced while the proof was being settled is refused with
 /// the skip diagnostic instead of rewritten: a commit no trailer check ever saw
+/// is never destroyed by the reset or by the return to the unborn state.
+/// Acts on a transaction whose proof is settled, refusing a moved repository.
+///
+/// The proof itself — the resolved identity, the listed commits, and their
+/// trailer verification — is computed by the caller over one pinned commit.
+/// Every action below re-asserts that identity immediately before it runs, so a
+/// repository that advanced while the proof was being settled is refused with
+/// the skipped outcome instead of rewritten: a commit no trailer check ever saw
 /// is never destroyed by the reset or by the return to the unborn state.
 ///
 /// Once the tree sits at the recorded base, the tolerance contract of a
@@ -1424,7 +1539,7 @@ fn settle_proved_transaction(
     unwound_steps: usize,
     reclaimed: ReclaimedOrphans,
     deadline: &GitDeadline,
-) -> Result<Option<String>> {
+) -> Result<RecoveryOutcome> {
     // If there were no step commits and no checkpoint commit created, there is
     // no transaction state to unwind. Resetting --hard in this case would
     // destroy legitimate uncommitted working tree changes. Closing the
@@ -1432,13 +1547,15 @@ fn settle_proved_transaction(
     // re-asserted before the marker is cleared.
     if unwound_steps == 0 && !checkpoint.created_checkpoint_commit {
         if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
-            return Ok(Some(drift.skip_diagnostic()));
+            return Ok(drift.skip_outcome());
         }
         clear_transaction_marker(dir)?;
         if reclaimed.is_empty() {
-            return Ok(None);
+            return Ok(RecoveryOutcome::NothingToDo);
         }
-        return Ok(Some(format!("Cleaned up {}.", reclaimed.clause())));
+        return Ok(RecoveryOutcome::Cleaned {
+            artifacts: reclaimed.count(),
+        });
     }
 
     // Return the tree to the recorded base and unwind a temporary checkpoint
@@ -1448,7 +1565,7 @@ fn settle_proved_transaction(
     // exactly the paths the transaction tracked leave the working tree. Both
     // leave untracked files alone, matching the previous recovery semantics.
     if let Some(drift) = pinned_identity_drift(dir, pinned, deadline) {
-        return Ok(Some(drift.skip_diagnostic()));
+        return Ok(drift.skip_outcome());
     }
     match &checkpoint.base {
         TransactionBase::Commit(base) => {
@@ -1463,7 +1580,7 @@ fn settle_proved_transaction(
                 // with the same diagnostic, while a genuine Git failure
                 // propagates.
                 if let Some(drift) = error.downcast_ref::<HeadDrift>() {
-                    return Ok(Some(drift.skip_diagnostic()));
+                    return Ok(drift.skip_outcome());
                 }
                 return Err(error).context("Failed to return the branch to its unborn base");
             }
@@ -1521,7 +1638,7 @@ fn settle_proved_transaction(
              retries the recovery"
         ));
     }
-    Ok(Some(msg))
+    Ok(RecoveryOutcome::Recovered { message: msg })
 }
 
 /// Returns the ignore rules that hide the harness state and the credentials.
@@ -1706,37 +1823,48 @@ fn verify_protected_paths_ignored(dir: &Path, deadline: &GitDeadline) -> Result<
     );
 }
 
-/// Refuses a capture that would overwrite a live writer's transaction marker.
+/// Resolves the transaction marker an earlier capture left behind.
 ///
 /// The marker is the single artifact crash recovery acts on, so a capture never
-/// replaces one that describes a transaction another process is still
-/// driving: that writer may be mid-capture, mid-step, or mid-finalization, and
-/// a capture of this process would leave its work behind a marker that no
-/// longer names it.
+/// silently replaces one: it first resolves whatever state the marker describes
+/// through the same proof a startup recovery runs. A marker another live process
+/// owns refuses the capture outright, because that writer may be mid-capture,
+/// mid-step, or mid-finalization, and a capture of this process would leave its
+/// work behind a marker that no longer names it. That is the refusal an isolated
+/// commit raises.
+///
+/// A marker this process wrote itself describes a transaction whose commits
+/// already exist, so overwriting it would strand them: the capture proves the
+/// transaction by its recorded base and unwinds it exactly as a startup would.
+/// A proof the repository no longer supports refuses the capture and keeps the
+/// marker for a later startup, because a silent overwrite would make the commits
+/// it explains unrecoverable. A marker attributed to a provably dead writer and
+/// an unattributed legacy marker keep the previous behavior of being replaced,
+/// and the first is what a startup recovery resolves.
 ///
 /// The ownership decision is the one the recovery gate and the staging-sibling
-/// sweep apply, read through the same helper, and the refusal is the one an
-/// isolated commit raises. A marker this process wrote itself keeps the
-/// previous behavior, because no other process could have opened it; a marker
-/// attributed to a provably dead writer and an unattributed legacy marker keep
-/// it as well, and the first is what a startup recovery resolves.
-fn refuse_owned_transaction_marker(dir: &Path) -> Result<()> {
+/// sweep apply, read through the same helper.
+fn resolve_owned_transaction_marker(dir: &Path, deadline: &GitDeadline) -> Result<()> {
     let Some(checkpoint) = read_transaction_marker(dir) else {
         return Ok(());
     };
-    let own_pid = std::process::id();
     let Some(writer_pid) = live_writer(checkpoint.writer_pid) else {
         return Ok(());
     };
-    if writer_pid == own_pid {
-        return Ok(());
+    if writer_pid != std::process::id() {
+        return Err(anyhow::Error::new(LiveTransactionWriter {
+            writer_pid,
+            step: "open a transaction",
+        }));
     }
-    Err(anyhow::Error::new(LiveTransactionWriter {
-        writer_pid,
-        step: "open a transaction",
-    }))
+    match settle_marked_transaction(dir, &checkpoint, ReclaimedOrphans::NONE, deadline)? {
+        RecoveryOutcome::Skipped { reason } => Err(anyhow::Error::msg(format!(
+            "Refusing to open a transaction: the transaction this process left open could not be \
+             resolved ({reason}); repository left untouched and its marker is preserved"
+        ))),
+        _ => Ok(()),
+    }
 }
-
 /// Creates a safe checkpoint of uncommitted changes before applying AI modifications.
 ///
 /// A tree holding uncommitted work is captured in two phases: the marker that
@@ -1762,11 +1890,12 @@ pub fn create_checkpoint_with_deadline(
     hooks: GitHooks,
     deadline: &GitDeadline,
 ) -> Result<CheckpointInfo> {
-    // A capture overwrites the marker, so the ownership gate runs first: the
-    // refusal precedes the ignore-rule installation, the repository probes,
-    // and the first marker write, leaving any live transaction exactly as it
-    // was.
-    refuse_owned_transaction_marker(dir)?;
+    // A capture replaces the marker, so it resolves whatever transaction the
+    // marker still describes first: a marker another live writer owns refuses
+    // the capture before the ignore-rule installation, the repository probes,
+    // and the first marker write, while a transaction this process left open is
+    // proven by its recorded base and unwound exactly as a startup would.
+    resolve_owned_transaction_marker(dir, deadline)?;
 
     // The ignore rules are the only mechanism that keeps the credential file out
     // of `git add -A`, so a failure to install them aborts the checkpoint instead
@@ -1847,6 +1976,14 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
 
 /// Restores the working tree to the pre-checkpoint state under the supplied
 /// wall-clock budget.
+///
+/// The transaction is closed only after the temporary checkpoint commit is
+/// unwound, so a crash between the two steps leaves the marker for the next
+/// startup instead of leaving a checkpoint commit that no marker explains. The
+/// reset has already replaced the pre-turn working tree by the time the unwind
+/// runs, so a refused unwind is reported in the diagnostic instead of aborting
+/// the rollback: the marker survives, and the next recovery resolves the same
+/// state idempotently.
 pub fn restore_checkpoint_with_deadline(
     dir: &Path,
     checkpoint: &CheckpointInfo,
@@ -1877,21 +2014,39 @@ pub fn restore_checkpoint_with_deadline(
         deadline,
     );
 
-    // 2. Close the transaction before the checkpoint is unwound. The reset above
-    //    has already replaced the pre-turn working tree, so a failed unwind must
-    //    never leave the marker behind and strand every later recovery: the
-    //    marker is cleared first, and the failure propagates as a diagnostic the
-    //    rollback-retry loop of the engine can act on.
-    clear_transaction_marker(dir)?;
-    if checkpoint.created_checkpoint_commit {
-        unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline).with_context(
-            || {
-                format!(
-                    "the working tree was reset but the `{CHECKPOINT_PREFIX}` commit could not \
-                 be unwound; the pre-turn work stays recoverable inside it at HEAD"
-                )
-            },
-        )?;
+    // 2. Unwind the temporary checkpoint commit before the transaction is
+    //    closed. A crash between the two steps leaves the marker, which the
+    //    next startup resolves idempotently, while the opposite order would
+    //    clear the marker first and strand a checkpoint commit that nothing
+    //    explains.
+    //
+    //    The reset above has already replaced the pre-turn working tree, so a
+    //    refused unwind is reported in the diagnostic instead of aborting the
+    //    rollback: the marker survives, and the next recovery resolves the
+    //    remaining state.
+    let closed = !checkpoint.created_checkpoint_commit
+        || match unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::error!(
+                    "The checkpoint commit could not be unwound while rolling the transaction \
+                     back: no commit the marker records sits at HEAD; the transaction marker is \
+                     preserved and a later recovery resolves the remaining state"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to unwind the checkpoint commit while rolling the transaction back: \
+                     {}; the pre-turn work stays recoverable inside the `{CHECKPOINT_PREFIX}` \
+                     commit at HEAD and the transaction marker is preserved for a later recovery",
+                    error
+                );
+                false
+            }
+        };
+    if closed {
+        clear_transaction_marker(dir)?;
     }
 
     cleanup_orphaned_staging_files(dir);

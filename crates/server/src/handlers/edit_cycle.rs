@@ -26,7 +26,12 @@ use tauqe_protocol::events;
 /// closing without an applied change set always explains itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditTermination {
-    /// The turn concluded with a conversational answer and proposed no file edits.
+    /// The turn concluded with a conversational answer instead of a change set.
+    ///
+    /// A dialogue closes an answered turn through [`EditCycle::close_answered`],
+    /// which reports no error; this variant classifies the endings of the step
+    /// contours, where a step that answers instead of committing did not deliver
+    /// the change it owed.
     Answered,
     /// The turn proposed file edits, but they could not be converged or applied by virtual staging.
     StagingRefused,
@@ -117,7 +122,9 @@ impl EditCycle {
     ///
     /// An applied outcome never carries an error. An unapplied outcome always
     /// carries a reason: the error it already names, or the description of
-    /// `termination` when it names none. Returns whether this call won the
+    /// `termination` when it names none. The one ending outside that rule is a
+    /// conversational answer, which [`EditCycle::close_answered`] closes without
+    /// an error because nothing was refused. Returns whether this call won the
     /// closing; a losing call publishes nothing.
     pub(crate) fn close_outcome(
         &self,
@@ -153,6 +160,22 @@ impl EditCycle {
                 verification,
             },
         )
+    }
+
+    /// Closes the cycle for a turn that answered without a change set.
+    ///
+    /// A conversational answer is a successful ending of a dialogue rather than
+    /// a refused change, so the closing names no error: nothing was staged,
+    /// nothing was lost, and there is nothing for the developer to repair.
+    /// Returns whether this call won the closing.
+    pub(crate) fn close_answered(&self) -> bool {
+        self.finish(EditOutcome {
+            applied: false,
+            error: None,
+            changed_files: Vec::new(),
+            commit_hash: None,
+            verification: None,
+        })
     }
 
     /// Arbitrates the closing and publishes `edit/finished` for the winner.
@@ -393,6 +416,27 @@ mod tests {
                 events::EDIT_STARTED,
                 events::EDIT_FINISHED
             ]
+        );
+    }
+
+    #[test]
+    fn an_answered_ending_carries_no_error() {
+        let (out, mut rx) = OutChannel::new();
+        let cycle = EditCycle::new(out, "op-8");
+        assert!(cycle.open());
+        assert!(cycle.close_answered());
+        assert!(!cycle.close_answered(), "a closed cycle publishes nothing");
+
+        let events = drain(&mut rx);
+        assert_eq!(
+            methods(&events),
+            vec![events::EDIT_STARTED, events::EDIT_FINISHED]
+        );
+        let finished = &events[1]["params"];
+        assert_eq!(finished["applied"], false);
+        assert!(
+            finished.get("error").is_none(),
+            "an answer is not a failure: {finished}"
         );
     }
 }

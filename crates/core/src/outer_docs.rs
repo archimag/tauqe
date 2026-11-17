@@ -49,7 +49,7 @@ pub const OUTER_DOCS_CACHE_DIR: &str = ".tauqe/cache/outer_docs";
 /// The directory is what makes the prefix jail expressible on disk: the root
 /// document and every relative document it links to share one subtree, and no
 /// document the declaration does not cover ever lands inside it.
-pub fn document_dir(id: &str) -> String {
+pub(crate) fn document_dir(id: &str) -> String {
     format!("{OUTER_DOCS_CACHE_DIR}/{id}")
 }
 
@@ -58,17 +58,17 @@ pub fn document_dir(id: &str) -> String {
 /// The root keeps its own file name inside the directory of its declaration, so a
 /// relative document lands beside it and a link the root text carries names the
 /// very file the harness caches.
-pub fn document_cache_path(doc: &OuterDoc) -> String {
+pub(crate) fn document_cache_path(doc: &OuterDoc) -> String {
     format!("{}/{}", document_dir(&doc.id), root_file_name(&doc.source))
 }
 
 /// Repository-relative path one relative document of `doc` is cached under.
-pub fn relative_cache_path(doc: &OuterDoc, relative: &str) -> String {
+pub(crate) fn relative_cache_path(doc: &OuterDoc, relative: &str) -> String {
     format!("{}/{}", document_dir(&doc.id), relative)
 }
 
 /// Reports whether `path` names the documentation cache or anything beneath it.
-pub fn is_outer_docs_cache_path(path: &str) -> bool {
+pub(crate) fn is_outer_docs_cache_path(path: &str) -> bool {
     Path::new(path).starts_with(OUTER_DOCS_CACHE_DIR)
 }
 
@@ -78,7 +78,7 @@ pub fn is_outer_docs_cache_path(path: &str) -> bool {
 /// derived from the declaration, while the wire contract addresses the document
 /// by its logical path alone. A path outside the cache addresses no document
 /// and answers `None`.
-pub fn logical_path(path: &str) -> Option<&str> {
+pub(crate) fn logical_path(path: &str) -> Option<&str> {
     let relative = path.strip_prefix(OUTER_DOCS_CACHE_DIR)?.strip_prefix('/')?;
     if relative.is_empty() {
         return None;
@@ -95,7 +95,6 @@ pub fn logical_path(path: &str) -> Option<&str> {
 pub const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Reports whether `path` is a clean repository-relative path written with `/`.
-/// Reports whether `path` is a clean repository-relative path written with `/`.
 ///
 /// The declaration is portable, so the rule is stated on the raw segments: an
 /// empty path, an empty segment (which covers an absolute path, a doubled
@@ -111,7 +110,7 @@ pub const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 /// character keeps the bytes the jail validated and the bytes the host resolves
 /// identical, so the rule is closed under decoding without the harness decoding
 /// anything itself.
-pub fn is_clean_relative_path(path: &str) -> bool {
+pub(crate) fn is_clean_relative_path(path: &str) -> bool {
     if path.is_empty()
         || path.contains('\\')
         || path.contains('\0')
@@ -412,18 +411,18 @@ pub fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuterDoc {
     /// Mount point of the root document inside the outer documentation tree.
-    pub id: String,
+    pub(crate) id: String,
     /// Human-readable label rendered in the catalog the model reads.
-    pub title: String,
+    pub(crate) title: String,
     /// Optional note describing what the document covers.
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Where the content of the root document comes from.
-    pub source: OuterDocSource,
+    source: OuterDocSource,
 }
 
 impl OuterDoc {
     /// Resolves one declared entry, reporting why it is unusable.
-    pub fn from_entry(entry: &OuterDocEntry) -> Result<Self, String> {
+    pub(crate) fn from_entry(entry: &OuterDocEntry) -> Result<Self, String> {
         let id = entry.id.trim();
         if !is_clean_relative_path(id) {
             return Err(format!(
@@ -475,6 +474,7 @@ fn root_file_name(source: &OuterDocSource) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct OuterDocsRegistry {
     docs: Vec<OuterDoc>,
+    #[cfg(test)]
     diagnostics: Vec<String>,
 }
 
@@ -495,11 +495,13 @@ impl OuterDocsRegistry {
     /// this degradation is a second line of defense.
     pub fn new(entries: &[OuterDocEntry]) -> Self {
         let mut docs: Vec<OuterDoc> = Vec::with_capacity(entries.len());
+        #[cfg(test)]
         let mut diagnostics: Vec<String> = Vec::new();
         for entry in entries {
             match OuterDoc::from_entry(entry) {
                 Ok(doc) => {
                     if docs.iter().any(|declared| declared.id == doc.id) {
+                        #[cfg(test)]
                         diagnostics.push(format!(
                             "the outer document id `{}` is declared twice",
                             doc.id
@@ -508,29 +510,36 @@ impl OuterDocsRegistry {
                     }
                     docs.push(doc);
                 }
-                Err(reason) => diagnostics.push(reason),
+                Err(reason) => {
+                    #[cfg(test)]
+                    diagnostics.push(reason);
+                    #[cfg(not(test))]
+                    let _ = reason;
+                }
             }
         }
-        Self { docs, diagnostics }
+        Self {
+            docs,
+            #[cfg(test)]
+            diagnostics,
+        }
     }
 
     /// Reports whether the project declares no external documentation.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.docs.is_empty()
     }
 
-    /// The declared documents, in declaration order.
-    pub fn docs(&self) -> &[OuterDoc] {
-        &self.docs
-    }
-
     /// Declarations that could not be resolved, in declaration order.
-    pub fn diagnostics(&self) -> &[String] {
+    #[cfg(test)]
+    fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
 
     /// Finds a declared root document by its id.
-    pub fn document(&self, id: &str) -> Option<&OuterDoc> {
+    #[cfg(test)]
+    fn document(&self, id: &str) -> Option<&OuterDoc> {
         self.docs.iter().find(|doc| doc.id == id)
     }
 
@@ -543,7 +552,7 @@ impl OuterDocsRegistry {
     /// snapshot that now exists, `Ok(None)` reports that the path names no
     /// declared document and leaves it an ordinary request, and a refusal travels
     /// as [`MaterializeError`] with its classification intact.
-    pub async fn materialize_request(
+    pub(crate) async fn materialize_request(
         &self,
         repo_root: &Path,
         path: &str,
@@ -579,7 +588,7 @@ impl OuterDocsRegistry {
     }
 
     /// Materializes one declared entry against a trust declaration.
-    pub(crate) async fn materialize_declared_with(
+    async fn materialize_declared_with(
         &self,
         repo_root: &Path,
         id: &str,

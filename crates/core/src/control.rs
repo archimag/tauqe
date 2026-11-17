@@ -14,6 +14,7 @@
 
 pub mod cache;
 pub mod context;
+pub mod history;
 pub mod outcome;
 pub mod plan;
 pub mod prompt;
@@ -22,13 +23,9 @@ pub mod repl;
 pub mod turn;
 
 pub use context::{CancellationToken, EventSink, LoopContext};
+pub use history::compact_history_if_needed_with_budget;
 pub use outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
-pub use plan::{run_plan_step_loop, PlanStepArtifact, PlanStepLoopConfig};
+pub use plan::{PlanStepArtifact, PlanStepLoopConfig};
 pub use prompt::PromptBuilder;
 pub use repl::{repl_capabilities, run_repl_loop, ReplArtifact, ReplLoopConfig};
-pub use turn::{
-    handle_research_commands, run_edit_loop, run_research_loop, run_staging_loop, run_turn_loop,
-    EditArtifact, EditLoopConfig, ResearchArtifact, ResearchFeedback, ResearchLoopConfig,
-    StagingArtifact, StagingLoopConfig, TurnArtifact, TurnLoopConfig, EDIT_CAPABILITIES,
-    RESEARCH_CAPABILITIES,
-};
+pub use turn::{run_turn_loop, ResearchLoopConfig, TurnArtifact, TurnLoopConfig};

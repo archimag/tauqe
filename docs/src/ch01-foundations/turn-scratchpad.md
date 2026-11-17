@@ -1,9 +1,9 @@
 # Turn Scratchpad
 
 A bounded turn can span many rounds: a discovery round, a failed staging attempt, a
-healing cycle. Between those rounds the model holds no memory of its own — the
-prompt is re-sent, not remembered. The scratchpad is the carrier of that working
-state.
+healing cycle. The turn transcript replays each round to the next one, so the dialogue
+itself is remembered; the scratchpad carries the part of that working state a model
+prefers to state compactly instead of re-deriving it from its own prose.
 
 ---
 
@@ -47,9 +47,9 @@ enough to describe it:
 - **Scratchpad** — the accumulated text the model records for itself. It arrives
   either as a `scratchpad` block or as a self-closing `scratchpad` tag carrying a
   `note` attribute, and both forms contribute to the same buffer.
-- **Turn scratchpad block** — the re-injection of that buffer into the next round,
-  rendered as one explicit block after the whole stable prefix of the system
-  message.
+- **Recorded note** — the text a round records for itself. It travels back to the
+  model inside the assistant answer the turn transcript replays, so the working state of
+  a turn is read from the dialogue rather than re-rendered into the system head.
 - **Budget** — a hard character cap on the buffer, with truncation on a character
   boundary so multi-byte text is never split.
 
@@ -68,10 +68,11 @@ turn.
 2. **Accumulate.** The buffer persists across research rounds, staging retries, and
    healing rounds. A later round does not need to restate what an earlier round
    recorded.
-3. **Re-inject.** Before the next request, the buffer is rendered as the last block
-   of the system message — after the context files and the active plan. Keeping it
-   last is what preserves the provider's cached prefix: the volatile tail changes on
-   every round by design, while everything in front of it stays byte-identical.
+3. **Read back.** The buffer is not re-injected into the system message between
+   rounds. The answer that carried the note is replayed by the turn transcript as the
+   assistant message of its round, so the model reads its own notes back from the
+   dialogue it produced. Keeping them out of the head is what holds the provider's
+   cached prefix byte-identical inside a phase.
 4. **Bound.** The buffer is capped at 4,000 characters. Truncation lands on a
    character boundary, and the prompt instructions ask for dense bullets instead of
    prose so the cap is reached rarely.

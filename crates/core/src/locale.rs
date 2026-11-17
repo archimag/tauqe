@@ -67,7 +67,7 @@ pub fn build_locale_user_prompt(params: &LocaleGenerateParams) -> String {
 /// operation (see `crates/core/Conventions.md`, section 1.2). The model returns
 /// machine-readable translation entries instead of free-form text recovered by
 /// heuristics.
-pub fn locale_response_schema() -> serde_json::Value {
+fn locale_response_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {

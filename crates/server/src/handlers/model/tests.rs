@@ -34,19 +34,19 @@ use crate::handlers::history::handle_history_get;
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 /// Capability surface of a free interactive dialogue.
-fn dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+fn dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
     tauqe_core::control::repl_capabilities(None)
 }
 
 /// Capability surface of a plan-anchored dialogue.
-fn plan_dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+fn plan_dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
     tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Plan {
         id: "plan-1".to_string(),
     }))
 }
 
 /// Capability surface of a review-anchored dialogue.
-fn review_dialogue_capabilities() -> tauqe_protocol::CapabilityExpr {
+fn review_dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
     tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Review {
         id: "review-1".to_string(),
     }))

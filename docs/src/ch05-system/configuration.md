@@ -139,7 +139,7 @@ it runs a declared command line and reads its exit status.
 | --- | --- |
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
-| `[repl]` | edit retries, verification healing budget, replan budget, per-tier coder and architect attempt budgets, workflow mode, edit protocol, patch strategy, prompt layout |
+| `[repl]` | the turn round budget, the replan budget, workflow mode, edit protocol, patch strategy |
 | `[history]` | token budget and uncompressed tail length |
 | `[context]` | research rounds, the aggregate token budget, the outline budget, report caps, pinned patterns |
 | `[[review.presets]]` | named review presets, audited path slices, and post-analysis timing |
@@ -173,23 +173,14 @@ explained in the same vocabulary. The profile module that owns that vocabulary i
 described in *The Three-Phase Modification Lifecycle*; this chapter declares only
 the key.
 
-The same section declares how the rendered prompt blocks become a message sequence,
-through its `prompt_layout` key. The policy is orthogonal to both the transport and
-the patch strategy: the transport picks the encoding of a model answer, the strategy
-picks how a change set addresses a line range, and the layout picks the order and the
-growth shape of the message sequence.
-
-| `prompt_layout` | Message sequence | Resolved default |
-| --- | --- | --- |
-| `semantic` | blocks grouped by kind: one system message carrying the contract, the outline, the whole context block, the active plan, the language directive, the history block, and the scratchpad | read-only discussion, isolated step |
-| `chronological` | a byte-stable head, an append-only transcript of history records interleaved with the context files they observed, and a volatile tail of plan, context manifest, and scratchpad | interactive REPL |
-
-An absent key keeps the resolution by turn intent: an interactive REPL turn takes the
-chronological transcript, whose append-only growth keeps the provider prefix cache
-warm from one turn to the next, while a read-only discussion and an isolated step
-carry no growing history to interleave and keep the semantic order. A declared value
-overrides that resolution for every intent, and the blocks themselves stay identical
-under both policies — only their composition differs.
+The message sequence carries no key: every turn is composed into the chronological
+transcript — a byte-stable head, an append-only transcript of history records
+interleaved with the context files they observed, and a volatile tail of plan, context
+manifest, and scratchpad. Its append-only growth keeps the provider prefix cache warm
+from one turn to the next, while the blocks themselves never change, only their
+composition. The transcript is orthogonal to both remaining keys: `protocol` picks the
+encoding of a model answer and `patch_strategy` picks how a change set addresses a line
+range.
 
 `providers.openrouter.api_key` is deliberately skipped on deserialization: a key
 pasted into `tauqe.toml` is ignored rather than honored, so the mistake cannot become
@@ -287,23 +278,22 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 
 | Key | Documented default | Bounds |
 | --- | --- | --- |
-| `context.max_research_rounds` | 5 | widening rounds per turn |
+| `repl.max_turn_rounds` | 16 | physical provider calls one turn may spend: discovery, patch retry, healing, and the correction of an empty answer alike |
 | `context.token_budget` | 300,000 | aggregate cost of the context: repository files and external documents alike |
 | `context.repomap_token_budget` | 4,000 | the repository outline |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
-| `repl.max_retries` | 5 | staging retries and verification healing rounds within one turn |
 | `repl.max_replans` | 2 | automated replans after a blocked step |
-| `repl.max_tier_attempts` | 3 | content attempts one coder tier receives before the ladder escalates |
-| `repl.max_architect_attempts` | 2 | generation attempts one architect tier receives before the architect ladder escalates |
 | project entry `timeout_secs` | 600 | one verification, format, post-hook, or named-command invocation |
 Keys renamed by a later revision keep their former spelling as a permanent
 deserialization alias, so an existing `tauqe.toml` keeps loading unchanged:
-`context.max_discovery_rounds` remains accepted as an alias of
-`context.max_research_rounds`, `context.files_token_budget` remains accepted as an
-alias of `context.token_budget`, and the former `[develop]` and `[edit]` section
-names remain accepted as aliases of `[repl]`. Those retired names appear nowhere
-else in this book.
+`context.files_token_budget` remains accepted as an alias of
+`context.token_budget`, and the former `[develop]` and `[edit]` section names remain
+accepted as aliases of `[repl]`. Those retired names appear nowhere else in this
+book.
+The round budgets retired with the unified turn loop carry no alias: they are absent
+from the typed contract, and `repl.max_turn_rounds` is the single pool they were
+replaced by.
 A project entry's own `timeout_secs` overrides the harness budget for that entry
 alone. A repository may override any documented default, and this repository does
 (section 3.6). The point is not the numbers but their addressability: a small library
@@ -395,10 +385,11 @@ whose rungs differ by model or by reasoning depth, so the same model can run
 shallowly in one role and deeply in another without a duplicate catalog entry.
 
 Two ladders exist and they never cross. `coder` answers a failed *how*: its
-`max_tier_attempts` (3 by default) bounds how many content attempts one rung receives
-before the ladder escalates, while the staging retries and verification healing rounds
-inside one attempt stay bounded by `max_retries`. `architect` answers a failed *what*:
-its `max_architect_attempts` (2 by default) bounds how many generation attempts one rung
+`attempts` on the entry bounds how many content attempts one rung receives before
+the ladder escalates, while every round inside one attempt — a discovery round, a
+patch retry, a healing round — spends the single `max_turn_rounds` pool of the turn.
+`architect` answers a failed *what*: its `attempts` (2 by default) bounds how many
+generation attempts one rung receives
 receives before `next_architect_tier` promotes the work, and the ladder is consumed by
 replanning a broken horizon. `auto_level_up` enables the coder ladder; without it, a
 failing turn rolls back and reports instead of escalating. The escalation rules
@@ -421,9 +412,10 @@ unverified; a declaration whose reference chain is broken is refused by
 validation instead of being silently skipped.
 
 The wall-clock budget comes from the entry's `timeout_secs`, and the fallback is 600
-seconds, which a real test suite routinely needs. Healing is bounded by the edit retry
-budget (`develop.max_retries`), so a verification failure receives the same number of
-repair rounds as a failed patch.
+seconds, which a real test suite routinely needs. A healing round is one provider
+call, so it spends the same `repl.max_turn_rounds` pool a discovery round or a patch
+retry spends: a verification failure receives a repair round, and the pool bounds
+how many the turn can afford.
 
 Every invocation is one process in its own process group with that budget, so a timeout
 or a cancellation tears down the compiler and every binary it spawned. The exit status

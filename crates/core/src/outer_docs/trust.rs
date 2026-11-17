@@ -88,18 +88,18 @@ const TRUST_FILE_NAME: &str = "refs-trust.toml";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceDeclaration {
     /// Absolute path of the repository this entry authorizes.
-    pub root: String,
+    pub(crate) root: String,
     /// Absolute directories a declared local source may be read from.
     #[serde(default)]
-    pub local_roots: Vec<String>,
+    pub(crate) local_roots: Vec<String>,
     /// Whether a declared remote source may address a non-public network.
     #[serde(default)]
-    pub allow_private_network: bool,
+    pub(crate) allow_private_network: bool,
 }
 
 impl WorkspaceDeclaration {
     /// Renders the entry as a copyable `[[workspace]]` block.
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         #[derive(Serialize)]
         struct Declaration<'a> {
             workspace: Vec<&'a WorkspaceDeclaration>,
@@ -170,7 +170,7 @@ pub enum TrustRefusal {
 
 impl TrustRefusal {
     /// Exact cause of the refusal, in the vocabulary of the declared source.
-    pub fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         match self {
             Self::WorkspaceNotAuthorized { workspace } => format!(
                 "the workspace `{root}` has no entry in `{TRUST_FILE_NAME}`, so it reads no local source outside the repository and reaches no non-public address",
@@ -198,7 +198,7 @@ impl TrustRefusal {
     ///
     /// A source the harness will simply not fetch has no such remedy: the
     /// `[[outer_docs]]` declaration itself must name a different source.
-    pub fn remedy(&self) -> Option<String> {
+    pub(crate) fn remedy(&self) -> Option<String> {
         let workspace = match self {
             Self::WorkspaceNotAuthorized { workspace }
             | Self::LocalSourceOutsideRoots { workspace, .. }

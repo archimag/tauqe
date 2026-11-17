@@ -3,7 +3,7 @@ use std::path::Path;
 /// Resolves a candidate file path against a list of permitted editable paths.
 /// For `create` operations, suffix matching is disabled to prevent accidental overwrites.
 /// For `replace`/`delete`, exact match is preferred; ambiguous suffix matches return an error.
-pub fn resolve_target_path_for_op(
+pub(crate) fn resolve_target_path_for_op(
     candidate: &str,
     editable_paths: &[String],
     is_create: bool,
@@ -46,15 +46,6 @@ pub fn resolve_target_path_for_op(
     }
 }
 
-/// Resolves a candidate file path against editable paths (defaulting to non-create semantics).
-pub fn resolve_target_path(candidate: &str, editable_paths: &[String]) -> String {
-    resolve_target_path_for_op(candidate, editable_paths, false).unwrap_or_else(|_| {
-        let cleaned = candidate.trim().trim_matches('`').trim();
-        let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
-        cleaned.strip_prefix('/').unwrap_or(cleaned).to_string()
-    })
-}
-
 /// Resolves a model-named path the streaming preview is about to read from disk.
 ///
 /// The streaming filters resolve a path before the authoritative staging engine
@@ -79,7 +70,7 @@ pub(crate) fn resolve_preview_read_path(
 }
 
 /// Normalizes line breaks and whitespace around content.
-pub fn normalize_content(raw: &str) -> String {
+pub(crate) fn normalize_content(raw: &str) -> String {
     let s = if let Some(stripped) = raw.strip_prefix("\r\n") {
         stripped
     } else if let Some(stripped) = raw.strip_prefix('\n') {

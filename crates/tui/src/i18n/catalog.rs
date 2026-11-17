@@ -536,6 +536,11 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("history.auto_scroll_off", "[Auto-scroll: OFF]", "History auto-scroll disabled indicator", None),
         item("history.badge.in_flight", "IN-FLIGHT", "History badge marking a turn whose prompt is still running", Some(12)),
         item("history.badge.rolled_back", "ROLLED BACK", "History badge marking a turn whose prompt never reached the model context", Some(14)),
+        item("history.badge.interrupted", "INTERRUPTED", "History badge marking a turn that was interrupted before it produced a final answer", Some(14)),
+        item("history.rounds_header", "Rounds ({})", "History label naming the intermediate rounds a recorded turn ran; {} receives the round count", None),
+        item("history.round_badge", "[R{}]", "History badge naming one intermediate round of a turn; {} receives the one-based round ordinal", Some(8)),
+        item("history.round_feedback_label", "feedback: ", "History label prefixing the feedback the harness returned after an intermediate round", None),
+        item("history.rounds_note", "{} rounds", "History note counting the folded rounds of a collapsed record", None),
         item("history.rolled_back_hint", "Not sent to the model context. Press [↑] in the prompt or Ctrl+P to restore it.", "History hint telling the developer how to restore a rolled back prompt", None),
 
         // ------------------------------------------------------------------
@@ -975,6 +980,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("cmd.history.clear", "Clear the conversation history (with confirmation)", "History command description", None),
         item("cmd.history.fold_toggle", "Fold or unfold the active history item", "History command description", None),
+        item("cmd.history.toggle_rounds", "Fold or unfold the intermediate rounds of the selected item", "History command description", None),
         item("cmd.history.copy_block", "Copy the code block of the active item", "History command description", None),
         item("cmd.history.copy_item", "Copy the selected item text to the clipboard", "History command description", None),
         item("cmd.history.return", "Return to the REPL", "History command description", None),

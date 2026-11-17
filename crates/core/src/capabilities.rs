@@ -15,49 +15,45 @@ mod regime;
 mod rules;
 mod schema;
 
-pub struct PromptRenderContext<'a> {
-    pub editable_paths: &'a [String],
-    pub has_eager_repo_map: bool,
-    pub project: Option<&'a ProjectConfig>,
-    pub patch_strategy: PatchStrategy,
+pub(crate) struct PromptRenderContext<'a> {
+    _editable_paths: &'a [String],
+    has_eager_repo_map: bool,
+    project: Option<&'a ProjectConfig>,
+    patch_strategy: PatchStrategy,
 }
 
 impl<'a> PromptRenderContext<'a> {
-    pub fn new(editable_paths: &'a [String], _marker: Option<&'a str>) -> Self {
+    pub(crate) fn new(editable_paths: &'a [String], _marker: Option<&'a str>) -> Self {
         Self {
-            editable_paths,
+            _editable_paths: editable_paths,
             has_eager_repo_map: false,
             project: None,
             patch_strategy: PatchStrategy::SearchReplace,
         }
     }
 
-    pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
+    pub(crate) fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
         self.has_eager_repo_map = has_eager_repo_map;
         self
     }
 
-    pub fn with_project(mut self, project: Option<&'a ProjectConfig>) -> Self {
+    pub(crate) fn with_project(mut self, project: Option<&'a ProjectConfig>) -> Self {
         self.project = project;
         self
     }
 
-    pub fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
+    pub(crate) fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
         self.patch_strategy = patch_strategy;
         self
     }
 }
 
-pub use rules::{
-    compose_contract_rules, compose_structured_protocol_instructions, contract_rule, delta_rule,
-    render_contract_rules, structured_instruction, ContractContext, ContractRule,
+pub(crate) use rules::{
+    compose_contract_rules, compose_structured_protocol_instructions, ContractContext,
 };
 
-// The regime trunk composes as two typed lists, and an integration test must
-// prove that the dialogue contours render that trunk byte-identically. The two
-// composers are re-exported so the proof stays reachable without exposing the
-// internal module layout.
-pub use regime::{intent_delta_rules, shared_trunk_rules};
+#[cfg(test)]
+pub(crate) use rules::render_contract_rules;
 
 #[allow(unused_imports)]
 pub(crate) use decode::decode_capability_expr;

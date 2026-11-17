@@ -17,11 +17,12 @@ use self::types::{
     StreamingChunk,
 };
 
-pub mod catalog;
+#[cfg(test)]
+pub(crate) mod catalog;
 mod sse;
 pub mod types;
 
-pub use self::types::GenerationStats;
+pub(crate) use self::types::GenerationStats;
 
 /// Maximum time to establish a connection to OpenRouter.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -42,7 +43,7 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn new(api_key: String) -> Self {
+    pub(crate) fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
@@ -59,7 +60,8 @@ impl OpenRouterProvider {
         }
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
@@ -67,7 +69,8 @@ impl OpenRouterProvider {
     /// Overrides the budget of the best-effort generation-stats enrichment
     /// fetch. Production keeps `GENERATION_STATS_TIMEOUT`; tests shrink it so
     /// a stalled endpoint is observed without waiting out the ceiling.
-    pub fn with_generation_stats_timeout(mut self, timeout: std::time::Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_generation_stats_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.generation_stats_timeout = timeout;
         self
     }
@@ -78,7 +81,7 @@ impl OpenRouterProvider {
     /// under the configured budget: a slow, hung, or unreachable
     /// generation endpoint yields `None` instead of stalling the caller inside
     /// the shared client's much larger read budget.
-    pub async fn get_generation_stats(
+    pub(crate) async fn get_generation_stats(
         &self,
         generation_id: &str,
     ) -> Result<Option<GenerationStats>> {

@@ -12,16 +12,20 @@
 //! request together with the repository outline and listing requests — declares
 //! them in one place. The registry folds the fragments in module order, so the
 //! composed schema stays a deterministic projection of the enabled surface.
+//!
+//! The composed schema is self-contained: a shared definition a plan payload
+//! references is inlined at its use site and no `$defs` section survives,
+//! because strict Structured Output mode is not guaranteed to resolve a JSON
+//! Pointer of a shared definition, least of all inside a discriminated union.
 
 use serde_json::{json, Map, Value};
 #[cfg(test)]
 use tauqe_protocol::DocTopic;
 use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityExpr, CommitMessageCommand, ContextRequestCommand,
+    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextRequestCommand,
     CustomToolCommand, DirListCommand, DocRequestCommand, LlmCapability, OuterDocRequestCommand,
     PatchStrategy, RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand,
-    ShortDescriptionCommand, StructuredChangeProposal, TextCommand, TurnErrorCommand,
-    TurnSkipCommand, VerifyCommand,
+    StructuredChangeProposal, TextCommand, TurnErrorCommand, TurnSkipCommand,
 };
 
 use crate::capabilities::PromptRenderContext;
@@ -73,12 +77,17 @@ fn op_property(patch_strategy: PatchStrategy) -> Value {
 /// branches at once, and its description restates the exclusion because the
 /// discriminator is the only place the model reads what the branch means.
 fn branch_kind_property(label: &str) -> Value {
+    let description = if label == "answer" {
+        "Operational branch this response follows: 'answer'. Select this when your response in 'message' is complete and final, requiring no further research rounds or code edits.".to_string()
+    } else {
+        format!(
+            "Operational branch this response follows: '{label}'. A response follows exactly one branch, so the commands of another branch are never stated in the same round."
+        )
+    };
     json!({
         "type": "string",
         "enum": [label],
-        "description": format!(
-            "Operational branch this response follows: '{label}'. A response follows exactly one branch, so the commands of another branch are never stated in the same round."
-        )
+        "description": description
     })
 }
 
@@ -89,7 +98,7 @@ fn branch_kind_property(label: &str) -> Value {
 /// commands and physically omit the properties of every other branch. `required`
 /// mirrors the emitted properties, because a strict schema must require exactly what
 /// it declares.
-pub(crate) fn branch_variant(label: &str, fields: Map<String, Value>) -> Value {
+fn branch_variant(label: &str, fields: Map<String, Value>) -> Value {
     let mut properties = Map::new();
     properties.insert("kind".to_string(), branch_kind_property(label));
     for (name, schema) in fields {
@@ -99,11 +108,16 @@ pub(crate) fn branch_variant(label: &str, fields: Map<String, Value>) -> Value {
         .keys()
         .map(|name| Value::String(name.clone()))
         .collect();
+    let description = if label == "answer" {
+        "Variant of the 'answer' branch: terminal marker indicating that your conversational text in 'message' is the complete final answer to the user and no further research or code edits are required".to_string()
+    } else {
+        format!(
+            "Variant of the '{label}' branch: it carries the branch discriminator together with the commands of that branch, and nothing of any other branch"
+        )
+    };
     json!({
         "type": "object",
-        "description": format!(
-            "Variant of the '{label}' branch: it carries the branch discriminator together with the commands of that branch, and nothing of any other branch"
-        ),
+        "description": description,
         "properties": Value::Object(properties),
         "required": required,
         "additionalProperties": false
@@ -115,7 +129,7 @@ pub(crate) fn branch_variant(label: &str, fields: Map<String, Value>) -> Value {
 /// The union is what makes the exclusion grammatical: a strict schema cannot forbid
 /// a field, but it can refuse to declare two shapes at once, so the fields of the
 /// branch a response did not select are not part of the object it produces.
-pub(crate) fn action_union(label: String, variants: Vec<Value>) -> (String, Value) {
+fn action_union(label: String, variants: Vec<Value>) -> (String, Value) {
     (
         label,
         json!({
@@ -226,7 +240,7 @@ fn projected_changes_schema(patch_strategy: PatchStrategy) -> Value {
 
 /// Returns the JSON schema properties owned by one atomic [`LlmCapability`]
 /// under `ctx`, or `None` when the capability is inactive in `ctx`.
-pub(crate) fn capability_schema(
+fn capability_schema(
     cap: LlmCapability,
     ctx: &PromptRenderContext<'_>,
 ) -> Option<Map<String, Value>> {
@@ -236,15 +250,8 @@ pub(crate) fn capability_schema(
             let _ = schemars_object::<TextCommand>();
             map.insert(
                 "message".to_string(),
-                string_property("Conversational explanation or response to the user"),
-            );
-        }
-        LlmCapability::ShortDescription => {
-            let _ = schemars_object::<ShortDescriptionCommand>();
-            map.insert(
-                "message".to_string(),
                 string_property(
-                    "Concise 1-3 sentence explanation of the action, findings, or changes",
+                    "Conversational explanation or response to the user, present at every stage of the turn whatever branch the action selects",
                 ),
             );
         }
@@ -368,17 +375,6 @@ pub(crate) fn capability_schema(
                     }
                 }),
             );
-        }
-        LlmCapability::ToolchainVerify => {
-            let verify = finalize_strict_object(
-                schemars_object::<VerifyCommand>(),
-                "Deterministic toolchain verification request",
-                &[
-                    ("target", "Verification scope: 'all', 'check', 'test', or 'clippy'"),
-                    ("on_success", "'silent' reports only a concise confirmation, 'report' surfaces the full command output"),
-                ],
-            );
-            map.insert("verify".to_string(), verify);
         }
         LlmCapability::PlanCreation => {
             map.insert(
@@ -510,15 +506,15 @@ pub(crate) fn capability_schema(
     Some(map)
 }
 
-/// Recursively collects properties and shared `$defs` from a [`CapabilityExpr`].
+/// Recursively collects properties and shared `$defs` from a [`CapabilityTree`].
 fn collect_expr_schema(
-    expr: &CapabilityExpr,
+    expr: &CapabilityTree,
     ctx: &PromptRenderContext<'_>,
     defs: &mut Map<String, Value>,
 ) -> Map<String, Value> {
     let mut properties = Map::new();
     match expr {
-        CapabilityExpr::Leaf(cap) => {
+        CapabilityTree::Leaf(cap) => {
             if matches!(cap, LlmCapability::PlanCreation | LlmCapability::PlanUpdate) {
                 if let Some(entries) =
                     tauqe_protocol::discussion::schema::plan_schema_definitions().as_object()
@@ -534,35 +530,41 @@ fn collect_expr_schema(
                 }
             }
         }
-        CapabilityExpr::Set(items) => {
+        CapabilityTree::Set(_, items) => {
             for item in items {
                 for (name, schema) in collect_expr_schema(item, ctx, defs) {
                     properties.entry(name).or_insert(schema);
                 }
             }
         }
-        CapabilityExpr::AnyOf(label, branches) => {
-            let described: Vec<(&str, Map<String, Value>)> = branches
-                .iter()
-                .map(|branch| {
-                    (
-                        branch.kind.as_str(),
-                        collect_expr_schema(&branch.expr, ctx, defs),
-                    )
-                })
-                .collect();
-            if described.len() < 2 {
-                for (_, fields) in described {
+        CapabilityTree::AnyOf(label, branches) => {
+            let mut variants: Vec<(&str, Map<String, Value>)> = Vec::new();
+            for branch in branches {
+                match branch.label().filter(|kind| !kind.is_empty()) {
+                    Some(kind) => variants.push((kind, collect_expr_schema(branch, ctx, defs))),
+                    // A branch that carries no name takes part in the level that
+                    // holds the union, exactly as a transparent block does.
+                    None => {
+                        for (name, schema) in collect_expr_schema(branch, ctx, defs) {
+                            properties.entry(name).or_insert(schema);
+                        }
+                    }
+                }
+            }
+            if variants.len() < 2 {
+                // A union of fewer than two named branches excludes nothing, so
+                // its properties return to the level that holds it.
+                for (_, fields) in variants {
                     for (name, schema) in fields {
                         properties.entry(name).or_insert(schema);
                     }
                 }
             } else {
-                let variants: Vec<Value> = described
+                let tagged: Vec<Value> = variants
                     .into_iter()
                     .map(|(kind, fields)| branch_variant(kind, fields))
                     .collect();
-                let (name, union) = action_union(label.clone(), variants);
+                let (name, union) = action_union(label.clone(), tagged);
                 properties.insert(name, union);
             }
         }
@@ -570,27 +572,103 @@ fn collect_expr_schema(
     properties
 }
 
+/// Prefix of the JSON Pointer that addresses one shared definition.
+const DEFINITION_POINTER_PREFIX: &str = "#/$defs/";
+
+/// Resolves every shared-definition reference of `node` in place.
+///
+/// The plan tree is unrolled into one definition per depth level and a payload
+/// references them by pointer, because a definition that references itself is
+/// not expressible at all. A shared definition is still a second place a schema
+/// can break: a strict Structured Output mode is not guaranteed to resolve a
+/// JSON Pointer, and a pointer nested inside a discriminated union is the least
+/// reliable of them. The composed surface is therefore self-contained — every
+/// reference is replaced by the body of the definition it names, inlined once
+/// per use site.
+///
+/// `visited` carries the definitions of the current walk, so a definition that
+/// reached itself keeps its pointer instead of recursing forever; the unrolled
+/// plan tree is an acyclic chain, so that guard never fires for it.
+fn inline_definitions(
+    node: &Value,
+    definitions: &Map<String, Value>,
+    visited: &mut Vec<String>,
+) -> Value {
+    match node {
+        Value::Object(object) => {
+            let reference = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|target| target.strip_prefix(DEFINITION_POINTER_PREFIX))
+                .filter(|name| !visited.iter().any(|seen| seen.as_str() == *name))
+                .and_then(|name| definitions.get(name).map(|body| (name, body)));
+            if let Some((name, definition)) = reference {
+                visited.push(name.to_string());
+                let body = inline_definitions(definition, definitions, visited);
+                visited.pop();
+                let siblings: Map<String, Value> = object
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "$ref")
+                    .map(|(key, value)| {
+                        (key.clone(), inline_definitions(value, definitions, visited))
+                    })
+                    .collect();
+                return match body {
+                    Value::Object(mut resolved) => {
+                        resolved.extend(siblings);
+                        Value::Object(resolved)
+                    }
+                    other => other,
+                };
+            }
+            let mut inlined = Map::with_capacity(object.len());
+            for (key, value) in object {
+                inlined.insert(key.clone(), inline_definitions(value, definitions, visited));
+            }
+            Value::Object(inlined)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| inline_definitions(item, definitions, visited))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Composes the full strict JSON schema for a [`CapabilityExpr`] under `ctx`.
+///
+/// The composed schema is the whole wire contract, so it carries the plan tree
+/// a payload uses in place and never a definitions section: every reference the
+/// capability modules emit is resolved here, and one projection therefore
+/// serves the schema, the decoder, and the rendered instructions unchanged.
 pub(crate) fn capability_expr_schema(
-    expr: &CapabilityExpr,
+    expr: &CapabilityTree,
     ctx: &PromptRenderContext<'_>,
 ) -> Value {
-    let mut defs = Map::new();
-    let properties = collect_expr_schema(expr, ctx, &mut defs);
+    let mut definitions = Map::new();
+    let collected = collect_expr_schema(expr, ctx, &mut definitions);
+    let mut visited: Vec<String> = Vec::new();
+    let properties: Map<String, Value> = collected
+        .into_iter()
+        .map(|(name, schema)| {
+            (
+                name,
+                inline_definitions(&schema, &definitions, &mut visited),
+            )
+        })
+        .collect();
     let required: Vec<Value> = properties
         .keys()
         .map(|name| Value::String(name.clone()))
         .collect();
-    let mut schema = json!({
+    json!({
         "type": "object",
         "properties": Value::Object(properties),
         "required": required,
         "additionalProperties": false
-    });
-    if !defs.is_empty() {
-        schema["$defs"] = Value::Object(defs);
-    }
-    schema
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -601,6 +679,24 @@ mod tests {
     fn project_with_command() -> ProjectConfig {
         serde_json::from_str(r#"{"commands": {"check": {"command": "just", "args": ["check"]}}}"#)
             .expect("project parses")
+    }
+
+    /// Returns the inlined plan tree node a payload declares at `level`.
+    ///
+    /// The composed schema substitutes every shared definition at its use site,
+    /// so a deeper level is reached through the `children` chain of the level
+    /// above it instead of through a reference to a definition.
+    fn inlined_plan_node<'a>(
+        composed: &'a Value,
+        payload: &str,
+        collection: &str,
+        level: usize,
+    ) -> &'a Value {
+        let mut node = &composed["properties"][payload]["properties"][collection]["items"];
+        for _ in 1..level {
+            node = &node["properties"]["children"]["items"];
+        }
+        node
     }
 
     #[test]
@@ -740,53 +836,60 @@ mod tests {
             );
         }
 
-        // The shared definitions reach the root of the composed surface exactly
-        // once, whichever plan capability composes it.
-        for capability in [LlmCapability::PlanCreation, LlmCapability::PlanUpdate] {
-            let composed = capability_expr_schema(&CapabilityExpr::leaf(capability), &ctx);
-            assert_eq!(
-                &composed["$defs"],
-                tauqe_protocol::discussion::schema::plan_schema_definitions()
-            );
-            let map = composed["$defs"]
-                .as_object()
-                .expect("the plan definitions are an object");
-            assert_eq!(map.len(), 2 * PLAN_TREE_DEPTH);
+        // The composed surface is self-contained: the shared definitions are
+        // inlined where a payload uses them, so neither a definitions section
+        // nor a reference reaches the wire, whichever plan capability composes
+        // it.
+        for (capability, payload) in [
+            (LlmCapability::PlanCreation, "plan_create"),
+            (LlmCapability::PlanUpdate, "plan_update"),
+        ] {
+            let composed = capability_expr_schema(&CapabilityTree::leaf(capability), &ctx);
+            assert!(composed.get("$defs").is_none(), "{capability}");
+            let serialized = composed.to_string();
+            assert!(!serialized.contains("$ref"), "{capability}");
+            assert!(!serialized.contains("$defs"), "{capability}");
 
-            for kind in ["ConceptItem", "PlanItem"] {
+            for (collection, kind) in [("concept", "ConceptItem"), ("items", "PlanItem")] {
                 for level in 1..=PLAN_TREE_DEPTH {
-                    let name = format!("{kind}L{level}");
-                    let node = map
-                        .get(name.as_str())
-                        .unwrap_or_else(|| panic!("the unrolled tree declares {name}"));
-                    assert_eq!(node["additionalProperties"], serde_json::json!(false));
-                    assert_eq!(node["properties"]["children"]["type"], "array", "{name}");
+                    let node = inlined_plan_node(&composed, payload, collection, level);
+                    assert_eq!(node["type"], "object", "{kind} level {level}");
+                    assert_eq!(
+                        node["additionalProperties"],
+                        serde_json::json!(false),
+                        "{kind} level {level}"
+                    );
+                    let children = &node["properties"]["children"];
+                    assert_eq!(children["type"], "array", "{kind} level {level}");
                     if level < PLAN_TREE_DEPTH {
                         assert_eq!(
-                            node["properties"]["children"]["items"]["$ref"],
-                            format!("#/$defs/{kind}L{}", level + 1),
-                            "{name} chains to the next level of its own kind"
+                            children["items"]["type"], "object",
+                            "{kind} level {level} chains to the next level of its own kind"
                         );
                     } else {
                         assert_eq!(
-                            node["properties"]["children"]["maxItems"],
-                            serde_json::json!(0)
+                            children["maxItems"],
+                            serde_json::json!(0),
+                            "{kind} level {level} seals the tree"
                         );
                     }
 
                     let declared: std::collections::BTreeSet<&str> = node["properties"]
                         .as_object()
-                        .expect("the definition declares its fields")
+                        .expect("the inlined level declares its fields")
                         .keys()
                         .map(String::as_str)
                         .collect();
                     let required: std::collections::BTreeSet<&str> = node["required"]
                         .as_array()
-                        .expect("the definition requires its fields")
+                        .expect("the inlined level requires its fields")
                         .iter()
                         .filter_map(|field| field.as_str())
                         .collect();
-                    assert_eq!(declared, required, "{name} requires what it declares");
+                    assert_eq!(
+                        declared, required,
+                        "{kind} level {level} requires what it declares"
+                    );
                 }
             }
         }
@@ -900,13 +1003,12 @@ mod tests {
             tauqe_protocol::discussion::schema::review_update_schema()
         );
 
-        let variants = review_update["anyOf"]
-            .as_array()
-            .expect("the review payload is a nullable union");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[1]["type"], "null");
+        // The nullable shape is the canonical strict form: one object schema
+        // whose `type` array admits `null` beside `object`, so no combinator
+        // stands between the payload and the fields it declares.
+        assert_eq!(review_update["type"], serde_json::json!(["object", "null"]));
 
-        let object = &variants[0];
+        let object = review_update;
         let mut properties: Vec<&str> = object["properties"]
             .as_object()
             .expect("the review payload declares its fields")
@@ -963,6 +1065,29 @@ mod tests {
         assert!(union["description"]
             .as_str()
             .is_some_and(|description| description.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn the_answer_branch_states_that_it_is_a_terminal_marker() {
+        let variant = branch_variant("answer", Map::new());
+        assert_eq!(variant["properties"]["kind"]["enum"], json!(["answer"]));
+        assert_eq!(variant["additionalProperties"], json!(false));
+
+        // The branch that ends a dialogue carries nothing but its discriminator,
+        // so both descriptions say that the answer itself lives in the root
+        // `message` and that selecting this branch is what closes the turn.
+        let kind = variant["properties"]["kind"]["description"]
+            .as_str()
+            .expect("the discriminator states its meaning");
+        assert!(kind.contains("complete and final"));
+        assert!(kind.contains("no further research rounds or code edits"));
+
+        let description = variant["description"]
+            .as_str()
+            .expect("the variant states its meaning");
+        assert!(description.contains("terminal marker"));
+        assert!(description.contains("'message'"));
+        assert!(description.contains("complete final answer"));
     }
 
     fn assert_descriptions(node: &serde_json::Value, path: &str, is_root: bool) {
@@ -1077,16 +1202,14 @@ mod tests {
 
     #[test]
     fn capability_expr_schema_handles_single_and_nested_any_of_and_defs() {
-        use tauqe_protocol::CapabilityBranch;
-
         let ctx = PromptRenderContext::new(&[], None);
 
         // Single-branch AnyOf merges transparently into the enclosing level.
-        let single = CapabilityExpr::any_of(
+        let single = CapabilityTree::any_of(
             "action",
-            [CapabilityBranch::new(
+            [CapabilityTree::named_set(
                 "only",
-                CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)]),
+                [CapabilityTree::leaf(LlmCapability::TextMessage)],
             )],
         );
         let single_schema = capability_expr_schema(&single, &ctx);
@@ -1096,44 +1219,52 @@ mod tests {
         assert_descriptions(&single_schema, "single", true);
 
         // Nested AnyOf and PlanCreation lift `$defs` to the root and keep strict invariants.
-        let nested = CapabilityExpr::set([
-            CapabilityExpr::leaf(LlmCapability::TextMessage),
-            CapabilityExpr::any_of(
+        let nested = CapabilityTree::root([
+            CapabilityTree::leaf(LlmCapability::TextMessage),
+            CapabilityTree::any_of(
                 "action",
                 [
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "plan",
-                        CapabilityExpr::set([
-                            CapabilityExpr::leaf(LlmCapability::PlanCreation),
-                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                        ]),
+                        [
+                            CapabilityTree::leaf(LlmCapability::PlanCreation),
+                            CapabilityTree::leaf(LlmCapability::CommitMessage),
+                        ],
                     ),
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "nested",
-                        CapabilityExpr::any_of(
+                        [CapabilityTree::any_of(
                             "sub_action",
                             [
-                                CapabilityBranch::new(
+                                CapabilityTree::named_set(
                                     "search",
-                                    CapabilityExpr::leaf(LlmCapability::RepoSearch),
+                                    [CapabilityTree::leaf(LlmCapability::RepoSearch)],
                                 ),
-                                CapabilityBranch::new(
+                                CapabilityTree::named_set(
                                     "edit",
-                                    CapabilityExpr::leaf(LlmCapability::EditReplace),
+                                    [CapabilityTree::leaf(LlmCapability::EditReplace)],
                                 ),
                             ],
-                        ),
+                        )],
                     ),
                 ],
             ),
         ]);
         let nested_schema = capability_expr_schema(&nested, &ctx);
-        assert!(nested_schema.get("$defs").is_some());
+        // The plan branch of the union carries its unrolled tree inlined in
+        // place, so the exclusion of the branches costs no shared definition and
+        // no reference a strict mode would have to resolve.
+        assert!(nested_schema.get("$defs").is_none());
+        assert!(!nested_schema.to_string().contains("$ref"));
         let variants = nested_schema["properties"]["action"]["anyOf"]
             .as_array()
             .expect("outer anyOf");
         assert_eq!(variants.len(), 2);
         assert!(variants[1]["properties"]["sub_action"]["anyOf"].is_array());
+        assert_eq!(
+            variants[0]["properties"]["plan_create"]["properties"]["concept"]["items"]["type"],
+            "object"
+        );
         assert_descriptions(&nested_schema, "nested", true);
 
         // Full interactive_repl surface composes cleanly with all descriptions.

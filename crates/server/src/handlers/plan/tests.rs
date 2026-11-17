@@ -48,6 +48,19 @@ fn tier_with_attempts(model: &str, attempts: u32) -> tauqe_protocol::ModelEntry 
     entry
 }
 
+/// Returns the whole prompt surface of one round.
+///
+/// The context files of a round travel as their own transcript messages, so a
+/// test that asks what the model was told reads every message of the request
+/// instead of the system head alone.
+fn round_text(messages: &[tauqe_core::providers::ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
 fn test_state(dir: &TestDir) -> Arc<AppState> {
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1056,15 +1069,15 @@ async fn test_handle_plan_replan_preloads_blocked_step_files() {
     assert!(res.error.is_none(), "replan failed: {:?}", res.error);
 
     // The blocked step's declared target and reference files are preloaded into
-    // the context block of the architect prompt before the very first generation
-    // round.
+    // the context of the architect prompt before the very first generation
+    // round, and the transcript carries each of them as a `<file>` element.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
-    let system_prompt = &requests[0].messages[0].content;
-    assert!(system_prompt.contains("<file path=\"src/target.rs\""));
-    assert!(system_prompt.contains("<file path=\"src/reference.rs\""));
-    assert!(system_prompt.contains("pub fn target() {}"));
-    assert!(system_prompt.contains("pub fn reference_helper() -> u64 { 7 }"));
+    let prompt = round_text(&requests[0].messages);
+    assert!(prompt.contains("<file path=\"src/target.rs\""));
+    assert!(prompt.contains("<file path=\"src/reference.rs\""));
+    assert!(prompt.contains("pub fn target() {}"));
+    assert!(prompt.contains("pub fn reference_helper() -> u64 { 7 }"));
 }
 
 #[tokio::test]
@@ -1142,7 +1155,12 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
 
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 2);
-    let feedback_prompt = &requests[1].messages[1].content;
+    // The context feedback extends the task message, which closes the round.
+    let feedback_prompt = &requests[1]
+        .messages
+        .last()
+        .expect("the round carries a task message")
+        .content;
     assert!(feedback_prompt.contains("<context_feedback>"));
     assert!(feedback_prompt.contains("already loaded in context"));
 
@@ -1389,18 +1407,17 @@ async fn test_handle_plan_refine_preloads_all_existing_step_files() {
 
     // Deep planning preloads every existing step's declared target and
     // reference files before the architect's first generation round, not just a
-    // single blocked step's. The turn kernel renders them as `<file>` elements
-    // of the context block in the stable head of the round, so the task fragment
-    // never restates a file it does not own.
+    // single blocked step's. The transcript renders them as `<file>` elements of
+    // the context, so the task fragment never restates a file it does not own.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
-    let system_prompt = &requests[0].messages[0].content;
-    assert!(system_prompt.contains("<file path=\"src/a.rs\""));
-    assert!(system_prompt.contains("<file path=\"src/b.rs\""));
-    assert!(system_prompt.contains("<file path=\"src/ref.rs\""));
-    assert!(system_prompt.contains("pub fn a() {}"));
-    assert!(system_prompt.contains("pub fn b() {}"));
-    assert!(system_prompt.contains("pub fn r() -> u64 { 1 }"));
+    let prompt = round_text(&requests[0].messages);
+    assert!(prompt.contains("<file path=\"src/a.rs\""));
+    assert!(prompt.contains("<file path=\"src/b.rs\""));
+    assert!(prompt.contains("<file path=\"src/ref.rs\""));
+    assert!(prompt.contains("pub fn a() {}"));
+    assert!(prompt.contains("pub fn b() {}"));
+    assert!(prompt.contains("pub fn r() -> u64 { 1 }"));
 }
 
 #[tokio::test]
@@ -3089,7 +3106,11 @@ async fn test_plan_step_structured_protocol_execution() {
     // marker-bound control tags.
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
-    let user_prompt = &requests[0].messages[1].content;
+    let user_prompt = &requests[0]
+        .messages
+        .last()
+        .expect("the round carries a task message")
+        .content;
     for tag in ["<success", "<context_request", "<blocked", "<verify"] {
         assert!(
             !user_prompt.contains(tag),
@@ -3257,7 +3278,6 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.repl.max_retries = 2;
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![

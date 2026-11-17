@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
+use tauqe_core::git::checkpoint::RecoveryOutcome;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
     events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, DiscussionTarget, Event,
@@ -204,15 +205,42 @@ impl AppState {
         history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
         out: OutChannel,
     ) -> Arc<Self> {
-        // Crash recovery: check and recover any dangling checkpoint or step commits from an interrupted workflow
-        if let Ok(Some(recovery_msg)) =
-            tauqe_core::git::checkpoint::recover_interrupted_workflow(&repo_path)
-        {
-            tracing::warn!(
-                repo_root = %repo_path.display(),
-                "Recovered interrupted workflow: {}",
-                recovery_msg,
-            );
+        // Crash recovery resolves any dangling checkpoint or step commit an
+        // interrupted workflow left behind, and the resolved shape decides how
+        // it is recorded: a completed recovery and a reclaimed artifact are
+        // informational, a skipped proof is a warning that names its reason,
+        // and a failed pass is an error that names the repository root. A skip
+        // is never presented as a completed recovery.
+        match tauqe_core::git::checkpoint::recover_interrupted_workflow(&repo_path) {
+            Ok(RecoveryOutcome::NothingToDo) => {}
+            Ok(RecoveryOutcome::Recovered { message }) => {
+                tracing::info!(
+                    repo_root = %repo_path.display(),
+                    "Recovered interrupted workflow: {}",
+                    message,
+                );
+            }
+            Ok(RecoveryOutcome::Skipped { reason }) => {
+                tracing::warn!(
+                    repo_root = %repo_path.display(),
+                    "Skipped crash recovery: {}",
+                    reason,
+                );
+            }
+            Ok(RecoveryOutcome::Cleaned { artifacts }) => {
+                tracing::info!(
+                    repo_root = %repo_path.display(),
+                    artifacts,
+                    "Reclaimed the artifacts of an interrupted workflow",
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    repo_root = %repo_path.display(),
+                    "Crash recovery failed: {:#}",
+                    error,
+                );
+            }
         }
 
         // Read RPCs are side-effect free: listing, loading, and resolving a

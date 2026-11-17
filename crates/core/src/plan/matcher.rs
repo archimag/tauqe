@@ -1,7 +1,7 @@
 use tauqe_protocol::Plan;
 
 /// Computes the Levenshtein edit distance between two strings.
-pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
     let m = a_chars.len();
@@ -40,7 +40,7 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Normalizes an identifier or slug for comparison.
-pub fn normalize_identifier(id: &str) -> String {
+fn normalize_identifier(id: &str) -> String {
     id.trim().to_lowercase().replace('_', "-")
 }
 
@@ -56,8 +56,7 @@ pub enum PlanResolution<'a> {
 }
 
 impl<'a> PlanResolution<'a> {
-    /// Returns the resolved plan if unambiguous.
-    pub fn plan(self) -> Option<&'a Plan> {
+    fn plan(self) -> Option<&'a Plan> {
         match self {
             PlanResolution::Found(p) => Some(p),
             _ => None,
@@ -65,7 +64,8 @@ impl<'a> PlanResolution<'a> {
     }
 
     /// Returns `true` if multiple candidates matched.
-    pub fn is_ambiguous(&self) -> bool {
+    #[cfg(test)]
+    fn is_ambiguous(&self) -> bool {
         matches!(self, PlanResolution::Ambiguous(_))
     }
 }
@@ -73,7 +73,7 @@ impl<'a> PlanResolution<'a> {
 /// Resolves a candidate plan by exact ID or normalized ID match only (case-insensitive and `_`/`-` normalized).
 ///
 /// Never performs fuzzy Levenshtein, prefix, or title matching.
-pub fn resolve_plan_id_exact<'a>(query: &str, plans: &'a [Plan]) -> Option<&'a Plan> {
+pub(crate) fn resolve_plan_id_exact<'a>(query: &str, plans: &'a [Plan]) -> Option<&'a Plan> {
     let q = query.trim();
     if q.is_empty() {
         return None;
@@ -101,7 +101,7 @@ pub fn resolve_plan_id_exact<'a>(query: &str, plans: &'a [Plan]) -> Option<&'a P
 ///
 /// At stages 2-6, if multiple candidates match with equal confidence, returns
 /// `PlanResolution::Ambiguous(candidates)` instead of guessing.
-pub fn resolve_plan<'a>(
+pub(crate) fn resolve_plan<'a>(
     query: &str,
     plans: &'a [Plan],
     active_id: Option<&str>,
@@ -208,7 +208,7 @@ pub fn resolve_plan<'a>(
 /// Resolves a candidate plan id, slug, or title against a list of known plans.
 ///
 /// Returns `Some(&Plan)` only if an unambiguous match is found.
-pub fn resolve_plan_id<'a>(
+pub(crate) fn resolve_plan_id<'a>(
     query: &str,
     plans: &'a [Plan],
     active_id: Option<&str>,

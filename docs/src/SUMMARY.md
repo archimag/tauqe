@@ -5,7 +5,7 @@
 # Part I — Foundations & Cognitive Architecture
 
 - [Philosophy: The Semantic Harness](ch01-foundations/semantic-harness.md)
-- [The Autonomous Bounded Turn FSM](ch01-foundations/bounded-turn-fsm.md)
+- [The Autonomous Bounded Turn](ch01-foundations/bounded-turn.md)
 - [Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)
 - [Turn Scratchpad](ch01-foundations/turn-scratchpad.md)
 

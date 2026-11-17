@@ -30,7 +30,7 @@ pub struct OpenRouterConfig {
 
 impl ProvidersConfig {
     /// Models registered in the provider catalog, in declaration order.
-    pub fn catalog(&self) -> &[ModelCatalogEntry] {
+    pub(crate) fn catalog(&self) -> &[ModelCatalogEntry] {
         match &self.openrouter {
             Some(config) => &config.models,
             None => &[],
@@ -61,7 +61,8 @@ pub fn has_openrouter_key(config: &AppConfig) -> bool {
         .unwrap_or(false)
 }
 
-pub fn credentials_candidates(
+#[cfg(test)]
+fn credentials_candidates(
     repo_root: Option<&Path>,
     explicit_credentials: Option<&Path>,
 ) -> Vec<PathBuf> {
@@ -147,7 +148,7 @@ pub fn load_credentials(
     )
 }
 
-pub(crate) fn load_credentials_internal(
+fn load_credentials_internal(
     repo_root: Option<&Path>,
     home: Option<&Path>,
     config_dir: Option<&Path>,

@@ -81,6 +81,12 @@ pub struct HistoryViewState {
     pub selected_item_index: usize,
     pub content_width: usize,
     pub expanded_items: HashSet<u64>,
+    /// Records whose intermediate round list is unfolded.
+    ///
+    /// A record that ran several rounds stays compact until the developer asks
+    /// for its detail, so a long healed turn never pushes the rest of the
+    /// chronicle off screen (c-05, c-06).
+    pub rounds_expanded: HashSet<u64>,
     pub code_blocks: Vec<HistoryCodeBlock>,
     pub copy_flash: Option<((u64, usize), std::time::Instant)>,
     pub theme_mode: crate::config::ThemeMode,
@@ -110,6 +116,7 @@ impl Default for HistoryViewState {
             selected_item_index: 0,
             content_width: 80,
             expanded_items: HashSet::new(),
+            rounds_expanded: HashSet::new(),
             code_blocks: Vec::new(),
             copy_flash: None,
             theme_mode: crate::config::ThemeMode::Auto,
@@ -128,6 +135,20 @@ impl HistoryViewState {
             self.expanded_items.remove(&id);
         } else {
             self.expanded_items.insert(id);
+        }
+    }
+
+    /// Whether the intermediate rounds of `id` are unfolded.
+    pub fn is_rounds_expanded(&self, id: u64) -> bool {
+        self.rounds_expanded.contains(&id)
+    }
+
+    /// Folds or unfolds the intermediate rounds of `id`.
+    pub fn toggle_rounds(&mut self, id: u64) {
+        if self.rounds_expanded.contains(&id) {
+            self.rounds_expanded.remove(&id);
+        } else {
+            self.rounds_expanded.insert(id);
         }
     }
 
@@ -193,6 +214,7 @@ impl HistoryViewState {
         // (c-3).
         let live: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
         self.expanded_items.retain(|id| live.contains(id));
+        self.rounds_expanded.retain(|id| live.contains(id));
         self.body_cache.clear();
 
         // Recompute geometry against the new item set and re-anchor the viewport.
@@ -274,6 +296,7 @@ impl HistoryViewState {
         let dropped: Vec<u64> = self.items.drain(..excess).map(|item| item.id).collect();
         for id in &dropped {
             self.expanded_items.remove(id);
+            self.rounds_expanded.remove(id);
             self.body_cache.evict(id);
         }
         let flash_dropped = self
@@ -330,8 +353,9 @@ impl HistoryViewState {
         self.items = items;
         // Fold state of an entry the answer dropped is stale; the rendered
         // bodies stay cached by id and simply stop being requested (c-3).
-        let live: HashSet<u64> = self.items.iter().map(|item| item.id).collect();
+        let live: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
         self.expanded_items.retain(|id| live.contains(id));
+        self.rounds_expanded.retain(|id| live.contains(id));
         if self.auto_scroll {
             self.selected_item_index = self.items.len().saturating_sub(1);
             self.scroll_to_selected_item(view_height, Some(self.content_width));
@@ -353,6 +377,7 @@ impl HistoryViewState {
             max_width,
             selected,
             Some(&self.expanded_items),
+            Some(&self.rounds_expanded),
             None,
             self.theme_mode,
             &mut self.body_cache,
@@ -504,6 +529,7 @@ pub fn compute_history_lines_full(
         max_width,
         selected_index,
         expanded_items,
+        None,
         flashing_block,
         crate::config::ThemeMode::Auto,
         &mut cache,
@@ -581,6 +607,18 @@ fn build_item_header(
             format!(" [{}] ", active_t("history.badge.in_flight")),
             engine
                 .bg(palette.status_info)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
+        )),
+        // An interrupted turn recorded the rounds it did complete and never a
+        // final answer. The record stays visible as its own attempt rather
+        // than a rejected prompt, yet its incompleteness must stay explicit,
+        // so it carries a warning badge instead of a terminal outcome badge
+        // (c-05).
+        HistoryEntryStatus::Interrupted => Some(Span::styled(
+            format!(" [{}] ", active_t("history.badge.interrupted")),
+            engine
+                .bg(palette.status_warning)
                 .fg(engine.color(palette.text_inverse))
                 .bold(),
         )),
@@ -665,6 +703,7 @@ fn file_change_path(change: &HistoryFileChange) -> String {
 fn build_item_body(
     item: &UiHistoryItem,
     is_expanded: bool,
+    rounds_expanded: bool,
     max_width: Option<usize>,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache<u64>,
@@ -771,6 +810,13 @@ fn build_item_body(
                 lines.extend(wrap_one(Line::from(file_spans), max_width));
             }
         }
+
+        lines.extend(build_rounds_block(
+            item,
+            rounds_expanded,
+            max_width,
+            theme_mode,
+        ));
     } else {
         // Collapsed preview: display up to COLLAPSED_PREVIEW_LINES
         let all_raw_lines: Vec<&str> = item.text.lines().collect();
@@ -799,6 +845,13 @@ fn build_item_body(
             notes.push(active_t("history.modified_files_note").replacen(
                 "{}",
                 &files_count.to_string(),
+                1,
+            ));
+        }
+        if !item.rounds.is_empty() {
+            notes.push(active_t("history.rounds_note").replacen(
+                "{}",
+                &item.rounds.len().to_string(),
                 1,
             ));
         }
@@ -831,11 +884,133 @@ fn build_item_body(
     (lines, blocks)
 }
 
+/// Renders the intermediate rounds a recorded turn ran before its answer.
+///
+/// Each round is addressed by the one-based ordinal the producer stamped on it,
+/// so the badge a reader sees (`[R1]`, `[R2]`) names exactly the round the
+/// transcript replays into future turns (c-05, c-06). The fold state belongs to
+/// the record: a folded round stays one compact row that names the attempt,
+/// while an unfolded round adds its whole message together with the feedback the
+/// harness returned after it. The block renders from typed fields only, so it
+/// needs no cache of its own.
+fn build_rounds_block(
+    item: &UiHistoryItem,
+    rounds_expanded: bool,
+    max_width: Option<usize>,
+    theme_mode: crate::config::ThemeMode,
+) -> Vec<Line<'static>> {
+    if item.rounds.is_empty() {
+        return Vec::new();
+    }
+    let engine = crate::theme::engine::active_engine(theme_mode);
+    let palette = engine.palette();
+    let fold_icon = if rounds_expanded { "▼ " } else { "▶ " };
+    let fold_style = if rounds_expanded {
+        engine.fg(palette.status_warning).bold()
+    } else {
+        engine.fg(palette.text_muted).bold()
+    };
+
+    let mut lines = wrap_one(
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(fold_icon, fold_style),
+            Span::styled(
+                active_t("history.rounds_header").replacen("{}", &item.rounds.len().to_string(), 1),
+                engine.fg(palette.text_muted).bold(),
+            ),
+        ]),
+        max_width,
+    );
+
+    for round in &item.rounds {
+        let badge = Span::styled(
+            active_t("history.round_badge").replacen("{}", &round.index.to_string(), 1),
+            engine.fg(palette.status_info).bold(),
+        );
+        if rounds_expanded {
+            lines.extend(wrap_one(
+                Line::from(vec![
+                    Span::raw("    "),
+                    badge,
+                    Span::raw(" "),
+                    Span::styled(
+                        first_line_of(&round.message),
+                        engine.fg(palette.text_primary).bold(),
+                    ),
+                ]),
+                max_width,
+            ));
+            for line in round.message.lines().skip(1) {
+                lines.extend(wrap_one(
+                    Line::from(Span::styled(
+                        format!("      {}", line),
+                        engine.fg(palette.text_primary),
+                    )),
+                    max_width,
+                ));
+            }
+            let feedback = collapse_whitespace(&round.feedback);
+            if !feedback.is_empty() {
+                lines.extend(wrap_one(
+                    Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled(
+                            active_t("history.round_feedback_label"),
+                            engine.fg(palette.text_muted).bold(),
+                        ),
+                        Span::styled(feedback, engine.fg(palette.text_muted).italic()),
+                    ]),
+                    max_width,
+                ));
+            }
+        } else {
+            lines.extend(wrap_one(
+                Line::from(vec![
+                    Span::raw("    "),
+                    badge,
+                    Span::raw(" "),
+                    Span::styled(
+                        first_line_of(&round.message),
+                        engine.fg(palette.text_primary),
+                    ),
+                ]),
+                max_width,
+            ));
+        }
+    }
+
+    lines
+}
+
+/// Collapses every whitespace run of `text` into a single space.
+///
+/// A folded round occupies exactly one row, so its message reaches the row as
+/// one continuous phrase instead of pushing its own line breaks into the layout.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns the first line of `text`, collapsed to single-spaced text.
+fn first_line_of(text: &str) -> String {
+    text.lines()
+        .next()
+        .map(collapse_whitespace)
+        .unwrap_or_default()
+}
+
+// The layout is the private render helper of this module: it threads the
+// independent pieces of view state the document depends on (width, cursor, the
+// answer and rounds fold sets, the copy flash target, the theme, and the body
+// cache), so the parameters stay explicit instead of being bundled into a
+// struct every caller would have to build.
+#[allow(clippy::too_many_arguments)]
 fn layout_history(
     items: &[UiHistoryItem],
     max_width: Option<usize>,
     selected_index: Option<usize>,
     expanded_items: Option<&HashSet<u64>>,
+    rounds_expanded: Option<&HashSet<u64>>,
     flashing_block: Option<(u64, usize)>,
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache<u64>,
@@ -862,6 +1037,9 @@ fn layout_history(
         let is_expanded = expanded_items
             .map(|set| set.contains(&item.id))
             .unwrap_or(false);
+        let rounds_unfolded = rounds_expanded
+            .map(|set| set.contains(&item.id))
+            .unwrap_or(false);
         all_lines.extend(wrap_one(
             build_item_header(item, is_selected, is_expanded, theme_mode),
             max_width,
@@ -872,8 +1050,15 @@ fn layout_history(
         let flash_id = flashing_block.and_then(|(i_id, b_id)| (i_id == item.id).then_some(b_id));
 
         let body_base = all_lines.len();
-        let (body_lines, body_blocks) =
-            build_item_body(item, is_expanded, max_width, theme_mode, cache, flash_id);
+        let (body_lines, body_blocks) = build_item_body(
+            item,
+            is_expanded,
+            rounds_unfolded,
+            max_width,
+            theme_mode,
+            cache,
+            flash_id,
+        );
         all_lines.extend(body_lines);
         for block in body_blocks {
             code_blocks.push(HistoryCodeBlock {
@@ -893,7 +1078,7 @@ fn layout_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use tauqe_protocol::TurnRoundRecord;
     /// Plain text of every rendered line, joined from its spans.
     ///
     /// The active palette is process-wide state, so two layouts produced inside
@@ -931,6 +1116,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            rounds: Vec::new(),
             status: HistoryEntryStatus::Committed,
         }
     }
@@ -1089,6 +1275,7 @@ mod tests {
             Some(0),
             Some(&st.expanded_items),
             None,
+            None,
             st.theme_mode,
             &mut st.body_cache,
         );
@@ -1104,6 +1291,7 @@ mod tests {
             width,
             Some(1),
             Some(&st.expanded_items),
+            None,
             None,
             st.theme_mode,
             &mut st.body_cache,
@@ -1272,6 +1460,7 @@ mod tests {
                 Some(0),
                 Some(&st.expanded_items),
                 None,
+                None,
                 st.theme_mode,
                 &mut st.body_cache,
             );
@@ -1304,6 +1493,7 @@ mod tests {
             Some(0),
             Some(&st.expanded_items),
             None,
+            None,
             st.theme_mode,
             &mut st.body_cache,
         );
@@ -1317,6 +1507,7 @@ mod tests {
             width,
             Some(0),
             Some(&st.expanded_items),
+            None,
             Some((block.item_id, block.block_id)),
             st.theme_mode,
             &mut st.body_cache,
@@ -1332,6 +1523,7 @@ mod tests {
             width,
             Some(0),
             Some(&st.expanded_items),
+            None,
             Some((block.item_id, block.block_id)),
             st.theme_mode,
             &mut st.body_cache,
@@ -1347,6 +1539,7 @@ mod tests {
             width,
             Some(0),
             Some(&st.expanded_items),
+            None,
             None,
             st.theme_mode,
             &mut st.body_cache,
@@ -1969,5 +2162,183 @@ mod tests {
             !st.has_more,
             "the window never claims paging it did not need"
         );
+    }
+    /// A recorded turn that ran two intermediate rounds before its answer.
+    fn multi_round_item(id: u64) -> UiHistoryItem {
+        let mut item = assistant_item(id, "Final answer.");
+        item.rounds = vec![
+            TurnRoundRecord {
+                index: 1,
+                message: "Inspected the parser.\nThe second line stays folded.".to_string(),
+                feedback: "3 matches in src/parser.rs".to_string(),
+            },
+            TurnRoundRecord {
+                index: 2,
+                message: "Staged the change.".to_string(),
+                feedback: String::new(),
+            },
+        ];
+        item
+    }
+
+    /// The rounds of a turn are addressed by their one-based ordinal, so an
+    /// unfolded record names every attempt with its own `[R1]` / `[R2]` badge
+    /// together with the feedback the harness returned (c-05, c-06).
+    #[test]
+    fn test_unfolded_rounds_render_badges_messages_and_feedback() {
+        let mut expanded = HashSet::new();
+        expanded.insert(1);
+        let mut rounds = HashSet::new();
+        rounds.insert(1);
+
+        let (lines, _, _) = layout_history(
+            &[multi_round_item(1)],
+            Some(60),
+            Some(0),
+            Some(&expanded),
+            Some(&rounds),
+            None,
+            crate::config::ThemeMode::Auto,
+            &mut MarkdownBodyCache::new(),
+        );
+        let rendered = rendered_text(&lines);
+
+        assert!(rendered.iter().any(|line| line.contains("Rounds (2)")));
+        assert!(rendered.iter().any(|line| line.contains("[R1]")));
+        assert!(rendered.iter().any(|line| line.contains("[R2]")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("The second line stays folded.")),
+            "an unfolded round carries its whole message"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("3 matches in src/parser.rs")),
+            "an unfolded round carries the feedback that opened the next one"
+        );
+    }
+
+    /// A folded round stays one compact row that still names the attempt, so the
+    /// badges remain visible without spending the body of the answer (c-06).
+    #[test]
+    fn test_folded_rounds_keep_one_compact_row_per_round() {
+        let mut expanded = HashSet::new();
+        expanded.insert(1);
+        let folded = HashSet::new();
+
+        let (lines, _, _) = layout_history(
+            &[multi_round_item(1)],
+            Some(60),
+            Some(0),
+            Some(&expanded),
+            Some(&folded),
+            None,
+            crate::config::ThemeMode::Auto,
+            &mut MarkdownBodyCache::new(),
+        );
+        let text = normalize_whitespace(&rendered_text(&lines).join("\n"));
+
+        assert!(text.contains("[R1] Inspected the parser."));
+        assert!(text.contains("[R2] Staged the change."));
+        assert!(
+            !text.contains("The second line stays folded."),
+            "a folded round never spends its second line"
+        );
+        assert!(
+            !text.contains("3 matches in src/parser.rs"),
+            "a folded round never spends its feedback"
+        );
+    }
+
+    /// An interrupted turn never produced a final answer, so its record keeps the
+    /// rounds it did complete and marks the incompleteness with its own badge
+    /// instead of a terminal outcome badge (c-05).
+    #[test]
+    fn test_interrupted_record_shows_its_badge_and_keeps_the_rounds() {
+        let mut item = multi_round_item(4);
+        item.status = HistoryEntryStatus::Interrupted;
+        item.text = String::new();
+
+        let collapsed = render_item(&item);
+        assert!(collapsed.iter().any(|line| line.contains("[INTERRUPTED]")));
+        assert!(
+            collapsed.iter().any(|line| line.contains("2 rounds")),
+            "a collapsed interrupted record still reports its attempts"
+        );
+
+        let mut expanded = HashSet::new();
+        expanded.insert(4);
+        let folded = HashSet::new();
+        let (lines, _, _) = layout_history(
+            std::slice::from_ref(&item),
+            Some(60),
+            Some(0),
+            Some(&expanded),
+            Some(&folded),
+            None,
+            crate::config::ThemeMode::Auto,
+            &mut MarkdownBodyCache::new(),
+        );
+        let rendered = rendered_text(&lines);
+        assert!(rendered.iter().any(|line| line.contains("[INTERRUPTED]")));
+        assert!(rendered.iter().any(|line| line.contains("[R2]")));
+    }
+
+    /// Unfolding the rounds of a record grows the document, so the scroll range
+    /// the viewport derives from it grows with the lines the developer asked for
+    /// instead of clipping the last attempt (c-06).
+    #[test]
+    fn test_unfolding_rounds_grows_the_document_and_its_scroll_range() {
+        let mut st = HistoryViewState {
+            content_width: 60,
+            items: vec![multi_round_item(1)],
+            ..Default::default()
+        };
+        st.expanded_items.insert(1);
+        let width = Some(st.content_width);
+        let height = 5u16;
+
+        let (folded_total, _) = st.layout_offsets(width, Some(0));
+        st.toggle_rounds(1);
+        assert!(st.is_rounds_expanded(1));
+        let (unfolded_total, _) = st.layout_offsets(width, Some(0));
+        assert!(
+            unfolded_total > folded_total,
+            "unfolded rounds add lines to the record body"
+        );
+
+        st.rendered_lines_count = folded_total;
+        let folded_scroll = st.max_scroll(height);
+        st.rendered_lines_count = unfolded_total;
+        assert!(
+            st.max_scroll(height) > folded_scroll,
+            "the scroll range follows the lines the document really carries"
+        );
+    }
+
+    /// A structural replacement drops the rounds fold state of a record it
+    /// removes, so the map never keeps an identifier nothing can render (c-05).
+    #[test]
+    fn test_structural_replacement_prunes_the_rounds_fold_state() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            items: vec![multi_round_item(1), multi_round_item(2)],
+            ..Default::default()
+        };
+        st.rounds_expanded.insert(1);
+        st.rounds_expanded.insert(2);
+
+        st.apply_compaction(
+            history_item(3, UiHistoryKind::System, "Compacted"),
+            &[2],
+            2,
+            32,
+            5,
+        );
+
+        assert!(!st.rounds_expanded.contains(&1));
+        assert!(st.rounds_expanded.contains(&2));
     }
 }

@@ -7,7 +7,7 @@
 use tauqe_tools::atomic_write::STAGING_TEMP_MARKER;
 use tauqe_tools::git::checkpoint::{
     create_ai_commit, create_checkpoint, create_step_commit, ensure_tauqe_ignored,
-    finalize_ai_commit, recover_interrupted_workflow, restore_checkpoint,
+    finalize_ai_commit, recover_interrupted_workflow, restore_checkpoint, RecoveryOutcome,
 };
 use tauqe_tools::git::cmd::{run_git, run_git_check_ignore};
 use tauqe_tools::git::diff::{
@@ -388,11 +388,7 @@ fn test_crashed_atomic_write_orphans_are_ignored_and_reclaimed_by_recovery() {
     );
 
     let recovery = recover_interrupted_workflow(root).unwrap();
-    let message = recovery.unwrap_or_default();
-    assert!(
-        message.contains("Cleaned up 2 orphaned staging artifact(s)"),
-        "{message}"
-    );
+    assert_eq!(recovery, RecoveryOutcome::Cleaned { artifacts: 2 });
 
     assert!(!worktree_orphan.exists());
     assert!(!state_orphan.exists());

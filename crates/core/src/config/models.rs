@@ -23,7 +23,6 @@ pub const BUILTIN_DEFAULT_CODER_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_ARCHITECT_MODEL: &str = "~anthropic/claude-sonnet-latest";
 pub const BUILTIN_DEFAULT_REPL_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_REVIEWER_MODEL: &str = "~anthropic/claude-sonnet-latest";
-pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_REPL_MODEL;
 
 /// Serializes an optional model reference in its canonical `provider:name` form.
 ///
@@ -91,7 +90,7 @@ impl ModelsConfig {
     /// provider model specification. A registered alias wins, so a project may
     /// name a model the way the catalog declares it without restating the
     /// provider identifier.
-    pub fn resolve_model_spec(
+    pub(crate) fn resolve_model_spec(
         catalog: &[ModelCatalogEntry],
         spec: &str,
     ) -> Result<ModelRef, String> {
@@ -109,7 +108,10 @@ impl ModelsConfig {
     }
 
     /// Returns the alias registered for a model in the provider catalog.
-    pub fn model_alias<'a>(catalog: &'a [ModelCatalogEntry], model: &ModelRef) -> Option<&'a str> {
+    pub(crate) fn model_alias<'a>(
+        catalog: &'a [ModelCatalogEntry],
+        model: &ModelRef,
+    ) -> Option<&'a str> {
         catalog
             .iter()
             .find(|entry| &entry.model == model)
@@ -197,7 +199,7 @@ impl ModelsConfig {
     ///
     /// A role entry that declares a zero generation budget is rejected as well:
     /// a model allowed zero attempts could never regenerate a rejected patch.
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.repl.is_empty() {
             return Err(
                 "Invalid models configuration: models.repl must list at least one model"
@@ -371,7 +373,7 @@ impl ModelsConfig {
     }
 
     /// Resolves a [`ModelRole`] to a concrete [`ModelRef`] with no external fallback.
-    pub fn resolve_role(&self, role: ModelRole) -> ModelRef {
+    fn resolve_role(&self, role: ModelRole) -> ModelRef {
         self.resolve_role_with_fallback(role, None)
     }
 
@@ -381,7 +383,7 @@ impl ModelsConfig {
     /// The acceptance role is the exception: its own chain (`gatekeeper`, then
     /// the Scribe model, then the base `repl` entry) runs first, and the
     /// external fallback is consulted only once that chain is exhausted.
-    pub fn resolve_role_with_fallback(
+    pub(crate) fn resolve_role_with_fallback(
         &self,
         role: ModelRole,
         fallback: Option<ModelRef>,
@@ -470,7 +472,11 @@ impl ModelsConfig {
     /// A selection the role does not configure names no entry and keeps the
     /// deterministic default of the role it runs in, so a model outside the
     /// configuration never inherits a budget somebody else declared.
-    pub fn resolve_selection_attempts(&self, role: ModelRole, selection: &ModelSelection) -> u32 {
+    pub(crate) fn resolve_selection_attempts(
+        &self,
+        role: ModelRole,
+        selection: &ModelSelection,
+    ) -> u32 {
         let (attempts, level_up) = self.selection_parameters(role, selection);
         let model = self.resolve_model(selection);
         let effort = self.resolve_selection_effort(role, selection);
@@ -508,7 +514,7 @@ impl ModelsConfig {
     }
 
     /// Resolves a [`ModelSelection`] to a concrete [`ModelRef`].
-    pub fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
+    pub(crate) fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
         match selection {
             ModelSelection::Role(role) => self.resolve_role(*role),
             ModelSelection::Specific(model) => model.clone(),
@@ -528,7 +534,7 @@ impl ModelsConfig {
     /// Every rung preserves the level-up marker declared on its configuration
     /// entry, so an excluded model remains distinguishable from a participating
     /// rung without re-reading configuration.
-    pub fn coder_ladder(&self) -> Vec<ModelEntry> {
+    pub(crate) fn coder_ladder(&self) -> Vec<ModelEntry> {
         let ladder: Vec<ModelEntry> = self
             .role_slice(ModelRole::Coder)
             .unwrap_or(&[])
@@ -547,7 +553,7 @@ impl ModelsConfig {
     ///
     /// Out-of-range indices clamp to the last rung, so escalation never panics
     /// once the ladder is exhausted.
-    pub fn coder_tier(&self, idx: usize) -> ModelEntry {
+    pub(crate) fn coder_tier(&self, idx: usize) -> ModelEntry {
         let ladder = self.coder_ladder();
         let last = ladder.len().saturating_sub(1);
         ladder
@@ -564,7 +570,7 @@ impl ModelsConfig {
     /// `level_up = false` begins at the strongest eligible position
     /// ([`ModelsConfig::coder_tier_index`]), so it saturates here as well and no
     /// stronger tier is ever entered automatically.
-    pub fn next_coder_tier(&self, idx: usize) -> Option<(usize, ModelEntry)> {
+    pub(crate) fn next_coder_tier(&self, idx: usize) -> Option<(usize, ModelEntry)> {
         let current = self.coder_tier(idx);
         let next_idx = idx + 1;
         let next = self.coder_tier(next_idx);
@@ -588,7 +594,7 @@ impl ModelsConfig {
     /// ladder position either, yet it is already at the top: it starts from the
     /// strongest eligible rung and leaves the ladder saturated
     /// ([`ModelsConfig::next_coder_tier`]).
-    pub fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
+    pub(crate) fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
         let Some(selection) = selection else {
             return 0;
         };
@@ -631,7 +637,7 @@ impl ModelsConfig {
     /// Every rung preserves the level-up marker declared on its configuration
     /// entry, so an excluded Architect remains distinguishable from a
     /// participating rung without re-reading configuration.
-    pub fn architect_ladder(&self) -> Vec<ArchitectTier> {
+    fn architect_ladder(&self) -> Vec<ArchitectTier> {
         let ladder: Vec<ArchitectTier> = self
             .role_slice(ModelRole::Architect)
             .unwrap_or(&[])
@@ -703,7 +709,7 @@ impl ModelsConfig {
     /// A recorded rung the ladder excludes by `level_up = false` is a manual run
     /// the developer pinned: restarting would silently downgrade it, so the
     /// configuration stays as it is and escalation is saturated.
-    pub fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
+    pub(crate) fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
         let Some(recorded) = recorded else {
             return self.architect_tier(0);
         };
@@ -728,12 +734,16 @@ impl ModelsConfig {
     }
 
     /// Summary of effective concrete models assigned to all semantic roles.
-    pub fn roles_summary(&self) -> ModelRolesSummary {
+    #[cfg(test)]
+    pub(crate) fn roles_summary(&self) -> ModelRolesSummary {
         self.roles_summary_with_fallback(None)
     }
 
     /// Summary of effective concrete models assigned to all semantic roles with fallback.
-    pub fn roles_summary_with_fallback(&self, fallback: Option<ModelRef>) -> ModelRolesSummary {
+    pub(crate) fn roles_summary_with_fallback(
+        &self,
+        fallback: Option<ModelRef>,
+    ) -> ModelRolesSummary {
         ModelRolesSummary {
             scribe: self.resolve_role_with_fallback(ModelRole::Scribe, fallback.clone()),
             coder: self.resolve_role_with_fallback(ModelRole::Coder, fallback.clone()),

@@ -57,13 +57,11 @@ the end of the turn.
 6. **Budgets are measured, not guessed.** File cost is its estimated content plus
    the estimated wrapper its `<file>` element renders, and the aggregate is checked
    against a configured ceiling before anything is added.
-7. **Order is deterministic and belongs to the layout policy.** Every entry
+7. **Order is deterministic and belongs to the chronological transcript.** Every entry
    carries a monotonic insertion watermark, so a file's position derives from
-   when it arrived, never from its name or from hash iteration order. The
-   semantic policy renders layer order with insertion order inside a layer; the
-   chronological policy renders the global insertion order. Neither of them ever
-   sorts alphabetically, because a re-sorted prompt invalidates the cached
-   prefix between rounds.
+   when it arrived, never from its name or from hash iteration order. The transcript
+   places each file by that watermark, and it never sorts alphabetically, because a
+   re-sorted prompt invalidates the cached prefix between rounds.
 8. **The prompt prefix, model identity, and provider session travel together.**
    A dialogue keeps one session while the context block stays byte-identical and
    the target model remains unchanged. Session rotation is triggered at two
@@ -140,12 +138,8 @@ rows, and the revision advances only when something actually changed.
 The context files of a turn are rendered from readable files inside the repository,
 and a path that escapes the repository, has been deleted, or cannot be decoded as
 UTF-8 is skipped instead of failing the turn. The order they travel in is the
-business of the active layout policy:
-
-- the **semantic** policy renders one `<context>` block in layer order, with
-  insertion order inside each layer;
-- the **chronological** policy renders transcript order, which is the order of the
-  insertion watermark every entry carries.
+transcript order of the chronological assembly: the order of the insertion watermark
+every entry carries.
 
 An **insertion watermark** is the monotonic counter value a path receives when it
 first enters the context and keeps for as long as it stays there, so a re-add
@@ -158,10 +152,19 @@ allocated. That position never changes afterwards, so a file discovered mid-turn
 keeps its slot when the next turn adopts it and the records appended later land
 behind it.
 
-Both orders are deterministic and both grow append-only: a file that enters the
+The transcript is deterministic and grows append-only: a file that enters the
 context mid-turn extends the sequence at its tail. Alphabetical sorting would
 reorder the prompt between rounds, invalidate the provider's cached prefix, and make
 a multi-round turn pay for the whole prefix again.
+
+Two sequences share the word *transcript*, and they are different objects. The **turn
+transcript** is local to one bounded turn: it holds the rendered head, the frozen task
+message, and the answer/feedback pairs of the rounds already exchanged, and it is
+dropped when the turn ends. The **session journal** (`.tauqe/history.jsonl`) is durable,
+and a file's arrival watermark is ordered against it. A round of the running turn is
+therefore never a journal record: the turn writes one card when it opens and one result
+when it closes, and the intermediate rounds it ran are nested inside that card
+(*The Autonomous Bounded Turn FSM* §3.2.8).
 
 ### 3.2 Pinned and hierarchical resolution
 

@@ -1,5 +1,5 @@
 pub mod json;
-pub mod layout;
+pub(crate) mod layout;
 pub mod protocol;
 pub mod refine;
 
@@ -11,12 +11,11 @@ use crate::context::ContextFileContent;
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::history::HistorySnapshot;
-use crate::prompt::layout::layout_for;
+use crate::prompt::layout::assemble_chronological_messages;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
 use tauqe_protocol::{
-    CapabilityExpr, ContextAccess, EditProtocolKind, ModelRole, PatchStrategy, Plan,
-    PromptLayoutKind, RepositoryState,
+    CapabilityTree, ContextAccess, EditProtocolKind, PatchStrategy, Plan, RepositoryState,
 };
 
 /// Typed kind of the contour that drives a turn.
@@ -42,15 +41,13 @@ pub enum ContourKind {
 /// regime follow the same typed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnBrief {
-    /// Contour that drives the turn and gates the rules of its regime.
-    pub contour: ContourKind,
+    pub(crate) contour: ContourKind,
     /// Opening text the turn renders ahead of the Core System Contract.
-    pub intro: String,
+    intro: String,
 }
 
 impl TurnBrief {
-    /// Builds the brief of an interactive dialogue.
-    pub fn dialogue() -> Self {
+    pub(crate) fn dialogue() -> Self {
         Self {
             contour: ContourKind::Dialogue,
             intro: DIALOGUE_INTRO.to_string(),
@@ -69,7 +66,7 @@ impl TurnBrief {
     ///
     /// A synthesis reasons about the project rather than about the working tree, so it
     /// opens with the introduction of its own planning role.
-    pub fn architect() -> Self {
+    pub(crate) fn architect() -> Self {
         Self {
             contour: ContourKind::Architect,
             intro: ARCHITECT_INTRO.to_string(),
@@ -86,14 +83,14 @@ impl Default for TurnBrief {
 /// Opening text of an interactive dialogue.
 const DIALOGUE_INTRO: &str = concat!(
     "You are Tauqe AI, a proactive engineering assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n",
-    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role in this dialogue is to act on direct requests, answer open questions in writing, and keep the developer in control of the objective.\n",
+    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. A turn runs in autonomous rounds: you may explore the repository across discovery rounds before concluding the turn with your final answer, code edits, or plan. Your role in this dialogue is to act on direct requests, answer open questions in writing, and keep the developer in control of the objective.\n",
     "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
 );
 
 /// Opening text of one isolated step.
 const STEP_INTRO: &str = concat!(
     "You are Tauqe Coder, the execution engine of one isolated plan step inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n",
-    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role is to implement the assigned step exactly as designed, without re-architecting it, and to close with a concise summary of what changed and why.\n",
+    "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. A turn runs in autonomous rounds: you may explore the repository across discovery rounds before implementing edits and verifying them in the concluding round. Your role is to implement the assigned step exactly as designed, without re-architecting it, and to close with a concise summary of what changed and why.\n",
     "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
 );
 
@@ -103,9 +100,6 @@ const ARCHITECT_INTRO: &str = concat!(
     "The developer states the task; the harness holds the work in typed contracts, verifies every change, and closes the turn with a Git transaction. Your role is to synthesize the concept tree and the architectural invariants that the implementation steps must satisfy.\n",
     "Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n",
 );
-
-/// Default model role used for squash commit message synthesis.
-pub const SQUASH_COMMIT_ROLE: ModelRole = ModelRole::Scribe;
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -171,7 +165,7 @@ pub fn build_squash_commit_prompt(
 /// operation (see `crates/core/Conventions.md`, section 1.2). The Scribe returns
 /// a machine-readable summary object instead of free-form prose recovered by
 /// heuristics.
-pub fn history_compaction_response_schema() -> serde_json::Value {
+fn history_compaction_response_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -185,8 +179,7 @@ pub fn history_compaction_response_schema() -> serde_json::Value {
     })
 }
 
-/// Builds the provider [`ResponseFormat`] that enforces the history compaction schema.
-pub fn history_compaction_response_format() -> ResponseFormat {
+pub(crate) fn history_compaction_response_format() -> ResponseFormat {
     ResponseFormat::JsonSchema {
         json_schema: JsonSchemaDefinition {
             name: "history_compaction".to_string(),
@@ -199,18 +192,11 @@ pub fn history_compaction_response_format() -> ResponseFormat {
     }
 }
 
-/// Extracts the summary text from the Scribe's structured compaction output.
-pub fn parse_compaction_summary(raw: &str) -> Option<String> {
+pub(crate) fn parse_compaction_summary(raw: &str) -> Option<String> {
     extract_json_string_field(raw, "summary")
 }
 
-/// JSON Schema for the squashed commit message output.
-///
-/// Squash commit synthesis never produces code changes, so it is a Structured
-/// Output operation (see `crates/core/Conventions.md`, section 1.2). The Scribe
-/// returns the message as a machine-readable field instead of text recovered by
-/// stripping code fences.
-pub fn squash_commit_response_schema() -> serde_json::Value {
+fn squash_commit_response_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -400,8 +386,8 @@ pub struct ContextBlockCache {
 }
 
 impl ContextBlockCache {
-    /// Number of files whose rendering the memo currently holds.
-    pub fn cached_files(&self) -> usize {
+    #[cfg(test)]
+    fn cached_files(&self) -> usize {
         self.elements.len()
     }
 
@@ -409,7 +395,10 @@ impl ContextBlockCache {
     ///
     /// A file whose effective access and content are unchanged is reproduced
     /// byte for byte; everything else is the only element the round encodes.
-    fn element(
+    /// The research journal renders the files a round delivered through this
+    /// very method, so a delivered file carries the anchors, the `access`
+    /// attribute, and the bytes the context block of the turn renders.
+    pub(crate) fn element(
         &mut self,
         file: &ContextFileContent,
         access: ContextAccess,
@@ -437,68 +426,26 @@ impl ContextBlockCache {
     }
 }
 
-pub struct PromptAssembly {
-    pub repo_state: Option<RepositoryState>,
-    pub context_revision: u64,
-    pub context_files: Vec<ContextFileContent>,
-    pub workflow: String,
-    /// Typed wire format of the active protocol.
-    ///
-    /// The format is a transport fact, so the assembly stores it as a typed
-    /// value instead of the protocol's display name. It is rendered in the
-    /// project metadata and handed to the contract composer, which keeps a
-    /// structured prompt free of control-tag spellings.
-    pub edit_protocol: EditProtocolKind,
-    /// Interaction records frozen at the start of the turn.
-    ///
-    /// The records travel structurally rather than as a pre-rendered block: the
-    /// semantic layout renders the `<history>` block from them byte for byte,
-    /// and the chronological layout interleaves them with the context files by
-    /// their insertion watermarks.
-    pub history: Option<std::sync::Arc<HistorySnapshot>>,
-    pub repo_map: Option<String>,
-    /// Compact directory-tree outline of the repository.
-    ///
-    /// Rendered only when the eager global symbol map is disabled, so the model
-    /// still learns where subsystems live without a full outline pass.
-    pub repo_dirs: Option<String>,
-    pub active_plan: Option<Plan>,
-    /// Introductory brief of the turn, owned by the loop that drives it.
-    ///
-    /// The brief carries both the text the turn opens with and the typed contour that
-    /// gates the rules of its regime, so the assembly never infers either from the
-    /// capability surface.
-    pub turn_brief: Option<TurnBrief>,
-    pub turn_scratchpad: Option<String>,
-    /// Maximum characters of a turn scratchpad block kept before truncation.
-    ///
-    /// The bound is resolved from the project's `[context]` section, so a turn
-    /// never truncates working memory at a compile-time ceiling.
-    pub max_scratchpad_chars: usize,
-    /// Strategy that decides how a change set addresses the lines it replaces.
-    ///
-    /// Under [`PatchStrategy::LineAnchor`] every file of the context block is
-    /// rendered with the opaque anchor of each line, so the model names a line
-    /// range instead of echoing the replaced text.
-    pub patch_strategy: PatchStrategy,
-    /// Layout policy that composes the message sequence of this turn.
-    ///
-    /// The policy travels as the typed [`PromptLayoutKind`] of the turn. The
-    /// assembly never branches on a policy name: it hands the kind to
-    /// [`layout_for`] and receives the interchangeable implementation that
-    /// serves it.
-    pub prompt_layout: PromptLayoutKind,
-    pub project: Option<tauqe_protocol::ProjectConfig>,
-    /// External documentation the project declares in `[[outer_docs]]`.
-    ///
-    /// The declarations render as a compact catalog in the byte-stable head, so
-    /// the model learns which documents it may request without learning where
-    /// the harness keeps them.
-    pub outer_docs: Vec<crate::config::OuterDocEntry>,
+pub(crate) struct PromptAssembly {
+    _repo_state: Option<RepositoryState>,
+    _context_revision: u64,
+    pub(crate) context_files: Vec<ContextFileContent>,
+    _workflow: String,
+    _edit_protocol: EditProtocolKind,
+    history: Option<std::sync::Arc<HistorySnapshot>>,
+    repo_map: Option<String>,
+    repo_dirs: Option<String>,
+    active_plan: Option<Plan>,
+    pub(crate) turn_brief: Option<TurnBrief>,
+    pub(crate) turn_scratchpad: Option<String>,
+    max_scratchpad_chars: usize,
+    patch_strategy: PatchStrategy,
+    project: Option<tauqe_protocol::ProjectConfig>,
+    outer_docs: Vec<crate::config::OuterDocEntry>,
 }
 
 impl PromptAssembly {
-    pub fn new(
+    pub(crate) fn new(
         repo_state: Option<RepositoryState>,
         context_revision: u64,
         context_files: Vec<ContextFileContent>,
@@ -508,11 +455,11 @@ impl PromptAssembly {
         repo_map: Option<String>,
     ) -> Self {
         Self {
-            repo_state,
-            context_revision,
+            _repo_state: repo_state,
+            _context_revision: context_revision,
             context_files,
-            workflow: workflow.into(),
-            edit_protocol,
+            _workflow: workflow.into(),
+            _edit_protocol: edit_protocol,
             history,
             repo_map,
             repo_dirs: None,
@@ -521,59 +468,37 @@ impl PromptAssembly {
             turn_scratchpad: None,
             max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             patch_strategy: PatchStrategy::default(),
-            // A caller that resolved a layout for the turn overwrites this
-            // field with the typed kind; until then the assembly keeps the
-            // semantic block order, which every intent renders correctly.
-            prompt_layout: PromptLayoutKind::Semantic,
             project: None,
             outer_docs: Vec::new(),
         }
     }
 
-    /// Attaches the project command configuration available to this turn.
-    pub fn with_project(mut self, project: Option<tauqe_protocol::ProjectConfig>) -> Self {
+    pub(crate) fn with_project(mut self, project: Option<tauqe_protocol::ProjectConfig>) -> Self {
         self.project = project;
         self
     }
 
-    /// Attaches the external documentation declarations of the project.
-    ///
-    /// The catalog rendered from them publishes which documents exist; where a
-    /// document comes from stays a harness detail.
-    pub fn with_outer_docs(mut self, outer_docs: Vec<crate::config::OuterDocEntry>) -> Self {
+    pub(crate) fn with_outer_docs(mut self, outer_docs: Vec<crate::config::OuterDocEntry>) -> Self {
         self.outer_docs = outer_docs;
         self
     }
 
-    /// Declares how the rendered context block must address the lines of a file.
-    pub fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
+    pub(crate) fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
         self.patch_strategy = patch_strategy;
         self
     }
 
-    /// Declares the introductory brief the turn renders.
-    pub fn with_turn_brief(mut self, turn_brief: TurnBrief) -> Self {
-        self.turn_brief = Some(turn_brief);
-        self
-    }
-
-    pub fn with_scratchpad(mut self, scratchpad: Option<String>) -> Self {
-        self.turn_scratchpad = scratchpad;
-        self
-    }
-
-    /// Attaches the compact directory outline rendered for this turn.
-    pub fn with_repo_dirs(mut self, repo_dirs: Option<String>) -> Self {
+    pub(crate) fn with_repo_dirs(mut self, repo_dirs: Option<String>) -> Self {
         self.repo_dirs = repo_dirs;
         self
     }
 
-    pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
+    fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
         let capabilities = self.effective_capability_expr(protocol);
-        let effective_protocol = protocol.with_capability_expr(capabilities.clone());
+        let effective_protocol = protocol
+            .with_capability_expr(capabilities.clone())
+            .with_project(self.project.clone());
         let mut prompt = String::new();
-        // The introduction belongs to the contour that drives the turn: the loop
-        // hands its brief to the assembly, so no flag selects the opening text.
         let turn_brief = self.turn_brief.clone().unwrap_or_default();
         prompt.push_str(&turn_brief.intro);
         let has_eager_repo_map = self.has_eager_repo_map();
@@ -581,17 +506,11 @@ impl PromptAssembly {
             .with_eager_repo_map(has_eager_repo_map)
             .with_project(self.project.as_ref())
             .with_patch_strategy(self.patch_strategy);
-        let contract_ctx = ContractContext::new(render_ctx)
-            .with_prompt_layout(self.prompt_layout)
-            .with_contour(turn_brief.contour);
+        let contract_ctx = ContractContext::new(render_ctx).with_contour(turn_brief.contour);
         prompt.push_str("## Core System Contract\n");
         prompt.push_str(&compose_contract_rules(&capabilities, &contract_ctx));
         prompt.push('\n');
 
-        // The capability set narrowed by the declared `TurnIntent` decides which
-        // mode the active protocol renders, so the assembly owns no wire-format
-        // knowledge: a discussion turn receives exactly the instructions of the
-        // concrete protocol whose decoder will parse its output.
         let editable_paths: Vec<String> = self
             .context_files
             .iter()
@@ -604,14 +523,6 @@ impl PromptAssembly {
             self.patch_strategy,
         ));
 
-        // The head carries no repository metadata: the working-tree state reaches
-        // the model through the context block and through the Git transactions the
-        // harness performs, so no host path, branch, or revision is rendered here.
-
-        // The catalog of the declared external documentation closes the
-        // byte-stable head: the declaration changes between turns, never between
-        // the rounds of one turn. It is gated by the capability that can act on
-        // it, so a narrowed surface never lists a document it cannot request.
         if capabilities.contains(tauqe_protocol::LlmCapability::OuterDocRequest) {
             if let Some(catalog) = self.format_outer_docs_catalog_block() {
                 prompt.push('\n');
@@ -622,96 +533,28 @@ impl PromptAssembly {
         prompt
     }
 
-    /// Returns the capability tree this turn both advertises and accepts.
-    ///
-    /// The tree belongs to the contour that started the turn: the control loop
-    /// hands its declared surface to the protocol, so the rendered instructions,
-    /// the structured response schema, the stream filter, and the decoder all
-    /// observe that one surface. The assembly therefore projects the protocol and
-    /// never narrows it against a second declaration.
-    pub(crate) fn effective_capability_expr(
-        &self,
-        protocol: &dyn PromptProtocol,
-    ) -> CapabilityExpr {
+    fn effective_capability_expr(&self, protocol: &dyn PromptProtocol) -> CapabilityTree {
         protocol.capability_expr()
     }
-    /// Resolves the access a layout renders for `file`.
-    ///
-    /// Every dialogue renders the access layer the file resolves to, and both
-    /// layouts read this single predicate, so an element can never disagree with
-    /// the layer behind it. No contour relabels the layers: a plan discussion is
-    /// a dialogue like any other and renders exactly what the REPL renders,
-    /// because the developer may request a concrete change there. A file the plan
-    /// loaded as editable therefore stays editable instead of being flattened into
-    /// a read-only view.
-    pub(crate) fn context_file_access(&self, file: &ContextFileContent) -> ContextAccess {
+
+    fn context_file_access(&self, file: &ContextFileContent) -> ContextAccess {
         file.access
     }
-    /// Renders the authoritative context block of a turn.
-    ///
-    /// The block opens with the constant `<context>` tag and lists every file in
-    /// context insertion order as `<file path="..." access="...">`. Nothing in
-    /// the block depends on the context revision counter or on the layer a file
-    /// came from: a newly discovered file appends an element at the end, and
-    /// promoting a file from read-only to editable rewrites only its own
-    /// attribute. A subsequent round therefore extends the previous context
-    /// block instead of rewriting it, which keeps the cached prompt prefix
-    /// intact.
-    ///
-    /// Under [`PatchStrategy::LineAnchor`] every line of every file is prefixed
-    /// with its opaque anchor, so an edit names a line range instead of echoing
-    /// the text it replaces. A caller that renders several rounds of one turn
-    /// hands in a shared [`ContextBlockCache`] through
-    /// [`PromptAssembly::format_context_block_with`].
-    pub fn format_context_block(&self) -> Option<String> {
-        self.format_context_block_with(&mut ContextBlockCache::default())
-    }
 
-    /// Renders the context block while reusing the memo of an earlier round.
-    ///
-    /// A file whose path, effective access, and content are unchanged is
-    /// reproduced from the memo byte for byte, so only the files a later round
-    /// actually changed or appended are encoded again.
-    pub fn format_context_block_with(&self, cache: &mut ContextBlockCache) -> Option<String> {
-        if self.context_files.is_empty() {
-            return None;
-        }
-
-        let mut out = String::new();
-        out.push_str("<context>\n");
-        for file in &self.context_files {
-            let access = self.context_file_access(file);
-            out.push_str(cache.element(file, access, self.patch_strategy));
-        }
-        out.push_str("</context>");
-        Some(out)
-    }
-
-    /// Returns the interaction records frozen for this turn, if any.
-    ///
-    /// The records travel structurally rather than as a pre-rendered block, so
-    /// the semantic layout renders the `<history>` block from them and the
-    /// chronological layout can interleave them with the context elements. An
-    /// empty snapshot renders no block at all and is therefore reported as
-    /// absent.
-    pub fn history_snapshot(&self) -> Option<&HistorySnapshot> {
+    fn history_snapshot(&self) -> Option<&HistorySnapshot> {
         self.history
             .as_deref()
             .filter(|snapshot| !snapshot.is_empty())
     }
 
-    /// Reports whether an eager repository symbol map is rendered this turn.
-    ///
-    /// The predicate matches [`PromptAssembly::format_repo_map_block`] exactly,
-    /// so a map that renders no block never claims to be present.
     fn has_eager_repo_map(&self) -> bool {
         self.repo_map
             .as_deref()
             .is_some_and(|map| !map.trim().is_empty())
     }
 
-    pub fn format_repo_map_block(&self) -> Option<String> {
-        self.repo_map.as_ref().and_then(|map| {
+    fn format_repo_map_block(&self) -> Option<String> {
+        self.repo_map.as_deref().and_then(|map| {
             let trimmed = map.trim();
             if trimmed.is_empty() {
                 None
@@ -721,8 +564,8 @@ impl PromptAssembly {
         })
     }
 
-    pub fn format_repo_dirs_block(&self) -> Option<String> {
-        self.repo_dirs.as_ref().and_then(|dirs| {
+    fn format_repo_dirs_block(&self) -> Option<String> {
+        self.repo_dirs.as_deref().and_then(|dirs| {
             let trimmed = dirs.trim();
             if trimmed.is_empty() {
                 None
@@ -732,35 +575,21 @@ impl PromptAssembly {
         })
     }
 
-    /// Renders the repository outline section of a prompt.
-    ///
-    /// The eager symbol map and the compact directory outline are mutually
-    /// exclusive: the model reads symbol contours whenever a map renders and the
-    /// folder layout only when the map is absent. The section carries its own
-    /// heading and ends with a blank line, so a layout appends it as one block.
-    pub(crate) fn format_repository_outline_block(&self) -> Option<String> {
+    fn format_repository_outline_block(&self) -> Option<String> {
         if let Some(map) = self.format_repo_map_block() {
             return Some(format!("## Repository Map\n{map}\n\n"));
         }
         self.format_repo_dirs_block()
             .map(|dirs| format!("## Repository Directories\n{dirs}\n\n"))
     }
-    /// Whether the brief the loop declared drives this turn as an isolated step.
-    ///
-    /// The predicate reads the typed contour of the [`TurnBrief`] and nothing else:
-    /// the regime of a turn is declared by the loop that owns it, so no caller
-    /// infers one from the shape of the capability surface.
-    pub(crate) fn is_step_contour(&self) -> bool {
+
+    fn is_step_contour(&self) -> bool {
         self.turn_brief
             .as_ref()
             .is_some_and(|brief| brief.contour == ContourKind::Step)
     }
 
-    /// Renders the active plan section of a prompt, if the turn may read it.
-    ///
-    /// A step contour receives its own instructions and the scope of a single
-    /// plan item, so the whole active plan is deliberately withheld from it.
-    pub(crate) fn format_active_plan_block(&self) -> Option<String> {
+    fn format_active_plan_block(&self) -> Option<String> {
         if self.is_step_contour() {
             return None;
         }
@@ -769,23 +598,12 @@ impl PromptAssembly {
         Some(format!("## Active Task Plan Context\n{block}\n\n"))
     }
 
-    /// Renders the turn scratchpad section of a prompt.
-    ///
-    /// The scratchpad is rewritten on every round of a turn, so a layout places
-    /// the section in the volatile tail rather than in the stable head.
-    pub(crate) fn format_scratchpad_section(&self) -> Option<String> {
+    fn format_scratchpad_section(&self) -> Option<String> {
         self.format_scratchpad_block()
             .map(|block| format!("## Turn Scratchpad (Working Memory)\n{block}\n\n"))
     }
 
-    /// Renders the compact manifest of the context this turn carries.
-    ///
-    /// The manifest lists one element per context file with its path and its
-    /// effective access and carries no file content. A layout that distributes
-    /// the file bodies through a transcript therefore still hands the model a
-    /// complete view of what is in context, and the manifest grows at the tail
-    /// without invalidating a byte that precedes it.
-    pub(crate) fn format_context_manifest_section(&self) -> Option<String> {
+    fn format_context_manifest_section(&self) -> Option<String> {
         if self.context_files.is_empty() {
             return None;
         }
@@ -801,21 +619,7 @@ impl PromptAssembly {
         Some(out)
     }
 
-    /// Renders the compact catalog of the external documentation a project declares.
-    ///
-    /// The heading states how a declared document is invoked — one request through
-    /// the `outer_doc_requests` field names a declared identifier, and that
-    /// identifier is a prefix: `id` addresses the root document exactly as its
-    /// original text, and `id/relative.md` addresses a document below the
-    /// directory that holds the root and never climbs above it. The list itself
-    /// publishes what a request may name — the title and the optional description
-    /// of one entry — and nothing about where the material comes from: an address,
-    /// a host path, and a cache path stay harness details. Entries keep their
-    /// declaration order, and one that cannot be resolved contributes no line, so
-    /// an unusable declaration is reported by configuration validation instead of
-    /// a line nobody can request. A declaration that resolves to nothing renders
-    /// no block at all.
-    pub(crate) fn format_outer_docs_catalog_block(&self) -> Option<String> {
+    fn format_outer_docs_catalog_block(&self) -> Option<String> {
         let mut catalog = String::new();
         for entry in &self.outer_docs {
             let Ok(doc) = crate::outer_docs::OuterDoc::from_entry(entry) else {
@@ -835,8 +639,8 @@ impl PromptAssembly {
         ))
     }
 
-    pub fn format_scratchpad_block(&self) -> Option<String> {
-        self.turn_scratchpad.as_ref().and_then(|pad| {
+    fn format_scratchpad_block(&self) -> Option<String> {
+        self.turn_scratchpad.as_deref().and_then(|pad| {
             let trimmed = pad.trim();
             if trimmed.is_empty() {
                 None
@@ -853,7 +657,8 @@ impl PromptAssembly {
         })
     }
 
-    pub fn assemble_chat_messages(
+    #[cfg(test)]
+    pub(crate) fn assemble_chat_messages(
         &self,
         current_prompt: &str,
         protocol: &dyn PromptProtocol,
@@ -865,21 +670,13 @@ impl PromptAssembly {
         )
     }
 
-    /// Assembles the messages while reusing the turn-scoped context memo.
-    ///
-    /// The block order belongs to the active [`layout::PromptLayout`] policy:
-    /// the assembly renders no sequence of its own and merely hands itself, the
-    /// developer message, and the shared memo to the policy that serves
-    /// [`PromptAssembly::prompt_layout`]. The memo stays layout-agnostic, so a
-    /// `<file>` element rendered in an earlier round is reproduced byte for
-    /// byte and the provider keeps matching its cached prefix.
-    pub fn assemble_chat_messages_with_context_cache(
+    pub(crate) fn assemble_chat_messages_with_context_cache(
         &self,
         current_prompt: &str,
         protocol: &dyn PromptProtocol,
         context_cache: &mut ContextBlockCache,
     ) -> Vec<ChatMessage> {
-        layout_for(self.prompt_layout).assemble(self, current_prompt, protocol, context_cache)
+        assemble_chronological_messages(self, current_prompt, protocol, context_cache)
     }
 }
 
@@ -1030,24 +827,31 @@ mod tests {
         let proto = JsonPromptProtocol::default();
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
-        assert_eq!(messages.len(), 2);
+        // The head keeps the contract, the instructions, and the outline; the
+        // interaction record and the file body travel through the transcript.
         assert_eq!(messages[0].role, "system");
-        assert!(messages[0].content.contains("Core System Contract"));
-        assert!(messages[0].content.contains("src/main.rs"));
-        assert!(messages[0].content.contains("fn main() {}"));
-        assert!(messages[0].content.contains("## Repository Map"));
-        assert!(messages[0].content.contains("<repo_map>"));
-        assert!(messages[0].content.contains("crates/core/src/git.rs"));
-        assert!(messages[0].content.contains("## Session History"));
-        assert!(messages[0].content.contains("<history>"));
-        assert!(messages[0]
-            .content
-            .contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
-        // The regime rules travel beside the shared ones in the byte-stable
-        // head, so the developer message carries the task alone.
-        assert!(messages[0].content.contains("Action Authorization"));
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content, "Explain this code");
+        let head = &messages[0].content;
+        assert!(head.contains("Core System Contract"));
+        assert!(head.contains("## Repository Map"));
+        assert!(head.contains("<repo_map>"));
+        assert!(head.contains("crates/core/src/git.rs"));
+        assert!(head.contains("Action Authorization"));
+        assert!(!head.contains("src/main.rs"));
+        assert!(!head.contains("fn main() {}"));
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains("## Compacted Session Summary")));
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains(r#"path="src/main.rs""#)
+                && message.content.contains("fn main() {}")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("<history>")));
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("Explain this code")
+        );
     }
 
     #[test]
@@ -1084,29 +888,43 @@ mod tests {
         // the very same Action Authorization rule the REPL states.
         assert!(!sys.contains("Discussion Mode Scope"));
         assert!(!sys.contains("architectural discussion"));
-        // The authorization rule is regime-specific, and the unified
-        // composition states it in the same head as the shared rules.
         assert!(sys.contains("Action Authorization"));
-        assert!(sys.contains("<context>"));
+        assert!(sys.contains("Context Surface"));
+        assert!(!sys.contains(r#"path="src/main.rs""#));
+
         // A plan discussion is a dialogue like any other: every element carries
         // the layer the file actually resolves to, so an editable file stays
         // editable and a reference file stays read-only instead of the whole
         // context being flattened into a read-only view. The assertion targets
         // the rendered element rather than the whole prompt, because the contract
         // names both attribute values as prompt-side vocabulary.
-        assert!(sys.contains("path=\"src/main.rs\" access=\"editable\""));
-        assert!(!sys.contains("path=\"src/main.rs\" access=\"read_only\""));
-        assert!(sys.contains("path=\"src/lib.rs\" access=\"read_only\""));
-        assert!(!sys.contains("path=\"src/lib.rs\" access=\"editable\""));
-        assert!(!sys.contains("<editable_files>"));
-        assert!(!sys.contains("<read_only_files>"));
+        // The head states the contract and never carries a file body, so the
+        // element sequence is the transcript message that opens the block.
+        let context = messages
+            .iter()
+            .find(|message| message.content.starts_with("<context>\n"))
+            .expect("the files travel as a transcript message");
+        assert!(context
+            .content
+            .contains(r#"path="src/main.rs" access="editable""#));
+        assert!(!context
+            .content
+            .contains(r#"path="src/main.rs" access="read_only""#));
+        assert!(context
+            .content
+            .contains(r#"path="src/lib.rs" access="read_only""#));
+        assert!(!context
+            .content
+            .contains(r#"path="src/lib.rs" access="editable""#));
+        assert!(!context.content.contains("<editable_files>"));
+        assert!(!context.content.contains("<read_only_files>"));
 
         // The answer obligation is owned by the enabled capability modules: a
         // discussion that gathered its material answers in prose instead of
         // closing the turn silently.
         // The response structure belongs to the schema alone: the contract
-        // states the answer obligation and the prompt names no response field
-        // as a reference.
+        // states the answer obligation and the prompt names no response field as
+        // a reference.
         assert!(sys.contains("never closed by silence"));
         assert!(!sys.contains("- `message`:"));
         assert!(!sys.contains("- `context_requests`:"));
@@ -1126,7 +944,7 @@ mod tests {
     fn test_discussion_renders_stub_protocol_instructions_without_json_schema() {
         use crate::prompt::protocol::PromptProtocol;
         use tauqe_protocol::{
-            CapabilityExpr, LlmCapability, LlmCommand, PatchStrategy, TextCommand,
+            CapabilityTree, LlmCapability, LlmCommand, PatchStrategy, TextCommand,
         };
 
         /// Protocol stub whose only mode text is its own heading.
@@ -1141,8 +959,8 @@ mod tests {
                 EditProtocolKind::Structured
             }
 
-            fn capability_expr(&self) -> CapabilityExpr {
-                CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)])
+            fn capability_expr(&self) -> CapabilityTree {
+                CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)])
             }
 
             fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
@@ -1160,7 +978,7 @@ mod tests {
                 "## Mode: Stub Wire\nAnswer in the stub wire format.\n".to_string()
             }
 
-            fn with_capability_expr(&self, _expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
+            fn with_capability_expr(&self, _expr: CapabilityTree) -> Box<dyn PromptProtocol> {
                 Box::new(StubWireProtocol)
             }
 
@@ -1226,8 +1044,10 @@ mod tests {
         ));
     }
 
+    /// The element rendering of one file is stable: the context revision never
+    /// enters it, and promoting a file rewrites only its own attribute.
     #[test]
-    fn test_context_block_is_static_and_append_only() {
+    fn test_context_element_rendering_is_static_and_revision_independent() {
         let file = |path: &str, access: ContextAccess| ContextFileContent {
             path: path.to_string(),
             access,
@@ -1235,36 +1055,36 @@ mod tests {
             insertion_seq: 0,
         };
 
-        let mut assembly = PromptAssembly::new(
-            None,
-            7,
-            vec![file("src/a.rs", ContextAccess::ReadOnly)],
-            "git",
-            EditProtocolKind::Structured,
-            None,
-            None,
-        );
-        let first = assembly.format_context_block().unwrap();
-        assert!(first.starts_with("<context>\n"));
+        let mut files = [
+            file("src/a.rs", ContextAccess::ReadOnly),
+            file("src/b.rs", ContextAccess::Editable),
+        ];
+        let mut cache = ContextBlockCache::default();
+        let neighbor = cache
+            .element(&files[1], files[1].access, PatchStrategy::SearchReplace)
+            .to_string();
+        let first = cache
+            .element(&files[0], files[0].access, PatchStrategy::SearchReplace)
+            .to_string();
+        assert!(first.starts_with(r#"    <file path="src/a.rs" access="read_only">"#));
         assert!(!first.contains("revision"));
-        assert!(first.contains("path=\"src/a.rs\" access=\"read_only\""));
+        assert!(first.contains("// src/a.rs\n"));
+        assert!(neighbor.contains(r#"path="src/b.rs" access="editable""#));
 
-        // A newly discovered file appends an element and leaves the previous
-        // block untouched, and the revision counter never enters the prefix.
-        assembly
-            .context_files
-            .push(file("src/b.rs", ContextAccess::Editable));
-        assembly.context_revision = 8;
-        let second = assembly.format_context_block().unwrap();
-        assert!(second.starts_with(&first[..first.len() - "</context>".len()]));
-        assert!(second.contains("path=\"src/b.rs\" access=\"editable\""));
-
-        // Promotion rewrites only the access attribute in place.
-        assembly.context_files[0].access = ContextAccess::Editable;
-        let promoted = assembly.format_context_block().unwrap();
-        assert_eq!(promoted.matches("path=\"src/a.rs\"").count(), 1);
-        assert!(promoted.contains("path=\"src/a.rs\" access=\"editable\""));
-        assert!(promoted.find("src/a.rs").unwrap() < promoted.find("src/b.rs").unwrap());
+        // Promotion rewrites only the access attribute of that one element and
+        // never relocates it or reflows its neighbor.
+        files[0].access = ContextAccess::Editable;
+        let promoted = cache
+            .element(&files[0], files[0].access, PatchStrategy::SearchReplace)
+            .to_string();
+        assert_eq!(promoted.matches(r#"path="src/a.rs""#).count(), 1);
+        assert!(promoted.contains(r#"path="src/a.rs" access="editable""#));
+        assert_eq!(
+            cache
+                .element(&files[1], files[1].access, PatchStrategy::SearchReplace)
+                .to_string(),
+            neighbor
+        );
     }
 
     /// The wrapper estimate and the rendered element come from one builder, so
@@ -1296,153 +1116,147 @@ mod tests {
     }
 
     #[test]
-    fn test_context_block_renders_opaque_anchors_for_every_file() {
+    fn test_context_element_renders_opaque_anchors_for_every_file() {
         use crate::edits::anchor::encode_anchor;
 
-        let files = || {
-            vec![
-                ContextFileContent {
-                    path: "src/a.rs".to_string(),
-                    access: ContextAccess::ReadOnly,
-                    content: "alpha\nbeta\n".to_string(),
-                    insertion_seq: 0,
-                },
-                ContextFileContent {
-                    path: "src/b.rs".to_string(),
-                    access: ContextAccess::Editable,
-                    content: "gamma".to_string(),
-                    insertion_seq: 0,
-                },
-            ]
-        };
-
-        let anchored = PromptAssembly::new(
-            None,
-            1,
-            files(),
-            "git",
-            EditProtocolKind::Structured,
-            None,
-            None,
-        )
-        .with_patch_strategy(PatchStrategy::LineAnchor);
-        let block = anchored.format_context_block().unwrap();
+        let files = [
+            ContextFileContent {
+                path: "src/a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+                content: "alpha\nbeta\n".to_string(),
+                insertion_seq: 0,
+            },
+            ContextFileContent {
+                path: "src/b.rs".to_string(),
+                access: ContextAccess::Editable,
+                content: "gamma".to_string(),
+                insertion_seq: 0,
+            },
+        ];
+        let mut cache = ContextBlockCache::default();
+        let anchored: Vec<String> = files
+            .iter()
+            .map(|file| {
+                cache
+                    .element(file, file.access, PatchStrategy::LineAnchor)
+                    .to_string()
+            })
+            .collect();
+        let a = &anchored[0];
+        let b = &anchored[1];
 
         // Both access layers carry anchors, so a read-only file is addressable
         // exactly like an editable one.
-        assert!(block.contains("access=\"read_only\""));
-        assert!(block.contains("access=\"editable\""));
-        // Every line names its zero-based index through the codec seeded by
-        // its own file, so the same line of two files carries unrelated tokens.
-        assert!(block.contains(&format!("{} | alpha", encode_anchor("src/a.rs", 0))));
-        assert!(block.contains(&format!("{} | beta", encode_anchor("src/a.rs", 1))));
-        assert!(block.contains(&format!("{} | gamma", encode_anchor("src/b.rs", 0))));
-        assert!(!block.contains("\nalpha"));
+        assert!(a.contains(r#"access="read_only""#));
+        assert!(b.contains(r#"access="editable""#));
+        // Every line names its zero-based index through the codec seeded by its
+        // own file, so the same line of two files carries unrelated tokens.
+        assert!(a.contains(&format!("{} | alpha", encode_anchor("src/a.rs", 0))));
+        assert!(a.contains(&format!("{} | beta", encode_anchor("src/a.rs", 1))));
+        assert!(b.contains(&format!("{} | gamma", encode_anchor("src/b.rs", 0))));
+        assert!(!a.contains("\nalpha"));
         // The closing newline of the file is still rendered exactly once.
-        assert!(!block.contains(&format!("{} | beta\n\n", encode_anchor("src/a.rs", 1))));
+        assert!(!a.contains(&format!("{} | beta\n\n", encode_anchor("src/a.rs", 1))));
 
-        // The search/replace strategy keeps the raw lines untouched.
-        let plain = PromptAssembly::new(
-            None,
-            1,
-            files(),
-            "git",
-            EditProtocolKind::Structured,
-            None,
-            None,
-        )
-        .with_patch_strategy(PatchStrategy::SearchReplace);
-        let raw = plain.format_context_block().unwrap();
-        assert!(raw.contains("\nalpha\nbeta\n"));
-        assert!(!raw.contains(&format!("{} | ", encode_anchor("src/a.rs", 0))));
+        // The search/replace strategy keeps the raw lines untouched. The memo is
+        // fresh, because an element an earlier round rendered under another
+        // strategy is handed back verbatim.
+        let mut raw_cache = ContextBlockCache::default();
+        let raw: Vec<String> = files
+            .iter()
+            .map(|file| {
+                raw_cache
+                    .element(file, file.access, PatchStrategy::SearchReplace)
+                    .to_string()
+            })
+            .collect();
+        assert!(raw[0].contains("\nalpha\nbeta\n"));
+        assert!(!raw[0].contains(&format!("{} | ", encode_anchor("src/a.rs", 0))));
     }
 
     #[test]
     fn test_context_cache_reuses_identical_bytes_and_rerenders_only_changed_files() {
         use crate::edits::anchor::encode_anchor;
 
-        let mut assembly = PromptAssembly::new(
-            None,
-            1,
-            vec![
-                ContextFileContent {
-                    path: "src/a.rs".to_string(),
-                    access: ContextAccess::ReadOnly,
-                    content: "alpha\n".to_string(),
-                    insertion_seq: 0,
-                },
-                ContextFileContent {
-                    path: "src/b.rs".to_string(),
-                    access: ContextAccess::ReadOnly,
-                    content: "beta\n".to_string(),
-                    insertion_seq: 0,
-                },
-            ],
-            "git",
-            EditProtocolKind::Structured,
-            None,
-            None,
-        )
-        .with_patch_strategy(PatchStrategy::LineAnchor);
+        let mut files = [
+            ContextFileContent {
+                path: "src/a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+                content: "alpha\n".to_string(),
+                insertion_seq: 0,
+            },
+            ContextFileContent {
+                path: "src/b.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+                content: "beta\n".to_string(),
+                insertion_seq: 0,
+            },
+        ];
 
         let mut cache = ContextBlockCache::default();
-        let first = assembly.format_context_block_with(&mut cache).unwrap();
+        let first = cache
+            .element(&files[0], files[0].access, PatchStrategy::LineAnchor)
+            .to_string();
+        let untouched = cache
+            .element(&files[1], files[1].access, PatchStrategy::LineAnchor)
+            .to_string();
         assert_eq!(cache.cached_files(), 2);
 
         // An unchanged round is reproduced byte for byte from the memo.
-        let second = assembly.format_context_block_with(&mut cache).unwrap();
-        assert_eq!(second, first);
-        assert_eq!(cache.cached_files(), 2);
-
-        // Promoting a file rewrites only its own element; its neighbor keeps
-        // the exact bytes it already had, so the prefix stays stable.
-        let untouched = format!(
-            "    <file path=\"src/b.rs\" access=\"read_only\">\n{} | beta\n    </file>\n",
-            encode_anchor("src/b.rs", 0)
+        assert_eq!(
+            cache
+                .element(&files[0], files[0].access, PatchStrategy::LineAnchor)
+                .to_string(),
+            first
         );
-        assert!(first.contains(&untouched));
+        assert_eq!(cache.cached_files(), 2);
+        assert!(untouched.contains(&format!("{} | beta", encode_anchor("src/b.rs", 0))));
 
-        assembly.context_files[0].access = ContextAccess::Editable;
-        let promoted = assembly.format_context_block_with(&mut cache).unwrap();
-        assert!(promoted.contains("path=\"src/a.rs\" access=\"editable\""));
+        // Promoting a file rewrites only its own element; its neighbor keeps the
+        // exact bytes it already had, so the prefix stays stable.
+        files[0].access = ContextAccess::Editable;
+        let promoted = cache
+            .element(&files[0], files[0].access, PatchStrategy::LineAnchor)
+            .to_string();
+        assert!(promoted.contains(r#"path="src/a.rs" access="editable""#));
         assert!(promoted.contains(&format!("{} | alpha", encode_anchor("src/a.rs", 0))));
-        assert!(promoted.contains(&untouched));
+        assert_eq!(
+            cache
+                .element(&files[1], files[1].access, PatchStrategy::LineAnchor)
+                .to_string(),
+            untouched
+        );
     }
 
     #[test]
     fn test_anchored_context_falls_back_to_raw_beyond_the_codec_domain() {
         use crate::edits::anchor::encode_anchor;
 
-        // The codec covers `u16::MAX + 1` lines. A file of exactly that length
-        // is still addressable; one line more cannot be addressed at all.
+        // The codec covers `u16::MAX + 1` lines. A file of exactly that length is
+        // still addressable; one line more cannot be addressed at all.
         let within_domain: String = (0..=u16::MAX).map(|i| format!("line {i}\n")).collect();
         let beyond_domain = format!("{within_domain}line beyond\n");
 
         let render = |content: String| {
-            PromptAssembly::new(
-                None,
-                1,
-                vec![ContextFileContent {
-                    path: "src/big.rs".to_string(),
-                    access: ContextAccess::ReadOnly,
-                    content,
-                    insertion_seq: 0,
-                }],
-                "git",
-                EditProtocolKind::Structured,
-                None,
-                None,
-            )
-            .with_patch_strategy(PatchStrategy::LineAnchor)
+            let file = ContextFileContent {
+                path: "src/big.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+                content,
+                insertion_seq: 0,
+            };
+            let mut cache = ContextBlockCache::default();
+            cache
+                .element(&file, file.access, PatchStrategy::LineAnchor)
+                .to_string()
         };
 
-        let block = render(within_domain).format_context_block().unwrap();
+        let block = render(within_domain);
         assert!(block.contains(&format!(
             "{} | line 65535",
             encode_anchor("src/big.rs", u16::MAX)
         )));
 
-        let block = render(beyond_domain).format_context_block().unwrap();
+        let block = render(beyond_domain);
         assert!(block.contains("\nline beyond\n"));
         assert!(!block.contains(&format!("{} | ", encode_anchor("src/big.rs", 0))));
     }
@@ -1486,28 +1300,41 @@ mod tests {
 
         let proto = JsonPromptProtocol::default();
         let messages = assembly.assemble_chat_messages("Do work", &proto);
-        let sys = &messages[0].content;
 
-        let repo_map = sys.find("## Repository Map").expect("repo map block");
-        let history = sys.find("## Session History").expect("history block");
-        let context = sys.find("## Project Context").expect("context block");
-        let plan = sys
+        let head = &messages[0].content;
+        assert_eq!(messages[0].role, "system");
+        assert!(head.contains("## Repository Map"));
+        assert!(head.contains("crate\n  fn main"));
+        // The context body and the interaction records travel through the
+        // transcript, never through the byte-stable head.
+        assert!(!head.contains(r#"path="src/main.rs""#));
+        assert!(!head.contains("fn main() {}"));
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains("## Compacted Session Summary")));
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains("fn main() {}")));
+
+        // The volatile tail carries the plan, the context manifest, and the
+        // scratchpad in one growing block, and the task closes the sequence.
+        let tail = &messages[messages.len() - 2].content;
+        let plan = tail
             .find("## Active Task Plan Context")
             .expect("active plan block");
-        let scratchpad = sys
+        let manifest = tail
+            .find("## Project Context Manifest")
+            .expect("context manifest block");
+        let scratchpad = tail
             .find("## Turn Scratchpad (Working Memory)")
             .expect("scratchpad block");
-
-        assert!(repo_map < context);
-        assert!(context < plan);
-        // The session history grows after every completed turn, so it is the
-        // last stable block: a divergence between two consecutive turns cuts
-        // the cached prefix at the latest possible point.
-        assert!(plan < history);
-        assert!(history < scratchpad);
-        assert!(sys.trim_end().ends_with("</scratchpad>"));
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content, "Do work");
+        assert!(plan < manifest);
+        assert!(manifest < scratchpad);
+        assert!(tail.trim_end().ends_with("</scratchpad>"));
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("Do work")
+        );
     }
 
     #[test]
@@ -1876,7 +1703,7 @@ mod tests {
         assert!(full.contains("Self-Knowledge"));
 
         // With documentation requests disabled the anchor survives as prose.
-        let text_only = JsonPromptProtocol::with_capabilities(CapabilityExpr::from_leaves([
+        let text_only = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
         ]));
         let narrowed = assembly.build_system_prompt(&text_only);
@@ -1922,11 +1749,12 @@ mod tests {
         assert!(block.contains("- Hypothesis: Foo needs Bar"));
         assert!(block.contains("</scratchpad>"));
 
+        // The scratchpad is rewritten on every round, so it travels in the
+        // volatile tail of the transcript rather than in the byte-stable head.
         let messages = assembly.assemble_chat_messages("Continue", &proto);
-        assert!(messages[0]
-            .content
-            .contains("## Turn Scratchpad (Working Memory)"));
-        assert!(messages[0].content.contains("- Hypothesis: Foo needs Bar"));
+        let tail = &messages[messages.len() - 2].content;
+        assert!(tail.contains("## Turn Scratchpad (Working Memory)"));
+        assert!(tail.contains("- Hypothesis: Foo needs Bar"));
     }
 
     #[test]
@@ -1971,9 +1799,14 @@ mod tests {
         assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 
         let messages = assembly.assemble_chat_messages("Explain this code", &json);
-        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
-        assert!(messages[1].content.ends_with("Explain this code"));
+        assert!(messages[0]
+            .content
+            .contains("Code Modification Protocol (Structured Output JSON)"));
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("Explain this code")
+        );
     }
 
     #[test]
@@ -2295,7 +2128,7 @@ mod tests {
         );
 
         // A narrowed surface that cannot request a document advertises none.
-        let narrowed = JsonPromptProtocol::with_capabilities(CapabilityExpr::from_leaves([
+        let narrowed = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::EditReplace,
         ]));

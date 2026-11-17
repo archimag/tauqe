@@ -1,9 +1,9 @@
 use crate::escape::{escape_xml_text, single_line};
 use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
 
-pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
+pub(crate) const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
 
-pub const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
+pub(crate) const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
 
 /// Joins identifiers or paths into a single escaped, comma-separated line.
 fn escape_list(items: &[String]) -> String {
@@ -24,7 +24,7 @@ fn escape_list(items: &[String]) -> String {
 /// `commit_message`, `blocked`, `context_requests`), while the tagged contour
 /// names its control tags bound to `marker`. A structured turn emits no command
 /// tag, so the marker it carries is never used.
-pub fn format_plan_step_execution_prompt(
+pub(crate) fn format_plan_step_execution_prompt(
     plan: &Plan,
     step_id: &str,
     _protocol: EditProtocolKind,
@@ -160,7 +160,7 @@ pub fn format_plan_step_execution_prompt(
     ));
     out.push_str("2. Own the implementation (`How`) only, never the requirement (`What`): the architecture of this step is fixed by the plan. Replacing the designed data structures, rewriting the interfaces or contracts the concept defines, substituting the selected components or libraries, or relaxing the given invariants is strictly prohibited.\n");
     out.push_str("3. Do NOT implement any upcoming or subsequent steps from the plan.\n");
-    out.push_str("4. Keep changes minimal and coherent. Propose code modifications in the `changes` array. Toolchain verification is handled automatically and deterministically by the harness; do NOT fill the `verify` field.\n");
+    out.push_str("4. Keep changes minimal and coherent. Propose code modifications in the `changes` array. Toolchain verification is handled automatically and deterministically by the harness, so the step owns the change set alone and never selects, narrows, or skips the verification that gates it.\n");
     out.push_str("5. When implementation and verification are complete, fill in `commit_message` with the English Conventional Commits commit message of the change set.\n");
     out.push_str("6. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:src/lib.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting research rounds. Do NOT halt with conversational text if the necessary files can simply be requested. An external specification declared for this step is already materialized in <context> as read-only reference: request a document below its root through the `outer_doc_requests` field as `root/relative.md`, follow the relative links the root text carries, and never name a path that climbs above the declared root.\n");
     out.push_str("7. If the step cannot be implemented within the approved architectural decision, because the implementation would require a different data structure, a changed interface, a substituted component, or a relaxed concept invariant, do NOT improvise an alternative design. Stop and set the `blocked` field with `is_blocked` true, a `reason`, and `details` describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n");
@@ -173,10 +173,10 @@ pub fn format_plan_step_execution_prompt(
 ///
 /// The prompt echoes the model's previous response and optional diagnostic
 /// feedback, then explicitly demands strict adherence to the active protocol on
-/// the next turn: the structured contour asks for a change set carrying a
-/// non-empty `commit_message`, while the tagged contour asks for an edit block
-/// and the success tag bound to `marker`.
-pub fn format_plan_step_retry_prompt(
+/// the next turn, and re-attaches the full target step task execution prompt so
+/// the model retains the complete architectural context, plan details, and target files.
+pub(crate) fn format_plan_step_retry_prompt(
+    task_prompt: &str,
     assistant_text: &str,
     error: Option<&str>,
     _protocol: EditProtocolKind,
@@ -212,7 +212,15 @@ pub fn format_plan_step_retry_prompt(
     out.push_str(
         "2. If no code changes are required to complete the step, explain why in `reason`.\n",
     );
-    out.push_str("3. Do NOT replace the structured fields with conversational text alone, and do NOT end the turn without either a valid `changes` entry, a `reason`, or a reported blocker.\n");
+    out.push_str("3. If an insurmountable technical blocker unrelated to the architectural decision stops the work, state it in `error_message`.\n");
+    out.push_str("4. Do NOT replace the structured fields with conversational text alone, and do NOT end the turn without either a valid `changes` entry, a `reason`, a reported blocker, or an `error_message`.\n\n");
+
+    let trimmed_task = task_prompt.trim();
+    if !trimmed_task.is_empty() {
+        out.push_str("---\n\n");
+        out.push_str(trimmed_task);
+        out.push('\n');
+    }
 
     out
 }
@@ -331,6 +339,7 @@ mod tests {
     #[test]
     fn retry_prompt_demands_a_protocol_operation() {
         let prompt = format_plan_step_retry_prompt(
+            "# Target Plan Step Execution: [P-1:1] Bound the emit length",
             "finished <edit> nothing",
             Some("no edits"),
             EditProtocolKind::Structured,
@@ -342,6 +351,7 @@ mod tests {
         assert!(prompt.contains("no edits"));
         assert!(prompt.contains("`changes`"));
         assert!(prompt.contains("`commit_message`"));
+        assert!(prompt.contains("Target Plan Step Execution"));
     }
     #[test]
     fn structured_execution_prompt_speaks_the_field_vocabulary() {
@@ -403,6 +413,7 @@ mod tests {
     #[test]
     fn structured_retry_prompt_speaks_the_field_vocabulary() {
         let prompt = format_plan_step_retry_prompt(
+            "# Target Plan Step Execution: [P-1:1] Bound the emit length",
             "I stopped early.",
             Some("no edits"),
             EditProtocolKind::Structured,
@@ -413,6 +424,7 @@ mod tests {
         assert!(!prompt.contains("M7"));
         assert!(prompt.contains("`changes`"));
         assert!(prompt.contains("`commit_message`"));
+        assert!(prompt.contains("Target Plan Step Execution"));
     }
 
     #[test]

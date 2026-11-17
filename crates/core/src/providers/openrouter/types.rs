@@ -79,10 +79,10 @@ pub(crate) struct GenerationData {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct GenerationStats {
-    pub total_cost: Option<f64>,
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
+pub(crate) struct GenerationStats {
+    pub(crate) total_cost: Option<f64>,
+    pub(crate) prompt_tokens: Option<u32>,
+    pub(crate) completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

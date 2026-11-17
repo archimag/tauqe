@@ -23,12 +23,13 @@ mod stage;
 pub(crate) mod strategy;
 pub mod stream;
 
-pub use apply::{apply_edit_proposal, apply_edit_proposal_with_config};
-pub use protocol::{
-    ContextRequest, EditProtocolFactory, StructuredEditProtocol, TerminalOutcome, VerifyOnSuccess,
-    VerifyRequest, VerifyTarget,
-};
-pub use stage::{prepare_staged_edits, prepare_staged_edits_with_config, stage_and_validate_edits};
+#[cfg(test)]
+pub(crate) use apply::apply_edit_proposal;
+pub(crate) use apply::apply_edit_proposal_with_config;
+pub use protocol::{ContextRequest, EditProtocolFactory};
+#[cfg(test)]
+pub(crate) use stage::prepare_staged_edits;
+pub(crate) use stage::{prepare_staged_edits_with_config, stage_and_validate_edits};
 pub use tauqe_tools::edits::anchor;
 pub use tauqe_tools::edits::fuzzy;
 pub use tauqe_tools::edits::staging;

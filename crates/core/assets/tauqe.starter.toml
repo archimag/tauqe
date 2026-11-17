@@ -210,20 +210,12 @@ repl = ["openrouter:~google/gemini-flash-latest"]
 # # of reproducing the text it replaces; `search_replace` echoes the replaced text
 # # and matches it exactly.
 # patch_strategy = "line_anchor"
-# # Prompt layout policy. Absent by default, because the layout then follows the
-# # turn intent: a dialogue contour builds the append-only chronological
-# # transcript, while an isolated step and an architect synthesis keep the
-# # semantic block order. A declared value pins one policy for every turn.
-# # prompt_layout = "chronological"
-# # Retry budget of one turn: failed edit staging and verification healing. It
-# # bounds how often a single attempt may repair its own change set; how many
-# # generation attempts a model tier receives is declared per model entry with
-# # `attempts`.
-# max_retries = 3
+# # Total budget of LLM rounds granted to a single turn: research, staging retries,
+# # verification healing, and empty response retries all spend from this pool.
+# max_turn_rounds = 16
 # # Automated replanning cycles a blocked coder step may trigger before the
 # # harness asks the developer to intervene.
 # max_replans = 2
-
 
 # =============================================================================
 # 5. Context and research budgets
@@ -237,7 +229,6 @@ repl = ["openrouter:~google/gemini-flash-latest"]
 # instead of living with a bound that does not fit.
 
 # [context]
-# max_research_rounds = 5          # autonomous discovery rounds per turn
 # token_budget = 300000            # aggregate budget: repository files and outer docs
 # repomap_token_budget = 4000      # budget of the repository map
 # include_repo_map = true          # render the map eagerly; false keeps it on demand

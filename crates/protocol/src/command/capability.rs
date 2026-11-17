@@ -140,8 +140,6 @@ pub enum LlmCapability {
     /// contracts it was pointed at; the internal documentation of the harness
     /// itself stays closed to a step.
     OuterDocRequest,
-    /// Requests to run deterministic toolchain verification.
-    ToolchainVerify,
     /// Creation of a new project plan.
     PlanCreation,
     /// Modification of an existing project plan.
@@ -168,8 +166,6 @@ pub enum LlmCapability {
     /// Explicit unconditional abort emitted when external host environment actions or developer intervention is required.
     Abort,
     CustomTools,
-    /// Concise explanation accompanying code modifications in turn/step execution.
-    ShortDescription,
 }
 
 impl LlmCapability {
@@ -192,7 +188,6 @@ impl LlmCapability {
         Self::DirList,
         Self::DocRequest,
         Self::OuterDocRequest,
-        Self::ToolchainVerify,
         Self::PlanCreation,
         Self::PlanUpdate,
         Self::ReviewUpdate,
@@ -203,7 +198,6 @@ impl LlmCapability {
         Self::Blocked,
         Self::Abort,
         Self::CustomTools,
-        Self::ShortDescription,
     ];
 
     /// Canonical lower-case identifier used on the wire.
@@ -223,7 +217,6 @@ impl LlmCapability {
             Self::DirList => "dir_list",
             Self::DocRequest => "doc_request",
             Self::OuterDocRequest => "outer_doc_request",
-            Self::ToolchainVerify => "toolchain_verify",
             Self::PlanCreation => "plan_creation",
             Self::PlanUpdate => "plan_update",
             Self::ReviewUpdate => "review_update",
@@ -234,7 +227,6 @@ impl LlmCapability {
             Self::Blocked => "blocked",
             Self::Abort => "abort",
             Self::CustomTools => "custom_tools",
-            Self::ShortDescription => "short_description",
         }
     }
 
@@ -259,9 +251,7 @@ impl LlmCapability {
             | Self::PlanUpdate
             | Self::ReviewUpdate
             | Self::Scratchpad
-            | Self::CustomTools
-            | Self::ShortDescription => CapabilityPhase::Execution,
-            Self::ToolchainVerify => CapabilityPhase::Verification,
+            | Self::CustomTools => CapabilityPhase::Execution,
             Self::CommitMessage
             | Self::TurnError
             | Self::TurnSkip
@@ -283,8 +273,7 @@ impl LlmCapability {
             | Self::EditDelete
             | Self::EditMove
             | Self::EditMoveDir
-            | Self::EditOverwrite
-            | Self::ShortDescription => CapabilityDelivery::LiveStreaming,
+            | Self::EditOverwrite => CapabilityDelivery::LiveStreaming,
             _ => CapabilityDelivery::RoundDeferred,
         }
     }
@@ -296,74 +285,85 @@ impl fmt::Display for LlmCapability {
     }
 }
 
-/// A mutually exclusive operational branch of capabilities.
-///
-/// In a single round, an agent or model can operate within exactly one branch
-/// (for example, either performing discovery or applying modifications),
-/// enforcing mutual exclusion at the protocol and schema level. The branch
-/// label is data, not a derived property: the contour that assembles the tree
-/// declares `kind` explicitly, so no consumer sniffs the leaves to recover it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityBranch {
-    /// Machine-readable identifier of the branch (e.g. "research", "edit").
-    pub kind: String,
-    /// Capability expression carried by this branch.
-    pub expr: CapabilityExpr,
-}
-
-impl CapabilityBranch {
-    /// Creates a new capability branch.
-    pub fn new(kind: impl Into<String>, expr: CapabilityExpr) -> Self {
-        Self {
-            kind: kind.into(),
-            expr,
-        }
-    }
-}
-
 /// Algebraic composition of capabilities into an operational branch tree.
 ///
 /// A protocol surface is rarely a flat list when incompatible actions must be
-/// excluded from the same round. A capability expression makes that structure
-/// explicit: [`Leaf`](Self::Leaf) names one atomic capability,
-/// [`Set`](Self::Set) conjoins children into one operational branch, and
-/// [`AnyOf`](Self::AnyOf) declares mutually exclusive branches of a single
-/// round, each carried as a [`CapabilityBranch`] with its own label beside the
-/// capabilities it holds, so the JSON constrained decoder can select one branch
-/// and physically exclude the properties of every other branch from the
-/// produced object. The flat projection a consumer acts upon is recovered
-/// through [`leaves`](Self::leaves), so a consumer that needs the flat list
-/// reads it here instead of walking the tree itself.
+/// excluded from the same round. A capability tree makes that structure
+/// explicit with three nodes and nothing else: [`Leaf`](Self::Leaf) names one
+/// atomic capability, [`Set`](Self::Set) conjoins children into one operational
+/// block, and [`AnyOf`](Self::AnyOf) declares mutually exclusive branches of a
+/// single round. Every node is labeled, so the JSON constrained decoder selects
+/// one branch and physically excludes the properties of every other branch from
+/// the produced object.
 ///
-/// The expression is a pure algebraic value: it carries no behavior of its own
-/// and drives no turn. It states only which capabilities belong to which
-/// branch, so the prompt, the response schema, and the XML decoder can read
-/// one declaration instead of restating the grouping.
+/// The tree is a pure algebraic value: it carries no behavior of its own and
+/// drives no turn. It states only which capabilities belong to which branch, so
+/// the prompt, the response schema, and the decoder read one declaration instead
+/// of restating the grouping. The flat projection a consumer acts upon is
+/// recovered through [`leaves`](Self::leaves), and a surface assembled from more
+/// than one declaration is reconciled through [`merge`](Self::merge).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CapabilityExpr {
+pub enum CapabilityTree {
     /// A single atomic capability.
     Leaf(LlmCapability),
-    /// Conjunction: every child belongs to the same operational branch.
-    Set(Vec<CapabilityExpr>),
+    /// A block of capabilities: the conjunction of its children.
+    ///
+    /// The label names the block. An empty label is the transparent root
+    /// conjunction built by [`root`](Self::root): its children take part in the
+    /// level that holds them. A named label is the block built by
+    /// [`named_set`](Self::named_set): placed inside an [`AnyOf`](Self::AnyOf)
+    /// it becomes the variant that label discriminates, so a branch states its
+    /// own name and no consumer recovers it from the leaves.
+    Set(String, Vec<CapabilityTree>),
     /// Disjunction of mutually exclusive branches.
     ///
-    /// The label names the discriminated union the branches collapse into
-    /// (for example `"action"`), while every branch carries its own
-    /// [`CapabilityBranch::kind`] beside the capabilities it holds, so the
-    /// JSON constrained decoder can select one branch and physically exclude
-    /// the properties of every other branch from the produced object.
-    AnyOf(String, Vec<CapabilityBranch>),
+    /// The label names the discriminated union the branches collapse into (for
+    /// example `"action"`), while every branch carries its own label, so the
+    /// JSON constrained decoder selects one branch and physically excludes the
+    /// properties of every other branch from the produced object.
+    AnyOf(String, Vec<CapabilityTree>),
 }
-
-impl CapabilityExpr {
+impl CapabilityTree {
     /// Builds a leaf expression from a single capability.
     pub fn leaf(capability: LlmCapability) -> Self {
         Self::Leaf(capability)
     }
 
-    /// Builds a conjunction over the given child expressions.
-    pub fn set(items: impl IntoIterator<Item = CapabilityExpr>) -> Self {
-        Self::Set(items.into_iter().collect())
+    /// Builds the transparent root conjunction over the given children.
+    ///
+    /// The block carries the empty label, so its children take part in the level
+    /// that holds them instead of forming a branch of their own.
+    pub fn root(items: impl IntoIterator<Item = CapabilityTree>) -> Self {
+        Self::Set(String::new(), items.into_iter().collect())
+    }
+
+    /// Builds an unnamed conjunction over the given child expressions.
+    ///
+    /// The block is the same transparent root [`root`](Self::root) declares, kept
+    /// under the spelling the contours use while their phase trees are assembled
+    /// from the shared branches.
+    pub fn set(items: impl IntoIterator<Item = CapabilityTree>) -> Self {
+        Self::root(items)
+    }
+
+    /// Builds a labeled block of capabilities.
+    ///
+    /// The label names the block, so placing it inside an
+    /// [`AnyOf`](Self::AnyOf) turns it into the variant the label
+    /// discriminates.
+    pub fn named_set(
+        label: impl Into<String>,
+        items: impl IntoIterator<Item = CapabilityTree>,
+    ) -> Self {
+        Self::Set(label.into(), items.into_iter().collect())
+    }
+
+    /// Builds a disjunction of labeled branches.
+    pub fn any_of(
+        label: impl Into<String>,
+        branches: impl IntoIterator<Item = CapabilityTree>,
+    ) -> Self {
+        Self::AnyOf(label.into(), branches.into_iter().collect())
     }
 
     /// Builds a conjunction over the given atomic capabilities.
@@ -371,18 +371,10 @@ impl CapabilityExpr {
     /// A caller that holds a flat list of capabilities — a narrowed surface, a
     /// test fixture, an ad-hoc contour — declares it as a tree without
     /// re-deriving the leaf shape by hand. The result is the same conjunction
-    /// [`set`](Self::set) builds, so every consumer observes one tree shape
+    /// [`root`](Self::root) builds, so every consumer observes one tree shape
     /// whichever constructor produced it.
     pub fn from_leaves(capabilities: impl IntoIterator<Item = LlmCapability>) -> Self {
-        Self::Set(capabilities.into_iter().map(Self::Leaf).collect())
-    }
-
-    /// Builds a disjunction of labeled branches.
-    pub fn any_of(
-        name: impl Into<String>,
-        branches: impl IntoIterator<Item = CapabilityBranch>,
-    ) -> Self {
-        Self::AnyOf(name.into(), branches.into_iter().collect())
+        Self::root(capabilities.into_iter().map(Self::Leaf))
     }
 
     /// Reports whether the expression is a leaf.
@@ -398,14 +390,25 @@ impl CapabilityExpr {
         }
     }
 
+    /// Label of the node.
+    ///
+    /// A [`Set`](Self::Set) reports the name of its block, which is empty for the
+    /// transparent root conjunction, and an [`AnyOf`](Self::AnyOf) reports the
+    /// name of its union. A leaf carries no label, so the branch name is read
+    /// here instead of being sniffed from the leaves.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Set(label, _) | Self::AnyOf(label, _) => Some(label.as_str()),
+        }
+    }
+
     /// Reports whether the tree reaches `capability` through any branch.
     pub fn contains(&self, capability: LlmCapability) -> bool {
         match self {
             Self::Leaf(leaf) => *leaf == capability,
-            Self::Set(items) => items.iter().any(|item| item.contains(capability)),
-            Self::AnyOf(_, branches) => branches
-                .iter()
-                .any(|branch| branch.expr.contains(capability)),
+            Self::Set(_, items) => items.iter().any(|item| item.contains(capability)),
+            Self::AnyOf(_, branches) => branches.iter().any(|branch| branch.contains(capability)),
         }
     }
 
@@ -428,7 +431,7 @@ impl CapabilityExpr {
         match self {
             // A marker branch holds no leaf, yet it stays an operational
             // branch of its own, so narrowing keeps it in the tree.
-            Self::Set(items) if items.is_empty() => true,
+            Self::Set(_, items) if items.is_empty() => true,
             _ => self.leaves().iter().any(|c| match c {
                 LlmCapability::EditReplace
                 | LlmCapability::EditCreate
@@ -436,7 +439,6 @@ impl CapabilityExpr {
                 | LlmCapability::EditMove
                 | LlmCapability::EditMoveDir
                 | LlmCapability::EditOverwrite
-                | LlmCapability::ToolchainVerify
                 | LlmCapability::ContextRequest
                 | LlmCapability::RepoSearch
                 | LlmCapability::RepoDirs
@@ -456,8 +458,7 @@ impl CapabilityExpr {
                 // The conversational channel is operational: a branch that
                 // carries only the text field still acts on the response, so
                 // it survives narrowing and filtering.
-                | LlmCapability::TextMessage
-                | LlmCapability::ShortDescription => true,
+                | LlmCapability::TextMessage => true,
                 LlmCapability::Scratchpad
                 | LlmCapability::CommitMessage
                 | LlmCapability::TurnError
@@ -467,8 +468,8 @@ impl CapabilityExpr {
     }
 
     /// Returns a filtered expression retaining only capabilities that satisfy
-    /// `predicate`. A retained branch keeps its kind, so a filtered tree
-    /// carries the same labels as the tree it was filtered from.
+    /// `predicate`. A retained node keeps its label, so a filtered tree carries
+    /// the same names as the tree it was filtered from.
     pub fn filter<F>(&self, predicate: &F) -> Option<Self>
     where
         F: Fn(LlmCapability) -> bool,
@@ -481,30 +482,25 @@ impl CapabilityExpr {
                     None
                 }
             }
-            Self::Set(items) => {
+            Self::Set(label, items) => {
                 let filtered: Vec<_> = items
                     .iter()
                     .filter_map(|item| item.filter(predicate))
                     .collect();
-                // A Set that was empty before filtering stays: the answer
+                // A block that was empty before filtering stays: the answer
                 // marker holds no leaf, so narrowing keeps the conversational
                 // branch instead of dropping it as exhausted foliage.
                 if filtered.is_empty() && !items.is_empty() {
                     None
                 } else {
-                    Some(Self::Set(filtered))
+                    Some(Self::Set(label.clone(), filtered))
                 }
             }
             Self::AnyOf(label, branches) => {
-                let filtered: Vec<CapabilityBranch> = branches
+                let filtered: Vec<CapabilityTree> = branches
                     .iter()
-                    .filter_map(|branch| {
-                        branch
-                            .expr
-                            .filter(predicate)
-                            .map(|expr| CapabilityBranch::new(branch.kind.clone(), expr))
-                    })
-                    .filter(|branch| branch.expr.has_operational_capability())
+                    .filter_map(|branch| branch.filter(predicate))
+                    .filter(|branch| branch.has_operational_capability())
                     .collect();
                 if filtered.is_empty() {
                     None
@@ -515,9 +511,74 @@ impl CapabilityExpr {
         }
     }
 
-    /// Depth-first walk that appends every leaf to `out`. Duplicates are
-    /// dropped by the contains-check, so a capability reached through two
-    /// branches appears only once in the projection.
+    /// Merges `other` into this tree, preserving every capability both declare.
+    ///
+    /// The operation reconciles the two directions a surface is assembled from: a
+    /// contour declares its phase as a tree, and the loop that runs the phase
+    /// enriches that declaration with the surface it owns. The merge is
+    /// idempotent — merging the same tree into a surface that already carries it
+    /// yields the surface unchanged — so a surface composed more than once
+    /// renders the same bytes, the prompt head stays stable inside a turn, and
+    /// the provider prefix cache of the following round is never invalidated.
+    pub fn merge(&self, other: &Self) -> Self {
+        if self == other {
+            return self.clone();
+        }
+        match (self, other) {
+            (Self::Set(left, ours), Self::Set(right, theirs)) if left == right => Self::Set(
+                left.clone(),
+                Self::merge_children(ours.clone(), theirs.iter().cloned()),
+            ),
+            (Self::AnyOf(left, ours), Self::AnyOf(right, theirs)) if left == right => Self::AnyOf(
+                left.clone(),
+                Self::merge_children(ours.clone(), theirs.iter().cloned()),
+            ),
+            (Self::Set(label, ours), _) => Self::Set(
+                label.clone(),
+                Self::merge_children(ours.clone(), std::iter::once(other.clone())),
+            ),
+            _ => Self::root([self.clone(), other.clone()]),
+        }
+    }
+
+    /// Folds `incoming` into `children`, merging a node that names the same
+    /// block as one already present instead of appending it twice.
+    fn merge_children(
+        mut children: Vec<Self>,
+        incoming: impl IntoIterator<Item = Self>,
+    ) -> Vec<Self> {
+        for child in incoming {
+            if children.contains(&child) {
+                continue;
+            }
+            match children
+                .iter()
+                .position(|held| held.identity() == child.identity())
+            {
+                Some(index) => {
+                    let merged = children[index].merge(&child);
+                    children[index] = merged;
+                }
+                None => children.push(child),
+            }
+        }
+        children
+    }
+
+    /// Identity of the node within one level: two nodes with the same identity
+    /// name the same block, capability, or union and are therefore merged
+    /// instead of appended side by side.
+    fn identity(&self) -> (&'static str, &str) {
+        match self {
+            Self::Leaf(capability) => ("leaf", capability.as_str()),
+            Self::Set(label, _) => ("set", label.as_str()),
+            Self::AnyOf(label, _) => ("any_of", label.as_str()),
+        }
+    }
+
+    /// Depth-first walk that appends every leaf to `out`. Duplicates are dropped
+    /// by the contains-check, so a capability reached through two branches
+    /// appears only once in the projection.
     fn walk_leaves(&self, out: &mut Vec<LlmCapability>) {
         match self {
             Self::Leaf(capability) => {
@@ -525,14 +586,14 @@ impl CapabilityExpr {
                     out.push(*capability);
                 }
             }
-            Self::Set(items) => {
+            Self::Set(_, items) => {
                 for item in items {
                     item.walk_leaves(out);
                 }
             }
             Self::AnyOf(_, branches) => {
                 for branch in branches {
-                    branch.expr.walk_leaves(out);
+                    branch.walk_leaves(out);
                 }
             }
         }
@@ -559,7 +620,6 @@ mod tests {
             (LlmCapability::DirList, "\"dir_list\""),
             (LlmCapability::DocRequest, "\"doc_request\""),
             (LlmCapability::OuterDocRequest, "\"outer_doc_request\""),
-            (LlmCapability::ToolchainVerify, "\"toolchain_verify\""),
             (LlmCapability::PlanCreation, "\"plan_creation\""),
             (LlmCapability::PlanUpdate, "\"plan_update\""),
             (LlmCapability::ReviewUpdate, "\"review_update\""),
@@ -570,7 +630,6 @@ mod tests {
             (LlmCapability::Blocked, "\"blocked\""),
             (LlmCapability::Abort, "\"abort\""),
             (LlmCapability::CustomTools, "\"custom_tools\""),
-            (LlmCapability::ShortDescription, "\"short_description\""),
         ];
 
         for (capability, expected) in cases {
@@ -599,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_llm_capability_as_str_and_phase() {
-        assert_eq!(LlmCapability::ALL.len(), 26);
+        assert_eq!(LlmCapability::ALL.len(), 24);
         for capability in LlmCapability::ALL {
             let encoded = format!("\"{}\"", capability.as_str());
             assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
@@ -628,11 +687,6 @@ mod tests {
             (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
             (LlmCapability::ReviewUpdate, CapabilityPhase::Execution),
             (LlmCapability::Scratchpad, CapabilityPhase::Execution),
-            (LlmCapability::ShortDescription, CapabilityPhase::Execution),
-            (
-                LlmCapability::ToolchainVerify,
-                CapabilityPhase::Verification,
-            ),
             (LlmCapability::CommitMessage, CapabilityPhase::Outcome),
             (LlmCapability::TurnError, CapabilityPhase::Outcome),
             (LlmCapability::TurnSkip, CapabilityPhase::Outcome),
@@ -671,8 +725,7 @@ mod tests {
                 | LlmCapability::EditDelete
                 | LlmCapability::EditMove
                 | LlmCapability::EditMoveDir
-                | LlmCapability::EditOverwrite
-                | LlmCapability::ShortDescription => CapabilityDelivery::LiveStreaming,
+                | LlmCapability::EditOverwrite => CapabilityDelivery::LiveStreaming,
                 _ => CapabilityDelivery::RoundDeferred,
             };
             assert_eq!(capability.delivery(), expected);
@@ -700,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_capability_expr_leaf_projection() {
-        let expr = CapabilityExpr::leaf(LlmCapability::EditReplace);
+        let expr = CapabilityTree::leaf(LlmCapability::EditReplace);
         assert!(expr.is_leaf());
         assert_eq!(expr.as_leaf(), Some(LlmCapability::EditReplace));
         assert_eq!(expr.leaves().as_slice(), &[LlmCapability::EditReplace]);
@@ -710,10 +763,10 @@ mod tests {
 
     #[test]
     fn test_capability_expr_set_unions_children_in_first_seen_order() {
-        let expr = CapabilityExpr::set([
-            CapabilityExpr::leaf(LlmCapability::ContextRequest),
-            CapabilityExpr::leaf(LlmCapability::EditReplace),
-            CapabilityExpr::leaf(LlmCapability::CommitMessage),
+        let expr = CapabilityTree::root([
+            CapabilityTree::leaf(LlmCapability::ContextRequest),
+            CapabilityTree::leaf(LlmCapability::EditReplace),
+            CapabilityTree::leaf(LlmCapability::CommitMessage),
         ]);
         assert_eq!(
             expr.leaves().as_slice(),
@@ -727,25 +780,26 @@ mod tests {
 
     #[test]
     fn test_capability_expr_any_of_unions_branches_and_dedups() {
-        let expr = CapabilityExpr::any_of(
+        let expr = CapabilityTree::any_of(
             "action",
             [
-                CapabilityBranch::new(
+                CapabilityTree::named_set(
                     "research",
-                    CapabilityExpr::set([
-                        CapabilityExpr::leaf(LlmCapability::ContextRequest),
-                        CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                    ]),
+                    [
+                        CapabilityTree::leaf(LlmCapability::ContextRequest),
+                        CapabilityTree::leaf(LlmCapability::CommitMessage),
+                    ],
                 ),
-                CapabilityBranch::new(
+                CapabilityTree::named_set(
                     "edit",
-                    CapabilityExpr::set([
-                        CapabilityExpr::leaf(LlmCapability::EditReplace),
-                        CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                    ]),
+                    [
+                        CapabilityTree::leaf(LlmCapability::EditReplace),
+                        CapabilityTree::leaf(LlmCapability::CommitMessage),
+                    ],
                 ),
             ],
         );
+        assert_eq!(expr.label(), Some("action"));
         assert_eq!(
             expr.leaves().as_slice(),
             &[
@@ -758,24 +812,24 @@ mod tests {
 
     #[test]
     fn test_capability_expr_nested_tree_yields_flat_surface() {
-        let expr = CapabilityExpr::set([
-            CapabilityExpr::leaf(LlmCapability::TextMessage),
-            CapabilityExpr::any_of(
+        let expr = CapabilityTree::root([
+            CapabilityTree::leaf(LlmCapability::TextMessage),
+            CapabilityTree::any_of(
                 "action",
                 [
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "edit",
-                        CapabilityExpr::set([
-                            CapabilityExpr::leaf(LlmCapability::EditReplace),
-                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                        ]),
+                        [
+                            CapabilityTree::leaf(LlmCapability::EditReplace),
+                            CapabilityTree::leaf(LlmCapability::CommitMessage),
+                        ],
                     ),
-                    CapabilityBranch::new(
+                    CapabilityTree::named_set(
                         "plan",
-                        CapabilityExpr::set([
-                            CapabilityExpr::leaf(LlmCapability::PlanCreation),
-                            CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                        ]),
+                        [
+                            CapabilityTree::leaf(LlmCapability::PlanCreation),
+                            CapabilityTree::leaf(LlmCapability::CommitMessage),
+                        ],
                     ),
                 ],
             ),
@@ -797,26 +851,59 @@ mod tests {
 
     #[test]
     fn test_capability_expr_empty_children_project_to_empty_surface() {
-        let expr = CapabilityExpr::set(std::iter::empty::<CapabilityExpr>());
+        let expr = CapabilityTree::root(std::iter::empty::<CapabilityTree>());
         assert!(expr.leaves().is_empty());
-        let expr = CapabilityExpr::any_of("action", std::iter::empty::<CapabilityBranch>());
+        let expr = CapabilityTree::any_of("action", std::iter::empty::<CapabilityTree>());
         assert!(expr.leaves().is_empty());
     }
-
     #[test]
     fn test_capability_expr_serde_roundtrip() {
-        let expr = CapabilityExpr::any_of(
+        let expr = CapabilityTree::any_of(
             "action",
-            [CapabilityBranch::new(
+            [CapabilityTree::named_set(
                 "research",
-                CapabilityExpr::set([
-                    CapabilityExpr::leaf(LlmCapability::ContextRequest),
-                    CapabilityExpr::leaf(LlmCapability::CommitMessage),
-                ]),
+                [
+                    CapabilityTree::leaf(LlmCapability::ContextRequest),
+                    CapabilityTree::leaf(LlmCapability::CommitMessage),
+                ],
             )],
         );
         let json = serde_json::to_string(&expr).expect("expression serializes");
-        let decoded: CapabilityExpr = serde_json::from_str(&json).expect("expression deserializes");
+        let decoded: CapabilityTree = serde_json::from_str(&json).expect("expression deserializes");
         assert_eq!(decoded, expr);
+    }
+
+    #[test]
+    fn test_capability_expr_labels_and_idempotent_merge() {
+        let root = CapabilityTree::root([CapabilityTree::leaf(LlmCapability::ContextRequest)]);
+        assert_eq!(root.label(), Some(""));
+        let block = CapabilityTree::named_set(
+            "research",
+            [CapabilityTree::leaf(LlmCapability::RepoSearch)],
+        );
+        assert_eq!(block.label(), Some("research"));
+        assert_eq!(
+            CapabilityTree::leaf(LlmCapability::TextMessage).label(),
+            None
+        );
+
+        // A merge never repeats a capability the parent already carries, so a
+        // surface merged more than once renders the bytes it rendered before.
+        let merged = root.merge(&CapabilityTree::leaf(LlmCapability::CommitMessage));
+        assert_eq!(
+            merged.merge(&CapabilityTree::leaf(LlmCapability::CommitMessage)),
+            merged
+        );
+        assert!(merged.contains(LlmCapability::ContextRequest));
+        assert!(merged.contains(LlmCapability::CommitMessage));
+
+        // A labeled branch keeps its name, and merging it into a tree that
+        // already holds it is a no-op.
+        let with_branch = root.merge(&block);
+        assert_eq!(with_branch.merge(&block), with_branch);
+        assert_eq!(
+            with_branch.leaves(),
+            vec![LlmCapability::ContextRequest, LlmCapability::RepoSearch]
+        );
     }
 }

@@ -32,15 +32,17 @@ and whether the round cap still allows it.
 1. **Declared material only.** Research reads tracked files, the harness-owned
    sandboxes, and the external documents the project declares in `[[outer_docs]]`.
    An unknown path becomes explicit "not found" feedback instead of a guess.
-2. **Every round is bounded.** Rounds, searches, outlines, listings, and the single
-   context token budget all have configured ceilings.
+2. **Every round is bounded.** Each round spends one unit of the turn pool
+   (`repl.max_turn_rounds`), and searches, outines, listings, and the single
+   context token budget carry configured ceilings of their own.
 3. **Deterministic execution.** Searches run in Rust over tracked files, outlines
    come from Tree-sitter, documentation comes from embedded chapters, and a
    declared document is materialized from its declared source exactly once.
 4. **Nothing learned is lost.** Findings that are not context files accumulate in a
-   turn-scoped journal that survives every later phase.
-5. **The cached prefix does not move.** Round findings extend the user message;
-   they never rewrite the stable block of the system prompt.
+   turn-scoped journal and are delivered once, as the feedback message of the round that
+   follows the boundary which produced them.
+5. **The cached prefix does not move.** That feedback extends the sequence at its tail;
+   it never rewrites the stable block of the system prompt.
 6. **A breach halts with a diagnostic.** No budget silently drops a requested file.
 7. **The phase is deterministic; the content is generative.** The model chooses
    what to ask for, never which stage runs next.
@@ -65,7 +67,9 @@ and whether the round cap still allows it.
 A research round is one model interaction that may carry any number of typed
 research commands. The round first materializes the declared external documents it
 addresses, then the dispatcher resolves repository facts once, hands them to every
-handler that owns a command, and folds the results into one outcome.
+handler that owns a command, and folds the results into one outcome. One round is
+executed by `execute_research_step`; the phase owns no loop of its own, so a
+discovery round can never terminate the turn.
 A round carries research commands only. Discovery is its own operational branch
 of the capability surface, so a round that opens files or searches the tree
 proposes no change set, and a round that patches the tree asks for nothing. A
@@ -112,8 +116,9 @@ Findings return as delimited blocks:
 
 Non-file findings cannot enter the context block: that block is the authoritative
 set of context files, and mixing outlines or documentation into it would pollute
-patching. They accumulate instead in the turn-scoped `TurnResearchJournal`, an
-append-only, de-duplicated tail of the user message.
+patching. They accumulate instead in the turn-scoped `TurnResearchJournal`, whose
+feedback is published once: the transcript delivers it as the user message of the round
+that follows the boundary.
 
 ### 2.5 Budgets
 
@@ -121,7 +126,7 @@ The phase obeys these ceilings:
 
 | Bound | Setting or constant | Default |
 | --- | --- | --- |
-| Research rounds per turn | `context.max_research_rounds` | 5 |
+| Rounds per turn, shared with every other round of the turn | `repl.max_turn_rounds` | 16 |
 | Aggregate context tokens | `context.token_budget` | 300,000 |
 | Outline tokens | `context.repomap_token_budget` | 4,000 |
 | Searches per round | `context.max_search_requests_per_round` | 5 |
@@ -314,15 +319,19 @@ The journal is an ordered, append-only collection of feedback blocks. Blank bloc
 are dropped; a block identical to one already recorded is dropped too, so
 re-requesting the same outline never inflates the tail.
 
-When a later round composes the user message, the order is fixed:
+When a round finishes, the harness publishes one feedback message through the single
+slot of the transcript, and the next round appends it as its user message. The message
+carries what that boundary produced:
 
-1. the original task;
-2. the accumulated journal;
-3. the diagnostics of the current phase.
+- the findings of a research round — files added, search reports, listings, outlines,
+  documentation;
+- the diagnostics of a failed phase — a patch retry report or a verification failure.
 
-Staging retries and verification healing obtain their prompt through that same
-composition, so a retry differs from its earlier attempt only in the trailing
-diagnostics. Research knowledge paid for once remains available for the whole turn.
+The original task and every round already exchanged are not re-composed for the next
+request: the transcript replays them unchanged. A retry therefore differs from its
+earlier attempt only in the feedback it appends, and research knowledge paid for once
+stays readable for the whole turn, because the answer that carried it is part of the
+sequence.
 
 The same dispatcher serves the structured Architect synthesis contour in
 `crates/core`, which projects plan horizons and decomposes review groups. That

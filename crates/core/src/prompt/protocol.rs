@@ -8,7 +8,7 @@
 //! independent of any single protocol format.
 
 use tauqe_protocol::{
-    CapabilityExpr, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
+    CapabilityTree, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
 };
 
 /// Decodes raw model output into normalized core commands.
@@ -36,7 +36,7 @@ pub trait PromptProtocol: Send + Sync {
     /// composes the response schema and scopes the decoder, so a capability can
     /// neither be advertised while remaining undecodable nor accepted while
     /// being hidden from the instructions.
-    fn capability_expr(&self) -> CapabilityExpr;
+    fn capability_expr(&self) -> CapabilityTree;
 
     /// Flat projection of the advertised tree, in first-seen depth-first order.
     ///
@@ -55,7 +55,19 @@ pub trait PromptProtocol: Send + Sync {
     ///
     /// Every concrete protocol implements this, so a caller narrows a turn to a
     /// capability tree without branching on the concrete protocol type.
-    fn with_capability_expr(&self, expr: CapabilityExpr) -> Box<dyn PromptProtocol>;
+    fn with_capability_expr(&self, expr: CapabilityTree) -> Box<dyn PromptProtocol>;
+
+    /// Returns a variant of this protocol bound to the project declaration.
+    ///
+    /// The declaration decides whether the composed schema advertises the
+    /// commands of `[project.commands]` as typed custom tools and whether the
+    /// decoder accepts one, so a contour hands the active declaration to its
+    /// protocol before it renders the instructions of a round or decodes the
+    /// answer. A protocol whose surface does not depend on the declaration
+    /// answers with the surface it already carries.
+    fn with_project(&self, _project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
+        self.with_capability_expr(self.capability_expr())
+    }
 
     /// Decodes raw model output into normalized core commands.
     ///
@@ -148,8 +160,8 @@ mod tests {
             EditProtocolKind::Structured
         }
 
-        fn capability_expr(&self) -> CapabilityExpr {
-            CapabilityExpr::set([CapabilityExpr::leaf(LlmCapability::TextMessage)])
+        fn capability_expr(&self) -> CapabilityTree {
+            CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)])
         }
 
         fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
@@ -167,7 +179,7 @@ mod tests {
             String::new()
         }
 
-        fn with_capability_expr(&self, _expr: CapabilityExpr) -> Box<dyn PromptProtocol> {
+        fn with_capability_expr(&self, _expr: CapabilityTree) -> Box<dyn PromptProtocol> {
             // The fixture advertises a fixed capability tree; narrowing is
             // exercised by the concrete protocols.
             Box::new(TextOnlyProtocol)

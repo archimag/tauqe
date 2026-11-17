@@ -1376,4 +1376,60 @@ mod tests {
         assert!(!encoded.contains("plan_rejections"));
         assert!(!encoded.contains("plan_warnings"));
     }
+
+    /// The started event is the single declaration of the running work, so every
+    /// kind the harness can run must survive the round trip through it: a client
+    /// renders the marker from the decoded variant and never re-derives the work
+    /// kind from the stored plans or reviews.
+    #[test]
+    fn test_model_started_event_declares_every_kind_of_work() {
+        let contexts = [
+            TurnWorkContext::Interactive,
+            TurnWorkContext::PlanStep {
+                plan_id: "plan-1".to_string(),
+                plan_title: "Universal work marker".to_string(),
+                queue: two_step_queue(),
+            },
+            TurnWorkContext::ReviewGroupStep {
+                review_id: "rev-1".to_string(),
+                review_title: "Multi-level audit".to_string(),
+                group_id: "arch-1".to_string(),
+                group_title: "Shared commit boundary".to_string(),
+                queue: two_step_queue(),
+            },
+            TurnWorkContext::ReviewStep {
+                review_id: "rev-1".to_string(),
+                review_title: "Multi-level audit".to_string(),
+                queue: two_step_queue(),
+            },
+            TurnWorkContext::ReviewPhase {
+                review_id: "rev-1".to_string(),
+                review_title: "Multi-level audit".to_string(),
+                phase: ReviewWorkPhase::Decomposition,
+                queue: TurnWorkQueue::default(),
+            },
+        ];
+
+        for context in contexts {
+            let is_batch = !matches!(&context, TurnWorkContext::Interactive);
+            let event = ModelStartedEvent {
+                operation_id: "op-work".to_string(),
+                model: ModelRef::openrouter("coder/model"),
+                role: Some(ModelRole::Coder),
+                alias: None,
+                effort: None,
+                plan_context: None,
+                work_context: Some(context.clone()),
+                is_batch,
+            };
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: ModelStartedEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                decoded.work_context,
+                Some(context.clone()),
+                "the declared work must survive the round trip: {json}"
+            );
+            assert_eq!(decoded.is_batch, is_batch);
+        }
+    }
 }

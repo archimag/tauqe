@@ -43,7 +43,7 @@ pub(crate) fn resolve_path(candidate: &str, editable_paths: &[String], is_create
 
 /// Returns the content of a previewed file from staged memory or, failing that,
 /// from the working tree through the repository boundary.
-pub(crate) fn current_file_content(
+fn current_file_content(
     staged: &HashMap<String, String>,
     repo_root: &Path,
     path: &str,
@@ -91,15 +91,15 @@ pub(crate) const TRUNCATED_EDIT_DIAGNOSTIC: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HunkCoordinates {
     /// One-based first line of the hunk in the file before the change.
-    pub(crate) old_start: usize,
+    old_start: usize,
     /// Number of source lines the hunk covers.
-    pub(crate) old_lines: usize,
+    old_lines: usize,
     /// One-based first line of the hunk in the file after the change.
-    pub(crate) new_start: usize,
+    new_start: usize,
     /// Number of result lines the hunk covers.
-    pub(crate) new_lines: usize,
+    new_lines: usize,
     /// Section the hunk belongs to, as a diff header names it after its ranges.
-    pub(crate) context_hint: Option<String>,
+    context_hint: Option<String>,
 }
 
 /// Longest section hint a streamed hunk carries, in characters.
@@ -110,7 +110,7 @@ impl HunkCoordinates {
     ///
     /// A created file has nothing to replace, so its old side stays absent. An
     /// overwritten file is replaced from its first line to its last one.
-    pub(crate) fn whole_file(old_text: Option<&str>, new_text: &str) -> Self {
+    fn whole_file(old_text: Option<&str>, new_text: &str) -> Self {
         let (old_start, old_lines) = match old_text {
             Some(text) if !text.is_empty() => (1, line_count(text)),
             _ => (0, 0),
@@ -131,7 +131,7 @@ impl HunkCoordinates {
     /// patch the fuzzy matcher accepted without an exact match is located by its
     /// first line instead, and a patch whose position cannot be named reports
     /// unknown coordinates rather than an invented line.
-    pub(crate) fn replacement(current: &str, old_text: &str, new_text: &str) -> Self {
+    fn replacement(current: &str, old_text: &str, new_text: &str) -> Self {
         let lines = scan_lines(current);
         let Some(offset) = locate_replacement(current, &lines, old_text) else {
             return Self::unknown();
@@ -151,7 +151,7 @@ impl HunkCoordinates {
     /// The anchors name the lines the context block rendered, so the range keeps
     /// the indices it decoded to on the old side, while the new side counts the
     /// lines the replacement introduces from the very same line.
-    pub(crate) fn anchored(
+    fn anchored(
         original: &str,
         lines: &[LineSpan],
         first: usize,
@@ -167,8 +167,7 @@ impl HunkCoordinates {
         }
     }
 
-    /// Coordinates a staging simulator could not resolve.
-    pub(crate) fn unknown() -> Self {
+    fn unknown() -> Self {
         Self {
             old_start: 0,
             old_lines: 0,
@@ -183,9 +182,9 @@ impl HunkCoordinates {
 #[derive(Debug)]
 pub(crate) struct AnchorPreview {
     /// Snapshot text of the addressed range.
-    pub(crate) replaced: String,
+    replaced: String,
     /// Coordinates of the range on both sides of the change.
-    pub(crate) coordinates: HunkCoordinates,
+    coordinates: HunkCoordinates,
 }
 
 /// Builds the streamed hunk event of one applied change.
@@ -279,7 +278,7 @@ pub(crate) struct StagingSimulator {
 }
 
 impl StagingSimulator {
-    pub(crate) fn new(staged_contents: HashMap<String, String>, repo_root: PathBuf) -> Self {
+    fn new(staged_contents: HashMap<String, String>, repo_root: PathBuf) -> Self {
         Self {
             original_contents: staged_contents.clone(),
             staged_contents,
@@ -291,7 +290,7 @@ impl StagingSimulator {
     ///
     /// The supplied contents describe the files the change set starts from, so
     /// they also become the snapshot anchored ranges are resolved against.
-    pub(crate) fn set_staged_contents(&mut self, staged_contents: HashMap<String, String>) {
+    fn set_staged_contents(&mut self, staged_contents: HashMap<String, String>) {
         self.original_contents = staged_contents.clone();
         self.staged_contents = staged_contents;
     }
@@ -302,7 +301,7 @@ impl StagingSimulator {
     /// rendered context, so the preview must discard the hunks of the voided
     /// attempt instead of applying the replacement on top of them. The snapshot
     /// itself is preserved, because the anchors still name the lines it held.
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         self.staged_contents = self.original_contents.clone();
     }
 
@@ -335,7 +334,7 @@ impl StagingSimulator {
     /// A file's anchored ranges therefore arrive as one batch: the staged
     /// content becomes the applied result rather than an accumulation of
     /// batches.
-    pub(crate) fn apply_anchor_batch(
+    fn apply_anchor_batch(
         &mut self,
         path: &str,
         edits: &[AnchorEdit<'_>],
@@ -356,7 +355,7 @@ impl StagingSimulator {
     }
 
     /// Returns the current content from staged memory or, failing that, from disk.
-    pub(crate) fn current_content(&self, path: &str) -> Result<String, String> {
+    fn current_content(&self, path: &str) -> Result<String, String> {
         current_file_content(&self.staged_contents, &self.repo_root, path)
     }
 
@@ -374,7 +373,7 @@ impl StagingSimulator {
     /// to, because that is the document the old side of the hunk describes, and
     /// they travel back to the caller so the streamed hunk names the lines it
     /// really changes.
-    pub(crate) fn apply_hunk(
+    fn apply_hunk(
         &mut self,
         path: &str,
         old_text: &str,
@@ -402,7 +401,7 @@ impl StagingSimulator {
     /// A source the repository boundary refuses is never read, so a move cannot
     /// disclose a file outside the repository: the move is previewed without
     /// content and the staging engine reports the rejection.
-    pub(crate) fn apply_move(&mut self, from: &str, to: &str) {
+    fn apply_move(&mut self, from: &str, to: &str) {
         if let Some(content) = self.staged_contents.remove(from) {
             self.staged_contents.insert(to.to_string(), content);
         } else {
@@ -425,7 +424,7 @@ impl StagingSimulator {
     }
 
     /// Records full file content for a create or overwrite operation.
-    pub(crate) fn overwrite(&mut self, path: &str, content: String) {
+    fn overwrite(&mut self, path: &str, content: String) {
         self.staged_contents.insert(path.to_string(), content);
     }
 }
@@ -437,13 +436,13 @@ impl StagingSimulator {
 /// Keeping the whole batch lets it be re-applied to the original snapshot as it
 /// grows, so an earlier range is never lost to a later one.
 pub(crate) struct OwnedAnchor {
-    pub(crate) start: String,
-    pub(crate) end: String,
-    pub(crate) content: String,
+    start: String,
+    end: String,
+    content: String,
 }
 
 impl OwnedAnchor {
-    pub(crate) fn as_edit(&self) -> AnchorEdit<'_> {
+    fn as_edit(&self) -> AnchorEdit<'_> {
         AnchorEdit {
             start: &self.start,
             end: &self.end,

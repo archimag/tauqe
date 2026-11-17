@@ -89,6 +89,20 @@ impl GitTransactionPolicy {
     }
 }
 
+/// A policy that is dropped without settling its transaction no longer holds an
+/// open transaction.
+///
+/// The checkpoint and the step commits it captured are left to the checkpoint
+/// recovery pass, which resolves exactly that residue, while the shared guard
+/// must stop reporting an open transaction: a supervisor that kept deferring a
+/// hard cancel for a policy nobody holds would wait out the whole deferral
+/// limit for a transaction that can never close.
+impl Drop for GitTransactionPolicy {
+    fn drop(&mut self) {
+        self.clear_transaction_state();
+    }
+}
+
 #[async_trait]
 impl ApplyPolicy for GitTransactionPolicy {
     async fn staging(

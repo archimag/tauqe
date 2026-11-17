@@ -20,14 +20,14 @@ use super::LlmProvider;
 #[derive(Debug, Clone, Default)]
 pub struct MockResponse {
     /// Reasoning (thinking) text emitted before the answer.
-    pub reasoning: Option<String>,
+    reasoning: Option<String>,
     /// Assistant answer text, which may carry protocol markup.
-    pub content: String,
+    content: String,
     /// Usage accounting reported after the answer.
-    pub usage: Option<ModelUsageInfo>,
+    usage: Option<ModelUsageInfo>,
     /// When set, the response terminates with a streaming error instead of an
     /// answer.
-    pub error: Option<String>,
+    error: Option<String>,
 }
 
 impl MockResponse {
@@ -98,14 +98,8 @@ impl MockLlmProvider {
         provider
     }
 
-    /// Appends a scripted response, consuming the provider for chaining.
-    pub fn script(self, response: MockResponse) -> Self {
-        self.queue(response);
-        self
-    }
-
     /// Appends a scripted response.
-    pub fn queue(&self, response: MockResponse) {
+    fn queue(&self, response: MockResponse) {
         self.with_state(|state| state.scripts.push_back(response));
     }
 

@@ -4,7 +4,6 @@ pub mod prompt;
 pub mod storage;
 pub mod uuid;
 
-pub use crate::plan::merge_subplan;
 pub use analysis::{
     parse_post_analysis, post_analysis_response_format, post_analysis_response_schema,
     validate_post_analysis, PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput,

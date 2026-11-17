@@ -389,19 +389,43 @@ fn is_ascii_digits(part: &str) -> bool {
 /// reporting a live writer dead invites a reclaim pass to delete the staged
 /// content or move aside the live backup that writer still owns.
 ///
+/// The probe validates its target before it signals. A value that does not fit
+/// the platform's `pid_t` names no process once converted: the conversion wraps
+/// it negative, and a negative id addresses a whole process group. The reserved
+/// low ids address the caller's own process group and the init process instead
+/// of the writer. Probing any of them would answer about a target that is not
+/// the writer — least of all "no such process" — so such an id is reported as
+/// not provably gone, exactly as a platform without a process probe reports
+/// every attributed writer.
+///
 /// A process id is reused once its process exits and is reaped, so the probe
 /// answers whether some process runs under the id, not whether it is the
 /// writer that created a given sibling; a reused id is reported alive, which
 /// errs on the side of leaving artifacts in place.
 #[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
+    let Some(target) = signalable_pid(pid) else {
+        return true;
+    };
     // Safety: `kill` with signal `0` inspects the process table and delivers
     // nothing, so the probe cannot disturb any process.
-    let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let probe = unsafe { libc::kill(target, 0) };
     if probe == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The `pid_t` the probe may address for `pid`, when `pid` names one process.
+///
+/// A value that does not fit the platform's `pid_t` and a reserved low id both
+/// name something other than the recorded writer once converted, so neither may
+/// reach `kill`: the caller learns that the writer is not provably gone instead
+/// of receiving an answer about another target.
+#[cfg(unix)]
+fn signalable_pid(pid: u32) -> Option<libc::pid_t> {
+    let target = libc::pid_t::try_from(pid).ok()?;
+    (target > 1).then_some(target)
 }
 
 /// Process liveness is a POSIX capability with no portable equivalent: a
@@ -1067,6 +1091,30 @@ mod tests {
     #[test]
     fn the_current_process_is_reported_alive() {
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_id_the_probe_cannot_address_is_never_signalled() {
+        use super::signalable_pid;
+
+        // The reserved low ids address the caller's own process group and the
+        // init process instead of the recorded writer, so neither reaches the
+        // probe and both report a writer that is not provably gone.
+        assert_eq!(signalable_pid(0), None);
+        assert_eq!(signalable_pid(1), None);
+
+        // A value that does not fit `pid_t` wraps negative once converted and
+        // would address a whole process group, so it is refused as well.
+        if libc::pid_t::try_from(u32::MAX).is_err() {
+            assert_eq!(signalable_pid(u32::MAX), None);
+        }
+
+        // A real process id reaches the probe unchanged.
+        assert_eq!(
+            signalable_pid(std::process::id()),
+            libc::pid_t::try_from(std::process::id()).ok()
+        );
     }
 
     // `git` is a hard prerequisite of this crate's suite, so the probe is

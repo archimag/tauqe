@@ -10,7 +10,7 @@ use super::ContextManager;
 pub use tauqe_tools::paths::{verify_path_within_repo, verify_path_within_repo_for_write};
 
 impl ContextManager {
-    pub fn normalize_path(&self, p: &str) -> Result<String> {
+    pub(crate) fn normalize_path(&self, p: &str) -> Result<String> {
         tauqe_tools::paths::normalize_repo_path(&self.repo_root, p)
     }
 }

@@ -77,3 +77,9 @@ clippy *args="--workspace":
 [metadata('timeout', '30')]
 log-tail n="50":
     tail -n {{n}} .tauqe/server.log
+
+[group('tauqe')]
+[doc('Check for dead code across the workspace with cargo hawk')]
+[metadata('timeout', '600')]
+hawk *args="":
+    cargo +1.99.0 hawk check {{args}}

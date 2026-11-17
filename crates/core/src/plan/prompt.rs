@@ -12,7 +12,7 @@ pub mod architect;
 pub mod critique;
 pub mod discussion;
 pub mod refine;
-pub mod step;
+pub(crate) mod step;
 
 pub use architect::{resolve_architect_tier, ArchitectLevelUp};
 pub use critique::{
@@ -21,18 +21,17 @@ pub use critique::{
     plan_critique_response_schema_definition, PlanCritiqueCategory, PlanCritiqueFinding,
     PlanCritiqueOutput, PlanCritiqueVerdict,
 };
-pub use discussion::{
-    format_active_plan_context, format_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
-};
+pub(crate) use discussion::format_active_plan_context;
+pub use discussion::format_plan_discussion_prompt;
 pub use refine::{
-    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, parse_plan_refinement_output,
-    plan_refine_response_schema, plan_refine_response_schema_definition, PlanHorizonDiagnostics,
-    PlanRefinementAbort, PlanRefinementOutput, MAX_PLAN_REFINEMENT_DEPTH,
+    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, PlanHorizonDiagnostics,
+    PlanRefinementAbort, PlanRefinementOutput,
 };
-pub use step::{
-    format_plan_step_execution_prompt, format_plan_step_retry_prompt, PLAN_STEP_EXECUTION_PREFIX,
-    PLAN_STEP_RETRY_PREFIX,
+pub(crate) use refine::{
+    parse_plan_refinement_output, plan_refine_response_schema,
+    plan_refine_response_schema_definition,
 };
+pub(crate) use step::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 
 #[cfg(test)]
 mod tests {
@@ -122,6 +121,7 @@ mod tests {
     #[test]
     fn test_format_plan_step_retry_prompt() {
         let prompt = format_plan_step_retry_prompt(
+            "Target Plan Step Execution: [jwt-auth:2] Endpoint",
             "I think we are done.",
             Some("No edits were applied"),
             EditProtocolKind::Structured,
@@ -132,8 +132,10 @@ mod tests {
         assert!(prompt.contains("I think we are done."));
         assert!(prompt.contains("No edits were applied"));
         assert!(prompt.contains("`reason`"));
+        assert!(prompt.contains("Target Plan Step Execution"));
 
-        let empty = format_plan_step_retry_prompt("   ", None, EditProtocolKind::Structured, None);
+        let empty =
+            format_plan_step_retry_prompt("", "   ", None, EditProtocolKind::Structured, None);
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));
     }

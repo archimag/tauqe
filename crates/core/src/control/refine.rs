@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tauqe_protocol::{
-    ArchitectTier, CapabilityExpr, LlmCapability, ModelRole, ProviderKind, TurnPhase,
+    ArchitectTier, CapabilityTree, LlmCapability, ModelRole, ProviderKind, TurnPhase,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -50,7 +50,7 @@ use crate::context::ContextManager;
 use crate::control::cache::TurnInputCache;
 use crate::control::context::{CancellationToken, EventSink, LoopContext};
 use crate::control::outcome::{AbortReport, SystemError};
-use crate::control::prompt::{execute_round, PromptBuilder};
+use crate::control::prompt::{execute_rebuilt_round, PromptBuilder};
 use crate::plan::prompt::{parse_plan_refinement_output, PlanRefinementOutput};
 use crate::prompt::protocol::PromptProtocol;
 use crate::prompt::refine::{unsupported_plan_update_reason, PlanRefinePromptProtocol};
@@ -78,8 +78,8 @@ const RESEARCH_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe research round
 /// because a synthesis runs unattended exactly as an isolated step does: a
 /// host-environment impossibility only the developer can repair is reported
 /// through `abort` instead of an improvised surrogate or a misreported blocker.
-pub(crate) fn architect_synthesis_capability_expr() -> CapabilityExpr {
-    CapabilityExpr::from_leaves([
+pub(crate) fn architect_synthesis_capability_expr() -> CapabilityTree {
+    CapabilityTree::from_leaves([
         LlmCapability::TextMessage,
         LlmCapability::ContextRequest,
         LlmCapability::RepoSearch,
@@ -145,19 +145,12 @@ pub enum StructuredRefineStatus {
     Cancelled,
 }
 
-impl StructuredRefineStatus {
-    /// Reports whether the synthesis produced an accepted horizon.
-    pub fn is_synthesized(&self) -> bool {
-        matches!(self, Self::Synthesized)
-    }
-}
-
-/// Result of one structured synthesis run.
+/// Final outcome of one structured synthesis run.
 #[derive(Debug, Clone)]
 pub struct StructuredRefineOutcome {
-    /// Typed payload of the round that ended the run, when one parsed.
+    /// Parsed output of the final round, when one was produced.
     pub output: Option<PlanRefinementOutput>,
-    /// Rung the run ended on.
+    /// Tier the synthesis concluded on.
     pub tier: ArchitectTier,
     /// Typed terminal status of the run.
     pub status: StructuredRefineStatus,
@@ -232,7 +225,7 @@ pub async fn run_structured_refine(
             break (None, StructuredRefineStatus::Cancelled);
         }
 
-        if rounds_used >= options.max_research_rounds {
+        if rounds_used >= options.max_turn_rounds {
             journal.push_block(RESEARCH_LIMIT_DIRECTIVE);
         }
 
@@ -259,7 +252,6 @@ pub async fn run_structured_refine(
             .with_prompt(Some(task.to_string()))
             .with_repo_map_config(options.include_repo_map, options.repomap_token_budget)
             .with_patch_strategy(options.patch_strategy())
-            .with_prompt_layout(Some(options.prompt_layout(false)))
             .with_turn_brief(Some(TurnBrief::architect()))
             .with_reasoning_effort(options.reasoning_effort);
 
@@ -274,7 +266,7 @@ pub async fn run_structured_refine(
                 prompt_builder,
             );
 
-            execute_round(&mut ctx, phase_diagnostics.as_deref(), None).await
+            execute_rebuilt_round(&mut ctx, phase_diagnostics.as_deref(), None).await
         };
 
         let envelope = match envelope {
@@ -430,11 +422,11 @@ pub async fn run_structured_refine(
                 break (Some(output), StructuredRefineStatus::Blocked { reason });
             }
             RoundStatus::NeedsContext => {
-                if rounds_used >= options.max_research_rounds {
+                if rounds_used >= options.max_turn_rounds {
                     break (
                         Some(output),
                         StructuredRefineStatus::Blocked {
-                            reason: research_limit_reason(options.max_research_rounds),
+                            reason: research_limit_reason(options.max_turn_rounds),
                         },
                     );
                 }
@@ -473,8 +465,8 @@ pub async fn run_structured_refine(
                     .send(StreamEvent::TurnPhase {
                         phase: TurnPhase::Research,
                         round: Some(rounds_used),
-                        max_rounds: Some(options.max_research_rounds),
-                        detail: Some("Research round completed".to_string()),
+                        max_rounds: Some(options.max_turn_rounds),
+                        detail: None,
                     })
                     .await;
                 if !outcome.has_progress(true) {

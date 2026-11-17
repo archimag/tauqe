@@ -17,7 +17,7 @@ pub fn default_credentials_path(
     )
 }
 
-pub(crate) fn default_credentials_path_internal(
+fn default_credentials_path_internal(
     repo_root: Option<&Path>,
     home: Option<&Path>,
     config_dir: Option<&Path>,

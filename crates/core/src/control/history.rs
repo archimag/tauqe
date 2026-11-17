@@ -1,17 +1,31 @@
+//! Session journal maintenance of the control contour.
+//!
+//! The journal is the durable record a bounded turn reads and every step of a
+//! batch extends. Two operations belong to that lifetime: keeping the session
+//! inside the configured token budget by folding its summarized prefix into one
+//! record, and recording the outcome of a finished turn.
+//!
+//! Both live in the control contour because the loops are what produce the
+//! material they record, and the budget they apply is the project's, never a
+//! compile-time constant (`crates/core/Conventions.md` §3.5).
+
+use tokio::sync::{mpsc, watch};
+
+use tauqe_protocol::ModelRef;
 use tauqe_protocol::{
     EditCreate, EditDelete, EditFileOp, EditLineAnchor, EditMove, EditMoveDir, EditOperation,
     EditOverwrite, EditReplace, HistoryFileChange, ModelResult,
 };
-use tokio::sync::{mpsc, watch};
-
-use tauqe_protocol::ModelRef;
 
 use crate::history::{HistoryManager, DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT};
 use crate::providers::{ChatMessage, LlmProvider, StreamEvent};
 
-pub use super::research::*;
-
-/// Compacts session history if estimated tokens exceed the configured threshold using default budgets.
+/// Compacts session history if estimated tokens exceed the configured threshold using
+/// the default budgets.
+///
+/// A caller that owns the project configuration applies the budget the project
+/// declares through [`compact_history_if_needed_with_budget`] instead; this entry
+/// point exists for a caller that carries no configuration of its own.
 pub async fn compact_history_if_needed(
     history_manager: &mut HistoryManager,
     provider: &dyn LlmProvider,
@@ -30,6 +44,12 @@ pub async fn compact_history_if_needed(
 }
 
 /// Compacts session history if estimated tokens exceed a specific budget threshold.
+///
+/// The Scribe summarizes the prefix the partition cuts off and the retained tail
+/// is preserved whole, so a card a turn recorded on both sides of its attempts —
+/// the turn with the rounds it ran and the answer that closed it — survives the
+/// compaction. A stream that fails or is cancelled leaves the journal untouched
+/// instead of replacing it with an empty summary.
 pub async fn compact_history_if_needed_with_budget(
     history_manager: &mut HistoryManager,
     provider: &dyn LlmProvider,
@@ -46,18 +66,7 @@ pub async fn compact_history_if_needed_with_budget(
         return Ok(());
     };
 
-    let mut head_text = String::new();
-    for entry in &head {
-        if let Ok(line) = entry.to_jsonl_line() {
-            head_text.push_str(&line);
-            head_text.push('\n');
-        }
-    }
-
-    let summarization_prompt = format!(
-        "Summarize the following interaction history into a concise, structured summary capturing the completed tasks, key code changes, and context:\n\n```jsonl\n{}\n```\nRespond with a single JSON object matching the enforced schema, placing the summary text in the `summary` field. Do not wrap the JSON in markdown code fences.",
-        head_text.trim()
-    );
+    let summarization_prompt = crate::history::compaction::build_compaction_request(&head);
 
     let messages = vec![
         ChatMessage::system("You are an expert software engineering assistant. Your task is to summarize past development session history concisely and accurately."),
@@ -132,7 +141,7 @@ pub async fn compact_history_if_needed_with_budget(
     Ok(())
 }
 
-/// Records workflow response into HistoryManager based on the final execution result.
+/// Records a finished turn into the session journal according to its result.
 pub fn record_workflow_response(
     history_manager: &mut HistoryManager,
     result: &ModelResult,
@@ -253,7 +262,14 @@ pub fn record_workflow_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::HistoryEntry;
     use crate::prompt::PromptAssembly;
+    use crate::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_protocol::{
+        EditFileOp, EditOperation, EditOutcome, EditProtocolKind, EditReplace, HistoryFileChange,
+        ModelRef,
+    };
+    use tokio::sync::watch;
 
     #[tokio::test]
     async fn test_compaction_aborted_on_stream_error_preserves_history() {
@@ -315,6 +331,139 @@ mod tests {
         ));
     }
 
+    /// A dialogue reads the journal it is about to extend, so a session that
+    /// outgrew the configured budget is folded into one summary record ahead of
+    /// the turn while the retained tail keeps the latest exchange.
+    #[tokio::test]
+    async fn an_over_budget_dialogue_journal_is_compacted_before_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = HistoryManager::new(dir.path().to_path_buf());
+        for index in 1..=4 {
+            history
+                .record_turn(format!("Task {index}"), vec!["src/lib.rs".to_string()])
+                .unwrap();
+            history
+                .record_response(format!("Done {index}"), None, None, vec![])
+                .unwrap();
+        }
+        let before = history.estimated_tokens();
+        let budget = before / 2;
+        assert!(history.needs_compaction(budget));
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(
+            r#"{"summary":"Tasks 1 through 3 completed and verified."}"#,
+        )]);
+        let model = ModelRef::openrouter("mock/scribe");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        compact_history_if_needed_with_budget(
+            &mut history,
+            &provider,
+            &model,
+            cancel_rx,
+            budget,
+            1,
+        )
+        .await
+        .expect("compaction runs");
+
+        let entries = history.get_entries().unwrap();
+        assert_eq!(entries.len(), 3, "one summary and the retained exchange");
+        match &entries[0] {
+            HistoryEntry::Summary { text, .. } => {
+                assert_eq!(text, "Tasks 1 through 3 completed and verified.")
+            }
+            other => panic!("the summarized prefix folds into a summary, got {other:?}"),
+        }
+        assert!(matches!(entries[1], HistoryEntry::Turn { .. }));
+        assert!(matches!(entries[2], HistoryEntry::Response { .. }));
+        assert!(
+            !history.needs_compaction(budget),
+            "the compacted journal must land inside the budget"
+        );
+    }
+
+    /// A batch executes many steps against one journal, so the run compacts it
+    /// between steps. The two-sided card a step records — the turn with the
+    /// rounds it ran and the answer that closed it — is durable evidence, so a
+    /// retained card survives whole and the journal lands inside the budget.
+    #[tokio::test]
+    async fn a_budgeted_step_batch_keeps_both_sided_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::history::SessionStorage::new(dir.path().to_path_buf());
+        for (card_id, prompt) in [(1u64, "Implement step one"), (3u64, "Implement step two")] {
+            storage
+                .append_entry(&HistoryEntry::Turn {
+                    id: Some(card_id),
+                    prompt: prompt.to_string(),
+                    context: vec!["src/lib.rs".to_string()],
+                    context_watermark: Some(1),
+                    rounds: vec![crate::history::entry::round_record(
+                        1,
+                        "Inspected the module and staged the change.",
+                        "verification passed",
+                    )],
+                })
+                .unwrap();
+            storage
+                .append_entry(&HistoryEntry::Response {
+                    id: Some(card_id + 1),
+                    message: format!("{prompt} closed."),
+                    commit: Some("abc1234".to_string()),
+                    summary: Some(prompt.to_string()),
+                    files: vec![HistoryFileChange::operated(
+                        EditFileOp::Replace,
+                        "src/lib.rs",
+                    )],
+                })
+                .unwrap();
+        }
+        let mut history = HistoryManager::new(dir.path().to_path_buf());
+        let before = history.estimated_tokens();
+        let budget = before - before / 4;
+        assert!(history.needs_compaction(budget));
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(
+            r#"{"summary":"Step one completed and verified."}"#,
+        )]);
+        let model = ModelRef::openrouter("mock/scribe");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        compact_history_if_needed_with_budget(
+            &mut history,
+            &provider,
+            &model,
+            cancel_rx,
+            budget,
+            1,
+        )
+        .await
+        .expect("compaction runs");
+
+        assert!(
+            !history.needs_compaction(budget),
+            "the step journal must land inside the budget"
+        );
+        let entries = history.get_entries().unwrap();
+        assert_eq!(entries.len(), 3, "one summary and the retained card");
+        assert!(matches!(entries[0], HistoryEntry::Summary { .. }));
+        match &entries[1] {
+            HistoryEntry::Turn { prompt, rounds, .. } => {
+                assert_eq!(prompt, "Implement step two");
+                assert_eq!(rounds.len(), 1, "the retained card keeps its rounds");
+                assert_eq!(rounds[0].feedback, "verification passed");
+            }
+            other => panic!("expected the retained turn card, got {other:?}"),
+        }
+        match &entries[2] {
+            HistoryEntry::Response {
+                message, commit, ..
+            } => {
+                assert_eq!(message, "Implement step two closed.");
+                assert_eq!(commit.as_deref(), Some("abc1234"));
+            }
+            other => panic!("expected the retained answer card, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_record_workflow_response_structured_strips_edits() {
         let dir = tempfile::tempdir().unwrap();
@@ -342,7 +491,7 @@ mod tests {
                 new_text: "fn new() {}".to_string(),
             })],
             proposal: None,
-            outcome: tauqe_protocol::EditOutcome {
+            outcome: EditOutcome {
                 applied: true,
                 error: None,
                 changed_files: vec!["src/a.rs".to_string()],
@@ -356,7 +505,7 @@ mod tests {
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            crate::history::entry::HistoryEntry::Response {
+            HistoryEntry::Response {
                 message,
                 commit,
                 summary,
@@ -389,7 +538,7 @@ mod tests {
                 new_text: "new".to_string(),
             })],
             proposal: None,
-            outcome: tauqe_protocol::EditOutcome {
+            outcome: EditOutcome {
                 applied: true,
                 error: None,
                 changed_files: vec!["a.rs".to_string()],
@@ -403,7 +552,7 @@ mod tests {
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            crate::history::entry::HistoryEntry::Response { message, files, .. } => {
+            HistoryEntry::Response { message, files, .. } => {
                 assert_eq!(message, "Need file a.rs\n\nUpdated file a.rs");
                 assert_eq!(
                     files,
@@ -433,7 +582,7 @@ mod tests {
                 message: "I found the issue and fixed it.".to_string(),
                 ..Default::default()
             }),
-            outcome: tauqe_protocol::EditOutcome {
+            outcome: EditOutcome {
                 applied: true,
                 error: None,
                 changed_files: vec!["src/parser.rs".to_string()],
@@ -447,7 +596,7 @@ mod tests {
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            crate::history::entry::HistoryEntry::Response { message, .. } => {
+            HistoryEntry::Response { message, .. } => {
                 assert_eq!(message, "I found the issue and fixed it.");
                 assert!(!message.contains("scratchpad"));
                 assert!(!message.contains("Working hypothesis"));
@@ -460,7 +609,7 @@ mod tests {
     fn test_scratchpad_round_accumulation_and_turn_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
-        let proto = crate::edits::StructuredEditProtocol;
+        let proto = crate::edits::protocol::structured::StructuredEditProtocol;
 
         // Round 1: Model emits research request and scratchpad note
         let round1_output = serde_json::json!({
@@ -494,7 +643,7 @@ mod tests {
             1,
             vec![],
             "git",
-            tauqe_protocol::EditProtocolKind::Structured,
+            EditProtocolKind::Structured,
             None,
             None,
         );
@@ -503,9 +652,13 @@ mod tests {
             "Continue",
             &crate::prompt::json::JsonPromptProtocol::default(),
         );
-        let prompt_text = &messages[0].content;
-        assert!(prompt_text.contains("<scratchpad>"));
-        assert!(prompt_text.contains("- Hypothesis: missing timeout field"));
+        // The scratchpad is rewritten on every round, so it travels in the
+        // volatile tail of the transcript instead of the byte-stable head.
+        let head = &messages[0].content;
+        assert!(!head.contains("<scratchpad>"));
+        let tail = &messages[messages.len() - 2].content;
+        assert!(tail.contains("<scratchpad>"));
+        assert!(tail.contains("- Hypothesis: missing timeout field"));
 
         // Round 2 response: Model updates scratchpad with verified conclusion
         let round2_output = serde_json::json!({
@@ -544,13 +697,14 @@ mod tests {
             &crate::control::repl::dialogue_capability_expr(false, false),
             &round2_output,
             &["src/config.rs".to_string()],
+            None,
         );
         record_workflow_response(&mut hm, &edit_res, &cleaned, vec![]);
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            crate::history::entry::HistoryEntry::Response { message, files, .. } => {
+            HistoryEntry::Response { message, files, .. } => {
                 assert_eq!(message, "I have updated the config.");
                 assert!(!message.contains("scratchpad"));
                 assert!(!message.contains("Verified: timeout field"));
