@@ -3,6 +3,8 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+mod contracts;
+
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(unix)]
 use tokio::signal::unix::Signal;
 
+mod discussion;
 mod dispatch;
 mod handlers;
 mod logging;
@@ -34,10 +37,10 @@ use transport::OutChannel;
 async fn main() -> anyhow::Result<()> {
     tauqe_core::init();
 
-    let explicit_config = tauqe_core::config::cli_arg_value_from(std::env::args(), "--config");
+    let explicit_config = tauqe_core::api::cli_arg_value_from(std::env::args(), "--config");
     let explicit_credentials =
-        tauqe_core::config::cli_arg_value_from(std::env::args(), "--credentials");
-    let repo_state = tauqe_core::git::get_repository_state(None);
+        tauqe_core::api::cli_arg_value_from(std::env::args(), "--credentials");
+    let repo_state = tauqe_core::api::discover_repository();
     let repo_path = PathBuf::from(&repo_state.root);
 
     logging::install_panic_hook();
@@ -76,12 +79,11 @@ async fn main() -> anyhow::Result<()> {
     // spot and leaving an open transaction behind.
     let shutdown_watch = shutdown_signal();
 
-    let config =
-        tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
-            repo_root: Some(&repo_path),
-            explicit_config: explicit_config.as_deref(),
-            explicit_credentials: explicit_credentials.as_deref(),
-        });
+    let config = tauqe_core::api::repository_configuration(
+        &repo_path,
+        explicit_config.as_deref(),
+        explicit_credentials.as_deref(),
+    );
 
     let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<HistoryMutation>();
     let (out, outbound_rx) = OutChannel::new();
@@ -110,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 HistoryMutation::Appended { item } => Event {
                     method: events::HISTORY_ENTRY_ADDED.to_string(),
                     params: serde_json::to_value(HistoryEntryAddedEvent {
-                        item,
+                        item: handlers::history::history_item_dto(item),
                         estimated_tokens: Some(estimated_tokens),
                     })
                     .ok(),
@@ -123,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
                     Event {
                         method: events::HISTORY_COMPACTED.to_string(),
                         params: serde_json::to_value(HistoryCompactedEvent {
-                            summary,
+                            summary: handlers::history::history_item_dto(summary),
                             tail_ids,
                             total_count,
                             estimated_tokens,
@@ -137,7 +139,10 @@ async fn main() -> anyhow::Result<()> {
                 // updates exactly that entry instead of guessing.
                 HistoryMutation::RolledBack { item } => Event {
                     method: events::HISTORY_ENTRY_ROLLED_BACK.to_string(),
-                    params: serde_json::to_value(HistoryEntryRolledBackEvent { item }).ok(),
+                    params: serde_json::to_value(HistoryEntryRolledBackEvent {
+                        item: handlers::history::history_item_dto(item),
+                    })
+                    .ok(),
                 },
             };
             out_for_history.send_event(&ev);
@@ -901,7 +906,7 @@ mod tests {
 
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let aborted_while_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let transaction = Arc::clone(&state.git_transaction_active);
+        let transaction = state.application.test_transaction_activity();
 
         let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
         let task = {

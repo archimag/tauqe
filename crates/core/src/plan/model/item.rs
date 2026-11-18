@@ -1,0 +1,109 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    Discussion,
+    #[default]
+    Todo,
+    InProgress,
+    Done,
+    Blocked,
+    Cancelled,
+}
+
+impl std::fmt::Display for PlanItemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Discussion => write!(f, "DISCUSSION"),
+            Self::Todo => write!(f, "TODO"),
+            Self::InProgress => write!(f, "IN_PROGRESS"),
+            Self::Done => write!(f, "DONE"),
+            Self::Blocked => write!(f, "BLOCKED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+        }
+    }
+}
+
+/// A node in the conceptual architectural tree ("What" / Requirements & Invariants).
+///
+/// Conceptual items represent design decisions, architectural invariants, and high-level
+/// goals. They are formed and discussed in dialogue, and remain read-only during deep
+/// implementation refinement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConceptItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ConceptItem>,
+}
+
+/// An actionable engineering step in the implementation blueprint ("How").
+///
+/// Implementation items are formed and refined by autonomous deep analysis.
+/// Each step contains the exact paths of targeted files (`files`) that are
+/// deterministically pre-loaded into context upon execution, as well as optional
+/// references to conceptual requirements (`concept_refs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(default)]
+    pub status: PlanItemStatus,
+    /// Diagnostic report of the semantic blocker that stopped this step.
+    ///
+    /// Present only while the step is blocked: it records why the bounded turn
+    /// could not proceed, so the reason survives the interrupted turn on disk
+    /// and in the interface instead of being lost with the transient session.
+    ///
+    /// A report carried by a step that is no longer `Blocked` is dropped by
+    /// `PlanImplementation::normalize_lifecycle_provenance`, so the field never
+    /// describes a stall the step already left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Identifier of the Git commit that completed this step.
+    ///
+    /// The harness records it once the step's turn converges and is committed,
+    /// so a finished step keeps a durable pointer to the change set that
+    /// produced it. Present only alongside `Done`: a step that never ran carries
+    /// no commit, and the value is part of the immutable record of a completed
+    /// step.
+    ///
+    /// A value supplied for a step that is not `Done` is dropped by
+    /// `PlanImplementation::normalize_lifecycle_provenance` before the step
+    /// reaches disk, so a mutation can never assert a change set it did not
+    /// produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_files: Vec<String>,
+    /// Identifiers of the project-declared `[[outer_docs]]` entries preloaded
+    /// as read-only reference context when this step executes.
+    ///
+    /// A leaf names external project documentation the same way it names
+    /// `readonly_files`: the harness materializes every declared entry and adds
+    /// it to the read-only context of the step turn. The field carries entry
+    /// identifiers only, never cache paths, so a step reaches nothing the
+    /// project did not declare itself. A container is never executed and keeps
+    /// the list empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outer_docs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concept_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<PlanItem>,
+}
+
+impl PlanItem {
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}

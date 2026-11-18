@@ -85,7 +85,7 @@ pub fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
 /// A child that outlives the budget or observes the caller's cancellation
 /// signal is torn down with its process group and reported as a failed
 /// invocation, so no Git command can stall the turn that started it.
-pub fn run_git_with_deadline(
+pub(crate) fn run_git_with_deadline(
     dir: Option<&Path>,
     args: &[&str],
     deadline: &GitDeadline,
@@ -130,7 +130,7 @@ pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>>
 
 /// Reports which of the supplied paths repository ignore rules exclude, under
 /// the supplied wall-clock budget.
-pub fn run_git_check_ignore_with_deadline(
+pub(crate) fn run_git_check_ignore_with_deadline(
     dir: &Path,
     paths: &[String],
     deadline: &GitDeadline,
@@ -325,7 +325,7 @@ pub fn stage_files(dir: &Path, files: &[String]) -> Result<()> {
 }
 
 /// Stages the specified list of files under the supplied wall-clock budget.
-pub fn stage_files_with_deadline(
+pub(crate) fn stage_files_with_deadline(
     dir: &Path,
     files: &[String],
     deadline: &GitDeadline,

@@ -1,6 +1,6 @@
+use crate::models::ModelCatalogEntry;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::ModelCatalogEntry;
 
 use super::paths::{dirs_config, dirs_home};
 use super::AppConfig;
@@ -467,12 +467,12 @@ models = [
         assert_eq!(catalog.len(), 2);
         assert_eq!(
             catalog[0].model,
-            tauqe_protocol::ModelRef::openrouter("google/gemini-flash-latest")
+            crate::models::ModelRef::openrouter("google/gemini-flash-latest")
         );
         assert_eq!(catalog[0].alias, None);
         assert_eq!(
             catalog[1].model,
-            tauqe_protocol::ModelRef::openrouter("deepseek/deepseek-chat")
+            crate::models::ModelRef::openrouter("deepseek/deepseek-chat")
         );
         assert_eq!(catalog[1].alias.as_deref(), Some("Deep"));
     }

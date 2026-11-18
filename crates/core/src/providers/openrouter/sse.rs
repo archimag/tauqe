@@ -1,6 +1,6 @@
 //! Server-sent event framing and logging helpers for the OpenRouter transport.
 
-use tauqe_protocol::ModelUsageInfo;
+use crate::providers::ModelUsageInfo;
 
 /// Maximum characters of a raw provider response body captured in a log record.
 pub(crate) const RESPONSE_BODY_LOG_CHARS: usize = 500;

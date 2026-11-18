@@ -7,8 +7,9 @@ use super::{architectural_session, test_item, test_session, test_state, TestDir}
 
 use super::super::handle_review_execute;
 
+use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{errors, IssueStatus, Request};
+use tauqe_protocol::{errors, Request};
 
 /// Builds a `review/execute` request carrying the given payload.
 fn execute_request(params: serde_json::Value) -> Request {
@@ -302,10 +303,10 @@ async fn execute_refuses_a_group_that_still_poses_an_open_question() {
     let mut item = test_item(1, IssueStatus::Discussion, "src/target.rs");
     item.group = Some("arch-1".to_string());
     let mut session = test_session("rev-open", vec![item]);
-    session.groups = vec![tauqe_protocol::ReviewGroup {
+    session.groups = vec![tauqe_core::review::ReviewGroup {
         id: "arch-1".to_string(),
         title: "Group arch-1".to_string(),
-        kind: tauqe_protocol::review::ReviewGroupKind::Architectural,
+        kind: tauqe_core::review::ReviewGroupKind::Architectural,
         ..Default::default()
     }];
     ReviewStorage::save_session(dir.path(), &session).unwrap();

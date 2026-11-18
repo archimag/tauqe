@@ -2,8 +2,6 @@ pub mod architect;
 pub mod common;
 pub mod config;
 pub mod context;
-// The edit-cycle primitive is introduced ahead of its consumers.
-#[allow(dead_code)]
 pub(crate) mod edit_cycle;
 pub mod git;
 pub mod history;
@@ -14,17 +12,17 @@ pub mod outer_docs;
 pub mod plan;
 pub mod review;
 
+use crate::contracts::Project;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::state::{AppState, OperationGuard};
-use tauqe_core::context::ContextManager;
 use tauqe_core::edits::EditProtocolFactory;
-use tauqe_core::history::HistoryManager;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
     errors, methods, InitializeResult, Request, RequestId, Response, PROTOCOL_VERSION,
 };
+#[cfg(test)]
 use tokio::sync::watch;
 
 pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
@@ -191,178 +189,45 @@ pub(crate) fn begin_exclusive_operation(
     })
 }
 
-/// Executes a blocking closure on the Tokio blocking pool.
-///
-/// Repository handlers perform synchronous git subprocess and file I/O. Running
-/// that work directly on an async worker thread starves the runtime, so it is
-/// offloaded here. A cancelled or panicked task degrades to an error string
-/// instead of crashing the daemon.
-pub(crate) async fn offload<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|err| format!("blocking task failed: {}", err))
-}
-
-/// Applies a mutation to the shared context atomically.
-///
-/// The mutation runs on the blocking pool because it touches the file system
-/// (metadata reads, path verification), but the exclusive context write guard
-/// is acquired first and moved into the blocking task with the closure, so the
-/// whole read-modify-write sequence stays serialized. Cloning the manager under
-/// a short read guard and overwriting the slot afterwards would let a
-/// concurrent mutation be lost and would reset the monotonic revision.
-pub(crate) async fn with_context_mutation<T, F>(
+/// Claims typed configuration access before RPC parameter decoding, retaining
+/// the existing busy-error precedence while core owns admission.
+pub(crate) fn begin_configuration_change(
+    req_id: &RequestId,
     state: &Arc<AppState>,
-    mutate: F,
-) -> Result<T, String>
-where
-    F: FnOnce(&mut ContextManager) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    state.mutate_context(mutate).await
-}
-
-/// Applies a mutation to the shared interaction history atomically.
-///
-/// History persistence is `fsync`-bounded, so the mutation runs on the blocking
-/// pool while the exclusive history guard stays held, keeping the whole
-/// read-modify-write sequence serialized the same way context mutations are.
-pub(crate) async fn with_history_mutation<T, F>(
-    state: &Arc<AppState>,
-    mutate: F,
-) -> Result<T, String>
-where
-    F: FnOnce(&mut HistoryManager) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    state.mutate_history(mutate).await
-}
-
-/// Verdict of the deterministic pre-flight gate shared by server-driven batches.
-///
-/// The gate must separate a repository that does not build from an operation
-/// that was cancelled while the verification still ran. The first is a project
-/// failure the developer has to resolve; the second is the requested
-/// termination of the operation, answered with `CANCELLED` so the caller
-/// releases the operation slot at once instead of reporting a verification
-/// failure of a suite that never ran to completion.
-#[derive(Debug)]
-pub(crate) enum PreflightVerdict {
-    /// The repository verified cleanly; the batch may start its first step.
-    Passed,
-    /// The operation was cancelled before or during the verification.
-    Cancelled,
-    /// The repository does not build; the report names the failed commands.
-    Failed(String),
-}
-
-/// Deterministic pre-flight verification shared by server-driven batches.
-///
-/// Runs the exact same project verification pipeline that the core executes after
-/// each autonomous workflow step. When the repository does not build or its tests
-/// fail, the batch is blocked synchronously before any LLM request or status change,
-/// so a broken tree never triggers a wasted self-healing loop. A repository that
-/// declares no verification command passes transparently. The project
-/// configuration is validated before the pipeline runs, so a `tauqe.toml`
-/// whose model roles or `[project]` command chain are broken is refused
-/// synchronously as well.
-///
-/// `cancel_rx` is the cancellation channel of the operation that already owns the
-/// slot: an already-cancelled operation never launches the pipeline, and a cancel
-/// delivered during the build/test suite is observed by the substrate, which
-/// tears the whole process group of the project command down instead of waiting
-/// the suite out.
-///
-/// The repository index is gated the same way: a lock no invocation may still
-/// own is reclaimed, a lock that clears on its own is waited out, and a lock
-/// that outlives the gate refuses the batch before its first step opens a
-/// transaction.
-pub(crate) async fn run_preflight_verification(
-    repo_root: &Path,
-    cancel_rx: watch::Receiver<bool>,
-) -> PreflightVerdict {
-    // A cancel delivered before the gate starts must not launch the pipeline at
-    // all: the operation slot is registered and the client waits for its release.
-    if *cancel_rx.borrow() {
-        tracing::info!("pre-flight verification skipped: the operation was already cancelled");
-        return PreflightVerdict::Cancelled;
-    }
-
-    // A locked index blocks every Git transaction the batch is about to open, so
-    // the gate runs before the configuration check and before the suite: the
-    // first capture of the first step would otherwise fail inside the queue,
-    // after a model request was already spent. The gate blocks on its backoff, so
-    // it runs off the async executor thread.
-    let gate_root = repo_root.to_path_buf();
-    let gate_cancel = cancel_rx.clone();
-    let gate = match offload(move || {
-        tauqe_core::git::ensure_index_available(&gate_root, Some(&gate_cancel))
+    message: &str,
+) -> Result<tauqe_core::api::ConfigurationOperation, Box<Response>> {
+    state.application.begin_configuration_change().map_err(|_| {
+        tracing::warn!(
+            code = errors::OPERATION_IN_PROGRESS,
+            "Refused to register a new operation: a slot is already active"
+        );
+        Box::new(Response::err(
+            req_id.clone(),
+            errors::OPERATION_IN_PROGRESS,
+            message,
+        ))
     })
-    .await
-    {
-        Ok(gate) => gate,
-        Err(reason) => {
-            return PreflightVerdict::Failed(format!(
-                "Pre-flight verification could not inspect the repository index: {reason}"
-            ));
-        }
-    };
-    match gate {
-        Ok(()) => {}
-        Err(tauqe_core::git::IndexGateError::Cancelled) => {
-            tracing::info!("pre-flight verification skipped: the index gate was cancelled");
-            return PreflightVerdict::Cancelled;
-        }
-        Err(error) => {
-            return PreflightVerdict::Failed(format!(
-                "Pre-flight verification refused to start: {error}"
-            ));
-        }
-    }
-
-    // The configuration integrity check runs first: a batch must not launch
-    // against a `tauqe.toml` whose model roles or command chain are broken,
-    // because its steps would fail mid-flight instead of being refused before
-    // any LLM request is spent. The check self-offloads its blocking file
-    // reads off the async executor thread, and a repository without a
-    // configuration file is governed by built-in defaults and passes.
-    if let Err(report) = tauqe_core::config::validate_project_config_on_disk(repo_root) {
-        return PreflightVerdict::Failed(report);
-    }
-
-    // A pre-flight gate runs before a turn exists, so it has no change set and
-    // the project command conservatively runs its full suite. The command races
-    // the cancellation signal inside the substrate, which kills the whole
-    // process group and reports an `is_cancelled` result, so no race is
-    // re-implemented here.
-    let (status, results) =
-        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], Some(&cancel_rx)).await;
-    // A project that declares no verification lifecycle states its own choice,
-    // so the gate passes transparently instead of refusing a batch the project
-    // never asked to verify.
-    if status.allows_commit() {
-        return PreflightVerdict::Passed;
-    }
-    if results.iter().any(|result| result.is_cancelled) {
-        tracing::warn!("pre-flight verification was cancelled by the operation");
-        return PreflightVerdict::Cancelled;
-    }
-
-    let mut failed_commands = Vec::new();
-    for result in results.iter().filter(|r| !r.success) {
-        failed_commands.push(format!("`{}`", result.command));
-    }
-    let report = if failed_commands.is_empty() {
-        "Pre-flight verification failed without diagnostic output.".to_string()
-    } else {
-        format!("Command {} failed.", failed_commands.join(", "))
-    };
-    PreflightVerdict::Failed(report)
 }
+
+/// Obtains the core-owned history cleanup lease before handling the request.
+pub(crate) fn begin_history_change(
+    req_id: &RequestId,
+    state: &Arc<AppState>,
+    message: &str,
+) -> Result<tauqe_core::api::HistoryOperation, Box<Response>> {
+    state.application.begin_history_change().map_err(|_| {
+        tracing::warn!(
+            code = errors::OPERATION_IN_PROGRESS,
+            "Refused to register a new operation: a slot is already active"
+        );
+        Box::new(Response::err(
+            req_id.clone(),
+            errors::OPERATION_IN_PROGRESS,
+            message,
+        ))
+    })
+}
+pub(crate) use tauqe_core::api::{run_preflight_verification, PreflightVerdict};
 
 /// Rebinds configuration, context, history, and usage telemetry to a
 /// repository root.
@@ -378,53 +243,17 @@ pub(crate) async fn run_preflight_verification(
 /// journal, so it is constructed on the blocking pool instead of stalling an
 /// async worker thread; attaching the mutation listener stays here, where the
 /// client event channel lives.
-pub(crate) async fn rebind_to_repository(state: &Arc<AppState>, repo_path: &Path) {
-    if repo_path.as_os_str().is_empty() {
-        return;
-    }
-
-    let loaded = config::reload_config_with_overrides(state, Some(repo_path)).await;
-    {
-        let mut guard = state.config.lock().await;
-        guard.selection = loaded.default_selection();
-        guard.config = loaded;
-    }
-
-    let repo_buf = repo_path.to_path_buf();
-    if let Err(err) = state
-        .mutate_context(move |ctx| ctx.set_repo_root(repo_buf))
-        .await
-    {
-        tracing::warn!(
-            error = %err,
-            "Failed to rebind the context to the initialized repository"
-        );
-    }
-
-    // The project lifetime totals belong to the repository, so they are
-    // re-adopted here. The context must already point at the new root because
-    // the telemetry path derives from it.
-    state.reload_usage_lifetime().await;
-
-    let history_root = repo_path.to_path_buf();
-    let mut history_manager = match offload(move || HistoryManager::new(history_root)).await {
-        Ok(history_manager) => history_manager,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Failed to rebuild the interaction history for the repository"
-            );
-            return;
-        }
-    };
-    let sender = state.history_sender.clone();
-    // Forward every history mutation so a compaction reaches the client as a
-    // structural rewrite rather than a trailing append.
-    history_manager.set_listener(move |mutation| {
-        let _ = sender.send(mutation);
-    });
-    let mut history = state.history.lock().await;
-    *history = history_manager;
+pub(crate) async fn rebind_to_repository(
+    state: &Arc<AppState>,
+    repo_path: &Path,
+    operation: &tauqe_core::api::ConfigurationOperation,
+) {
+    let out = state.out.clone();
+    operation
+        .rebind_repository(repo_path, move |id, snapshot| {
+            crate::usage::publish_snapshot(&out, id, snapshot)
+        })
+        .await;
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
@@ -432,7 +261,7 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
     // history, so it claims the operation slot instead of sampling it: a turn
     // registering right after a plain check would have every one of those
     // managers swapped underneath it.
-    let _operation = match begin_exclusive_operation(
+    let operation = match begin_configuration_change(
         &req.id,
         state,
         "Cannot re-initialize the repository while a model operation is in progress",
@@ -443,23 +272,21 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
 
     // Reading the repository state shells out to git, so it is offloaded and
     // resolved from the authoritative shared root instead of the process CWD.
-    let repo_root = state.repo_root().await;
-    let repo_state = match offload(move || {
-        let root = repo_root.as_path();
-        tauqe_core::git::get_repository_state(Some(root))
-    })
-    .await
-    {
-        Ok(repo_state) => repo_state,
-        Err(err) => {
-            tracing::warn!(error = %err, "Failed to read repository state during initialize");
-            return Response::err(req.id, tauqe_protocol::errors::REPOSITORY_STATE_FAILED, err);
+    let repo_state = match state.application.repository_state().await {
+        Ok(repository) => repository,
+        Err(error) => {
+            tracing::warn!(error=%error,"Failed to read repository state during initialize");
+            return Response::err(
+                req.id,
+                tauqe_protocol::errors::REPOSITORY_STATE_FAILED,
+                error.to_string(),
+            );
         }
     };
-    rebind_to_repository(state, Path::new(&repo_state.root)).await;
+    rebind_to_repository(state, Path::new(&repo_state.root), &operation).await;
 
     let (effective_model, workflow, edit_protocol, available_models) = {
-        let guard = state.config.lock().await;
+        let guard = state.application.configuration().await;
         (
             guard.config.resolve_model(&guard.selection),
             guard.config.repl.workflow,
@@ -472,13 +299,22 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         protocol_version: PROTOCOL_VERSION.to_string(),
         server_name: "tauqe-server".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-        repository: Some(repo_state),
-        model: effective_model,
-        workflow: Some(workflow),
+        repository: Some(git::repository_dto(repo_state)),
+        model: effective_model.project(),
+        workflow: Some(workflow.project()),
         edit_protocol: Some(edit_protocol),
-        available_models,
-        available_workflows: WorkflowFactory::available_workflows(),
-        available_edit_protocols: EditProtocolFactory::available_protocols(),
+        available_models: available_models
+            .into_iter()
+            .map(crate::contracts::Project::project)
+            .collect(),
+        available_workflows: WorkflowFactory::available_workflows()
+            .into_iter()
+            .map(Project::project)
+            .collect(),
+        available_edit_protocols: EditProtocolFactory::available_protocols()
+            .into_iter()
+            .map(Project::project)
+            .collect(),
     };
     Response::ok_typed(req.id, &result)
 }
@@ -671,19 +507,15 @@ mod tests {
         );
 
         state
-            .mutate_history(|history| {
-                history
-                    .record_turn("In-flight prompt".to_string(), Vec::new())
-                    .map(|_| ())
-            })
+            .application
+            .record_history_turn("In-flight prompt".into(), Vec::new())
             .await
-            .expect("recording the turn runs on the blocking pool")
             .expect("the turn record must persist");
         let recorded = state
-            .history
-            .lock()
+            .application
+            .test_mutate_history(|history| history.get_entries())
             .await
-            .get_entries()
+            .unwrap()
             .expect("history reads back")
             .len();
         assert!(recorded > 0, "the turn record must be persisted");
@@ -708,10 +540,10 @@ mod tests {
         );
         assert_eq!(
             state
-                .history
-                .lock()
+                .application
+                .test_mutate_history(|history| history.get_entries())
                 .await
-                .get_entries()
+                .unwrap()
                 .expect("history reads back")
                 .len(),
             recorded,

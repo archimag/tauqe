@@ -172,7 +172,7 @@ async fn preview_window_matches_the_window_the_launch_reads() {
             as usize;
     let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
         "src/a.rs",
-        tauqe_protocol::ContextAccess::ReadOnly,
+        tauqe_core::context::ContextAccess::ReadOnly,
     );
     config.context.token_budget = content_tokens.saturating_add(wrapper).saturating_mul(2);
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
@@ -234,7 +234,7 @@ async fn a_launch_audits_every_paid_file_beyond_the_retired_batch_cap() {
             as usize;
     let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
         sample,
-        tauqe_protocol::ContextAccess::ReadOnly,
+        tauqe_core::context::ContextAccess::ReadOnly,
     );
     let mut config = test_config();
     config.context.token_budget = content_tokens

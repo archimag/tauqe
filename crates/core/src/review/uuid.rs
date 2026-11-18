@@ -39,7 +39,7 @@ pub fn is_valid_uuid_v7(value: &str) -> bool {
 /// Returns `None` when `value` is not a valid UUIDv7. The timestamp is the
 /// value stored in the leading 48 bits: the Unix time in milliseconds at
 /// which the identifier was generated.
-pub fn parse_uuid_v7_timestamp(value: &str) -> Option<u64> {
+pub(crate) fn parse_uuid_v7_timestamp(value: &str) -> Option<u64> {
     let uuid = parse_canonical_v7(value)?;
     let (seconds, nanos) = uuid.get_timestamp()?.to_unix();
     Some(seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000)

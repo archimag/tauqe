@@ -13,16 +13,13 @@ mod supervisor;
 
 use std::sync::Arc;
 
-use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    errors, PlanExecuteParams, PlanItemStatus, PlanRefineParams, PlanReplanParams,
-    PlanScopeEvaluation, Request, Response,
+    errors, PlanExecuteParams, PlanRefineParams, PlanReplanParams, Request, Response,
 };
 
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 
-use super::common::offload_plan;
 use super::engine::{execute_plan_horizon_synthesis, PlanHorizonDiagnosticsOwned};
 use super::two_phase::{execute_two_phase_plan_synthesis, TwoPhaseRequest};
 
@@ -41,89 +38,32 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         }
     };
 
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let load_root = repo_root.clone();
-    let load_plan_id = params.plan_id.clone();
-    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!("Plan '{}' not found", params.plan_id),
-            );
-        }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
-    };
-
-    let steps = match plan
-        .implementation
-        .evaluate_scope(params.step_id.as_deref())
+    let (plan, step_ids) = match state
+        .application
+        .prepare_plan_execution(&params.plan_id, params.step_id.as_deref())
+        .await
     {
-        PlanScopeEvaluation::Ready(steps) => steps,
-        PlanScopeEvaluation::BlockedByDiscussion(items) => {
-            return Response::err(
-                req.id,
-                errors::STEP_IN_DISCUSSION,
-                format!(
-                    "Scope contains item(s) in DISCUSSION status: {}. Review them (change status to TODO) first",
-                    items.join(", ")
-                ),
-            );
-        }
-        PlanScopeEvaluation::BlockedByBlockers(items) => {
-            return Response::err(
-                req.id,
-                errors::STEP_BLOCKED,
-                format!(
-                    "Scope contains step(s) in BLOCKED status: {}. Resolve the reported blockers and replan before executing",
-                    items.join(", ")
-                ),
-            );
-        }
-        PlanScopeEvaluation::BlockedByDependencies(items) => {
-            return Response::err(
-                req.id,
-                errors::STEP_BLOCKED_BY_DEPENDENCIES,
-                format!(
-                    "Scope contains step(s) whose prerequisites are not yet DONE: {}. Complete the prerequisites first",
-                    items.join(", ")
-                ),
-            );
-        }
-        PlanScopeEvaluation::StepBlocked => {
-            return Response::err(
-                req.id,
-                errors::STEP_BLOCKED,
-                "Target step is BLOCKED; resolve the reported blocker and replan before executing",
-            );
-        }
-        PlanScopeEvaluation::AllCompleted => {
-            // A plan that carries an architectural concept but no synthesized
-            // horizon has no leaf to schedule yet: the batch projects the first
-            // horizon just-in-time, so the request is not rejected as a
-            // completed scope.
-            if plan.implementation.items.is_empty() && !plan.concept.is_empty() {
-                Vec::<tauqe_protocol::PlanItem>::new()
-            } else {
-                return Response::err(
-                    req.id,
-                    errors::NOTHING_TO_EXECUTE,
-                    "All steps in this scope are already completed",
-                );
-            }
-        }
-        PlanScopeEvaluation::Cancelled => {
-            return Response::err(
-                req.id,
-                errors::STEP_CANCELLED,
-                "Step is CANCELLED and cannot be executed",
-            );
-        }
-        PlanScopeEvaluation::NotFound => {
-            return Response::err(req.id, errors::NOT_FOUND, "Target item not found in plan");
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let code = match error.kind {
+                tauqe_core::api::PlanExecutionFailure::NothingToExecute => {
+                    errors::NOTHING_TO_EXECUTE
+                }
+                tauqe_core::api::PlanExecutionFailure::NotFound => errors::NOT_FOUND,
+                tauqe_core::api::PlanExecutionFailure::PlanLoadFailed => errors::PLAN_LOAD_FAILED,
+                tauqe_core::api::PlanExecutionFailure::StepBlocked => errors::STEP_BLOCKED,
+                tauqe_core::api::PlanExecutionFailure::StepBlockedByDependencies => {
+                    errors::STEP_BLOCKED_BY_DEPENDENCIES
+                }
+                tauqe_core::api::PlanExecutionFailure::StepCancelled => errors::STEP_CANCELLED,
+                tauqe_core::api::PlanExecutionFailure::StepInDiscussion => {
+                    errors::STEP_IN_DISCUSSION
+                }
+            };
+            return Response::err(req.id, code, error.message);
         }
     };
+    let repo_root = state.repo_root().await;
 
     let operation = match state.try_begin_operation() {
         Ok(guard) => Arc::new(guard),
@@ -165,11 +105,10 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     // unconditionally so no discussion anchor survives into code generation.
     state.clear_discussion_focus().await;
 
-    let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
     // The coder selection travels with the request, so every step of the batch
     // starts from the chosen ladder rung. The plan itself is the single source
     let options = PlanBatchOptions {
-        model: params.model,
+        model: params.model.map(crate::contracts::Project::project),
         step_id: params.step_id,
     };
     // The identity of the registered operation travels with the acknowledgement,
@@ -270,40 +209,16 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let effective_plan_id = if plan_id.trim().is_empty() {
-        let active_root = repo_root.clone();
-        offload_plan(move || PlanStorage::load_active_id(&active_root))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    } else {
-        plan_id
+    let repo_root = state.repo_root().await;
+    let plan = match state
+        .application
+        .documents_at(&repo_root)
+        .prepare_plan_refinement(plan_id)
+        .await
+    {
+        Ok(plan) => plan,
+        Err(error) => return plan_preparation_error(req.id, error),
     };
-
-    if effective_plan_id.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Missing plan ID and no active plan is set",
-        );
-    }
-
-    let load_root = repo_root.clone();
-    let load_plan_id = effective_plan_id.clone();
-    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!("Plan '{}' not found", effective_plan_id),
-            );
-        }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
-    };
-
     let operation = match state.try_begin_operation() {
         Ok(guard) => guard,
         Err(()) => {
@@ -327,8 +242,8 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         TwoPhaseRequest {
             plan,
             directives: instructions,
-            planner_model: custom_model,
-            critic_model,
+            planner_model: custom_model.map(crate::contracts::Project::project),
+            critic_model: critic_model.map(crate::contracts::Project::project),
             skip_critique,
             creation: false,
             operation_title: "Deep Plan Refinement",
@@ -374,82 +289,16 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let effective_plan_id = if plan_id.trim().is_empty() {
-        let active_root = repo_root.clone();
-        offload_plan(move || PlanStorage::load_active_id(&active_root))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    } else {
-        plan_id
+    let repo_root = state.repo_root().await;
+    let tauqe_core::api::PreparedPlanReplan { plan, step } = match state
+        .application
+        .documents_at(&repo_root)
+        .prepare_plan_replan(plan_id, step_id)
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return plan_preparation_error(req.id, error),
     };
-
-    if effective_plan_id.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Missing plan ID and no active plan is set",
-        );
-    }
-    if step_id.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Missing blocked step ID to replan",
-        );
-    }
-
-    let load_root = repo_root.clone();
-    let load_plan_id = effective_plan_id.clone();
-    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!("Plan '{}' not found", effective_plan_id),
-            );
-        }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
-    };
-
-    let step = match plan.implementation.find_item(&step_id) {
-        Some(item) => item.clone(),
-        None => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!(
-                    "Step '{}' not found in plan '{}'",
-                    step_id, effective_plan_id
-                ),
-            );
-        }
-    };
-
-    if !step.is_leaf() {
-        return Response::err(
-            req.id,
-            errors::NOT_A_LEAF,
-            format!(
-                "Step '{}' ({}) is not a leaf and cannot be replanned",
-                step.id, step.title
-            ),
-        );
-    }
-    if step.status == PlanItemStatus::Done {
-        return Response::err(
-            req.id,
-            errors::STEP_IMMUTABLE,
-            format!(
-                "Step '{}' is DONE and immutable; completed steps cannot be replanned",
-                step.id
-            ),
-        );
-    }
-
     let operation = match state.try_begin_operation() {
         Ok(guard) => guard,
         Err(()) => {
@@ -478,11 +327,28 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         state,
         plan,
         Some(diagnostics),
-        custom_model,
+        custom_model.map(crate::contracts::Project::project),
         instructions,
         "Plan Replanning",
         false,
         &operation,
     )
     .await
+}
+
+fn plan_preparation_error(
+    id: tauqe_protocol::RequestId,
+    error: tauqe_core::api::PlanPreparationError,
+) -> Response {
+    use tauqe_core::api::PlanPreparationError;
+    let code = match &error {
+        PlanPreparationError::MissingId | PlanPreparationError::MissingStep => {
+            errors::INVALID_PARAMS
+        }
+        PlanPreparationError::NotFound(_) => errors::NOT_FOUND,
+        PlanPreparationError::NotLeaf(_) => errors::NOT_A_LEAF,
+        PlanPreparationError::Immutable(_) => errors::STEP_IMMUTABLE,
+        PlanPreparationError::Storage(_) => errors::PLAN_LOAD_FAILED,
+    };
+    Response::err(id, code, error.to_string())
 }

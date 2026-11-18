@@ -1,5 +1,6 @@
+use crate::workflow::PatchStrategy;
+use crate::workflow::WorkflowKind;
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{PatchStrategy, WorkflowKind};
 
 /// Default budget of LLM rounds granted to a single turn.
 pub const DEFAULT_MAX_TURN_ROUNDS: usize = 16;

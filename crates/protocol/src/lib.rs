@@ -12,7 +12,6 @@
 /// handshake report a value that cannot drift from the definitions it names.
 pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub mod command;
 pub mod config;
 pub mod context;
 pub mod discussion;
@@ -20,7 +19,6 @@ pub mod edit;
 pub mod errors;
 pub mod events;
 pub mod git;
-pub mod glob;
 pub mod history;
 pub mod lifecycle;
 pub mod locale;
@@ -29,7 +27,6 @@ pub mod methods;
 pub mod model;
 pub mod outer_docs;
 pub mod plan;
-pub mod project;
 pub mod review;
 
 // The crate root re-exports the wire contract explicitly rather than through
@@ -50,20 +47,13 @@ pub mod review;
 //
 // A small fixed set of pure helpers is deliberately module-scoped and stays
 // reachable only through its module paths: `edit::normalize_repo_path`,
-// `edit::ChangeConversionError`, and `discussion::normalize_repo_map_path`.
+// `discussion::normalize_repo_map_path`.
 // That test's module-scoped helper table is the authoritative record of the
 // exceptions, so a helper is never lifted to the root and a contract name is
 // never left behind at its module.
-pub use command::{
-    AbortCommand, BlockedCommand, CapabilityDelivery, CapabilityPhase, CapabilityTree,
-    CommitMessageCommand, ContextRequestCommand, CustomToolCommand, DirListCommand,
-    DocRequestCommand, DocTopic, LlmCapability, LlmCommand, OuterDocRequestCommand,
-    RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand, TextCommand,
-    TurnErrorCommand, TurnSkipCommand,
-};
 pub use config::{
-    ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
-    PatchStrategy, ReviewPresetSummary, SystemStatusResult, WorkflowKind,
+    ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, ReviewPresetSummary,
+    SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -71,16 +61,14 @@ pub use context::{
     ContextSetAccessParams, ContextState,
 };
 pub use discussion::{
-    custom_tool_call_schema, DirListRequest, DiscussionClearFocusParams,
     DiscussionClearFocusResult, DiscussionContextRequest, DiscussionFocus,
-    DiscussionFocusChangedEvent, DiscussionGetFocusParams, DiscussionGetFocusResult,
-    DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest, DiscussionResponse,
+    DiscussionFocusChangedEvent, DiscussionGetFocusResult, DiscussionRequest,
     DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget, RepoSearchRequest,
 };
 pub use edit::{
     EditCreate, EditDelete, EditFileDoneEvent, EditFileOp, EditFileRetryingEvent,
     EditFileStartedEvent, EditFileStatus, EditFinishedEvent, EditHunkEvent, EditLineAnchor,
-    EditMove, EditMoveDir, EditOperation, EditOutcome, EditOverwrite, EditProposal, EditReplace,
+    EditMove, EditMoveDir, EditOperation, EditOutcome, EditOverwrite, EditReplace,
     EditStartedEvent, StructuredChangeProposal, VerificationVerdict,
 };
 pub use errors::{
@@ -88,16 +76,15 @@ pub use errors::{
     COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED, CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED,
     EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, GROUP_UNRESOLVED_QUESTIONS, HISTORY_GET_FAILED,
     INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
-    INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
-    ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, MODULE_CONFLICT,
-    NEEDS_CONTEXT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND, NO_API_KEY, OPERATION_IN_PROGRESS,
-    PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
-    PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED,
-    PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED,
-    REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED,
-    REVIEW_PREVIEW_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED,
-    SQUASH_PREVIEW_FAILED, STEP_BLOCKED, STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED,
-    STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNDO_FAILED, UNEXPECTED_STATUS,
+    INVALID_PLAN_TREE, INVALID_REQUEST, ITEM_IN_DISCUSSION, ITEM_REJECTED, LIST_FILES_FAILED,
+    METHOD_NOT_FOUND, MODEL_ERROR, MODULE_CONFLICT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND,
+    NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED,
+    PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED,
+    PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED,
+    REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED,
+    REVIEW_LOAD_FAILED, REVIEW_PREVIEW_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
+    SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED, STEP_BLOCKED,
+    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION,
 };
 
 // The event and error namespaces both declare `MODEL_ERROR`: the RPC error code
@@ -124,7 +111,6 @@ pub use git::{
     GitSquashGenerateMessageResult, GitSquashPreviewParams, GitSquashPreviewResult,
     RepositoryInitParams, RepositoryInitResult, RepositoryListFilesResult, RepositoryState,
 };
-pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryEntryRolledBackEvent, HistoryEntryStatus,
     HistoryFileChange, HistoryGetParams, HistoryGetResult, TurnRoundRecord, UiHistoryItem,
@@ -136,17 +122,17 @@ pub use message::{
     Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response, ResponseError,
 };
 pub use model::{
-    deserialize_model_ref_lenient, ArchitectTier, BatchFinishStatus, BatchFinishSummary,
-    CancelMode, CoderTier, ModelAskParams, ModelCancelParams, ModelCatalogEntry, ModelChangedEvent,
-    ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent,
-    ModelEscalatedEvent, ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent,
-    ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
-    ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent, ModelStreamResetEvent,
-    ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent,
-    PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
-    ReviewBatchFinishedEvent, ReviewWorkPhase, StructuredAbortProposal, StructuredBlockedProposal,
-    StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
-    TurnPhaseEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue, UsageTotals, UsageTotalsSnapshot,
+    ArchitectTier, BatchFinishStatus, BatchFinishSummary, CancelMode, DocTopic, ModelAskParams,
+    ModelCancelParams, ModelCatalogEntry, ModelChangedEvent, ModelConnectionRetryingEvent,
+    ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent, ModelEscalatedEvent,
+    ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent, ModelResultProposal, ModelRole,
+    ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelectParams, ModelSelectResult,
+    ModelSelection, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
+    ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind,
+    ReasoningEffort, RepoMapInfoEvent, ReviewBatchFinishedEvent, ReviewWorkPhase,
+    StructuredAbortProposal, StructuredBlockedProposal, StructuredOutcomeProposal,
+    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent, TurnWorkContext,
+    TurnWorkItem, TurnWorkQueue, UsageTotals, UsageTotalsSnapshot,
 };
 
 pub use outer_docs::{
@@ -154,32 +140,23 @@ pub use outer_docs::{
     OuterDocsCacheRemoveResult,
 };
 pub use plan::{
-    compute_items_status, ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult,
-    PlanCreatePipelineParams, PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams,
-    PlanGetParams, PlanGetResult, PlanImplementation, PlanItem, PlanItemStatus,
-    PlanListChangedEvent, PlanListResult, PlanRefineParams, PlanRefineResult, PlanRejection,
-    PlanRejectionKind, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
-    PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult,
-    PlanUpdatedEvent, PlanValidationError,
-};
-pub use project::{
-    format_diagnostics, Diagnostic, DiagnosticSeverity, ProjectCommandSpec, ProjectConfig,
-    ProjectConfigError, ProjectHookOutcome, ProjectParameterSpec, ProjectPostHookResponse,
-    ResolvedProjectCommand, TaskRunnerKind,
+    ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult, PlanCreatePipelineParams,
+    PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams, PlanGetParams, PlanGetResult,
+    PlanImplementation, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
+    PlanRefineParams, PlanRefineResult, PlanRejection, PlanRejectionKind, PlanReplanParams,
+    PlanSaveParams, PlanSetActiveParams, PlanSummary, PlanUpdateItemParams, PlanUpdatedEvent,
 };
 pub use review::{
-    ArchitecturalIssueGroup, IssueStatus, IssueType, PostAnalysisGroupOutput, PostAnalysisMode,
-    PostAnalysisOutput, PostAnalysisTriageOutput, ReviewAnalyzeFinishedEvent, ReviewAnalyzeParams,
-    ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewCancelParams, ReviewContentDeltaEvent,
-    ReviewDecisionStatus, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
+    ArchitecturalIssueGroup, IssueStatus, IssueType, PostAnalysisMode, ReviewAnalyzeFinishedEvent,
+    ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewCancelParams,
+    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
     ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewGroup,
     ReviewGroupFinishedEvent, ReviewGroupKind, ReviewGroupStartedEvent, ReviewIssue, ReviewItem,
-    ReviewItemStatus, ReviewLaunchConfig, ReviewListChangedEvent, ReviewListParams,
-    ReviewListResult, ReviewPostAnalysis, ReviewPreviewGroup, ReviewPreviewParams,
-    ReviewPreviewResult, ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewSession,
-    ReviewSeverity, ReviewStartParams, ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams,
-    ReviewUpdateItemResult, ReviewUpdateProposal, ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID,
-    LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
+    ReviewItemStatus, ReviewLaunchConfig, ReviewListChangedEvent, ReviewListResult,
+    ReviewPostAnalysis, ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult,
+    ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity,
+    ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
 };
 
 pub use review::{
@@ -249,7 +226,6 @@ mod wire_contract_tracking {
             "doc_requests",
         ),
         // command.rs
-        ("command.rs", "LlmCommand::DocRequest", "doc_request"),
         // context.rs
         ("context.rs", "ContextLayer::OuterDocs", "refs"),
     ];
@@ -271,16 +247,11 @@ mod wire_contract_tracking {
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("lib.rs", include_str!("lib.rs")),
         ("methods.rs", include_str!("methods.rs")),
-        (
-            "command/capability.rs",
-            include_str!("command/capability.rs"),
-        ),
-        ("command/topic.rs", include_str!("command/topic.rs")),
+        ("model/topic.rs", include_str!("model/topic.rs")),
         (
             "discussion/normalize.rs",
             include_str!("discussion/normalize.rs"),
         ),
-        ("discussion/schema.rs", include_str!("discussion/schema.rs")),
         ("edit/operation.rs", include_str!("edit/operation.rs")),
         ("edit/proposal.rs", include_str!("edit/proposal.rs")),
         ("model/batch.rs", include_str!("model/batch.rs")),
@@ -300,10 +271,7 @@ mod wire_contract_tracking {
         ("plan/item.rs", include_str!("plan/item.rs")),
         ("plan/node.rs", include_str!("plan/node.rs")),
         ("plan/rejection.rs", include_str!("plan/rejection.rs")),
-        ("plan/render.rs", include_str!("plan/render.rs")),
         ("plan/tests.rs", include_str!("plan/tests.rs")),
-        ("project/config.rs", include_str!("project/config.rs")),
-        ("review/analysis.rs", include_str!("review/analysis.rs")),
         ("review/dto.rs", include_str!("review/dto.rs")),
         ("review/events.rs", include_str!("review/events.rs")),
         ("review/group.rs", include_str!("review/group.rs")),
@@ -572,7 +540,6 @@ mod wire_contract_tracking {
     /// the bytes the compiler does: no runtime I/O and no dependency added to
     /// this leaf crate.
     const FACADE_SOURCES: &[(&str, &str)] = &[
-        ("command", include_str!("command.rs")),
         ("config", include_str!("config.rs")),
         ("context", include_str!("context.rs")),
         ("discussion", include_str!("discussion.rs")),
@@ -580,7 +547,6 @@ mod wire_contract_tracking {
         ("errors", include_str!("errors.rs")),
         ("events", include_str!("events.rs")),
         ("git", include_str!("git.rs")),
-        ("glob", include_str!("glob.rs")),
         ("history", include_str!("history.rs")),
         ("lifecycle", include_str!("lifecycle.rs")),
         ("locale", include_str!("locale.rs")),
@@ -588,7 +554,6 @@ mod wire_contract_tracking {
         ("model", include_str!("model.rs")),
         ("outer_docs", include_str!("outer_docs.rs")),
         ("plan", include_str!("plan.rs")),
-        ("project", include_str!("project.rs")),
         ("review", include_str!("review.rs")),
     ];
 
@@ -606,7 +571,6 @@ mod wire_contract_tracking {
     /// can only shrink.
     const MODULE_SCOPED_HELPERS: &[(&str, &str)] = &[
         ("discussion", "normalize_repo_map_path"),
-        ("edit", "ChangeConversionError"),
         ("edit", "normalize_repo_path"),
     ];
 

@@ -1,250 +1,46 @@
-//! Discussion prompt construction for model turns.
-//!
-//! A structured discussion turn and a focused interactive turn are both built
-//! here: the typed discussion target decides the prompt text and the dialogue
-//! branch the turn advertises, so neither is ever inferred from the prompt body.
-
-use std::sync::Arc;
-
-use tauqe_protocol::{
-    DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams, ResponseError,
-};
-
-use crate::handlers::offload;
+//! RPC adaptation for core-owned model ask preparation.
+use crate::contracts::Project;
 use crate::state::AppState;
+use std::sync::Arc;
+use tauqe_core::api::{DiscussionPromptError, ModelAskInput};
+use tauqe_protocol::{DiscussionTarget, ModelAskParams, ResponseError};
 
-/// Prompt and anchored dialogue branch resolved for a model ask request.
-///
-/// The branch is the typed value the turn's capability surface is derived from:
-/// a plan anchor declares plan mutation, and a review anchor — a finding dialogue
-/// and a group dialogue alike — declares the recorded decision. Nothing here is
-/// inferred from the prompt body, so text that merely resembles a discussion
-/// heading can never widen the surface of a turn.
 #[derive(Debug)]
 pub(super) struct ModelAskTurn {
-    /// Prompt text the turn sends.
     pub(super) prompt: String,
-    /// Dialogue branch the request anchored on, if any.
     pub(super) focus: Option<DiscussionTarget>,
 }
 
-/// Resolves the turn prompt and its anchored dialogue branch for a model ask.
-///
-/// A structured discussion turn carries its target explicitly, so the server
-/// generates the discussion prompt from those typed fields and replaces the
-/// focus anchor. A plain ask continues the anchored discussion instead: while a
-/// focus is active, the current state of the focused plan or review session is
-/// injected into the prompt on every turn.
 pub(super) async fn build_model_ask_prompt(
     state: &Arc<AppState>,
     params: ModelAskParams,
 ) -> Result<ModelAskTurn, ResponseError> {
-    match params {
-        ModelAskParams::Discussion(discussion) => {
-            let prompt = build_discussion_prompt(
-                state,
-                &discussion.target,
-                &discussion.focused_items,
-                &discussion.comment,
-            )
-            .await?;
-            // An explicit discussion target immediately replaces the focus
-            // anchor without resetting the REPL history.
-            state
-                .set_discussion_focus(focus_from_target(&discussion))
-                .await;
-            Ok(ModelAskTurn {
-                prompt,
-                focus: Some(discussion.target),
-            })
-        }
-        ModelAskParams::Prompt { text } => {
-            if text.trim().is_empty() {
-                return Err(ResponseError {
-                    code: tauqe_protocol::errors::INVALID_PARAMS.to_string(),
-                    message: "Model ask requires a non-empty prompt or a discussion target"
-                        .to_string(),
-                    data: None,
-                });
-            }
-            match focus_to_target(&state.discussion_focus().await) {
-                Some((target, focused_items)) => {
-                    match build_discussion_prompt(state, &target, &focused_items, &text).await {
-                        Ok(prompt) => Ok(ModelAskTurn {
-                            prompt,
-                            focus: Some(target),
-                        }),
-                        Err(err) => {
-                            // The focused entity is gone (for example the plan
-                            // was deleted elsewhere): drop the stale anchor and
-                            // answer the raw prompt instead of failing the turn.
-                            tracing::warn!(
-                                "Discussion focus target could not be loaded ({}); clearing focus",
-                                err.message
-                            );
-                            state.clear_discussion_focus().await;
-                            Ok(ModelAskTurn {
-                                prompt: text,
-                                focus: None,
-                            })
-                        }
-                    }
-                }
-                None => Ok(ModelAskTurn {
-                    prompt: text,
-                    focus: None,
-                }),
-            }
-        }
+    let input = match params {
+        ModelAskParams::Prompt { text } => ModelAskInput::Prompt { text },
+        ModelAskParams::Discussion(request) => ModelAskInput::Discussion {
+            target: request.target.project(),
+            focused_items: request.focused_items,
+            comment: request.comment,
+        },
+    };
+    let root = state.repo_root().await;
+    let prepared = state
+        .application
+        .prepare_model_ask(&root, input)
+        .await
+        .map_err(|error| {
+            let code = match &error {
+                DiscussionPromptError::InvalidInput => tauqe_protocol::errors::INVALID_PARAMS,
+                DiscussionPromptError::NotFound(_) => tauqe_protocol::errors::NOT_FOUND,
+                DiscussionPromptError::Storage(_) => tauqe_protocol::errors::INTERNAL_ERROR,
+            };
+            ResponseError::new(code, error.to_string())
+        })?;
+    if let Some(update) = prepared.focus_update {
+        state.publish_focus_update(update);
     }
-}
-
-/// Maps an explicit discussion target onto the focus anchor it establishes.
-fn focus_from_target(discussion: &DiscussionRequest) -> DiscussionFocus {
-    DiscussionFocus::from_target(discussion.target.clone(), discussion.focused_items.clone())
-}
-
-/// Maps an active focus anchor onto the discussion target it addresses.
-///
-/// Returns `None` for the free (unfocused) mode, so a plain prompt stays as-is.
-fn focus_to_target(focus: &DiscussionFocus) -> Option<(DiscussionTarget, Vec<String>)> {
-    focus
-        .target()
-        .map(|target| (target.clone(), focus.focused_items().to_vec()))
-}
-
-/// Builds the discussion prompt for a typed target, loading the referenced plan
-/// or review session from storage.
-///
-/// A group target resolves the session that declares the group and renders the
-/// cause the group states, the blocker recorded on it, and every finding that
-/// manifests it, so the dialogue addresses the group as one operational unit
-/// instead of restating its symptoms one by one.
-async fn build_discussion_prompt(
-    state: &Arc<AppState>,
-    target: &DiscussionTarget,
-    focused_items: &[String],
-    comment: &str,
-) -> Result<String, ResponseError> {
-    let repo_root = state.repo_root().await;
-    match target {
-        DiscussionTarget::Plan { id } => {
-            let loaded = {
-                let repo_root = repo_root.clone();
-                let id = id.clone();
-                offload(move || tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, &id))
-                    .await
-                    .map_err(internal_error)?
-            };
-            let plan = match loaded {
-                Ok(Some(plan)) => plan,
-                Ok(None) => return Err(not_found(format!("Plan '{}' not found", id))),
-                Err(err) => return Err(internal_error(format!("{:#}", err))),
-            };
-            Ok(tauqe_core::plan::prompt::format_plan_discussion_prompt(
-                &plan,
-                focused_items,
-                comment,
-            ))
-        }
-        DiscussionTarget::Review { id } => {
-            let loaded = {
-                let repo_root = repo_root.clone();
-                let id = id.clone();
-                offload(move || {
-                    tauqe_core::review::storage::ReviewStorage::load_review(&repo_root, &id)
-                })
-                .await
-                .map_err(internal_error)?
-            };
-            let session = match loaded {
-                Ok(Some(session)) => session,
-                Ok(None) => return Err(not_found(format!("Review session '{}' not found", id))),
-                Err(err) => return Err(internal_error(format!("{:#}", err))),
-            };
-            let focused: Vec<u32> = focused_items
-                .iter()
-                .filter_map(|raw| raw.trim().parse::<u32>().ok())
-                .collect();
-            Ok(
-                tauqe_core::review::prompt::format_review_discussion_prompt_items(
-                    &session, &focused, comment,
-                ),
-            )
-        }
-        DiscussionTarget::ReviewGroup {
-            session_id,
-            group_id,
-        } => {
-            let loaded = {
-                let repo_root = repo_root.clone();
-                let id = session_id.clone();
-                offload(move || {
-                    tauqe_core::review::storage::ReviewStorage::load_review(&repo_root, &id)
-                })
-                .await
-                .map_err(internal_error)?
-            };
-            let session = match loaded {
-                Ok(Some(session)) => session,
-                Ok(None) => {
-                    return Err(not_found(format!(
-                        "Review session '{}' not found",
-                        session_id
-                    )))
-                }
-                Err(err) => return Err(internal_error(format!("{:#}", err))),
-            };
-            let group = match session
-                .effective_groups()
-                .into_iter()
-                .find(|group| group.id == group_id.as_str())
-            {
-                Some(group) => group,
-                None => {
-                    return Err(not_found(format!(
-                        "Review group '{}' not found in session '{}'",
-                        group_id, session_id
-                    )))
-                }
-            };
-            // A group dialogue speaks for the whole group, so it carries every
-            // finding that manifests the cause instead of a selection of them.
-            // Membership follows the effective group of a finding: a finding
-            // that stores no group belongs to the implicit default group.
-            let findings: Vec<tauqe_protocol::review::ReviewItem> = session
-                .items
-                .iter()
-                .filter(|item| {
-                    let owner = item
-                        .group
-                        .as_deref()
-                        .unwrap_or(tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID);
-                    owner == group_id.as_str()
-                })
-                .cloned()
-                .collect();
-            Ok(
-                tauqe_core::review::prompt::format_review_group_discussion_prompt(
-                    &session, &group, &findings, comment,
-                ),
-            )
-        }
-    }
-}
-
-fn not_found(message: String) -> ResponseError {
-    ResponseError {
-        code: tauqe_protocol::errors::NOT_FOUND.to_string(),
-        message,
-        data: None,
-    }
-}
-
-fn internal_error(message: String) -> ResponseError {
-    ResponseError {
-        code: tauqe_protocol::errors::INTERNAL_ERROR.to_string(),
-        message,
-        data: None,
-    }
+    Ok(ModelAskTurn {
+        prompt: prepared.prompt,
+        focus: prepared.focus.map(Project::project),
+    })
 }

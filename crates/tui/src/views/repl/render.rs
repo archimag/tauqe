@@ -6,6 +6,7 @@ use tauqe_protocol::model::{
     ModelTurnPlanContext, ReviewWorkPhase, TurnWorkContext, TurnWorkItem, TurnWorkQueue,
 };
 use tauqe_protocol::{DiscussionFocus, DiscussionTarget};
+use tauqe_tui::projection::*;
 
 use crate::app::AppState;
 use crate::i18n::active_t;

@@ -1,6 +1,7 @@
 //! `review/start`: streamed synthesis, cancellation, and attempt withdrawal.
 
 use std::sync::Arc;
+use tauqe_core::context::ContextAccess;
 
 use super::super::{handle_review_cancel, handle_review_start};
 use super::{
@@ -12,7 +13,7 @@ use crate::transport::OutChannel;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{events, ContextAccess, Request};
+use tauqe_protocol::{events, Request};
 use tokio::sync::{mpsc, watch};
 
 #[tokio::test]
@@ -22,21 +23,21 @@ async fn test_handle_review_start_defaults_to_reviewer_role() {
     std::fs::write(&target_file, "fn foo() {}\n").unwrap();
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.models.reviewer = Some(vec![tauqe_protocol::ModelRef::openrouter(
+    config.models.reviewer = Some(vec![tauqe_core::models::ModelRef::openrouter(
         "test/reviewer-model",
     )
     .into()]);
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
+    config.models.repl =
+        vec![tauqe_core::models::ModelRef::openrouter("test/primary-model").into()];
 
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
 
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     let req = Request {
@@ -70,10 +71,9 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
     *state.provider_override.lock().await = Some(provider);
 
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     let req = Request {
@@ -130,7 +130,7 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
     );
     assert_eq!(session.items.len(), 1);
     let issues = session.issues();
-    assert_eq!(issues[0].issue_type, tauqe_protocol::IssueType::Bug);
+    assert_eq!(issues[0].issue_type, tauqe_core::review::IssueType::Bug);
 }
 
 #[tokio::test]
@@ -225,8 +225,8 @@ struct StreamCancellingProvider;
 
 #[async_trait::async_trait]
 impl LlmProvider for StreamCancellingProvider {
-    fn kind(&self) -> tauqe_protocol::ProviderKind {
-        tauqe_protocol::ProviderKind::OpenRouter
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
     }
 
     async fn stream_chat(
@@ -259,10 +259,9 @@ async fn test_review_start_surfaces_stream_cancelled_event() {
     *state.provider_override.lock().await = Some(Arc::new(StreamCancellingProvider));
 
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     let req = Request {
@@ -328,10 +327,9 @@ async fn test_review_start_withdraws_the_aborted_attempt_before_the_retry() {
     *state.provider_override.lock().await = Some(provider);
 
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     let req = Request {
@@ -437,10 +435,9 @@ async fn test_review_start_withholds_the_summary_until_the_outbound_queue_drains
     );
     *state.provider_override.lock().await = Some(provider);
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     // The client keeps its pipe open but stopped reading, so the queue already
@@ -524,10 +521,9 @@ async fn test_review_start_cancellation_releases_the_stalled_relay() {
     );
     *state.provider_override.lock().await = Some(provider);
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     stall_outbound_transport(&state);

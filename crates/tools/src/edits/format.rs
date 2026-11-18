@@ -28,10 +28,11 @@
 //! therefore handed to the blocking pool of the runtime instead of running on
 //! an executor thread, so a large change set never stalls the tasks that share
 //! the runtime with the turn.
+use crate::toolchain::config::ProjectConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauqe_protocol::{ContextState, EditOperation, ProjectConfig};
+use crate::edits::operation::EditOperation;
 use tokio::sync::watch;
 
 use super::change_set::{
@@ -57,32 +58,10 @@ use crate::toolchain::{resolve_formatter, FormatterResolution};
 /// attempt stops the filter instead of waiting for it. A repository that declares
 /// no filter keeps the authored content, and a filter that fails or times out
 /// does the same: a broken formatter never blocks a turn.
-pub async fn prepare_staged_edits_with_config(
-    repo_root: &Path,
-    project: &ProjectConfig,
-    context: &ContextState,
-    edits: &[EditOperation],
-    initial_staged: Option<&StagedEditsState>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
-) -> StageEditsResult {
-    prepare_staged_edits_with_config_and_validator(
-        repo_root,
-        project,
-        context,
-        edits,
-        initial_staged,
-        None,
-        cancel_rx,
-    )
-    .await
-}
-
-/// Stages edits, hands every staged file to `config_validator`, and formats the
-/// result in memory.
 pub async fn prepare_staged_edits_with_config_and_validator(
     repo_root: &Path,
     project: &ProjectConfig,
-    context: &ContextState,
+    context: &[String],
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
     config_validator: Option<StagedConfigValidator>,
@@ -110,7 +89,7 @@ pub async fn prepare_staged_edits_with_config_and_validator(
 struct StagingInputs {
     repo_root: PathBuf,
     project: ProjectConfig,
-    context: ContextState,
+    context: Vec<String>,
     edits: Vec<EditOperation>,
     initial_staged: Option<StagedEditsState>,
 }
@@ -120,14 +99,14 @@ impl StagingInputs {
     fn new(
         repo_root: &Path,
         project: &ProjectConfig,
-        context: &ContextState,
+        context: &[String],
         edits: &[EditOperation],
         initial_staged: Option<&StagedEditsState>,
     ) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
             project: project.clone(),
-            context: context.clone(),
+            context: context.to_vec(),
             edits: edits.to_vec(),
             initial_staged: initial_staged.cloned(),
         }
@@ -276,7 +255,7 @@ async fn format_staged_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, EditReplace};
+    use crate::edits::operation::EditReplace;
 
     /// The repository configuration file the filters rewrite.
     const CONFIG_PATH: &str = "tauqe.toml";
@@ -307,19 +286,8 @@ mod tests {
     }
 
     /// Builds the context snapshot that holds the staged configuration file.
-    fn context_state() -> ContextState {
-        ContextState {
-            revision: 1,
-            items: vec![ContextItem {
-                path: CONFIG_PATH.to_string(),
-                access: ContextAccess::Editable,
-                size_bytes: ORIGINAL_CONFIG.len() as u64,
-                estimated_tokens: 1,
-                layer: ContextLayer::User,
-                insertion_seq: 1,
-            }],
-            total_estimated_tokens: 1,
-        }
+    fn context_state() -> Vec<String> {
+        vec![CONFIG_PATH.to_string()]
     }
 
     /// Returns the exact staged bytes of `path`.
@@ -452,28 +420,7 @@ mod tests {
         let project = project_config(
             r#"{"format": {"command": "sh", "args": ["-c", "content=$(cat); case \"$content\" in pub*) echo refused >&2; exit 3;; esac; echo \"$content\" | tr a-z A-Z"]}}"#,
         );
-        let context = ContextState {
-            revision: 1,
-            items: vec![
-                ContextItem {
-                    path: CONFIG_PATH.to_string(),
-                    access: ContextAccess::Editable,
-                    size_bytes: ORIGINAL_CONFIG.len() as u64,
-                    estimated_tokens: 1,
-                    layer: ContextLayer::User,
-                    insertion_seq: 1,
-                },
-                ContextItem {
-                    path: HELPER_PATH.to_string(),
-                    access: ContextAccess::Editable,
-                    size_bytes: ORIGINAL_HELPER.len() as u64,
-                    estimated_tokens: 1,
-                    layer: ContextLayer::User,
-                    insertion_seq: 2,
-                },
-            ],
-            total_estimated_tokens: 2,
-        };
+        let context = vec![CONFIG_PATH.to_string(), HELPER_PATH.to_string()];
         let edits = [
             EditOperation::Replace(EditReplace {
                 path: CONFIG_PATH.to_string(),
@@ -569,28 +516,7 @@ mod tests {
         let project = project_config(
             r#"{"format": {"command": "sh", "args": ["-c", "printf '# %s\\n' \"$TAUQE_FILE_PATH\"; cat"]}}"#,
         );
-        let context = ContextState {
-            revision: 1,
-            items: vec![
-                ContextItem {
-                    path: CONFIG_PATH.to_string(),
-                    access: ContextAccess::Editable,
-                    size_bytes: ORIGINAL_CONFIG.len() as u64,
-                    estimated_tokens: 1,
-                    layer: ContextLayer::User,
-                    insertion_seq: 1,
-                },
-                ContextItem {
-                    path: HELPER_PATH.to_string(),
-                    access: ContextAccess::Editable,
-                    size_bytes: ORIGINAL_HELPER.len() as u64,
-                    estimated_tokens: 1,
-                    layer: ContextLayer::User,
-                    insertion_seq: 2,
-                },
-            ],
-            total_estimated_tokens: 2,
-        };
+        let context = vec![CONFIG_PATH.to_string(), HELPER_PATH.to_string()];
         let edits = [
             EditOperation::Replace(EditReplace {
                 path: CONFIG_PATH.to_string(),

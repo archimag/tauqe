@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::history::{HistoryManager, HistorySnapshot};
 use crate::prompt::ContextBlockCache;
 
 /// Per-turn memoization of deterministic proposal inputs.
@@ -21,14 +20,6 @@ pub struct TurnInputCache {
     /// `Some` marks the map as generated, so an empty map is frozen as well
     /// instead of being recomputed on every round.
     repo_map: Option<FrozenRepoMap>,
-    /// History records captured on the first proposal round of the turn.
-    ///
-    /// `Some` marks the history as resolved, so an absent or empty history is
-    /// frozen as well instead of re-reading history.jsonl on each round. The
-    /// snapshot keeps the records rather than the rendered block, so every
-    /// layout reads the same structural material.
-    #[allow(dead_code)]
-    history: Option<std::sync::Arc<HistorySnapshot>>,
     /// Body of every context file this turn has already read.
     ///
     /// A round renders the context it was handed, and within one turn that body
@@ -44,7 +35,7 @@ pub struct TurnInputCache {
     /// instead of re-walking the tracked file list on every round.
     repo_dirs: Option<FrozenRepoDirs>,
     /// Project configuration frozen on the first proposal round of the turn.
-    project: Option<tauqe_protocol::ProjectConfig>,
+    project: Option<crate::config::project::ProjectConfig>,
     /// Rendered context elements captured across the rounds of the turn.
     ///
     /// The memo keeps the rendering of every file that already entered the
@@ -108,9 +99,9 @@ struct MemoizedContextFile {
 fn context_item_disk_path(
     repo_root: &Path,
     path: &str,
-    layer: tauqe_protocol::ContextLayer,
+    layer: crate::context::ContextLayer,
 ) -> PathBuf {
-    if layer == tauqe_protocol::ContextLayer::OuterDocs
+    if layer == crate::context::ContextLayer::OuterDocs
         && !crate::outer_docs::is_outer_docs_cache_path(path)
     {
         repo_root
@@ -197,54 +188,6 @@ impl TurnInputCache {
         map
     }
 
-    /// Returns the interaction records frozen at the start of the turn.
-    ///
-    /// A contour that carries no growing dialogue history never calls this method
-    /// and therefore freezes nothing: an isolated step and an Architect synthesis
-    /// both qualify. For a dialogue the first call reads the session records off
-    /// the executor thread and freezes them; every later round reuses that exact
-    /// vector without hitting disk or re-parsing JSONL records. The freeze is
-    /// structural: the semantic layout renders the `<history>` block from it
-    /// byte for byte, and the chronological layout reads the recorded context
-    /// watermarks from the same material. Records appended while the turn runs
-    /// never reach the snapshot, so the prompt prefix stays byte-identical.
-    #[allow(dead_code)]
-    pub(crate) async fn history_snapshot(
-        &mut self,
-        history_manager: &HistoryManager,
-    ) -> Option<std::sync::Arc<HistorySnapshot>> {
-        if self.history.is_none() {
-            let snapshot = Self::resolve_history(history_manager).await;
-            self.history = Some(std::sync::Arc::new(snapshot));
-        }
-        self.history
-            .as_ref()
-            .filter(|snapshot| !snapshot.is_empty())
-            .cloned()
-    }
-
-    /// Reads the session records a dialogue turn freezes for its whole duration.
-    #[allow(dead_code)]
-    async fn resolve_history(history_manager: &HistoryManager) -> HistorySnapshot {
-        let hm = history_manager.clone();
-        match crate::blocking::run_blocking_async(move || hm.snapshot()).await {
-            Ok(Ok(snapshot)) => snapshot,
-            // A history that could not be read is not an empty history: the
-            // degradation is recorded before it is treated as absent.
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to read the session history; the turn proceeds without it"
-                );
-                HistorySnapshot::default()
-            }
-            Err(join_error) => {
-                crate::blocking::log_join_error(&join_error, "session history reading");
-                HistorySnapshot::default()
-            }
-        }
-    }
-
     /// Returns the compact directory outline frozen at the start of the turn.
     ///
     /// The tree is derived only from the tracked file list, so it is rendered
@@ -309,7 +252,7 @@ impl TurnInputCache {
         &mut self,
         repo_root: &Path,
         cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
-    ) -> tauqe_protocol::ProjectConfig {
+    ) -> crate::config::project::ProjectConfig {
         if let Some(project) = &self.project {
             return project.clone();
         }
@@ -339,7 +282,7 @@ impl TurnInputCache {
     pub(crate) async fn context_files(
         &mut self,
         repo_root: &Path,
-        items: &[tauqe_protocol::ContextItem],
+        items: &[crate::context::ContextItem],
     ) -> anyhow::Result<Vec<crate::context::ContextFileContent>> {
         let mut memoized: Vec<(String, PathBuf)> = Vec::new();
         let mut to_read: Vec<(String, PathBuf)> = Vec::new();
@@ -431,6 +374,7 @@ impl TurnInputCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
 
     /// The context memo reads a file once per turn and re-reads it only when the
     /// bytes on disk moved: a discovery addition costs one read, and a change set
@@ -439,7 +383,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_files_are_read_once_and_refreshed_when_the_bytes_move() {
         use crate::context::ContextManager;
-        use tauqe_protocol::ContextAccess;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -492,7 +435,8 @@ mod tests {
         use crate::context::ContextFileContent;
         use crate::prompt::json::JsonPromptProtocol;
         use crate::prompt::PromptAssembly;
-        use tauqe_protocol::{ContextAccess, EditProtocolKind, PatchStrategy};
+        use crate::workflow::EditProtocolKind;
+        use crate::workflow::PatchStrategy;
 
         let file = |path: &str, content: &str| ContextFileContent {
             path: path.to_string(),
@@ -622,42 +566,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn history_snapshot_is_frozen_across_rounds() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let mut history_manager = HistoryManager::new(root);
-        history_manager
-            .record_turn("Original prompt", vec!["a.rs".to_string()])
-            .unwrap();
-
-        let mut cache = TurnInputCache::default();
-        let first = cache
-            .history_snapshot(&history_manager)
-            .await
-            .expect("first round resolves history");
-        // The frozen records render exactly the block the live history would
-        // have produced at that moment.
-        let block = crate::history::render_history_block(first.entries())
-            .expect("the frozen records render");
-        assert_eq!(block, history_manager.format_history_tag().unwrap());
-        assert!(block.contains("Original prompt"));
-
-        // A record appended while the turn runs never reaches the snapshot.
-        history_manager
-            .record_turn("Subsequent prompt", vec!["b.rs".to_string()])
-            .unwrap();
-
-        let second = cache
-            .history_snapshot(&history_manager)
-            .await
-            .expect("second round reuses frozen history");
-        assert_eq!(second, first);
-        assert!(!crate::history::render_history_block(second.entries())
-            .expect("the frozen records render")
-            .contains("Subsequent prompt"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn directory_outline_is_frozen_across_rounds() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -686,53 +594,6 @@ mod tests {
         );
     }
 
-    /// The freeze is structural: the context watermarks the frozen turn
-    /// records observed stay readable for the whole turn, even after the live
-    /// history moved on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_snapshot_keeps_the_recorded_turn_watermarks() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let storage = crate::history::SessionStorage::new(root.clone());
-        storage
-            .append_entry(&crate::history::HistoryEntry::Turn {
-                id: Some(1),
-                prompt: "Original prompt".to_string(),
-                context: vec![],
-                context_watermark: Some(12),
-                rounds: Vec::new(),
-            })
-            .unwrap();
-        let history_manager = HistoryManager::new(root);
-
-        let mut cache = TurnInputCache::default();
-        let frozen = cache
-            .history_snapshot(&history_manager)
-            .await
-            .expect("the turn freezes its history");
-        assert_eq!(frozen.watermark(), Some(12));
-        assert!(matches!(
-            frozen.entries(),
-            [crate::history::HistoryEntry::Turn { .. }]
-        ));
-
-        // The live history keeps growing while the frozen structure stays the
-        // material this turn renders and interleaves from.
-        storage
-            .append_entry(&crate::history::HistoryEntry::Turn {
-                id: Some(2),
-                prompt: "Later prompt".to_string(),
-                context: vec![],
-                context_watermark: Some(20),
-                rounds: Vec::new(),
-            })
-            .unwrap();
-        let again = cache
-            .history_snapshot(&history_manager)
-            .await
-            .expect("the frozen snapshot is reused");
-        assert_eq!(again.watermark(), Some(12));
-    }
     /// A repository whose tracked file list cannot be resolved must degrade
     /// observably: the outline is frozen as absent for the rest of the turn
     /// and the failed listing leaves a warn record, so the degradation never

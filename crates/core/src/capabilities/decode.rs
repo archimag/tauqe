@@ -5,18 +5,28 @@
 //! tree so every leaf reads its property from the exact object level the
 //! composed schema declared.
 
-use serde::Deserialize;
-use serde_json::Value;
-use tauqe_protocol::discussion::normalize_repo_map_path;
-use tauqe_protocol::review::ReviewUpdateProposal;
-use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextAccess,
-    ContextRequestCommand, CustomToolCommand, DirListCommand, DirListRequest, DiscussionPlanAction,
-    DiscussionPlanUpdate, DocRequestCommand, DocTopic, EditFileOp, LlmCapability, LlmCommand,
-    OuterDocRequestCommand, PatchStrategy, RepoDirsCommand, RepoMapCommand, RepoSearchCommand,
-    RepoSearchRequest, ScratchpadCommand, StructuredChangeProposal, TextCommand, TurnErrorCommand,
+#[cfg(test)]
+use crate::config::project::ProjectConfig;
+use crate::context::ContextAccess;
+use crate::edits::EditFileOp;
+use crate::edits::StructuredChangeProposal;
+use crate::llm::discussion::normalize_repo_map_path;
+use crate::llm::discussion::DirListRequest;
+use crate::llm::discussion::RepoSearchRequest;
+use crate::llm::CapabilityTree;
+use crate::llm::DocTopic;
+use crate::llm::LlmCapability;
+use crate::llm::{
+    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
+    DirListCommand, DocRequestCommand, LlmCommand, OuterDocRequestCommand, RepoDirsCommand,
+    RepoMapCommand, RepoSearchCommand, ScratchpadCommand, TextCommand, TurnErrorCommand,
     TurnSkipCommand,
 };
+use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
+use crate::review::ReviewUpdateProposal;
+use crate::workflow::PatchStrategy;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::capabilities::PromptRenderContext;
 use crate::edits::protocol::utils::normalize_content;
@@ -222,7 +232,7 @@ fn decode_changes_for_op(node: &Value, allowed_ops: &[EditFileOp]) -> Vec<LlmCom
         resolved.old_text = normalize_content(&change.old_text);
         resolved.new_text = normalize_content(&change.new_text);
         resolved.content = normalize_content(&change.content);
-        match resolved.to_edit_command() {
+        match resolved.to_edit_operation_typed().map(LlmCommand::from) {
             Ok(command) => {
                 if let Ok(op) = resolved.parsed_op() {
                     if allowed_ops.contains(&op) {
@@ -467,11 +477,14 @@ fn decode_custom_tools(node: &Value) -> Vec<LlmCommand> {
 mod tests {
     use super::*;
     use crate::capabilities::capability_expr_schema;
+    use crate::edits::EditCreate;
+    use crate::edits::EditDelete;
+    use crate::edits::EditLineAnchor;
+    use crate::edits::EditMove;
+    use crate::edits::EditMoveDir;
+    use crate::edits::EditOverwrite;
+    use crate::edits::EditReplace;
     use serde_json::json;
-    use tauqe_protocol::{
-        EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOverwrite, EditReplace,
-        ProjectConfig,
-    };
 
     fn project_with_command() -> ProjectConfig {
         serde_json::from_str(r#"{"commands": {"check": {"command": "just", "args": ["check"]}}}"#)
@@ -798,7 +811,7 @@ mod tests {
     fn decodes_the_plan_payload_through_the_plan_action_union() {
         let ctx = PromptRenderContext::new(&[], None);
         let surface = crate::control::repl::repl_capability_expr(Some(
-            &tauqe_protocol::DiscussionTarget::Plan { id: "p-1".into() },
+            &crate::discussion::DiscussionTarget::Plan { id: "p-1".into() },
         ));
 
         let create = json!({

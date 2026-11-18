@@ -1,58 +1,31 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
+#[cfg(test)]
+use tauqe_core::providers::LlmProvider;
 use tauqe_protocol::{
-    errors, events, Event, GitDiffParams, GitDiffResult, ModelRole, RepositoryListFilesResult,
-    Request, Response,
+    errors, events, Event, GitDiffParams, GitDiffResult, RepositoryListFilesResult, Request,
+    Response,
 };
 
-use crate::reap::{abort_and_reap, await_bounded, Awaited};
 use crate::state::AppState;
-use crate::usage::UsageGuard;
 
-/// Distinguishes a failure while reading the commit list from a failure while
-/// squashing, so each maps to the correct client error code.
-enum SquashApplyError {
-    Commits(anyhow::Error),
-    Squash(anyhow::Error),
-}
-
-/// The rejection message shared by every endpoint that accepts a revision.
-const INVALID_REVISION: &str =
-    "Invalid revision: expected a non-empty revision not starting with '-'";
-
-/// Trims and validates a client-supplied Git revision.
-///
-/// Git parses an argument that begins with `-` as an option rather than as a
-/// revision, so a client-controlled `base_ref` such as `--output=<path>` or
-/// `-x` would be forwarded by `git log`, `git diff`, and `git reset --soft` as
-/// an option: argument injection into the Git invocation, carrying whatever
-/// side effects the reachable options permit, instead of a plain
-/// invalid-revision failure.
-///
-/// The core Git layer provides no conforming revision check the daemon could
-/// rely on instead (Conventions §1.6): `crates/core/src/git/diff.rs` builds its
-/// revision ranges with `format!("{base_ref}..HEAD")` and hands the value to
-/// `git reset --soft` verbatim. The boundary that accepts the untrusted string
-/// is therefore the only place the rule can live, and every handler that takes
-/// a `base_ref` or a `commit` off the wire routes through this single gate, so
-/// the same input is refused identically on all of them.
-fn validate_revision(base_ref: &str) -> Result<String, &'static str> {
-    let trimmed = base_ref.trim();
-    if trimmed.is_empty() || trimmed.starts_with('-') {
-        return Err(INVALID_REVISION);
+/// Converts the Git snapshot at the RPC boundary.
+pub(super) fn repository_dto(
+    state: tauqe_core::api::RepositoryState,
+) -> tauqe_protocol::RepositoryState {
+    tauqe_protocol::RepositoryState {
+        root: state.root,
+        branch: state.branch,
+        head: state.head,
+        dirty: state.dirty,
     }
-    Ok(trimmed.to_string())
 }
 
 pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_root = state.repo_root().await;
-    match super::offload(move || tauqe_core::git::get_repository_state(Some(repo_root.as_path())))
-        .await
-    {
-        Ok(repo_state) => Response::ok_typed(req.id, &repo_state),
-        Err(err) => Response::err(req.id, errors::REPOSITORY_STATE_FAILED, err),
+    match state.application.repository_state().await {
+        Ok(repository) => Response::ok_typed(req.id, &repository_dto(repository)),
+        Err(error) => Response::err(req.id, errors::REPOSITORY_STATE_FAILED, error.to_string()),
     }
 }
 
@@ -60,7 +33,7 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
     // Initialization rebinds every long-lived manager to the new root, so the
     // slot is claimed rather than sampled: a turn registering right after a
     // plain check would run against a context root that moved underneath it.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot initialize a repository while a model operation is in progress",
@@ -86,47 +59,34 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
         None => tauqe_protocol::RepositoryInitParams::default(),
     };
 
-    let initial_commit = params.initial_commit;
-    // The repository must be initialized at the authoritative shared root, not
-    // the daemon's process CWD, which can drift from the initialized project.
-    let init_root = state.repo_root().await;
-    let init_result = super::offload(move || {
-        tauqe_core::git::init_repository(Some(init_root.as_path()), initial_commit)
-    })
-    .await;
-
+    let init_result = operation.initialize_repository(params.initial_commit).await;
     match init_result {
-        Ok(Ok(repo_state)) => {
+        Ok(repo_state) => {
             // A freshly initialized project may now carry its own `tauqe.toml`,
             // so configuration, context, and history are rebound to the new
             // root exactly as `client/initialize` does.
-            super::rebind_to_repository(state, Path::new(&repo_state.root)).await;
+            super::rebind_to_repository(state, Path::new(&repo_state.root), &operation).await;
 
             state.out.send_event(&Event {
                 method: events::GIT_STATE_CHANGED.to_string(),
-                params: Some(serde_json::json!({ "repository": &repo_state })),
+                params: Some(
+                    serde_json::json!({ "repository": repository_dto(repo_state.clone()) }),
+                ),
             });
 
             let result = tauqe_protocol::RepositoryInitResult {
-                repository: repo_state,
+                repository: repository_dto(repo_state),
             };
             Response::ok_typed(req.id, &result)
         }
-        Ok(Err(err)) => Response::err(req.id, errors::INIT_FAILED, err.to_string()),
-        Err(err) => Response::err(req.id, errors::INIT_FAILED, err),
+        Err(err) => Response::err(req.id, errors::INIT_FAILED, err.to_string()),
     }
 }
 
 pub async fn handle_repository_list_files(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_root = state.repo_root().await;
-    let files =
-        super::offload(move || tauqe_core::git::list_repository_files(Some(repo_root.as_path())))
-            .await;
-
-    match files {
-        Ok(Ok(files)) => Response::ok_typed(req.id, &RepositoryListFilesResult { files }),
-        Ok(Err(err)) => Response::err(req.id, errors::LIST_FILES_FAILED, err.to_string()),
-        Err(err) => Response::err(req.id, errors::LIST_FILES_FAILED, err),
+    match state.application.repository_files().await {
+        Ok(files) => Response::ok_typed(req.id, &RepositoryListFilesResult { files }),
+        Err(error) => Response::err(req.id, errors::LIST_FILES_FAILED, error.to_string()),
     }
 }
 
@@ -147,30 +107,13 @@ pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Respons
         },
         None => GitDiffParams::default(),
     };
-    // A commit reference is gated by the shared revision gate before any Git
-    // plumbing runs, so an option-shaped value never reaches Git.
-    let commit = match params.commit {
-        Some(raw) => match validate_revision(&raw) {
-            Ok(revision) => Some(revision),
-            Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
-        },
-        None => None,
-    };
-    let target_path = params.path;
-
-    let repo_root = state.repo_root().await;
-    let diff = super::offload(move || match commit {
-        // A commit-scoped diff answers exactly that commit; the path filter
-        // belongs to the working-tree diff and is not applied.
-        Some(commit) => tauqe_core::git::get_commit_diff(repo_root.as_path(), &commit),
-        None => tauqe_core::git::get_diff(repo_root.as_path(), target_path.as_deref()),
-    })
-    .await;
-
-    match diff {
-        Ok(Ok(diff)) => Response::ok_typed(req.id, &GitDiffResult { diff }),
-        Ok(Err(err)) => Response::err(req.id, errors::GET_DIFF_FAILED, err.to_string()),
-        Err(err) => Response::err(req.id, errors::GET_DIFF_FAILED, err),
+    match state
+        .application
+        .repository_diff(params.commit, params.path)
+        .await
+    {
+        Ok(diff) => Response::ok_typed(req.id, &GitDiffResult { diff }),
+        Err(error) => repository_error(req.id, errors::GET_DIFF_FAILED, error),
     }
 }
 
@@ -203,59 +146,22 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
         None => tauqe_protocol::GitSquashPreviewParams::default(),
     };
 
-    let repo_root = state.repo_root().await;
-    let configured_upstream = state.config.lock().await.config.git.upstream.clone();
-    // An absent base keeps its meaning: the base is resolved from the session
-    // and upstream state below. A supplied one must pass the shared revision
-    // gate, so identical input is refused identically on every squash endpoint
-    // before any Git plumbing runs.
-    let requested_base = match params.base_ref {
-        Some(raw) => match validate_revision(&raw) {
-            Ok(revision) => Some(revision),
-            Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
-        },
-        None => None,
+    let preview = match state
+        .application
+        .squash_preview(&_operation, params.base_ref)
+        .await
+    {
+        Ok(preview) => preview,
+        Err(error) => return repository_error(req.id, errors::SQUASH_PREVIEW_FAILED, error),
     };
-
-    let preview = super::offload(move || {
-        let session_base =
-            tauqe_core::git::find_last_non_ai_commit(repo_root.as_path()).unwrap_or(None);
-        let upstream_base = tauqe_core::git::detect_upstream_branch(
-            repo_root.as_path(),
-            configured_upstream.as_deref(),
-        );
-
-        let base_ref = requested_base
-            .clone()
-            .or_else(|| session_base.clone())
-            .or_else(|| upstream_base.clone())
-            .unwrap_or_else(|| "HEAD~1".to_string());
-
-        // Propagate git failures instead of hiding them behind an empty
-        // preview; a swallowed error would silently corrupt the squash scope.
-        let commits_ahead = tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref)?;
-        let diff_stat = tauqe_core::git::get_diff_stat(repo_root.as_path(), &base_ref)?;
-        let files = tauqe_core::git::get_cumulative_file_diffs(repo_root.as_path(), &base_ref)?;
-
-        Ok::<_, anyhow::Error>((
-            base_ref,
-            session_base,
-            upstream_base,
-            commits_ahead,
-            diff_stat,
-            files,
-        ))
-    })
-    .await;
-
-    let (base_ref, session_base, upstream_base, commits_ahead, diff_stat, files) = match preview {
-        Ok(Ok(preview)) => preview,
-        Ok(Err(err)) => {
-            return Response::err(req.id, errors::SQUASH_PREVIEW_FAILED, err.to_string());
-        }
-        Err(err) => return Response::err(req.id, errors::SQUASH_PREVIEW_FAILED, err),
-    };
-
+    let tauqe_core::api::SquashPreview {
+        base_ref,
+        session_base,
+        upstream_base,
+        commits: commits_ahead,
+        diff_stat,
+        files,
+    } = preview;
     let items: Vec<tauqe_protocol::GitSquashCommitItem> = commits_ahead
         .into_iter()
         .map(|c| tauqe_protocol::GitSquashCommitItem {
@@ -272,7 +178,13 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
         upstream_base,
         commits: items,
         diff_stat,
-        files,
+        files: files
+            .into_iter()
+            .map(|file| tauqe_protocol::GitSquashFileDiff {
+                path: file.path,
+                diff: file.diff,
+            })
+            .collect(),
         suggested_message: None,
     };
 
@@ -280,297 +192,109 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
 }
 
 pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppState>) -> Response {
-    // The handler reads the commit list and the cumulative diff a running turn
-    // may be rewriting, then streams the message from that pair, so the slot is
-    // claimed for the whole handler: sampling it after the reads would let a
-    // concurrent `squashApply` rewrite move HEAD between the commit listing and
-    // the diff, feeding a torn pair into the provider prompt.
     let operation = match super::begin_exclusive_operation(
         &req.id,
         state,
         "Cannot generate a squash message while a model operation is in progress",
     ) {
-        Ok(guard) => guard,
+        Ok(op) => op,
         Err(resp) => return *resp,
     };
-
-    let params: tauqe_protocol::GitSquashGenerateMessageParams =
-        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-            Some(p) => p,
-            None => {
-                return Response::err(req.id, errors::INVALID_PARAMS, "Missing base_ref parameter");
-            }
-        };
-    // The revision is gated before it reaches any Git plumbing, so an
-    // option-shaped value is never forwarded to `git log` or `git diff`.
-    let base_ref = match validate_revision(&params.base_ref) {
-        Ok(revision) => revision,
-        Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
-    };
-
-    let repo_root = state.repo_root().await;
-
-    let git_data = super::offload(move || {
-        let commits = tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref);
-        let diff = tauqe_core::git::get_cumulative_diff(repo_root.as_path(), &base_ref)
-            .unwrap_or_default();
-        (commits, diff)
-    })
-    .await;
-
-    let (commits_ahead, cumulative_diff) = match git_data {
-        Ok((Ok(commits), diff)) => (commits, diff),
-        Ok((Err(err), _)) => {
-            return Response::err(
-                req.id,
-                errors::COMMITS_AHEAD_FAILED,
-                format!(
-                    "Failed to get commits ahead of {}: {}",
-                    params.base_ref, err
-                ),
-            );
-        }
-        Err(err) => return Response::err(req.id, errors::COMMITS_AHEAD_FAILED, err),
-    };
-
-    let (ctx_snapshot, pinned_paths) = {
-        let ctx = state.context.read().await;
-        let state_ctx = ctx.get_state();
-        let pinned_paths: std::collections::HashSet<String> = state_ctx
-            .items
-            .into_iter()
-            .filter(|i| i.layer == tauqe_protocol::ContextLayer::Pinned)
-            .map(|i| i.path)
-            .collect();
-        (ctx.clone(), pinned_paths)
-    };
-
-    let pinned_files = super::offload(move || {
-        let all_files = ctx_snapshot.read_context_files();
-        all_files
-            .into_iter()
-            .filter(|f| pinned_paths.contains(&f.path))
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-
-    let prompt = tauqe_core::prompt::build_squash_commit_prompt(
-        &commits_ahead,
-        &cumulative_diff,
-        &pinned_files,
-    );
-
-    let (provider_res, model) = {
-        let cfg = state.config.lock().await.config.clone();
-        let m = cfg.resolve_role(ModelRole::Scribe);
-        let p = resolve_squash_provider(state, &cfg, m.provider).await;
-        (p, m)
-    };
-
-    let (message, usage_snapshot) = if let Ok(provider) = provider_res {
-        // The slot claimed at entry already owns this operation.
-        // The identifier and the usage window exist before the first streamed
-        // byte, so a cancellation delivered before the stream starts still
-        // closes exactly one accounted operation.
-        let op_id = format!("op-{}", crate::state::next_operation_id());
-        let usage_guard = state.begin_usage(&op_id).await;
-        let cancel_rx = operation.cancel_receiver();
-        // The signal is also observed after the event loop, so a provider that
-        // stops streaming on cancellation without reporting it is still
-        // recognized as a cancelled turn.
-        let cancel_observer = cancel_rx.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(50);
-        let msgs = vec![ChatMessage::user(&prompt)];
-        let model_name = model.name.clone();
-        let response_format = tauqe_core::prompt::squash_commit_response_format();
-        let stream_task = tokio::spawn(async move {
-            provider
-                .stream_chat(&model_name, msgs, Some(response_format), tx, cancel_rx)
-                .await
-        });
-        // The handle lets the last-resort watchdog interrupt a provider request
-        // that never observes the cancellation signal.
-        operation.set_abort_handle(stream_task.abort_handle());
-        let mut full_text = String::new();
-        let mut stream_error: Option<String> = None;
-        let mut cancelled = false;
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::TextDelta(delta) => {
-                    full_text.push_str(&delta);
-                }
-                // Providers may report usage on intermediate chunks. It stays
-                // in the in-flight window and is folded into the session totals
-                // only by the single terminal flush below, so an intermediate
-                // report can never be counted twice.
-                StreamEvent::Usage(reported) => {
-                    usage_guard.observe(&reported).await;
-                }
-                StreamEvent::Error(msg) => {
-                    stream_error = Some(msg);
-                    break;
-                }
-                // An explicit provider cancellation is reported as `CANCELLED`
-                // instead of being swallowed by the catch-all arm and surfacing
-                // later as a generic internal failure.
-                StreamEvent::Cancelled => {
-                    cancelled = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        // The signal itself is authoritative: a provider may end the stream on
-        // cancellation without ever reporting a cancellation event.
-        let cancelled = cancelled || *cancel_observer.borrow();
-
-        // Surface both a cancelled turn and a streamed provider error so a
-        // broken or interrupted provider never masquerades as a successful
-        // fallback message. The abandoned request is reaped through the shared
-        // bounded task-exit confirmation (`crate::reap::abort_and_reap`, governed by
-        // the task-exit deadline) before the outcome is reported, so no provider call
-        // outlives the response and a task that never reaches a suspension point
-        // cannot park the handler.
-        if cancelled || stream_error.is_some() {
-            let _ = abort_and_reap(&op_id, "squash-message-stream", stream_task).await;
-            operation.clear_abort_handle();
-            close_squash_usage(state, usage_guard, &op_id).await;
-            let (code, message) = if cancelled {
-                (
-                    errors::CANCELLED,
-                    "Squash message generation was cancelled".to_string(),
-                )
-            } else {
-                (
-                    errors::INTERNAL_ERROR,
-                    stream_error.unwrap_or_else(|| "Squash message stream failed".to_string()),
-                )
-            };
-            return Response::err(req.id, code, message);
-        }
-
-        // A completed stream is awaited through the shared bounded task-exit
-        // confirmation (`crate::reap::await_bounded`, governed by the task-exit
-        // deadline).
-        let stream_result = await_bounded(&op_id, "squash-message-stream", stream_task).await;
-        operation.clear_abort_handle();
-        match stream_result {
-            Awaited::Joined(Ok(Ok(()))) => {}
-            Awaited::Joined(Ok(Err(err))) => {
-                close_squash_usage(state, usage_guard, &op_id).await;
-                return Response::err(req.id, errors::INTERNAL_ERROR, err.to_string());
-            }
-            Awaited::Joined(Err(join_err)) => {
-                close_squash_usage(state, usage_guard, &op_id).await;
-                return Response::err(
-                    req.id,
-                    errors::INTERNAL_ERROR,
-                    format!("Squash message stream task failed: {}", join_err),
-                );
-            }
-            Awaited::Orphaned => {
-                // The confirmation expired, so the abandoned task is still running:
-                // the response carries the recorded expiry diagnostic instead of a
-                // result the provider never delivered.
-                close_squash_usage(state, usage_guard, &op_id).await;
-                let message = format!(
-                    "Squash message stream task did not stop within the {} ms task-exit deadline",
-                    crate::reap::task_exit_deadline().as_millis()
-                );
-                return Response::err(req.id, errors::INTERNAL_ERROR, message);
-            }
-        }
-        let msg =
-            tauqe_core::prompt::parse_squash_commit_message(&full_text).unwrap_or_else(|| {
-                commits_ahead
-                    .first()
-                    .map(|c| c.subject.clone())
-                    .unwrap_or_else(|| "Squashed commits".to_string())
-            });
-        let snapshot = close_squash_usage(state, usage_guard, &op_id).await;
-        (msg, Some(snapshot))
-    } else {
-        // Without a provider no usage window opens, so the zero operation
-        // neither reaches the session totals nor increments the operation count.
-        (
-            commits_ahead
-                .first()
-                .map(|c| c.subject.clone())
-                .unwrap_or_else(|| "Squashed commits".to_string()),
-            None,
-        )
-    };
-
-    // The legacy fields are projected from the authoritative snapshot — the
-    // last completed operation and the session total — instead of a locally
-    // re-summed counter, so both channels always agree.
-    let result = match usage_snapshot {
-        Some(snapshot) => {
-            let totals = snapshot.operation_totals().clone();
-            tauqe_protocol::GitSquashGenerateMessageResult {
-                message,
-                usage: Some(totals.to_usage_info()),
-                session_total_cost: Some(snapshot.session.cost),
-                current_cost: Some(totals.cost),
-            }
-        }
-        None => tauqe_protocol::GitSquashGenerateMessageResult {
-            message,
-            usage: None,
-            session_total_cost: None,
-            current_cost: None,
-        },
-    };
-    Response::ok_typed(req.id, &result)
-}
-
-/// Resolves the LLM provider for a squash message.
-///
-/// Deterministic unit tests inject a scripted provider through the state's test
-/// seam; production builds construct a real network provider from configuration.
-async fn resolve_squash_provider(
-    _state: &Arc<AppState>,
-    config: &tauqe_core::config::AppConfig,
-    kind: tauqe_protocol::ProviderKind,
-) -> Result<Arc<dyn LlmProvider>, String> {
-    #[cfg(test)]
+    let params: tauqe_protocol::GitSquashGenerateMessageParams = match req
+        .params
+        .and_then(|p| serde_json::from_value(p).ok())
     {
-        if let Some(provider) = _state.provider_override.lock().await.clone() {
-            return Ok(provider);
-        }
-    }
-    create_provider(kind, config)
-        .map(Arc::from)
-        .map_err(|err| err.to_string())
-}
-
-/// Closes the squash operation's usage window and publishes the snapshot.
-///
-/// The flush is the single point where the operation folds into the session
-/// totals, so the cancelled, failed, and successful paths all reach the
-/// accumulator exactly once. The legacy per-operation usage event is mirrored
-/// from the same snapshot.
-async fn close_squash_usage(
-    state: &Arc<AppState>,
-    guard: UsageGuard,
-    op_id: &str,
-) -> tauqe_protocol::UsageTotalsSnapshot {
-    guard.flush().await;
-    let snapshot = state.usage_snapshot().await;
-    let totals = snapshot.operation_totals().clone();
-    state.out.send_event(&Event {
-        method: events::MODEL_USAGE.to_string(),
-        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-            operation_id: op_id.to_string(),
-            usage: totals.to_usage_info(),
-            session_total_cost: snapshot.session.cost,
-            current_cost: Some(totals.cost),
-        })
-        .ok(),
+        Some(p) => p,
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing base_ref parameter"),
+    };
+    let prepared = match state
+        .application
+        .prepare_squash_message(&operation, &params.base_ref)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return squash_error(req.id, e),
+    };
+    #[cfg(test)]
+    let provider = state.provider_override.lock().await.clone();
+    #[cfg(not(test))]
+    let provider = None;
+    let observer = Arc::new(SquashObserver {
+        state: Arc::clone(state),
     });
-    snapshot
+    let result = match state
+        .application
+        .generate_squash_message(
+            &operation,
+            prepared,
+            provider,
+            observer,
+            tauqe_core::api::SquashMessageExecutionConfig {
+                operation_id: format!("op-{}", crate::state::next_operation_id()),
+                exit_deadline: crate::reap::task_exit_deadline(),
+            },
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return squash_error(req.id, e),
+    };
+    let usage = result
+        .usage
+        .as_ref()
+        .map(|s| crate::usage::wire_usage(&s.operation_totals().to_usage_info()));
+    Response::ok_typed(
+        req.id,
+        &tauqe_protocol::GitSquashGenerateMessageResult {
+            message: result.message,
+            usage,
+            session_total_cost: result.usage.as_ref().map(|s| s.session.cost),
+            current_cost: result.usage.as_ref().map(|s| s.operation_totals().cost),
+        },
+    )
+}
+fn repository_error(
+    id: tauqe_protocol::RequestId,
+    failed: &str,
+    error: tauqe_core::api::RepositoryError,
+) -> Response {
+    let code = match error {
+        tauqe_core::api::RepositoryError::Invalid(_) => errors::INVALID_PARAMS,
+        _ => failed,
+    };
+    Response::err(id, code, error.to_string())
+}
+fn squash_error(
+    id: tauqe_protocol::RequestId,
+    error: tauqe_core::api::SquashMessageError,
+) -> Response {
+    let code = match &error {
+        tauqe_core::api::SquashMessageError::Invalid(_) => errors::INVALID_PARAMS,
+        tauqe_core::api::SquashMessageError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
+        tauqe_core::api::SquashMessageError::Model(_) => errors::INTERNAL_ERROR,
+        tauqe_core::api::SquashMessageError::Cancelled(_) => errors::CANCELLED,
+    };
+    Response::err(id, code, error.to_string())
+}
+struct SquashObserver {
+    state: Arc<AppState>,
+}
+impl tauqe_core::api::UsageObserver for SquashObserver {
+    fn publish_usage_totals(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
+        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
+    }
+    fn publish_usage(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
+        self.state.out.send_event(&Event {
+            method: events::MODEL_USAGE.into(),
+            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+                operation_id: id.into(),
+                usage: crate::usage::wire_usage(&snapshot.operation_totals().to_usage_info()),
+                session_total_cost: snapshot.session.cost,
+                current_cost: Some(snapshot.operation_totals().cost),
+            })
+            .ok(),
+        });
+    }
 }
 
 pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Response {
@@ -598,122 +322,35 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
             }
         };
 
-    // Squashing rewrites history, so the client-supplied inputs are validated
-    // before any git mutation: an empty message or a revision that looks like
-    // an option (leading '-') is rejected instead of being forwarded to git.
-    if params.message.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Commit message cannot be empty",
-        );
-    }
-    // The revision is gated before any Git mutation: an option-shaped value
-    // would be forwarded to `git reset --soft` as an option, not a revision.
-    let base_ref = match validate_revision(&params.base_ref) {
-        Ok(revision) => revision,
-        Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
-    };
-
-    let repo_root = state.repo_root().await;
-    let message = params.message.clone();
-
-    let applied = super::offload(move || {
-        match tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref) {
-            Ok(commits_ahead) => {
-                let count = commits_ahead.len();
-                match tauqe_core::git::squash_to_single_commit(
-                    repo_root.as_path(),
-                    &base_ref,
-                    &message,
-                ) {
-                    Ok(hash) => Ok((count, hash)),
-                    Err(err) => Err(SquashApplyError::Squash(err)),
-                }
-            }
-            Err(err) => Err(SquashApplyError::Commits(err)),
-        }
-    })
-    .await;
-
-    let (commits_count, squashed_hash) = match applied {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(SquashApplyError::Commits(err))) => {
-            return Response::err(
-                req.id,
-                errors::COMMITS_AHEAD_FAILED,
-                format!(
-                    "Failed to get commits ahead of {}: {}",
-                    params.base_ref, err
-                ),
-            );
-        }
-        Ok(Err(SquashApplyError::Squash(err))) => {
-            return Response::err(req.id, errors::SQUASH_FAILED, err.to_string());
-        }
-        Err(err) => return Response::err(req.id, errors::SQUASH_FAILED, err),
-    };
-
-    // The squash moved HEAD, so the repository state is read again on the
-    // blocking pool from the authoritative root.
-    let repo_root = state.repo_root().await;
-    let new_repo_state = match super::offload(move || {
-        tauqe_core::git::get_repository_state(Some(repo_root.as_path()))
-    })
-    .await
+    let applied = match state
+        .application
+        .apply_squash(&_operation, params.base_ref, params.message)
+        .await
     {
-        Ok(repo_state) => repo_state,
-        Err(err) => return Response::err(req.id, errors::SQUASH_FAILED, err),
+        Ok(result) => result,
+        Err(error) => {
+            let code = match &error {
+                tauqe_core::api::SquashApplyError::Invalid(_) => errors::INVALID_PARAMS,
+                tauqe_core::api::SquashApplyError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
+                tauqe_core::api::SquashApplyError::Squash(_) => errors::SQUASH_FAILED,
+            };
+            return Response::err(req.id, code, error.to_string());
+        }
     };
-
-    let first_line = params
-        .message
-        .lines()
-        .next()
-        .unwrap_or("Squash commits")
-        .to_string();
-    let msg_text = format!(
-        "Squashed {} commits ahead of {} into {}.",
-        commits_count, params.base_ref, squashed_hash
-    );
-
-    // Recording the response appends to `history.jsonl` behind an `fsync`
-    // barrier, so the mutation runs on the blocking pool with the exclusive
-    // history guard held instead of stalling an async worker.
-    let response_commit = squashed_hash.clone();
-    let recorded = crate::handlers::with_history_mutation(state, move |history| {
-        history.record_response(
-            &msg_text,
-            Some(response_commit),
-            Some(first_line),
-            Vec::new(),
-        )
-    })
-    .await;
-    if let Err(err) = recorded {
-        tracing::warn!(
-            error = %err,
-            "Failed to record the squashed commit in the interaction history"
-        );
-    }
-
     state.out.send_event(&Event {
-        method: events::GIT_STATE_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "repository": new_repo_state })),
+        method: events::GIT_STATE_CHANGED.into(),
+        params: Some(serde_json::json!({"repository":repository_dto(applied.repository)})),
     });
-
-    let apply_result = tauqe_protocol::GitSquashApplyResult {
-        squashed_commit: squashed_hash,
-        message: params.message,
-        base_ref: params.base_ref,
+    let result = tauqe_protocol::GitSquashApplyResult {
+        squashed_commit: applied.commit,
+        message: applied.message,
+        base_ref: applied.base_ref,
     };
-
     state.out.send_event(&Event {
-        method: events::GIT_SQUASH_COMPLETED.to_string(),
-        params: serde_json::to_value(&apply_result).ok(),
+        method: events::GIT_SQUASH_COMPLETED.into(),
+        params: serde_json::to_value(&result).ok(),
     });
-
-    Response::ok_typed(req.id, &apply_result)
+    Response::ok_typed(req.id, &result)
 }
 
 #[cfg(test)]
@@ -755,7 +392,14 @@ mod tests {
         assert_eq!(state.repo_root().await, dir);
         // The history manager is rebuilt against the new root instead of being
         // left anchored to the previous one.
-        assert_eq!(state.history.lock().await.repo_root(), dir.as_path());
+        assert_eq!(
+            state
+                .application
+                .test_mutate_history(|history| history.repo_root().to_path_buf())
+                .await
+                .unwrap(),
+            dir.as_path()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -801,12 +445,12 @@ mod tests {
         let repo = SquashTestRepo::new();
         let root = repo.path().to_path_buf();
 
-        let usage = tauqe_protocol::ModelUsageInfo {
+        let usage = tauqe_core::providers::ModelUsageInfo {
             prompt_tokens: 30,
             completion_tokens: 10,
             total_tokens: 40,
             cost: Some(0.25),
-            ..tauqe_protocol::ModelUsageInfo::default()
+            ..tauqe_core::providers::ModelUsageInfo::default()
         };
         let provider: Arc<dyn LlmProvider> =
             Arc::new(MockLlmProvider::scripted([MockResponse::text(
@@ -817,7 +461,7 @@ mod tests {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = AppConfig::default();
-        config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
+        config.models.scribe = Some(tauqe_core::models::ModelRef::openrouter("test/scribe"));
         let state = AppState::new(config, root, history_sender, out);
         *state.provider_override.lock().await = Some(provider);
 

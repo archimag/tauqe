@@ -8,11 +8,10 @@
 
 use std::sync::Arc;
 
-use tauqe_core::outer_docs::{
-    affected_documents, list_cache_entries, remove_cache_entry, CacheRemoveError,
-};
+use tauqe_core::api::CacheError;
 use tauqe_protocol::{
-    errors, events, Event, OuterDocsCacheListResult, OuterDocsCacheRemoveParams, Request, Response,
+    errors, OuterDocsCacheEntry, OuterDocsCacheListResult, OuterDocsCacheRemoveParams,
+    OuterDocsCacheRemoveResult, Request, Response,
 };
 
 use crate::state::AppState;
@@ -23,11 +22,19 @@ use crate::state::AppState;
 /// size, and one token estimate per document, never the disk prefix the
 /// snapshot is stored under.
 pub async fn handle_outer_docs_cache_list(req: Request, state: &Arc<AppState>) -> Response {
-    let root = state.repo_root().await;
-    let listed = super::offload(move || list_cache_entries(&root)).await;
-    match listed {
-        Ok(Ok(entries)) => Response::ok_typed(req.id, &OuterDocsCacheListResult { entries }),
-        Ok(Err(reason)) | Err(reason) => Response::err(req.id, errors::INTERNAL_ERROR, reason),
+    match state.application.outer_docs_cache().await {
+        Ok(entries) => {
+            let entries = entries
+                .into_iter()
+                .map(|entry| OuterDocsCacheEntry {
+                    path: entry.path,
+                    size_bytes: entry.size_bytes,
+                    estimated_tokens: entry.estimated_tokens,
+                })
+                .collect();
+            Response::ok_typed(req.id, &OuterDocsCacheListResult { entries })
+        }
+        Err(error) => Response::err(req.id, errors::INTERNAL_ERROR, error.to_string()),
     }
 }
 
@@ -41,13 +48,16 @@ pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>)
     // The removal rewrites the cache the context reasons over, so it claims the
     // operation slot instead of sampling it: a turn registering in between
     // would merge a context clone that still names the removed documents.
-    let _operation = match super::begin_exclusive_operation(
-        &req.id,
-        state,
-        "The external documentation cache cannot be modified while a turn or batch is running",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
+    let operation = match state.application.begin_context_change() {
+        Ok(operation) => operation,
+        Err(_) => {
+            tracing::warn!(
+                code = errors::OPERATION_IN_PROGRESS,
+                "Refused to register a new operation: a slot is already active"
+            );
+            return Response::err(req.id, errors::OPERATION_IN_PROGRESS,
+                "The external documentation cache cannot be modified while a turn or batch is running");
+        }
     };
 
     let params: OuterDocsCacheRemoveParams = match req
@@ -59,44 +69,27 @@ pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>)
             return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid path");
         }
     };
-    let logical = params.path.trim().to_string();
-
-    let root = state.repo_root().await;
-    let target = logical.clone();
-    let removal = super::offload(move || remove_cache_entry(&root, &target)).await;
-    let removed = match removal {
-        Ok(Ok(removed)) => removed,
-        Ok(Err(error)) => {
-            return Response::err(req.id, cache_error_code(&error), error.reason().to_string());
-        }
-        Err(error) => return Response::err(req.id, errors::INTERNAL_ERROR, error),
-    };
-
-    // A document the cache no longer holds leaves the resident layer, and the
-    // resulting snapshot is published so the interface renders the state the
-    // next turn will read instead of the documents this request removed.
-    let resident = state.context.read().await.outer_docs_files();
-    let documents = affected_documents(&logical, &resident);
-    let (released, ctx_state) = match state.remove_outer_docs_context(documents).await {
+    let outcome = match operation.remove_outer_docs_cache(params.path).await {
         Ok(outcome) => outcome,
-        Err(error) => return Response::err(req.id, errors::INTERNAL_ERROR, error),
+        Err(error) => return Response::err(req.id, cache_error_code(&error), error.to_string()),
     };
-    if released {
-        state.out.send_event(&Event {
-            method: events::CONTEXT_CHANGED.to_string(),
-            params: Some(serde_json::json!({ "state": ctx_state })),
-        });
+    if let Some(ctx_state) = outcome.context_update {
+        crate::handlers::context::publish_context(&state.out, &ctx_state);
     }
 
-    Response::ok_typed(req.id, &removed)
+    let result = OuterDocsCacheRemoveResult {
+        removed_files: outcome.removed.removed_files,
+        removed_bytes: outcome.removed.removed_bytes,
+    };
+    Response::ok_typed(req.id, &result)
 }
 
 /// The wire error code of one cache removal refusal.
-fn cache_error_code(error: &CacheRemoveError) -> &'static str {
+fn cache_error_code(error: &CacheError) -> &'static str {
     match error {
-        CacheRemoveError::InvalidPath(_) => errors::INVALID_PARAMS,
-        CacheRemoveError::NotFound(_) => errors::NOT_FOUND,
-        CacheRemoveError::Failed(_) => errors::INTERNAL_ERROR,
+        CacheError::InvalidPath(_) => errors::INVALID_PARAMS,
+        CacheError::NotFound(_) => errors::NOT_FOUND,
+        CacheError::Failed(_) => errors::INTERNAL_ERROR,
     }
 }
 
@@ -104,7 +97,8 @@ fn cache_error_code(error: &CacheRemoveError) -> &'static str {
 mod tests {
     use super::*;
     use crate::transport::OutChannel;
-    use tauqe_protocol::{methods, OuterDocsCacheRemoveResult, RequestId};
+    use tauqe_protocol::events;
+    use tauqe_protocol::{methods, RequestId};
 
     struct TestDir(std::path::PathBuf);
 
@@ -179,11 +173,11 @@ mod tests {
         let state = test_state(&dir);
         let resident = write_cache_file(&dir, "openrouter/api.md", "endpoints");
         write_cache_file(&dir, "openrouter/models.md", "models");
+        let mounted = resident.clone();
         state
-            .context
-            .write()
+            .mutate_context(move |context| context.add_outer_docs_file(&mounted))
             .await
-            .add_outer_docs_file(&resident)
+            .expect("fixture context mutation runs")
             .unwrap();
         let warm_session = state.session_uuid().await;
 
@@ -207,7 +201,7 @@ mod tests {
             serde_json::from_value(removed.result.unwrap()).unwrap();
         assert_eq!(removed.removed_files, 1);
         assert!(!dir.path().join(&resident).exists());
-        assert!(state.context.read().await.outer_docs_files().is_empty());
+        assert!(state.context_snapshot().await.outer_docs_files().is_empty());
         assert_ne!(
             warm_session,
             state.session_uuid().await,
@@ -248,5 +242,66 @@ mod tests {
         );
         assert!(state.is_operation_active());
         drop(operation);
+    }
+    #[tokio::test]
+    async fn cache_removal_publishes_context_only_when_resident_material_changes() {
+        let dir = TestDir::new();
+        let (out, mut events_rx) = OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            history,
+            out,
+        );
+        write_cache_file(&dir, "vendor/unmounted.md", "unmounted");
+        let mounted = write_cache_file(&dir, "vendor/mounted.md", "mounted");
+        state
+            .mutate_context(move |context| context.add_outer_docs_file(&mounted))
+            .await
+            .unwrap()
+            .unwrap();
+        let unchanged =
+            handle_outer_docs_cache_remove(remove_request(1, "vendor/unmounted.md"), &state).await;
+        assert!(unchanged.error.is_none());
+        assert!(events_rx.try_recv().is_err());
+        let invalid = handle_outer_docs_cache_remove(remove_request(2, "../vendor"), &state).await;
+        assert_eq!(invalid.error.unwrap().code, errors::INVALID_PARAMS);
+        assert!(events_rx.try_recv().is_err());
+        let changed =
+            handle_outer_docs_cache_remove(remove_request(3, "vendor/mounted.md"), &state).await;
+        assert!(changed.error.is_none());
+        let event: serde_json::Value =
+            serde_json::from_str(&events_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(event["method"], events::CONTEXT_CHANGED);
+        assert_eq!(
+            event["params"]["state"],
+            serde_json::to_value(crate::handlers::context::context_state_dto(
+                &state.context_state().await
+            ))
+            .unwrap()
+        );
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_removal_preserves_busy_precedence_over_invalid_parameters() {
+        let dir = TestDir::new();
+        let state = test_state(&dir);
+        let operation = state.try_begin_operation().unwrap();
+        let response = handle_outer_docs_cache_remove(
+            request(1, methods::OUTER_DOCS_CACHE_REMOVE, None),
+            &state,
+        )
+        .await;
+        assert_eq!(response.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+        drop(operation);
+        let response = handle_outer_docs_cache_remove(
+            request(2, methods::OUTER_DOCS_CACHE_REMOVE, None),
+            &state,
+        )
+        .await;
+        assert_eq!(response.error.unwrap().code, errors::INVALID_PARAMS);
+        assert!(!state.is_operation_active());
     }
 }

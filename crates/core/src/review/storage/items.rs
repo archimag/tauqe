@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::Path;
 
-use tauqe_protocol::review::ReviewUpdateProposal;
-use tauqe_protocol::{IssueStatus, ReviewIssue, ReviewItem};
+use crate::review::ReviewUpdateProposal;
+use crate::review::{IssueStatus, ReviewIssue, ReviewItem};
 
 use super::ReviewStorage;
 
@@ -60,7 +60,7 @@ impl ReviewStorage {
     }
 
     /// Updates status of a review item within the explicitly named review session.
-    pub fn update_session_item_status(
+    pub(crate) fn update_session_item_status(
         repo_root: &Path,
         review_id: &str,
         item_id: u32,
@@ -80,7 +80,7 @@ impl ReviewStorage {
     /// recommendation the finding already carries is never duplicated. A finding
     /// the named session does not hold is reported as absent instead of being
     /// invented, so a decision can never fabricate a finding.
-    pub fn apply_decision(
+    pub(crate) fn apply_decision(
         repo_root: &Path,
         review_id: &str,
         decision: &ReviewUpdateProposal,
@@ -108,7 +108,7 @@ impl ReviewStorage {
 
 #[cfg(test)]
 mod tests {
-    use tauqe_protocol::review::{
+    use crate::review::{
         IssueStatus, IssueType, ReviewDecisionStatus, ReviewItem, ReviewSession, ReviewSeverity,
         ReviewUpdateProposal,
     };

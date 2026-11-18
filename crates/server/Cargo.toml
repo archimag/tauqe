@@ -10,7 +10,6 @@ workspace = true
 [dependencies]
 tauqe-protocol.workspace = true
 tauqe-core.workspace = true
-tauqe-tools.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -24,3 +23,6 @@ futures-util.workspace = true
 # Enables `MockLlmProvider` for handler unit tests without leaking the test
 # double into the release daemon binary.
 tauqe-core = { workspace = true, features = ["test-support"] }
+
+# Compare actual TUI projections with core without coupling their runtime crates.
+tauqe-tui = { path = "../tui" }

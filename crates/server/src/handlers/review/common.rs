@@ -9,35 +9,19 @@
 //! keeps the per-operation modules focused on orchestration and keeps each of
 //! them within the cohesive size target.
 
+use crate::contracts::Project;
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{events, ReviewErrorEvent, ReviewListChangedEvent, ReviewUpdatedEvent};
 
 use crate::state::AppState;
 use crate::transport::OutChannel;
 
-/// Runs a blocking review-storage operation on the Tokio blocking pool.
-///
-/// The storage engine holds a synchronous process-wide mutex and performs disk
-/// I/O, both of which must stay off the async worker threads.
-pub(super) async fn offload_review<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    match crate::handlers::offload(f).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(format!("{:#}", err)),
-        Err(err) => Err(err),
-    }
-}
-
 /// Event emission and transient-context cleanup are shared with every other
 /// handler subsystem, so they are re-exported here instead of being duplicated
 /// per subsystem.
-pub(super) use crate::handlers::common::{cleanup_transient_context, emit};
+pub(super) use crate::handlers::common::emit;
 
 /// Emits a `review/error` event for a failed review operation.
 pub(super) fn emit_error(out: &OutChannel, operation_id: &str, message: String) {
@@ -72,26 +56,46 @@ pub(super) fn emit_error(out: &OutChannel, operation_id: &str, message: String) 
 pub(crate) async fn publish_review(state: &Arc<AppState>, repo_root: &Path, review_id: &str) {
     let load_root = repo_root.to_path_buf();
     let load_id = review_id.to_string();
-    if let Ok(Some(session)) =
-        offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await
+    if let Ok(Some(session)) = state
+        .application
+        .documents_at(&load_root)
+        .review(&load_id)
+        .await
     {
         emit(
             &state.out,
             events::REVIEW_UPDATED,
-            serde_json::to_value(ReviewUpdatedEvent { session }).ok(),
+            serde_json::to_value(ReviewUpdatedEvent {
+                session: session.project(),
+            })
+            .ok(),
         );
     }
+    publish_review_list(state, repo_root).await;
+}
+
+pub(super) async fn publish_review_list(state: &Arc<AppState>, repo_root: &Path) {
     let list_root = repo_root.to_path_buf();
-    if let Ok(reviews) = offload_review(move || ReviewStorage::load_all(&list_root)).await {
+    if let Ok(reviews) = state.application.documents_at(&list_root).reviews().await {
         let active_root = repo_root.to_path_buf();
-        let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
+        let active_id = state
+            .application
+            .documents_at(&active_root)
+            .active_review_id()
             .await
             .ok()
             .flatten();
         emit(
             &state.out,
             events::REVIEW_LIST_CHANGED,
-            serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+            serde_json::to_value(ReviewListChangedEvent {
+                reviews: reviews
+                    .into_iter()
+                    .map(crate::contracts::Project::project)
+                    .collect(),
+                active_id,
+            })
+            .ok(),
         );
     }
 }

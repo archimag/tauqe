@@ -266,7 +266,7 @@ pub fn log_join_error(error: &OffloadError, operation: &str) {
 /// replace the original payload with a fresh one raised where nothing remembers
 /// the real failure. The panic is therefore recorded and its payload resumed
 /// here, so the failure surfaces once, carrying the context it was raised with.
-pub fn resolve_offload_failure<T>(
+pub(crate) fn resolve_offload_failure<T>(
     error: OffloadError,
     operation: &str,
     inline: impl FnOnce() -> T,

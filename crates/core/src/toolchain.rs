@@ -14,14 +14,18 @@
 //! turn that already froze its configuration calls the `*_with_config` variants
 //! directly.
 
+use crate::config::project::ProjectConfig;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tauqe_protocol::{ProjectConfig, ProjectPostHookResponse, VerificationVerdict};
+use crate::edits::VerificationVerdict;
+#[cfg(test)]
+use tauqe_tools::toolchain::ProjectPostHookResponse;
 use tokio::sync::watch;
 
 pub use tauqe_tools::toolchain::{
-    format_with_project_config, merge_manifest, run_post_hooks_with_config,
+    format_diagnostics, format_with_project_config, merge_manifest, run_post_hooks_with_config,
     run_project_command_with_config, run_toolchain_check, run_toolchain_check_with_timeout, runner,
     InMemoryFormatOutcome, ToolchainCheckResult, DEFAULT_PROJECT_TIMEOUT_SECS,
 };
@@ -57,11 +61,6 @@ impl VerificationStatus {
     /// declared.
     pub fn allows_commit(self) -> bool {
         matches!(self, Self::Passed | Self::NotConfigured)
-    }
-
-    /// Whether the project declared no verification lifecycle at all.
-    pub fn is_not_configured(self) -> bool {
-        self == Self::NotConfigured
     }
 }
 
@@ -99,7 +98,7 @@ impl From<VerificationStatus> for VerificationVerdict {
 /// always take precedence over runner recipes, and a runner that is missing,
 /// fails, or answers with an unreadable dump leaves the declared configuration
 /// untouched instead of contributing a partially trusted command list.
-pub async fn effective_project_config(
+pub(crate) async fn effective_project_config(
     repo_root: &Path,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> ProjectConfig {
@@ -159,7 +158,7 @@ pub async fn run_verification_pipeline(
 /// their outcome is folded into an explicit [`VerificationStatus`]: a project
 /// that resolves no step reports [`VerificationStatus::NotConfigured`] instead
 /// of a fabricated success.
-pub async fn run_verification_pipeline_with_config(
+pub(crate) async fn run_verification_pipeline_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     changed_files: &[String],
@@ -235,7 +234,8 @@ fn classify_status(passed: bool, results: &[ToolchainCheckResult]) -> Verificati
 /// still captures whatever the hook produced through Git, so the command stays a
 /// plain project process. A repository that declares no hook runs nothing and
 /// succeeds.
-pub async fn run_post_hooks(
+#[cfg(test)]
+async fn run_post_hooks(
     repo_root: &Path,
     changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
@@ -255,7 +255,8 @@ pub async fn run_post_hooks(
 /// process still receives literal arguments and no shell ever sees them. The
 /// command runs in its own process group, so a timeout or a client cancellation
 /// tears down the whole descendant tree.
-pub async fn run_project_command(
+#[cfg(test)]
+async fn run_project_command(
     repo_root: &Path,
     name: &str,
     arguments: &BTreeMap<String, String>,
@@ -272,7 +273,7 @@ pub async fn run_project_command(
 /// exports when the entry is omitted. A declaration always keeps precedence over
 /// the export of the same role, so a project can pin the filter in `tauqe.toml`
 /// or delegate it to its justfile without changing the bounded turn.
-pub async fn format_staged_content(
+pub(crate) async fn format_staged_content(
     repo_root: &Path,
     content: &str,
     cancel_rx: Option<&watch::Receiver<bool>>,

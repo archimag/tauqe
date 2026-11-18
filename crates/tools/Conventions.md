@@ -4,7 +4,7 @@ This document specifies mandatory architectural and operational conventions for 
 Tauqe deterministic substrate (`crates/tools`).
 
 The crate owns every operation the harness performs without model judgement. It
-receives the shared wire contract and explicit arguments from the engine, performs
+receives explicit arguments from the engine, performs
 the operation, and reports a typed result. It holds no cognitive state and drives no
 turn.
 
@@ -13,17 +13,23 @@ turn.
 ## 1. Boundary and Dependency Direction
 
 1. **One-Way Dependencies:**
-   - `tauqe-tools` depends on `tauqe-protocol` and on the system crates its
-     operations require. It never depends on `tauqe-core`, on a provider client, or
-     on the turn machine.
-   - The hierarchy is strictly `protocol -> tools -> core -> server/tui`. The
-     compiler enforces the boundary: a cognitive type cannot even be named here.
+   - `tauqe-tools` depends only on external system/utility crates its operations
+     require. It never depends on `tauqe-protocol`,
+     `tauqe-core`, a provider client, or the turn machine.
+   - Technical inputs and results belong to tools; core adapts them. Path patterns
+     live in `tools::path_patterns` and are shared with UI previews without
+     importing transport or engine types.
 2. **Declared Inputs, Not Discovered State:**
    - Harness configuration and the decisions it carries reach the substrate as
-     explicit arguments: `ProjectConfig` names the command lines, the staged change
+     explicit arguments: `tools::toolchain::config::ProjectConfig` names the command lines, the staged change
      set names the paths, and the commit hook policy arrives as a `GitHooks` value.
    - The substrate never reads `tauqe.toml`, never selects a project command, and
      never decides which verification target a project runs.
+   - Staging operations are tools-owned technical inputs without serde or LLM
+     schema dependencies. Core converts engine operations and staging results
+     at the adapter boundary; tools never decodes model output.
+   - Staging receives context membership as repository-relative path strings,
+     never a `ContextState` DTO. Access policy and context metadata stay in core.
 3. **What Stays in the Engine:** decoding model output, prompt assembly, context and
    history management, plan and review persistence, provider communication, and the
    bounded turn FSM. The substrate answers a call; it never initiates one.
@@ -144,7 +150,9 @@ staged content or move a live backup aside.
    unrelated group down. The grace window of a polite termination is therefore
    waited out with the leader unreaped, and the forceful signal that closes it
    is harmless to a group whose only remaining member is the zombie leader.
-4. **Typed Diagnostics:** command output is parsed into file, line, column, severity,
+4. **Typed Diagnostics:** diagnostic types, post-hook outcomes, and deterministic
+   diagnostic report formatting belong to `tools::toolchain`, not the RPC contract.
+   Command output is parsed into file, line, column, severity,
    code, and message records. The report is rebuilt from those fields, so no ANSI
    escape, tool banner, or duplicated note reaches a model prompt.
 5. **No Raw Dumps in the Journal:** failures are recorded as compact, UTF-8-safe
@@ -345,3 +353,15 @@ marker a finished transaction already cleared.
   `core`.
 - **It is not a place for optimistic guesses.** If an answer can be derived from Git,
   an AST parser, or compiler output, it is computed here deterministically.
+
+
+## Shared Path-Pattern Utility
+
+`path_patterns` owns the pure repository-relative matcher, including the compiled
+`GlobPattern` and the single-match convenience function. Core and TUI consume
+this module directly; there is no separate path-patterns workspace crate or
+context facade re-export. Keep its established basename, directory-prefix,
+root, separator, and wildcard semantics pinned by the matcher tests. Its pure
+inputs/results must remain independent of engine, transport, and filesystem I/O.
+TUI may depend on tools for utilities while durable operations remain driven by
+core application scenarios.

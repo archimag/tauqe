@@ -23,7 +23,8 @@
 //! single source of truth: prompt rendering, the structured response schema,
 //! and command decoding all observe the same typed surface.
 
-use tauqe_protocol::{CapabilityTree, LlmCapability};
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
 
 use crate::prompt::ContourKind;
 
@@ -167,7 +168,7 @@ fn has_any_edit_capability(capabilities: &CapabilityTree) -> bool {
 mod tests {
     use super::*;
     use crate::capabilities::{compose_contract_rules, render_contract_rules, PromptRenderContext};
-    use tauqe_protocol::DiscussionTarget;
+    use crate::discussion::DiscussionTarget;
 
     /// Builds the capability surface of a free interactive dialogue.
     fn repl_surface() -> CapabilityTree {

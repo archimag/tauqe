@@ -1,242 +1,119 @@
-//! RPC handler for on-demand locale synthesis.
-//!
-//! English is the sole embedded source of truth for interface text (c-1); a
-//! translated catalog is synthesized on demand by a language model through the
-//! `locale/generate` method (c-2). The client never contacts a provider
-//! directly (c-4): it sends the English catalog together with its semantic
-//! annotations and receives a validated catalog back. Because a model cannot be
-//! trusted to measure physical terminal columns, every translated string is
-//! deterministically validated and sanitized (c-3) before the result leaves the
-//! daemon.
-
-use std::sync::Arc;
-
-use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
-use tauqe_protocol::{errors, LocaleGenerateParams, ModelRole, ProviderKind, Request, Response};
-
-use crate::reap::{abort_and_reap, await_bounded, Awaited};
+//! RPC adaptation for headless locale generation.
 use crate::state::AppState;
-use crate::usage::UsageGuard;
+use std::sync::Arc;
+use tauqe_core::api::{
+    LocaleExecutionConfig, LocaleGenerationError, UsageObserver, UsageTotalsSnapshot,
+};
+use tauqe_protocol::{errors, LocaleGenerateParams, Request, Response};
 
-/// Handles `locale/generate`: validates the request, runs a single structured
-/// provider call, and returns a sanitized catalog.
 pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Response {
     let params: LocaleGenerateParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
     {
-        Some(params) => params,
+        Some(p) => p,
         None => {
             return Response::err(
                 req.id,
                 errors::INVALID_PARAMS,
                 "Missing or invalid locale generate params",
-            );
+            )
         }
     };
-
-    if params.language.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Target language cannot be empty",
-        );
-    }
-    if params.items.is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "No catalog items to translate",
-        );
-    }
-
-    // Resolve the Scribe model and provider up front: locale synthesis is a
-    // lightweight structured text translation task owned by the Scribe role.
-    let (config, model) = {
-        let guard = state.config.lock().await;
-        let model = guard.config.resolve_role(ModelRole::Scribe);
-        (guard.config.clone(), model)
+    let prepared = match state
+        .application
+        .prepare_locale_generation(tauqe_core::locale::LocaleGenerateParams {
+            language: params.language,
+            items: params
+                .items
+                .into_iter()
+                .map(|item| tauqe_core::locale::LocaleCatalogItem {
+                    key: item.key,
+                    english: item.english,
+                    context: item.context,
+                    max_width: item.max_width,
+                })
+                .collect(),
+        })
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return locale_error(req.id, e),
     };
-    let provider = match resolve_locale_provider(state, &config, model.provider).await {
-        Ok(provider) => provider,
-        Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
+    #[cfg(test)]
+    let provider = match state.provider_override.lock().await.clone() {
+        Some(p) => Ok(p),
+        None => prepared.provider(),
     };
-
+    #[cfg(not(test))]
+    let provider = prepared.provider();
+    let provider = match provider {
+        Ok(p) => p,
+        Err(e) => return locale_error(req.id, e),
+    };
     let operation = match state.try_begin_operation() {
-        Ok(guard) => Arc::new(guard),
+        Ok(op) => op,
         Err(()) => {
             return Response::err(
                 req.id,
                 errors::OPERATION_IN_PROGRESS,
                 "Another operation is already running",
-            );
+            )
         }
     };
-
-    // Open the shared usage ledger: this call reports both the tokens the
-    // provider returned and the duration the harness measured, so every
-    // operation kind feeds one consistent snapshot.
-    let op_id = format!("op-{}", crate::state::next_operation_id());
-    let usage_guard = state.begin_usage(&op_id).await;
-
-    // Locale synthesis never produces code changes, so it is a Structured
-    // Output operation (see `crates/core/Conventions.md`, section 1.2): the
-    // model answers with the enforced JSON schema instead of free-form text.
-    let messages = vec![
-        ChatMessage::system(tauqe_core::locale::build_locale_system_prompt()),
-        ChatMessage::user(tauqe_core::locale::build_locale_user_prompt(&params)),
-    ];
-    let response_format = tauqe_core::locale::locale_response_format();
-
-    let cancel_rx = operation.cancel_receiver();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let model_name = model.name.clone();
-    let stream_cancel = cancel_rx.clone();
-    let stream_task = tokio::spawn(async move {
-        provider
-            .stream_chat(
-                &model_name,
-                messages,
-                Some(response_format),
-                tx,
-                stream_cancel,
-            )
-            .await
+    let observer = Arc::new(Observer {
+        state: Arc::clone(state),
     });
-    // The streamed provider task is reachable only through the operation slot:
-    // a hard cancel and the shutdown drain abort the call through this handle,
-    // so a provider that ignores the cooperative signal cannot outlive the
-    // request it belongs to.
-    operation.set_abort_handle(stream_task.abort_handle());
-
-    let mut raw_text = String::new();
-    let mut stream_error = None;
-    let mut cancelled = false;
-    while let Some(event) = rx.recv().await {
-        match event {
-            StreamEvent::TextDelta(delta) => raw_text.push_str(&delta),
-            // Usage is folded into the in-flight window as it arrives, so a
-            // cancelled or failed call is charged for whatever it already
-            // spent instead of losing the report when the loop breaks early.
-            StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
-            StreamEvent::Cancelled => {
-                cancelled = true;
-                break;
-            }
-            StreamEvent::Error(message) => {
-                stream_error = Some(message);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    // The event loop has exited, so the slot must stop pointing at the streamed
-    // task: the call is about to be awaited locally, and a hard cancel must not
-    // abort a task that has already finished.
-    operation.clear_abort_handle();
-
-    // A hard cancel is delivered as a signal rather than as a stream event, so
-    // the borrowed signal is consulted as well: an operation aborted through
-    // its handle yields a join error, which must surface as a cancellation
-    // instead of a model failure.
-    if *cancel_rx.borrow() || cancelled {
-        // The cancelled stream is reaped through the shared bounded task-exit
-        // confirmation (`crate::reap::abort_and_reap`, governed by the task-exit
-        // deadline), so a provider call that never reaches a suspension point
-        // cannot outlive the response.
-        let _ = abort_and_reap(&op_id, "locale-generation-stream", stream_task).await;
-        close_locale_usage(state, usage_guard, &op_id).await;
-        return Response::err(req.id, errors::CANCELLED, "Locale generation was cancelled");
-    }
-    if let Some(message) = stream_error {
-        // The stream reported a terminal error, but its task has not necessarily
-        // returned yet: it is reaped through the shared bounded task-exit
-        // confirmation (`crate::reap::abort_and_reap`, governed by the task-exit
-        // deadline) exactly as the cancellation branch above does, so no provider
-        // call outlives the response after the operation slot has been released.
-        let _ = abort_and_reap(&op_id, "locale-generation-stream", stream_task).await;
-        close_locale_usage(state, usage_guard, &op_id).await;
-        return Response::err(req.id, errors::MODEL_ERROR, message);
-    }
-    // A completed stream is awaited through the shared bounded task-exit
-    // confirmation (`crate::reap::await_bounded`, governed by the task-exit
-    // deadline): a task that never reaches a suspension point after its last event
-    // is classified as a typed stream failure carrying the recorded diagnostic
-    // instead of parking the request.
-    match await_bounded(&op_id, "locale-generation-stream", stream_task).await {
-        Awaited::Joined(Ok(Ok(()))) => {}
-        Awaited::Joined(Ok(Err(err))) => {
-            close_locale_usage(state, usage_guard, &op_id).await;
-            return Response::err(req.id, errors::MODEL_ERROR, err.to_string());
-        }
-        Awaited::Joined(Err(join_err)) => {
-            close_locale_usage(state, usage_guard, &op_id).await;
-            return Response::err(
-                req.id,
-                errors::MODEL_ERROR,
-                format!("Locale generation stream task failed: {}", join_err),
-            );
-        }
-        Awaited::Orphaned => {
-            // The confirmation expired, so the abandoned task is still running: the
-            // response carries the recorded expiry diagnostic instead of a result the
-            // provider never delivered.
-            close_locale_usage(state, usage_guard, &op_id).await;
-            let message = format!(
-                "Locale generation stream task did not stop within the {} ms task-exit deadline",
-                crate::reap::task_exit_deadline().as_millis()
-            );
-            return Response::err(req.id, errors::MODEL_ERROR, message);
-        }
-    }
-
-    // The terminal flush folds the reported usage and the measured duration of
-    // this one-shot call into the session totals, then mirrors the authoritative
-    // numbers onto the legacy per-operation channel. The legacy fields are
-    // projected from that snapshot, never from a separately maintained counter,
-    // so the aggregate and legacy views can never disagree.
-    close_locale_usage(state, usage_guard, &op_id).await;
-
-    // Deterministic geometry validation and graceful English fallback live in
-    // `core`: the daemon never trusts the model's own width arithmetic, so an
-    // over-budget string is shortened or reverted to its English term and a
-    // missing key transparently degrades to English (c-5).
-    let result = tauqe_core::locale::validate_and_sanitize_locale(
-        &params,
-        &tauqe_core::locale::parse_locale_output(&raw_text),
-    );
-    Response::ok_typed(req.id, &result)
-}
-
-/// Closes the locale call's usage window exactly once.
-///
-/// Every terminal path — success, cancellation, and provider failure — reaches
-/// this, so the tokens and the time the call already consumed are folded into
-/// the session totals instead of leaving a window open for the next operation to
-/// discard. The legacy per-operation usage channel is then mirrored from the
-/// same authoritative snapshot.
-async fn close_locale_usage(state: &Arc<AppState>, guard: UsageGuard, op_id: &str) {
-    guard.flush().await;
-    crate::handlers::model::emit_legacy_usage_event(state, op_id).await;
-}
-
-/// Resolves the LLM provider for a locale call.
-///
-/// Deterministic unit tests inject a scripted provider through the state's test
-/// seam; production builds construct a real network provider from configuration.
-async fn resolve_locale_provider(
-    _state: &Arc<AppState>,
-    config: &tauqe_core::config::AppConfig,
-    kind: ProviderKind,
-) -> Result<Arc<dyn LlmProvider>, String> {
-    #[cfg(test)]
+    match state
+        .application
+        .generate_locale(
+            &operation,
+            prepared,
+            provider,
+            observer,
+            LocaleExecutionConfig {
+                operation_id: format!("op-{}", crate::state::next_operation_id()),
+                exit_deadline: crate::reap::task_exit_deadline(),
+            },
+        )
+        .await
     {
-        if let Some(provider) = _state.provider_override.lock().await.clone() {
-            return Ok(provider);
-        }
+        Ok(result) => Response::ok_typed(
+            req.id,
+            &tauqe_protocol::LocaleGenerateResult {
+                language: result.language,
+                translations: result.translations,
+            },
+        ),
+        Err(e) => locale_error(req.id, e),
     }
-    create_provider(kind, config)
-        .map(Arc::from)
-        .map_err(|err| err.to_string())
+}
+fn locale_error(id: tauqe_protocol::RequestId, error: LocaleGenerationError) -> Response {
+    let code = match &error {
+        LocaleGenerationError::Invalid(_) => errors::INVALID_PARAMS,
+        LocaleGenerationError::Provider(_) => errors::NO_API_KEY,
+        LocaleGenerationError::Model(_) => errors::MODEL_ERROR,
+        LocaleGenerationError::Cancelled(_) => errors::CANCELLED,
+    };
+    Response::err(id, code, error.to_string())
+}
+struct Observer {
+    state: Arc<AppState>,
+}
+impl UsageObserver for Observer {
+    fn publish_usage_totals(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
+        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
+    }
+    fn publish_usage(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
+        self.state.out.send_event(&tauqe_protocol::Event {
+            method: tauqe_protocol::events::MODEL_USAGE.into(),
+            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+                operation_id: id.into(),
+                usage: crate::usage::wire_usage(&snapshot.operation_totals().to_usage_info()),
+                session_total_cost: snapshot.session.cost,
+                current_cost: Some(snapshot.operation_totals().cost),
+            })
+            .ok(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +123,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
+    use tauqe_core::providers::{ChatMessage, LlmProvider, StreamEvent};
     use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
 
     /// Hard budget for a fixture whose subject is a task that reaches no
@@ -506,13 +384,13 @@ mod tests {
     /// explicit cancellation, so the cancelled terminal path is exercised
     /// instead of the ordinary success path.
     struct CancellingProvider {
-        usage: tauqe_protocol::ModelUsageInfo,
+        usage: tauqe_core::providers::ModelUsageInfo,
     }
 
     #[async_trait]
     impl LlmProvider for CancellingProvider {
-        fn kind(&self) -> tauqe_protocol::ProviderKind {
-            tauqe_protocol::ProviderKind::OpenRouter
+        fn kind(&self) -> tauqe_core::models::ProviderKind {
+            tauqe_core::models::ProviderKind::OpenRouter
         }
 
         async fn stream_chat(
@@ -538,12 +416,12 @@ mod tests {
             "translations": [{"key": "tab.review", "translation": "Обзор"}]
         })
         .to_string();
-        let usage = tauqe_protocol::ModelUsageInfo {
+        let usage = tauqe_core::providers::ModelUsageInfo {
             prompt_tokens: 20,
             completion_tokens: 8,
             total_tokens: 28,
             cost: Some(0.4),
-            ..tauqe_protocol::ModelUsageInfo::default()
+            ..tauqe_core::providers::ModelUsageInfo::default()
         };
         let provider: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted([
             MockResponse::text(raw).with_usage(usage),
@@ -591,12 +469,12 @@ mod tests {
     /// window behind.
     #[tokio::test]
     async fn cancellation_still_charges_the_operation_once() {
-        let usage = tauqe_protocol::ModelUsageInfo {
+        let usage = tauqe_core::providers::ModelUsageInfo {
             prompt_tokens: 5,
             completion_tokens: 1,
             total_tokens: 6,
             cost: Some(0.1),
-            ..tauqe_protocol::ModelUsageInfo::default()
+            ..tauqe_core::providers::ModelUsageInfo::default()
         };
         let provider: Arc<dyn LlmProvider> = Arc::new(CancellingProvider { usage });
         let (state, mut rx) = state_with_provider_on_wire(provider).await;
@@ -652,8 +530,8 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for WedgedProvider {
-        fn kind(&self) -> tauqe_protocol::ProviderKind {
-            tauqe_protocol::ProviderKind::OpenRouter
+        fn kind(&self) -> tauqe_core::models::ProviderKind {
+            tauqe_core::models::ProviderKind::OpenRouter
         }
 
         async fn stream_chat(
@@ -737,8 +615,8 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for FailingThenWedgedProvider {
-        fn kind(&self) -> tauqe_protocol::ProviderKind {
-            tauqe_protocol::ProviderKind::OpenRouter
+        fn kind(&self) -> tauqe_core::models::ProviderKind {
+            tauqe_core::models::ProviderKind::OpenRouter
         }
 
         async fn stream_chat(
@@ -803,8 +681,8 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for WedgedAfterTerminalProvider {
-        fn kind(&self) -> tauqe_protocol::ProviderKind {
-            tauqe_protocol::ProviderKind::OpenRouter
+        fn kind(&self) -> tauqe_core::models::ProviderKind {
+            tauqe_core::models::ProviderKind::OpenRouter
         }
 
         async fn stream_chat(

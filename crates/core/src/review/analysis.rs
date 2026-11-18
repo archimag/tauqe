@@ -12,15 +12,19 @@
 //! so a decorated spelling of a real identity is accepted while a hallucinated
 //! one is rejected with a diagnostic instead of entering the classification
 //! layer.
-//! layer.
 //!
 //! The payload also routes: `triage` carries the status each finding's
 //! resolution starts from. The routing decides the lifecycle of an already
 //! recorded finding and never rewrites it, so it is validated against the same
 //! identities as the classification.
-pub use tauqe_protocol::review::{
-    IssueStatus, PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput,
+mod regrouping;
+pub use regrouping::{
+    ensure_finding_identities, PostAnalysisRegrouping, PostAnalysisRegroupingError,
+    RegroupingStatistics,
 };
+
+pub use super::model::{PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput};
+use crate::review::IssueStatus;
 
 use std::borrow::Cow;
 
@@ -45,7 +49,7 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 /// The schema is deliberately flat: it contains no recursive `$ref` and
 /// declares `additionalProperties: false` on every object, so a Structured
 /// Output engine can enforce it verbatim.
-pub fn post_analysis_response_schema() -> serde_json::Value {
+fn post_analysis_response_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -222,7 +226,7 @@ fn strip_identity_label(value: &str) -> Option<&str> {
 /// the identity the session holds instead of failing on presentation alone.
 /// Comparison ignores ASCII case, and the resolved value is the identity as the
 /// session stores it, never the spelling the model used.
-pub fn resolve_identity<'a>(raw: &str, known_uuids: &'a [String]) -> Option<&'a str> {
+fn resolve_identity<'a>(raw: &str, known_uuids: &'a [String]) -> Option<&'a str> {
     let candidate = normalize_identity(raw);
     if candidate.is_empty() {
         return None;

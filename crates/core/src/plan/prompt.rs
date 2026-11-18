@@ -33,10 +33,13 @@ pub(crate) use refine::{
 };
 pub(crate) use step::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 
+pub use architect::{format_architect_escalation_note, format_architect_tier};
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
+    use crate::plan::{Plan, PlanItem, PlanItemStatus};
+    use crate::workflow::EditProtocolKind;
 
     fn sample_plan() -> Plan {
         Plan::from_parts(
@@ -45,7 +48,7 @@ mod tests {
             Some("Implement secure tokens".to_string()),
             100,
             200,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Stateless JWT".to_string(),
                 details: Some("Use asymmetric ECDSA".to_string()),

@@ -1,9 +1,10 @@
 use crate::escape::{escape_xml_text, single_line};
-use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
+use crate::plan::{Plan, PlanItem, PlanItemStatus};
+use crate::workflow::EditProtocolKind;
 
-pub(crate) const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
+const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
 
-pub(crate) const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
+const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
 
 /// Joins identifiers or paths into a single escaped, comma-separated line.
 fn escape_list(items: &[String]) -> String {
@@ -65,7 +66,7 @@ pub(crate) fn format_plan_step_execution_prompt(
 
     if !plan.concept.is_empty() {
         out.push_str("### Architectural Concept (System Invariants & Focus):\n");
-        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+        fn render_concept(out: &mut String, items: &[crate::plan::ConceptItem], depth: usize) {
             let indent = "  ".repeat(depth);
             for item in items {
                 out.push_str(&format!(
@@ -228,7 +229,7 @@ pub(crate) fn format_plan_step_retry_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::ConceptItem;
+    use crate::plan::ConceptItem;
 
     /// Builds a plan whose single leaf step addresses one concept invariant.
     fn leaf_plan() -> Plan {

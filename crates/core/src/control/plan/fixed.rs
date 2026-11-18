@@ -7,7 +7,7 @@
 #![cfg(test)]
 use tokio::sync::watch;
 
-use tauqe_protocol::{PlanItem, PlanItemStatus};
+use crate::plan::{PlanItem, PlanItemStatus};
 
 use crate::control::context::LoopContext;
 use crate::control::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
@@ -55,7 +55,7 @@ fn collect_todo_leaves(items: &[PlanItem], leaves: &mut Vec<String>) {
 /// 2. Performs a preorder (DFS) walk of the plan items to extract leaf steps with status `Todo`.
 /// 3. Executes the sequence via [`run_plan_sequence_loop`], respecting soft-stop and cancellation signals.
 /// 4. Re-reads and refreshes aggregated container statuses via `refresh_parent_statuses()` in [`PlanStorage`].
-pub(crate) async fn run_fixed_plan_loop(
+async fn run_fixed_plan_loop(
     ctx: &mut LoopContext<'_>,
     plan_id: &str,
     config: &FixedPlanLoopConfig,
@@ -113,10 +113,11 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use tauqe_protocol::{
-        CapabilityTree, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan, PlanItem,
-        PlanItemStatus,
-    };
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::models::ModelRef;
+    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
+    use crate::workflow::EditProtocolKind;
 
     use crate::config::ModelsConfig;
     use crate::context::ContextManager;

@@ -37,7 +37,7 @@ pub struct PlanRejection {
 
 impl PlanRejection {
     /// Creates a rejection of `kind` carrying the wording it reports.
-    pub fn new(kind: PlanRejectionKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: PlanRejectionKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -55,7 +55,8 @@ impl PlanRejection {
     }
 
     /// Creates a rejection of a payload that never reached plan storage.
-    pub fn abandoned(message: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn abandoned(message: impl Into<String>) -> Self {
         Self::new(PlanRejectionKind::Abandoned, message)
     }
 }

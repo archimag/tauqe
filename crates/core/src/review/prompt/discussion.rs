@@ -1,12 +1,13 @@
 use crate::context::ContextFileContent;
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
-use tauqe_protocol::review::{ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
+use crate::review::{ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
 
 use super::refine::render_path_list;
-pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
+const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
-pub fn format_review_discussion_prompt(
+#[cfg(test)]
+pub(crate) fn format_review_discussion_prompt(
     session: &ReviewSession,
     focused_item_id: Option<u32>,
     user_comment: &str,

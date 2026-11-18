@@ -3,20 +3,24 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-pub use tauqe_protocol as protocol;
-
+pub mod api;
+mod application;
 pub mod blocking;
 pub(crate) mod capabilities;
 pub mod config;
 pub mod context;
 pub mod control;
+pub mod discussion;
 pub(crate) mod docs;
 pub mod edits;
 pub(crate) mod escape;
 pub mod git;
 pub mod history;
+mod infrastructure;
+pub mod llm;
 pub mod locale;
 pub mod mockups;
+pub mod models;
 pub mod outer_docs;
 pub mod plan;
 pub mod prompt;

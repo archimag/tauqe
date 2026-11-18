@@ -32,26 +32,26 @@
 
 use std::time::Duration;
 
+use crate::models::ProviderKind;
 use async_trait::async_trait;
-use tauqe_protocol::ProviderKind;
 use tokio::sync::{mpsc, watch};
 
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
 /// Total attempts made for one request, including the first one.
-pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 4;
+const DEFAULT_MAX_ATTEMPTS: u32 = 4;
 /// Pause before the second attempt; every later pause doubles it.
-pub(crate) const DEFAULT_BASE_DELAY_MS: u64 = 500;
+const DEFAULT_BASE_DELAY_MS: u64 = 500;
 /// Upper bound of a single backoff pause.
-pub(crate) const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
+const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
 /// Cumulative model output tolerated for a single request attempt.
 ///
 /// A model caught in a reasoning loop keeps streaming deltas forever: the relay
 /// forwards them, the client keeps appending, and the process grows until the
 /// system kills it. The ceiling turns that into a deterministic, terminal
 /// failure while the transport itself is still healthy.
-pub(crate) const DEFAULT_MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
 
 /// Marker embedded in the transport error raised when a provider cuts a
 /// structured JSON generation short at its token limit.
@@ -138,7 +138,7 @@ impl RetryingProvider {
 
     /// Overrides the cumulative output ceiling of a single attempt.
     #[cfg(test)]
-    pub(crate) fn with_max_stream_bytes(mut self, max_stream_bytes: usize) -> Self {
+    fn with_max_stream_bytes(mut self, max_stream_bytes: usize) -> Self {
         self.max_stream_bytes = max_stream_bytes.max(1);
         self
     }

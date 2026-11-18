@@ -7,14 +7,22 @@
 //! carry them belong to [`crate::control::turn::run_turn_loop`], which is the single
 //! loop of the turn.
 
+use crate::config::project::ProjectConfig;
+use crate::context::ContextAccess;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::staging::StagingState;
 use crate::control::context::LoopContext;
 use crate::control::outcome::{ResponseEnvelope, SystemError};
+use crate::edits::EditFileOp;
+use crate::edits::EditOperation;
+use crate::edits::EditProposal;
 use crate::edits::StagedEditsState;
+use crate::edits::VerificationVerdict;
 use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnapshot};
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
 use crate::providers::StreamEvent;
 use crate::toolchain::{
     format_staged_content, run_post_hooks_with_config, run_verification_pipeline_with_config,
@@ -22,10 +30,6 @@ use crate::toolchain::{
 };
 use crate::workflow::verification::{build_verification_retry_prompt, extract_error_paths};
 use similar::{ChangeTag, TextDiff};
-use tauqe_protocol::{
-    ContextAccess, EditFileOp, EditOperation, EditProposal, LlmCapability, LlmCommand,
-    ProjectConfig, VerificationVerdict,
-};
 
 /// Capabilities processed by the atomic edits and verification contour.
 pub(crate) const EDIT_CAPABILITIES: &[LlmCapability] = &[
@@ -542,7 +546,7 @@ fn compute_cumulative_diff_events(
 
         events.push(StreamEvent::EditFileDone {
             path: path.clone(),
-            status: tauqe_protocol::EditFileStatus::Ok,
+            status: crate::edits::EditFileStatus::Ok,
             error: None,
             hunks_count,
         });
@@ -676,7 +680,7 @@ fn format_verification_failure_report(
         let body = if r.diagnostics.is_empty() {
             r.combined_output.trim().to_string()
         } else {
-            tauqe_protocol::format_diagnostics(&r.diagnostics)
+            crate::toolchain::format_diagnostics(&r.diagnostics)
         };
         report.push_str(&format!(
             "Command `{}` failed:\n```\n{}\n```\n\n",
@@ -725,13 +729,14 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
+    use crate::edits::EditReplace;
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::llm::{CommitMessageCommand, LlmCommand, TextCommand};
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{
-        CapabilityTree, CommitMessageCommand, EditReplace, LlmCapability, LlmCommand, ModelRef,
-        TextCommand,
-    };
 
     struct Fixture {
         dir: tempfile::TempDir,

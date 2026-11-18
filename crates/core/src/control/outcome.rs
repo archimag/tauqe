@@ -1,6 +1,8 @@
 //! Outcome classifications, result envelopes, and failure reports.
 
-use tauqe_protocol::{LlmCapability, LlmCommand, ModelUsageInfo};
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
+use crate::providers::ModelUsageInfo;
 
 /// Infrastructure-level failure that aborts execution without consuming model attempts.
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +53,7 @@ impl ResponseEnvelope {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
-            if cmd.capability() == Some(capability) {
+            if crate::llm::command_capability(&cmd) == Some(capability) {
                 matched.push(cmd);
             } else {
                 remaining.push(cmd);
@@ -66,10 +68,7 @@ impl ResponseEnvelope {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
-            if cmd
-                .capability()
-                .is_some_and(|cap| capabilities.contains(&cap))
-            {
+            if crate::llm::command_capability(&cmd).is_some_and(|cap| capabilities.contains(&cap)) {
                 matched.push(cmd);
             } else {
                 remaining.push(cmd);
@@ -83,12 +82,16 @@ impl ResponseEnvelope {
     pub fn has(&self, capability: LlmCapability) -> bool {
         self.items
             .iter()
-            .any(|cmd| cmd.capability() == Some(capability))
+            .any(|cmd| crate::llm::command_capability(cmd) == Some(capability))
     }
 
     /// Returns the unique set of capabilities remaining in the envelope.
     pub fn remaining_capabilities(&self) -> Vec<LlmCapability> {
-        let mut caps: Vec<_> = self.items.iter().filter_map(|c| c.capability()).collect();
+        let mut caps: Vec<_> = self
+            .items
+            .iter()
+            .filter_map(crate::llm::command_capability)
+            .collect();
         caps.sort_by_key(|c| *c as usize);
         caps.dedup();
         caps
@@ -215,7 +218,8 @@ impl<T> LoopResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{BlockedCommand, CommitMessageCommand, TextCommand};
+    use crate::llm::{BlockedCommand, CommitMessageCommand, TextCommand};
+
     #[test]
     fn test_drainable_envelope() {
         let commands = vec![

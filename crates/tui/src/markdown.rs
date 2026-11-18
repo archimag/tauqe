@@ -300,9 +300,6 @@ pub struct ExtractedCodeBlock {
 ///
 /// The regions feed the interactive link registry, which turns them into
 /// clickable rectangles.
-// The regions are exercised by the extraction tests below; the allowance keeps
-// the crate's zero-warning gate green until the link registry reads them.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ExtractedLink {
     /// Position of the region inside the body, counting from zero.

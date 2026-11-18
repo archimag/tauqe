@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::llm::discussion::RepoSearchRequest;
 use regex::RegexBuilder;
-use tauqe_protocol::RepoSearchRequest;
 
 use crate::blocking::run_blocking;
 use crate::context::path::verify_path_within_repo;
@@ -10,7 +10,7 @@ use crate::escape::escape_xml_attr;
 use super::ResearchLimits;
 
 /// Maximum file size eligible for regex scanning (2 MiB).
-pub const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
+const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Maximum aggregate text a single round retains for regex scanning (64 MiB).
 ///
@@ -19,33 +19,33 @@ pub const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
 /// bounds that peak: files enter the corpus in the round's own file order while
 /// they fit, and every file left over is reported to the queries whose scope
 /// covers it instead of being materialized.
-pub const MAX_SEARCHABLE_CORPUS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SEARCHABLE_CORPUS_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Compiled regex size limit to prevent ReDoS and excessive memory usage (10 MiB).
-pub const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Compiled regex DFA size limit (10 MiB).
-pub const REGEX_DFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+const REGEX_DFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// A single matched repository file with its occurrence count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSearchMatch {
-    pub path: String,
-    pub count: usize,
+    pub(crate) path: String,
+    pub(crate) count: usize,
 }
 
 /// Aggregated outcome of executing a single [`RepoSearchRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSearchResult {
-    pub query: RepoSearchRequest,
-    pub matches: Vec<FileSearchMatch>,
-    pub total_matched_files: usize,
-    pub total_matches: usize,
-    pub omitted_files: usize,
+    pub(crate) query: RepoSearchRequest,
+    pub(crate) matches: Vec<FileSearchMatch>,
+    pub(crate) total_matched_files: usize,
+    pub(crate) total_matches: usize,
+    pub(crate) omitted_files: usize,
     /// In-scope files the round left unsearched because the aggregate corpus
     /// ceiling was reached.
-    pub unsearched_files: usize,
-    pub error: Option<String>,
+    pub(crate) unsearched_files: usize,
+    pub(crate) error: Option<String>,
 }
 
 /// Normalizes and validates a requested search path against repository boundaries.
@@ -53,7 +53,7 @@ pub struct RepoSearchResult {
 /// Empty strings, `"."`, and `"./"` denote the repository root (`""`). Absolute paths,
 /// directory traversal components (`..`), NUL bytes, and symlinks escaping the repository
 /// are rejected with descriptive diagnostic errors.
-pub fn normalize_search_path(repo_root: &Path, raw_path: &str) -> Result<String, String> {
+fn normalize_search_path(repo_root: &Path, raw_path: &str) -> Result<String, String> {
     if raw_path.contains('\0') {
         return Err(format!("Path contains NUL byte: {:?}", raw_path));
     }
@@ -402,6 +402,7 @@ fn failed_search_result(query: RepoSearchRequest, error: String) -> RepoSearchRe
 /// A single query is a one-member round: it resolves its scope and its compiled
 /// pattern, resolves the searchable corpus over that scope through the very same
 /// shared pass the multi-query round uses, and evaluates once.
+#[cfg(test)]
 fn execute_repo_search_sync(
     repo_root: &Path,
     query: &RepoSearchRequest,
@@ -424,7 +425,8 @@ fn execute_repo_search_sync(
 /// The number of reported matching files is bounded by the project's
 /// `[context].max_matched_files_per_search`, so a project tunes how much of a
 /// broad match set reaches the model instead of recompiling the engine.
-pub fn execute_repo_search(
+#[cfg(test)]
+fn execute_repo_search(
     repo_root: &Path,
     query: &RepoSearchRequest,
     available_files: &[String],
@@ -477,7 +479,7 @@ fn execute_repo_searches_sync(
 }
 
 /// Executes multiple repository searches with round limits and offloaded blocking I/O.
-pub fn execute_repo_searches(
+pub(crate) fn execute_repo_searches(
     repo_root: &Path,
     queries: &[RepoSearchRequest],
     available_files: &[String],
@@ -487,7 +489,7 @@ pub fn execute_repo_searches(
 }
 
 /// Formats a single [`RepoSearchResult`] into the `<search_feedback>` XML block.
-pub fn format_single_search_feedback(result: &RepoSearchResult) -> String {
+fn format_single_search_feedback(result: &RepoSearchResult) -> String {
     let mut out = String::new();
     let path_attr = if result.query.path.is_empty() {
         "."
@@ -533,7 +535,7 @@ pub fn format_single_search_feedback(result: &RepoSearchResult) -> String {
 }
 
 /// Formats multiple [`RepoSearchResult`] instances into combined `<search_feedback>` blocks.
-pub fn format_search_feedback(results: &[RepoSearchResult]) -> String {
+pub(crate) fn format_search_feedback(results: &[RepoSearchResult]) -> String {
     results
         .iter()
         .map(format_single_search_feedback)

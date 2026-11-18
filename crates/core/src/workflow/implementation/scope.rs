@@ -8,16 +8,15 @@
 //! terminal outcome is mapped back onto the storage that owns the entity
 //! instead of being guessed.
 
+use crate::workflow::turn::{ModelTurnPlanContext, TurnWorkContext, TurnWorkQueue};
 use std::path::Path;
 
 use crate::plan::storage::PlanStorage;
+use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation};
 use crate::review::prompt::apply_group_architectural_context;
 use crate::review::storage::ReviewStorage;
+use crate::review::{ReviewItem, ReviewSession, DEFAULT_REVIEW_GROUP_ID};
 use crate::workflow::implementation::StepFailure;
-use tauqe_protocol::{
-    Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation, ReviewItem, ReviewSession,
-    DEFAULT_REVIEW_GROUP_ID,
-};
 
 /// The source of work an implementation horizon is resolved from.
 ///
@@ -39,7 +38,7 @@ pub enum ExecutionScope {
 
 impl ExecutionScope {
     /// Targeted plan step or subtree, if the scope is constrained to one.
-    pub fn target_step_id(&self) -> Option<&str> {
+    pub(crate) fn target_step_id(&self) -> Option<&str> {
         match self {
             Self::Plan { step_id, .. } => step_id.as_deref(),
             Self::ReviewGroup { .. } | Self::ReviewFinding { .. } => None,
@@ -80,7 +79,7 @@ pub struct ImplementationFrame {
     /// The horizon to execute, with its header and concept tree.
     pub plan: Plan,
     /// Findings the completion transition closes, in stored order.
-    pub findings: Vec<ReviewItem>,
+    findings: Vec<ReviewItem>,
 }
 
 /// Resolves a stored local plan into its execution frame.
@@ -321,8 +320,9 @@ pub fn classify_scope_stall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
-    use tauqe_protocol::{PlanImplementation, ReviewGroup};
+    use crate::plan::PlanImplementation;
+    use crate::review::ReviewGroup;
+    use crate::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
     use tempfile::tempdir;
 
     /// Builds a finding that declares one editable and one protected file.
@@ -574,5 +574,230 @@ mod tests {
         let mut plan = stalled_plan();
         plan.implementation.items[0].status = PlanItemStatus::Done;
         assert_eq!(dependency_stalled_step(&plan), None);
+    }
+}
+
+impl ExecutionScope {
+    /// Declares the plan turn coordinates of a plan step.
+    ///
+    /// A review scope carries no plan coordinates: its turns are addressed by
+    /// the review entities the runner executes.
+    pub fn plan_context(&self, queue: &TurnWorkQueue) -> Option<ModelTurnPlanContext> {
+        let plan_id = match self {
+            ExecutionScope::Plan { plan_id, .. } => plan_id,
+            ExecutionScope::ReviewGroup { .. } | ExecutionScope::ReviewFinding { .. } => {
+                return None
+            }
+        };
+        let step_id = queue
+            .active()
+            .map(|item| item.id.clone())
+            .unwrap_or_default();
+        Some(ModelTurnPlanContext {
+            plan_id: plan_id.clone(),
+            step_id,
+            batch_step_ids: queue.items.iter().map(|item| item.id.clone()).collect(),
+        })
+    }
+
+    /// Declares the work the running step executes from typed fields.
+    ///
+    /// Every scope names its own work kind, so the interface never infers the task
+    /// from a title: a plan step carries the plan coordinates, and both review
+    /// scopes carry the review address with the queue the run advances through — a
+    /// review group through its unified horizon, a single finding as a degenerate
+    /// run.
+    ///
+    /// The typed request carries only the title of the horizon a scope owns, which
+    /// is the plan title, the group title, or the finding title; the title of the
+    /// review session itself is not part of it. Both review variants therefore
+    /// address the review by the identifier the client can resolve, instead of
+    /// inventing a session title nobody declared.
+    pub fn work_context(&self, title: &str, queue: TurnWorkQueue) -> TurnWorkContext {
+        match self {
+            ExecutionScope::Plan { plan_id, .. } => TurnWorkContext::PlanStep {
+                plan_id: plan_id.clone(),
+                plan_title: title.to_string(),
+                queue,
+            },
+            ExecutionScope::ReviewGroup {
+                review_id,
+                group_id,
+            } => TurnWorkContext::ReviewGroupStep {
+                review_id: review_id.clone(),
+                review_title: review_id.clone(),
+                group_id: group_id.clone(),
+                group_title: title.to_string(),
+                queue,
+            },
+            ExecutionScope::ReviewFinding { review_id, .. } => TurnWorkContext::ReviewStep {
+                review_id: review_id.clone(),
+                review_title: review_id.clone(),
+                queue,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod work_context_tests {
+    use super::*;
+    use crate::workflow::turn::TurnWorkItem;
+
+    /// Ordered queue every work-context assertion advances through.
+    fn queue() -> TurnWorkQueue {
+        TurnWorkQueue {
+            items: vec![
+                TurnWorkItem {
+                    id: "1".to_string(),
+                    title: "Declare the contract".to_string(),
+                },
+                TurnWorkItem {
+                    id: "2".to_string(),
+                    title: "Wire the client".to_string(),
+                },
+            ],
+            active_index: 1,
+        }
+    }
+
+    #[test]
+    fn a_plan_scope_declares_a_plan_step_context() {
+        let context = ExecutionScope::work_context(
+            &ExecutionScope::Plan {
+                plan_id: "plan-1".to_string(),
+                step_id: None,
+            },
+            "Plan One",
+            queue(),
+        );
+
+        match context {
+            TurnWorkContext::PlanStep {
+                plan_id,
+                plan_title,
+                queue,
+            } => {
+                assert_eq!(plan_id, "plan-1");
+                assert_eq!(plan_title, "Plan One");
+                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
+            }
+            other => panic!("unexpected context: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_review_finding_scope_declares_a_review_step_context() {
+        let context = ExecutionScope::work_context(
+            &ExecutionScope::ReviewFinding {
+                review_id: "rev-42".to_string(),
+                item_id: 7,
+            },
+            "Guard the parser",
+            queue(),
+        );
+
+        match context {
+            TurnWorkContext::ReviewStep {
+                review_id,
+                review_title,
+                queue,
+            } => {
+                assert_eq!(review_id, "rev-42");
+                // The typed request carries the horizon title, not the session
+                // title, so the review is addressed by its identifier.
+                assert_eq!(review_title, "rev-42");
+                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
+            }
+            other => panic!("unexpected context: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_review_group_scope_declares_a_review_group_step_context() {
+        let context = ExecutionScope::work_context(
+            &ExecutionScope::ReviewGroup {
+                review_id: "rev-42".to_string(),
+                group_id: "arch-1".to_string(),
+            },
+            "Unified error handling",
+            queue(),
+        );
+
+        match context {
+            TurnWorkContext::ReviewGroupStep {
+                review_id,
+                review_title,
+                group_id,
+                group_title,
+                queue,
+            } => {
+                assert_eq!(review_id, "rev-42");
+                assert_eq!(review_title, "rev-42");
+                assert_eq!(group_id, "arch-1");
+                // The frame the executor resolves carries the group title as the
+                // horizon title, so the step names the group it executes.
+                assert_eq!(group_title, "Unified error handling");
+                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
+            }
+            other => panic!("unexpected context: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod plan_coordinates_tests {
+    use super::*;
+    use crate::workflow::turn::TurnWorkItem;
+
+    #[test]
+    fn plan_coordinates_follow_queue_order_and_keep_missing_active_member_empty() {
+        let scope = ExecutionScope::Plan {
+            plan_id: "p".into(),
+            step_id: Some("scope-root".into()),
+        };
+        let mut queue = TurnWorkQueue {
+            items: vec![
+                TurnWorkItem {
+                    id: "2".into(),
+                    title: "Second".into(),
+                },
+                TurnWorkItem {
+                    id: "1".into(),
+                    title: "First".into(),
+                },
+            ],
+            active_index: 1,
+        };
+        let context = scope.plan_context(&queue).unwrap();
+        assert_eq!(context.plan_id, "p");
+        assert_eq!(context.step_id, "1");
+        assert_eq!(context.batch_step_ids, ["2", "1"]);
+        queue.active_index = 99;
+        let context = scope.plan_context(&queue).unwrap();
+        assert!(context.step_id.is_empty());
+        assert_eq!(context.batch_step_ids, ["2", "1"]);
+        assert!(scope
+            .plan_context(&TurnWorkQueue::default())
+            .unwrap()
+            .step_id
+            .is_empty());
+    }
+
+    #[test]
+    fn review_scopes_have_no_plan_coordinates() {
+        let queue = TurnWorkQueue::default();
+        assert!(ExecutionScope::ReviewGroup {
+            review_id: "r".into(),
+            group_id: "g".into()
+        }
+        .plan_context(&queue)
+        .is_none());
+        assert!(ExecutionScope::ReviewFinding {
+            review_id: "r".into(),
+            item_id: 7
+        }
+        .plan_context(&queue)
+        .is_none());
     }
 }

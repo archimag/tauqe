@@ -32,7 +32,6 @@ pub(crate) mod trust;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tauqe_protocol::{OuterDocsCacheEntry, OuterDocsCacheRemoveResult};
 use tokio::sync::watch;
 
 use crate::config::{OuterDocEntry, OuterDocSource};
@@ -40,6 +39,21 @@ use crate::outer_docs::trust::RefsTrust;
 
 pub use materialize::MaterializeError;
 pub use trust::{TrustRefusal, WorkspaceDeclaration};
+
+/// Inventory of one materialized document, addressed by its logical path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedDocument {
+    pub path: String,
+    pub size_bytes: u64,
+    pub estimated_tokens: u64,
+}
+
+/// Material removed from the isolated cache.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheRemoval {
+    pub removed_files: usize,
+    pub removed_bytes: u64,
+}
 
 /// Repository-relative directory holding the isolated documentation snapshot.
 pub const OUTER_DOCS_CACHE_DIR: &str = ".tauqe/cache/outer_docs";
@@ -130,11 +144,11 @@ pub(crate) fn is_clean_relative_path(path: &str) -> bool {
 /// The reported path is the logical path of the document — the declared
 /// identifier and the relative path below it — so the disk prefix the
 /// declaration compiles to never reaches the wire contract.
-pub fn list_cache_entries(repo_root: &Path) -> Result<Vec<OuterDocsCacheEntry>, String> {
+pub(crate) fn list_cache_entries(repo_root: &Path) -> Result<Vec<CachedDocument>, String> {
     let root = repo_root.join(OUTER_DOCS_CACHE_DIR);
     // Scanning the cache reads every directory of the snapshot tree, so the
     // walk runs off the async executor thread.
-    crate::blocking::run_blocking(move || -> Result<Vec<OuterDocsCacheEntry>, String> {
+    crate::blocking::run_blocking(move || -> Result<Vec<CachedDocument>, String> {
         let mut entries = BTreeMap::new();
         collect_cache_entries(&root, &root, &mut entries)?;
         Ok(entries.into_values().collect())
@@ -150,7 +164,7 @@ pub fn list_cache_entries(repo_root: &Path) -> Result<Vec<OuterDocsCacheEntry>, 
 fn collect_cache_entries(
     root: &Path,
     directory: &Path,
-    entries: &mut BTreeMap<String, OuterDocsCacheEntry>,
+    entries: &mut BTreeMap<String, CachedDocument>,
 ) -> Result<(), String> {
     let read = match std::fs::read_dir(directory) {
         Ok(read) => read,
@@ -182,7 +196,7 @@ fn collect_cache_entries(
                 .replace(std::path::MAIN_SEPARATOR, "/");
             entries.insert(
                 logical.clone(),
-                OuterDocsCacheEntry {
+                CachedDocument {
                     path: logical,
                     size_bytes,
                     estimated_tokens: crate::prompt::estimate_tokens_from_bytes(size_bytes),
@@ -203,16 +217,16 @@ fn cache_unreadable(directory: &Path, error: &std::io::Error) -> String {
 
 /// Why one removal from the external documentation cache did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CacheRemoveError {
+pub enum CacheError {
     /// The requested path is not a clean logical path of the cache.
     InvalidPath(String),
     /// The requested path names no cached document or directory.
     NotFound(String),
-    /// The removal reached the file system and failed.
+    /// Cache access or context reconciliation failed.
     Failed(String),
 }
 
-impl CacheRemoveError {
+impl CacheError {
     /// One-line cause of the failure.
     pub fn reason(&self) -> &str {
         match self {
@@ -221,7 +235,7 @@ impl CacheRemoveError {
     }
 }
 
-impl std::fmt::Display for CacheRemoveError {
+impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.reason())
     }
@@ -235,18 +249,18 @@ impl std::fmt::Display for CacheRemoveError {
 /// every directory the removal emptied is pruned afterwards, so a crash leaves
 /// either the complete subtree or none of it, and the inventory never reports a
 /// directory that no longer holds a document.
-pub fn remove_cache_entry(
+pub(crate) fn remove_cache_entry(
     repo_root: &Path,
     logical_path: &str,
-) -> Result<OuterDocsCacheRemoveResult, CacheRemoveError> {
+) -> Result<CacheRemoval, CacheError> {
     let logical = logical_path.trim();
     if logical.is_empty() {
-        return Err(CacheRemoveError::InvalidPath(
+        return Err(CacheError::InvalidPath(
             "a cache removal names no document".to_string(),
         ));
     }
     if !is_clean_relative_path(logical) {
-        return Err(CacheRemoveError::InvalidPath(format!(
+        return Err(CacheError::InvalidPath(format!(
             "`{logical}` is not a clean logical path of the external documentation cache"
         )));
     }
@@ -263,16 +277,16 @@ fn remove_cache_target(
     root: &Path,
     target: &Path,
     logical: &str,
-) -> Result<OuterDocsCacheRemoveResult, CacheRemoveError> {
+) -> Result<CacheRemoval, CacheError> {
     let metadata = match std::fs::symlink_metadata(target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CacheRemoveError::NotFound(format!(
+            return Err(CacheError::NotFound(format!(
                 "the external documentation cache holds no `{logical}`"
             )))
         }
         Err(error) => {
-            return Err(CacheRemoveError::Failed(format!(
+            return Err(CacheError::Failed(format!(
                 "the cached document `{logical}` could not be inspected: {error}"
             )))
         }
@@ -293,7 +307,7 @@ fn remove_cache_target(
     // directory that still holds a document survives. The cache directory
     // itself is never removed: it is the root every declaration resolves into.
     tauqe_tools::atomic_write::prune_empty_parents(root, target);
-    Ok(removal.result())
+    Ok(removal)
 }
 
 /// Prunes `target` and every directory below it that a removal emptied.
@@ -318,21 +332,14 @@ fn prune_empty_directories(target: &Path) {
     let _ = std::fs::remove_dir(target);
 }
 
-/// What one removal took out of the cache.
-#[derive(Default)]
-struct CacheRemoval {
-    removed_files: usize,
-    removed_bytes: u64,
-}
-
 impl CacheRemoval {
     /// Removes one cached document.
-    fn file(&mut self, path: &Path) -> Result<(), CacheRemoveError> {
+    fn file(&mut self, path: &Path) -> Result<(), CacheError> {
         let size = std::fs::symlink_metadata(path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         tauqe_tools::atomic_write::remove_atomic(path).map_err(|error| {
-            CacheRemoveError::Failed(format!(
+            CacheError::Failed(format!(
                 "the cached document `{}` could not be removed: {error:#}",
                 path.display()
             ))
@@ -343,23 +350,23 @@ impl CacheRemoval {
     }
 
     /// Removes every document below `directory`.
-    fn directory(&mut self, directory: &Path) -> Result<(), CacheRemoveError> {
+    fn directory(&mut self, directory: &Path) -> Result<(), CacheError> {
         let read = std::fs::read_dir(directory).map_err(|error| {
-            CacheRemoveError::Failed(format!(
+            CacheError::Failed(format!(
                 "the cached directory `{}` could not be read: {error}",
                 directory.display()
             ))
         })?;
         for entry in read {
             let entry = entry.map_err(|error| {
-                CacheRemoveError::Failed(format!(
+                CacheError::Failed(format!(
                     "the cached directory `{}` could not be read: {error}",
                     directory.display()
                 ))
             })?;
             let path = entry.path();
             let file_type = entry.file_type().map_err(|error| {
-                CacheRemoveError::Failed(format!(
+                CacheError::Failed(format!(
                     "the cached entry `{}` could not be inspected: {error}",
                     path.display()
                 ))
@@ -372,14 +379,6 @@ impl CacheRemoval {
         }
         Ok(())
     }
-
-    /// The report describing what was removed.
-    fn result(self) -> OuterDocsCacheRemoveResult {
-        OuterDocsCacheRemoveResult {
-            removed_files: self.removed_files,
-            removed_bytes: self.removed_bytes,
-        }
-    }
 }
 
 /// The resident documents that the removal of `removed` addresses.
@@ -389,7 +388,7 @@ impl CacheRemoval {
 /// while the removal surface addresses logical paths. A removal of a directory
 /// therefore covers every document below it, and the resident layer is
 /// reconciled with exactly the rule the removal applied to the disk.
-pub fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
+pub(crate) fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
     let logical = removed.trim();
     if logical.is_empty() {
         return Vec::new();
@@ -690,6 +689,7 @@ fn registry_name(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::context::ContextLayer;
     use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
@@ -699,12 +699,11 @@ mod tests {
     use super::{
         affected_documents, document_cache_path, document_dir, is_clean_relative_path,
         is_outer_docs_cache_path, list_cache_entries, logical_path, relative_cache_path,
-        remove_cache_entry, CacheRemoveError, OuterDoc, OuterDocsRegistry, MAX_DOCUMENT_BYTES,
+        remove_cache_entry, CacheError, OuterDoc, OuterDocsRegistry, MAX_DOCUMENT_BYTES,
         OUTER_DOCS_CACHE_DIR,
     };
     use crate::config::{OuterDocEntry, OuterDocSource};
     use crate::outer_docs::trust::{RefsTrust, TrustRefusal};
-    use tauqe_protocol::ContextLayer;
 
     /// A declaration with an empty source, which every fixture fills in.
     fn entry(id: &str, title: &str) -> OuterDocEntry {
@@ -1069,7 +1068,7 @@ mod tests {
             let error = remove_cache_entry(dir.path(), path)
                 .expect_err("a path outside the cache is refused");
             assert!(
-                matches!(error, CacheRemoveError::InvalidPath(_)),
+                matches!(error, CacheError::InvalidPath(_)),
                 "unexpected classification for {path}: {error}"
             );
         }
@@ -1088,7 +1087,7 @@ mod tests {
         let error = remove_cache_entry(dir.path(), "openrouter/api.md")
             .expect_err("an absent document is not found");
         assert!(
-            matches!(error, CacheRemoveError::NotFound(_)),
+            matches!(error, CacheError::NotFound(_)),
             "unexpected classification: {error}"
         );
     }

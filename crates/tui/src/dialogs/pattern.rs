@@ -7,7 +7,7 @@
 //!
 //! All helpers are pure: they read the repository file list that already
 //! arrived with the handshake and never touch disk, Git, or the network. The
-//! matcher is `tauqe_protocol::glob::GlobPattern`, the same type the server
+//! matcher is `tauqe_tools::path_patterns::GlobPattern`, the same type the server
 //! applies, so a preview can never predict a selection the server resolves
 //! differently.
 
@@ -16,7 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
-use tauqe_protocol::glob::GlobPattern;
+use tauqe_tools::path_patterns::GlobPattern;
 
 /// Path separator, and the terminator that turns a pattern into a directory
 /// prefix selecting every path beneath it rather than the directory entry.
@@ -141,11 +141,7 @@ impl PatternMatchMemo {
     }
 
     /// Number of real computations served since the dialog was built.
-    ///
-    /// Only the regression test reads this, exactly like `render_count` of
-    /// `crate::markdown::cache`, so the allowance keeps the zero-warning gate
-    /// green instead of widening the module surface for a counter.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn computations(&self) -> u64 {
         self.computations.get()
     }

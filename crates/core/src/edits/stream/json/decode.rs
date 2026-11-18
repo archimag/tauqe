@@ -346,7 +346,7 @@ impl StringFieldCursor {
 /// stops before any trailing escape that is not yet complete, so the decoded
 /// prefix stays stable between chunks and every decoded byte is emitted exactly
 /// once.
-pub fn extract_streamed_string_field(
+pub(crate) fn extract_streamed_string_field(
     buffer: &str,
     field_name: &str,
     cursor: &mut StringFieldCursor,

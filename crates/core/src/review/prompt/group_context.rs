@@ -8,8 +8,9 @@
 //! crate.
 
 use super::refine::recorded_decisions;
-use tauqe_protocol::plan::ConceptItem;
-use tauqe_protocol::{Plan, ReviewGroup, ReviewItem};
+use crate::plan::ConceptItem;
+use crate::plan::Plan;
+use crate::review::{ReviewGroup, ReviewItem};
 
 /// Identifier of the concept root every review group turn renders.
 const REVIEW_GROUP_CONCEPT_ROOT_ID: &str = "grp-1";
@@ -59,7 +60,7 @@ fn push_concept_child(
 /// finding becomes a child node that names the symptom and, when the reviewer
 /// stated one, its body. A whole group therefore renders the cause and its
 /// manifestations together for every sub-step it executes.
-pub fn apply_group_architectural_context(
+pub(crate) fn apply_group_architectural_context(
     plan: &mut Plan,
     group: &ReviewGroup,
     findings: &[ReviewItem],
@@ -114,7 +115,7 @@ pub fn apply_group_architectural_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{IssueStatus, ReviewIssue};
+    use crate::review::{IssueStatus, ReviewIssue};
 
     /// Builds a finding whose architectural context the translation consumes.
     fn finding(body: &str, recommendations: &[&str]) -> ReviewItem {
@@ -125,7 +126,7 @@ mod tests {
             commit: None,
             group: None,
             model: None,
-            issue_type: tauqe_protocol::review::IssueType::Bug,
+            issue_type: crate::review::IssueType::Bug,
             status: IssueStatus::Todo,
             description: body.to_string(),
             recommendations: recommendations.iter().map(|r| (*r).to_string()).collect(),

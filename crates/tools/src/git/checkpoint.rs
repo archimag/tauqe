@@ -131,14 +131,14 @@ pub struct CheckpointInfo {
     /// The base the transaction started from, serialized under the key
     /// earlier revisions already wrote.
     #[serde(rename = "previous_head")]
-    pub base: TransactionBase,
+    base: TransactionBase,
     /// The phase the marker was written in.
     ///
     /// A marker written by an earlier revision carries no such key, so a
     /// missing `phase` decodes as [`TransactionPhase::Established`] and keeps
     /// the meaning that revision gave it.
     #[serde(default)]
-    pub phase: TransactionPhase,
+    phase: TransactionPhase,
     /// The process id of the writer that opened the transaction.
     ///
     /// `Some` names the harness process that wrote this marker, so a later
@@ -146,7 +146,7 @@ pub struct CheckpointInfo {
     /// written by an earlier revision, which recorded no writer at all and
     /// therefore proves nothing about ownership.
     #[serde(default)]
-    pub writer_pid: Option<u32>,
+    writer_pid: Option<u32>,
 }
 
 /// The typed outcome of a crash-recovery pass over the repository.
@@ -1023,7 +1023,8 @@ fn remove_index_lock(lock: &Path, reason: &str) -> bool {
 /// A repository Git cannot inspect, an unreadable timestamp, and a lock a
 /// concurrent process removed first all answer `false`: the caller learns that
 /// no orphan was reclaimed, never that the repository is unusable.
-pub fn recover_stale_index_lock(dir: &Path, deadline: &GitDeadline) -> bool {
+#[cfg(test)]
+fn recover_stale_index_lock(dir: &Path, deadline: &GitDeadline) -> bool {
     matches!(
         index_availability(dir, deadline),
         IndexAvailability::Reclaimed

@@ -1,8 +1,9 @@
+use crate::models::ProviderKind;
+use crate::providers::ModelUsageInfo;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use tauqe_protocol::{ModelUsageInfo, ProviderKind};
 use tokio::sync::{mpsc, watch};
 
 use super::retry::JSON_TRUNCATION_MARKER;
@@ -20,7 +21,7 @@ use self::types::{
 #[cfg(test)]
 pub(crate) mod catalog;
 mod sse;
-pub mod types;
+pub(crate) mod types;
 
 pub(crate) use self::types::GenerationStats;
 
@@ -61,7 +62,7 @@ impl OpenRouterProvider {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
@@ -70,7 +71,7 @@ impl OpenRouterProvider {
     /// fetch. Production keeps `GENERATION_STATS_TIMEOUT`; tests shrink it so
     /// a stalled endpoint is observed without waiting out the ceiling.
     #[cfg(test)]
-    pub(crate) fn with_generation_stats_timeout(mut self, timeout: std::time::Duration) -> Self {
+    fn with_generation_stats_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.generation_stats_timeout = timeout;
         self
     }
@@ -81,10 +82,7 @@ impl OpenRouterProvider {
     /// under the configured budget: a slow, hung, or unreachable
     /// generation endpoint yields `None` instead of stalling the caller inside
     /// the shared client's much larger read budget.
-    pub(crate) async fn get_generation_stats(
-        &self,
-        generation_id: &str,
-    ) -> Result<Option<GenerationStats>> {
+    async fn get_generation_stats(&self, generation_id: &str) -> Result<Option<GenerationStats>> {
         let url = format!(
             "{}/generation?id={}",
             self.base_url.trim_end_matches('/'),

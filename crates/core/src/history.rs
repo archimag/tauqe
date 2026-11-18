@@ -1,3 +1,8 @@
+mod model;
+pub use model::{
+    HistoryEntryStatus, HistoryFileChange, HistoryFileOperation, HistoryItem, HistoryKind,
+    TurnRoundRecord,
+};
 pub(crate) mod compaction;
 pub mod entry;
 pub mod storage;
@@ -5,7 +10,6 @@ pub mod storage;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauqe_protocol::{HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind};
 use tauqe_tools::tokens::estimate_tokens_from_bytes;
 
 use self::entry::record_bytes;
@@ -28,15 +32,15 @@ pub use storage::SessionStorage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMutation {
     /// A new interaction record was appended to the end of the session.
-    Appended { item: UiHistoryItem },
+    Appended { item: HistoryItem },
     /// The summarized prefix was replaced by `summary`, preserving `tail_ids`.
     Compacted {
-        summary: UiHistoryItem,
+        summary: HistoryItem,
         tail_ids: Vec<u64>,
     },
     /// A record was rolled back: its turn failed or was cancelled before the
     /// result reached the model context.
-    RolledBack { item: UiHistoryItem },
+    RolledBack { item: HistoryItem },
 }
 
 #[derive(Clone)]
@@ -73,24 +77,6 @@ impl HistorySnapshot {
     /// Reports whether the snapshot carries no record at all.
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// Highest context insertion watermark its turn records observed.
-    ///
-    /// A record written before the watermark existed carries none, so a
-    /// session whose turns never captured one stays distinguishable from a
-    /// session whose turns observed an empty context.
-    #[cfg(test)]
-    pub(crate) fn watermark(&self) -> Option<u64> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match entry {
-                HistoryEntry::Turn {
-                    context_watermark, ..
-                } => *context_watermark,
-                _ => None,
-            })
-            .max()
     }
 }
 
@@ -173,12 +159,12 @@ impl HistoryManager {
         self.listener = Some(HistoryEntryListener(Arc::new(listener)));
     }
 
-    fn entry_to_ui_item(id: u64, entry: &HistoryEntry) -> UiHistoryItem {
+    fn entry_to_history_item(id: u64, entry: &HistoryEntry) -> HistoryItem {
         let final_id = entry.id().unwrap_or(id);
         match entry {
-            HistoryEntry::Summary { text, .. } => UiHistoryItem {
+            HistoryEntry::Summary { text, .. } => HistoryItem {
                 id: final_id,
-                kind: UiHistoryKind::System,
+                kind: HistoryKind::System,
                 text: text.clone(),
                 summary: None,
                 commit_hash: None,
@@ -191,9 +177,9 @@ impl HistoryManager {
                 context,
                 rounds,
                 ..
-            } => UiHistoryItem {
+            } => HistoryItem {
                 id: final_id,
-                kind: UiHistoryKind::User,
+                kind: HistoryKind::User,
                 text: prompt.clone(),
                 summary: None,
                 commit_hash: None,
@@ -211,9 +197,9 @@ impl HistoryManager {
                 summary,
                 files,
                 ..
-            } => UiHistoryItem {
+            } => HistoryItem {
                 id: final_id,
-                kind: UiHistoryKind::Assistant,
+                kind: HistoryKind::Assistant,
                 text: message.clone(),
                 summary: summary.clone(),
                 commit_hash: commit.clone(),
@@ -247,9 +233,9 @@ impl HistoryManager {
                         text.push_str(summary.trim());
                     }
                 }
-                UiHistoryItem {
+                HistoryItem {
                     id: final_id,
-                    kind: UiHistoryKind::System,
+                    kind: HistoryKind::System,
                     text,
                     summary: Some(format!("Review: {} findings", findings_count)),
                     commit_hash: None,
@@ -274,7 +260,7 @@ impl HistoryManager {
     fn notify_entry(&self, entry: &HistoryEntry, status: HistoryEntryStatus) {
         if let Some(listener) = &self.listener {
             let id = entry.id().unwrap_or(self.current_max_id);
-            let mut item = Self::entry_to_ui_item(id, entry);
+            let mut item = Self::entry_to_history_item(id, entry);
             item.status = status;
             (listener.0)(HistoryMutation::Appended { item });
         }
@@ -373,19 +359,19 @@ impl HistoryManager {
         self.storage.read_entries()
     }
 
-    pub fn get_ui_slice(
+    pub fn history_slice(
         &self,
         limit: usize,
         before_id: Option<u64>,
-    ) -> Result<(Vec<UiHistoryItem>, bool, usize)> {
+    ) -> Result<(Vec<HistoryItem>, bool, usize)> {
         let entries = self.get_entries()?;
         let total_count = entries.len();
-        let all_items: Vec<UiHistoryItem> = entries
+        let all_items: Vec<HistoryItem> = entries
             .iter()
             .enumerate()
             .map(|(idx, entry)| {
                 let fallback_id = (idx + 1) as u64;
-                Self::entry_to_ui_item(entry.id().unwrap_or(fallback_id), entry)
+                Self::entry_to_history_item(entry.id().unwrap_or(fallback_id), entry)
             })
             .collect();
 
@@ -477,7 +463,7 @@ impl HistoryManager {
         if let Some(listener) = &self.listener {
             if let Some(summary_entry) = compacted.first() {
                 let id = summary_entry.id().unwrap_or(1);
-                let summary = Self::entry_to_ui_item(id, summary_entry);
+                let summary = Self::entry_to_history_item(id, summary_entry);
                 (listener.0)(HistoryMutation::Compacted { summary, tail_ids });
             }
         }
@@ -505,7 +491,7 @@ impl HistoryManager {
                 .max()
                 .unwrap_or(0);
             if let Some(listener) = &self.listener {
-                let mut item = Self::entry_to_ui_item(entry_id, &discarded);
+                let mut item = Self::entry_to_history_item(entry_id, &discarded);
                 item.status = HistoryEntryStatus::RolledBack;
                 item.summary = Some(reason);
                 (listener.0)(HistoryMutation::RolledBack { item });
@@ -525,9 +511,9 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::HistoryFileOperation;
     use std::io::Write;
-    use tauqe_protocol::edit::EditFileOp;
-    use tauqe_protocol::TurnRoundRecord;
+
     use tempfile::tempdir;
 
     #[test]
@@ -665,14 +651,14 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_to_ui_item() {
+    fn test_entry_to_history_item() {
         let entry1 = HistoryEntry::Summary {
             id: Some(1),
             text: "Summary text".to_string(),
         };
-        let item1 = HistoryManager::entry_to_ui_item(1, &entry1);
+        let item1 = HistoryManager::entry_to_history_item(1, &entry1);
         assert_eq!(item1.id, 1);
-        assert_eq!(item1.kind, UiHistoryKind::System);
+        assert_eq!(item1.kind, HistoryKind::System);
         assert_eq!(item1.text, "Summary text");
 
         let entry2 = HistoryEntry::Turn {
@@ -686,9 +672,9 @@ mod tests {
                 "verification passed",
             )],
         };
-        let item2 = HistoryManager::entry_to_ui_item(2, &entry2);
+        let item2 = HistoryManager::entry_to_history_item(2, &entry2);
         assert_eq!(item2.id, 2);
-        assert_eq!(item2.kind, UiHistoryKind::User);
+        assert_eq!(item2.kind, HistoryKind::User);
         assert_eq!(item2.text, "Write tests");
         assert_eq!(item2.files, vec![HistoryFileChange::plain("test.rs")]);
         assert_eq!(item2.rounds.len(), 1, "the turn carries its rounds");
@@ -703,9 +689,9 @@ mod tests {
             summary: Some("Add tests".to_string()),
             files: vec![HistoryFileChange::plain("test.rs")],
         };
-        let item3 = HistoryManager::entry_to_ui_item(3, &entry3);
+        let item3 = HistoryManager::entry_to_history_item(3, &entry3);
         assert_eq!(item3.id, 3);
-        assert_eq!(item3.kind, UiHistoryKind::Assistant);
+        assert_eq!(item3.kind, HistoryKind::Assistant);
         assert_eq!(item3.text, "Done");
         assert_eq!(item3.commit_hash, Some("a1b2c3d".to_string()));
         assert_eq!(item3.summary, Some("Add tests".to_string()));
@@ -714,8 +700,8 @@ mod tests {
         // A persisted record already carries the typed operation, so the UI
         // item passes every record through unchanged.
         let entry5_files = vec![
-            HistoryFileChange::operated(EditFileOp::Replace, "src/lib.rs"),
-            HistoryFileChange::operated(EditFileOp::Create, "src/util.rs"),
+            HistoryFileChange::operated(HistoryFileOperation::Replace, "src/lib.rs"),
+            HistoryFileChange::operated(HistoryFileOperation::Create, "src/util.rs"),
             HistoryFileChange::moved("src/a.rs", "src/b.rs"),
             HistoryFileChange::plain("src/plain.rs"),
         ];
@@ -726,7 +712,7 @@ mod tests {
             summary: None,
             files: entry5_files.clone(),
         };
-        let item5 = HistoryManager::entry_to_ui_item(5, &entry5);
+        let item5 = HistoryManager::entry_to_history_item(5, &entry5);
         assert_eq!(item5.files, entry5_files);
 
         // A review record maps its summary into the history item text so the
@@ -739,9 +725,9 @@ mod tests {
             findings_count: 2,
             summary: Some("Locking is racy under load.".to_string()),
         };
-        let item4 = HistoryManager::entry_to_ui_item(4, &entry4);
+        let item4 = HistoryManager::entry_to_history_item(4, &entry4);
         assert_eq!(item4.id, 4);
-        assert_eq!(item4.kind, UiHistoryKind::System);
+        assert_eq!(item4.kind, HistoryKind::System);
         assert!(item4.text.contains("2 findings"));
         assert!(item4.text.contains("Focus on locking"));
         assert!(item4.text.contains("Locking is racy under load."));
@@ -750,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ui_slice_pagination() {
+    fn test_history_slice_pagination() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let mut hm = HistoryManager::new(root);
@@ -760,7 +746,7 @@ mod tests {
         }
 
         // Default last 2 (limit 2, before_id: None)
-        let (items, has_more, total) = hm.get_ui_slice(2, None).unwrap();
+        let (items, has_more, total) = hm.history_slice(2, None).unwrap();
         assert_eq!(total, 5);
         assert!(has_more);
         assert_eq!(items.len(), 2);
@@ -768,7 +754,7 @@ mod tests {
         assert_eq!(items[1].id, 5);
 
         // Paginate before id 4
-        let (items2, has_more2, total2) = hm.get_ui_slice(2, Some(4)).unwrap();
+        let (items2, has_more2, total2) = hm.history_slice(2, Some(4)).unwrap();
         assert_eq!(total2, 5);
         assert!(has_more2);
         assert_eq!(items2.len(), 2);
@@ -776,7 +762,7 @@ mod tests {
         assert_eq!(items2[1].id, 3);
 
         // Paginate before id 2
-        let (items3, has_more3, total3) = hm.get_ui_slice(2, Some(2)).unwrap();
+        let (items3, has_more3, total3) = hm.history_slice(2, Some(2)).unwrap();
         assert_eq!(total3, 5);
         assert!(!has_more3);
         assert_eq!(items3.len(), 1);
@@ -862,7 +848,7 @@ mod tests {
         }
         match &mutations[8] {
             HistoryMutation::Compacted { summary, tail_ids } => {
-                assert_eq!(summary.kind, UiHistoryKind::System);
+                assert_eq!(summary.kind, HistoryKind::System);
                 assert_eq!(summary.text, "Earlier tasks summarized.");
                 assert_eq!(tail_ids, &expected_tail_ids);
             }

@@ -50,7 +50,7 @@ impl ModelRef {
     /// - any other string keeps its raw text as an OpenRouter model name, so
     ///   the original value survives a read/write round-trip instead of being
     ///   silently lost.
-    pub fn parse_lenient(s: &str) -> Self {
+    fn parse_lenient(s: &str) -> Self {
         let trimmed = s.trim();
         if trimmed.is_empty() {
             return ModelRef::default();

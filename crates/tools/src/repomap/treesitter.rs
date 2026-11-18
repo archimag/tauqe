@@ -150,7 +150,7 @@ impl std::fmt::Debug for TreeSitterExtractor {
 }
 
 impl TreeSitterExtractor {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 }

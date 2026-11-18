@@ -1,52 +1,27 @@
-//! Server-side bridge between the Architect synthesis contour and RPC telemetry.
-//!
-//! The contour (`tauqe_core::workflow::fsm::structured`) is provider- and
-//! transport-agnostic: it reports every round through `StreamEvent` and resolves
-//! a client for another provider through an injected `ProviderResolver`. This
-//! module adapts both seams to the daemon:
-//!
-//! - [`ArchitectProviderResolver`] implements the hook on top of the shared
-//!   architect resolution path, so a promoted rung served by another provider
-//!   receives a client built from the project configuration.
-//! - [`relay_contour_events`] translates the contour stream into the wire events
-//!   a client already renders, accumulates the answer the adapter publishes as
-//!   `model/finished`, and closes the operation's usage window.
-//! - [`run_contour_synthesis`] is the launch skeleton every contour consumer
-//!   shares: provider resolution, the usage window, the contoured task with its
-//!   abort handle, the telemetry relay, and the context merge back.
-//!
-//! Plan horizon synthesis now consumes the contour through
-//! [`run_contour_synthesis`], while review group decomposition arrives in plan
-//! step 6.2: the module re-export therefore keeps a tolerant import allowance
-//! until then (the same precedent as `run_workflow_verification` in
-//! `crates/core`).
-
+//! Provider bindings and RPC event projection for the core Architect contour.
+use crate::contracts::Project;
 use std::sync::Arc;
 
 use crate::handlers::common::{emit, withdraw_streamed_attempt};
 use crate::state::{AppState, OperationGuard};
+#[cfg(test)]
 use crate::usage::UsageGuard;
 use async_trait::async_trait;
 use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::context::ContextManager;
-use tauqe_core::control::refine::{
-    run_structured_refine, ProviderResolver, StructuredRefineConfig, StructuredRefineOutcome,
-};
+use tauqe_core::control::refine::{ProviderResolver, StructuredRefineOutcome};
+use tauqe_core::models::{ArchitectTier, ProviderKind};
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::{
-    events, ArchitectTier, ModelConnectionRetryingEvent, ModelDeltaEvent, ModelErrorEvent,
-    ModelEscalatedEvent, ProviderKind, RepoMapInfoEvent, TurnPhaseEvent,
+    events, ModelConnectionRetryingEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
+    RepoMapInfoEvent, TurnPhaseEvent,
 };
-use tokio::sync::{mpsc, watch};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use super::resolve_architect_provider;
-
-/// Capacity of the contour event channel.
-///
-/// The contour forwards protocol-scrubbed events at token granularity, so the
-/// relay must keep up without ever making a proposal round wait on telemetry.
-const CONTOUR_EVENT_CAPACITY: usize = 256;
 
 /// Provider resolver the Architect contour consults when it escalates.
 ///
@@ -76,66 +51,26 @@ impl ProviderResolver for ArchitectProviderResolver {
     }
 }
 
-/// Telemetry the relay accumulated for the adapter that started the synthesis.
-///
-/// The contour owns the provider round, the tier ladder, and the research
-/// rounds; the adapter owns the RPC response. This summary is the seam between
-/// them: the answer a client needs for `model/finished`, whether the run was
-/// cancelled, and the provider failure it reported, if any.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ContourRelaySummary {
-    /// Every fragment of text the contour streamed, with voided attempts
-    /// dropped, ready for the `model/finished` event of the turn.
-    pub(crate) assistant_text: String,
-    /// Whether the contour reported a cancellation.
-    pub(crate) cancelled: bool,
-    /// Provider failure the contour reported, if any.
-    pub(crate) error: Option<String>,
-}
-
-/// Relays the contour event stream into the telemetry of the running operation.
-///
-/// The contour speaks `StreamEvent`, because it is a domain engine that knows
-/// nothing about the wire; the client speaks protocol events. The relay is the
-/// single place that translates one into the other, accumulates the answer the
-/// adapter publishes as `model/finished`, and withdraws the fragments of an
-/// attempt the transport voided.
-/// Relays the contour event stream into the telemetry of the running operation.
-///
-/// The contour speaks `StreamEvent`, because it is a domain engine that knows
-/// nothing about the wire; the client speaks protocol events. The relay is the
-/// single place that translates one into the other, accumulates the answer the
-/// adapter publishes as `model/finished`, and withdraws the fragments of an
-/// attempt the transport voided.
-///
-/// Token-granularity telemetry is paced against the outbound queue, so a client
-/// that stopped reading pauses the synthesis instead of growing daemon memory,
-/// and a cancelled operation ends that pause instead of outliving it.
-async fn relay_contour_events(
+pub(crate) use tauqe_core::api::ContourRelaySummary;
+struct Observer {
     state: Arc<AppState>,
-    op_id: String,
-    usage: UsageGuard,
-    mut events_rx: mpsc::Receiver<StreamEvent>,
-    mut cancel: watch::Receiver<bool>,
-) -> ContourRelaySummary {
-    let mut summary = ContourRelaySummary::default();
-    while let Some(event) = events_rx.recv().await {
-        // The transport owns the pacing classification, so the relay applies
-        // the shared policy instead of carrying an exemption set of its own: a
-        // terminal notice publishes immediately, while every other coordinate
-        // waits for the writer to catch up. A client that keeps its pipe open
-        // but stops reading therefore pauses the synthesis instead of growing
-        // daemon memory, without ever parking the completion, cancellation, or
-        // failure the stream reports.
-        state.out.pace_event(&event, &mut cancel).await;
+}
+#[async_trait]
+impl tauqe_core::api::ArchitectObserver for Observer {
+    async fn pace(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
+        self.state.out.pace_event(event, cancel).await;
+    }
+    fn usage_totals(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
+        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
+    }
+    fn publish(&self, op_id: &str, event: StreamEvent) {
         match event {
             StreamEvent::TextDelta(delta) => {
-                summary.assistant_text.push_str(&delta);
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_TEXT_DELTA,
                     serde_json::to_value(ModelDeltaEvent {
-                        operation_id: op_id.clone(),
+                        operation_id: op_id.to_string(),
                         delta,
                     })
                     .ok(),
@@ -143,10 +78,10 @@ async fn relay_contour_events(
             }
             StreamEvent::ReasoningDelta(delta) => {
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_REASONING_DELTA,
                     Some(serde_json::json!({
-                        "operation_id": op_id.as_str(),
+                        "operation_id": op_id,
                         "delta": delta,
                     })),
                 );
@@ -158,14 +93,14 @@ async fn relay_contour_events(
                 effort,
             } => {
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_ESCALATED,
                     serde_json::to_value(ModelEscalatedEvent {
-                        operation_id: op_id.clone(),
-                        model,
-                        role: Some(role),
+                        operation_id: op_id.to_string(),
+                        model: model.project(),
+                        role: Some(role.project()),
                         alias: None,
-                        effort,
+                        effort: effort.map(crate::contracts::Project::project),
                         tier,
                     })
                     .ok(),
@@ -178,11 +113,11 @@ async fn relay_contour_events(
                 detail,
             } => {
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::TURN_PHASE,
                     serde_json::to_value(TurnPhaseEvent {
-                        operation_id: op_id.clone(),
-                        phase,
+                        operation_id: op_id.to_string(),
+                        phase: phase.project(),
                         round,
                         max_rounds,
                         detail,
@@ -192,10 +127,10 @@ async fn relay_contour_events(
             }
             StreamEvent::RepoMapTokens(tokens) => {
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::TURN_REPOMAP,
                     serde_json::to_value(RepoMapInfoEvent {
-                        operation_id: op_id.clone(),
+                        operation_id: op_id.to_string(),
                         tokens,
                     })
                     .ok(),
@@ -208,10 +143,10 @@ async fn relay_contour_events(
                 reason,
             } => {
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_CONNECTION_RETRYING,
                     serde_json::to_value(ModelConnectionRetryingEvent {
-                        operation_id: op_id.clone(),
+                        operation_id: op_id.to_string(),
                         attempt,
                         max_attempts,
                         delay_secs,
@@ -224,33 +159,25 @@ async fn relay_contour_events(
             // the fragments it already streamed belong to an answer nobody will
             // keep: the accumulator drops them together with the client copy.
             StreamEvent::ResetStream => {
-                withdraw_streamed_attempt(&state.out, &op_id, || {
-                    summary.assistant_text.clear();
-                });
+                withdraw_streamed_attempt(&self.state.out, op_id, || {});
             }
-            StreamEvent::Usage(reported) => usage.observe(&reported).await,
+            StreamEvent::Usage(_) => {}
             StreamEvent::ContextChanged(ctx_state) => {
-                emit(
-                    &state.out,
-                    events::CONTEXT_CHANGED,
-                    Some(serde_json::json!({ "state": ctx_state })),
-                );
+                crate::handlers::context::publish_context(&self.state.out, &ctx_state);
             }
             StreamEvent::Cancelled => {
-                summary.cancelled = true;
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_CANCELLED,
-                    Some(serde_json::json!({ "operation_id": op_id.as_str() })),
+                    Some(serde_json::json!({ "operation_id": op_id })),
                 );
             }
             StreamEvent::Error(message) => {
-                summary.error = Some(message.clone());
                 emit(
-                    &state.out,
+                    &self.state.out,
                     events::MODEL_ERROR,
                     serde_json::to_value(ModelErrorEvent {
-                        operation_id: op_id.clone(),
+                        operation_id: op_id.to_string(),
                         message,
                     })
                     .ok(),
@@ -258,30 +185,30 @@ async fn relay_contour_events(
             }
             // The contour reports the end of the synthesis once, after it has
             // released the context it widened.
-            StreamEvent::Done => break,
+            StreamEvent::Done => {}
             // Editing, toolchain, and escalation telemetry of other contours
             // never reaches an architect synthesis.
             _ => {}
         }
     }
-
-    // The window is opened for the whole synthesis and closed exactly here, so
-    // the operation is accounted once no matter how many rounds it spent.
-    usage.flush().await;
-    summary
 }
-
-/// Runs one Architect synthesis on the shared contour and relays its telemetry.
-///
-/// This is the launch skeleton every contour consumer shares, so neither the
-/// plan horizon synthesis nor the review group decomposition re-implements the
-/// provider resolution, the usage window, the abort registration, or the context
-/// merge.
-///
-/// The contour works on its own clone of the context and owns the auto layer it
-/// widened, so the clone is merged back afterwards: the material research paid
-/// for survives the run, while the layers the synthesis only borrowed are
-/// restored exactly as the core engine leaves them.
+#[cfg(test)]
+async fn relay_contour_events(
+    state: Arc<AppState>,
+    op_id: String,
+    usage: UsageGuard,
+    events_rx: mpsc::Receiver<StreamEvent>,
+    cancel: watch::Receiver<bool>,
+) -> ContourRelaySummary {
+    tauqe_core::api::relay_architect_events(
+        Arc::new(Observer { state }),
+        op_id,
+        usage,
+        events_rx,
+        cancel,
+    )
+    .await
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_contour_synthesis(
     state: &Arc<AppState>,
@@ -295,148 +222,34 @@ pub(crate) async fn run_contour_synthesis(
     intro_header: String,
     budget_hint: String,
 ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
-    let config = state.config.lock().await.config.clone();
-    let provider = match resolve_architect_provider(state, &config, tier.model.provider).await {
-        Ok(provider) => provider,
-        Err(err) => {
-            emit(
-                &state.out,
-                events::MODEL_ERROR,
-                serde_json::to_value(ModelErrorEvent {
-                    operation_id: op_id.to_string(),
-                    message: err.clone(),
-                })
-                .ok(),
-            );
-            return (
-                Err(anyhow::anyhow!(err.clone())),
-                ContourRelaySummary {
-                    error: Some(err),
-                    ..ContourRelaySummary::default()
-                },
-            );
-        }
-    };
-
-    let repo_root = context.repo_root().to_path_buf();
-    let (events_tx, events_rx) = mpsc::channel::<StreamEvent>(CONTOUR_EVENT_CAPACITY);
-    let cancel_rx = operation.cancel_receiver();
-    // The relay waits out a client that stopped reading, so it shares the very
-    // signal that interrupts the synthesis it relays.
-    let relay_cancel = cancel_rx.clone();
-    let resolver = Arc::new(ArchitectProviderResolver::new(Arc::clone(state), config));
-
-    // The usage window wraps the whole synthesis, so every round and every tier
-    // it climbs report into the same accounting window under the identifier the
-    // surrounding operation already announced. The relay closes it.
-    let usage = state.begin_usage(op_id).await;
-    let relay = tokio::spawn(relay_contour_events(
-        Arc::clone(state),
-        op_id.to_string(),
-        usage,
-        events_rx,
-        relay_cancel,
-    ));
-
-    let contour = tokio::spawn(async move {
-        let mut contour_context = context;
-        let result = run_structured_refine(
-            &mut contour_context,
-            provider,
-            &task,
-            StructuredRefineConfig {
-                repo_root: repo_root.as_path(),
-                options: &options,
-                models: &models,
+    let config = state.application.configuration().await.config.clone();
+    let resolver = Arc::new(ArchitectProviderResolver::new(state.clone(), config));
+    state
+        .application
+        .run_architect_contour(
+            operation,
+            tauqe_core::api::PlanHorizonContour {
+                operation_id: op_id.to_string(),
+                task,
+                context,
+                options,
+                models_config: models,
                 tier,
-                providers: resolver.as_ref(),
-                intro_header: intro_header.as_str(),
-                budget_hint: budget_hint.as_str(),
+                intro_header,
+                budget_hint,
             },
-            events_tx,
-            cancel_rx,
+            resolver,
+            Arc::new(Observer {
+                state: state.clone(),
+            }),
         )
-        .await;
-        (contour_context, result)
-    });
-    // A hard cancel reaches the task that really runs, not just the future that
-    // waits for it, so the abort handle is installed for the whole synthesis and
-    // dropped the moment the contour settles.
-    operation.set_abort_handle(contour.abort_handle());
-    let joined = contour.await;
-    operation.clear_abort_handle();
-
-    let summary = match relay.await {
-        Ok(summary) => summary,
-        Err(join_error) => {
-            tracing::warn!(
-                operation_id = op_id,
-                error = %join_error,
-                "Architect telemetry relay terminated unexpectedly"
-            );
-            ContourRelaySummary::default()
-        }
-    };
-
-    let (contour_context, outcome) = match joined {
-        Ok(joined) => joined,
-        Err(join_error) => {
-            // A contour that ignored the cooperative signal is force-aborted through
-            // the operation slot, so its relayed `Cancelled` event never arrives and
-            // the summary alone would classify the dead task as a provider failure.
-            // The authoritative signal decides the classification: a raised hard
-            // cancel surfaces as a cancellation, while a task that died without it
-            // keeps its failure classification.
-            let mut summary = summary;
-            if *operation.cancel_receiver().borrow() {
-                tracing::warn!(
-                    operation_id = op_id,
-                    error = %join_error,
-                    "Architect contour terminated while the operation was cancelled"
-                );
-                summary.cancelled = true;
-            }
-            return (
-                Err(anyhow::anyhow!(
-                    "The architect synthesis task terminated unexpectedly: {join_error}"
-                )),
-                summary,
-            );
-        }
-    };
-
-    // The synthesis owns the auto context layer it widened: the material is the
-    // Architect's investigation rather than the developer's dialogue, so it is
-    // never kept. Everything the contour observed — the files research added
-    // and the restored layers — is merged back so a partial run keeps the work
-    // that was already paid for.
-    let merged = state
-        .mutate_context(move |shared| {
-            shared.merge_turn_context(&contour_context);
-            shared.get_state()
-        })
-        .await;
-    match merged {
-        Ok(ctx_state) => emit(
-            &state.out,
-            events::CONTEXT_CHANGED,
-            Some(serde_json::json!({ "state": ctx_state })),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                operation_id = op_id,
-                error = %err,
-                "Failed to merge the architect context back into the shared state"
-            );
-        }
-    }
-
-    (outcome, summary)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_core::context::ContextAccess;
 
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -445,10 +258,10 @@ mod tests {
     use std::time::Duration;
 
     use tauqe_core::control::refine::StructuredRefineStatus;
+    use tauqe_core::models::{ModelRef, ModelRole, ReasoningEffort};
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_protocol::{
-        ContextAccess, ModelRef, ModelRole, ModelUsageInfo, ReasoningEffort, TurnPhase,
-    };
+    use tauqe_core::providers::ModelUsageInfo;
+    use tauqe_core::workflow::turn::TurnPhase;
 
     use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
@@ -686,21 +499,20 @@ mod tests {
         )]));
         *state.provider_override.lock().await = Some(provider.clone() as Arc<dyn LlmProvider>);
 
-        let config = state.config.lock().await.config.clone();
+        let config = state.application.configuration().await.config.clone();
         let models = config.models.clone();
         let tier = models.architect_tier(0);
         let options = WorkflowOptions::from_app_config(&config);
 
         // The adapter hands the contour a snapshot of the shared context, so the
         // synthesis works on its own clone and reports the result back.
-        let mut snapshot = state.context.read().await.clone();
+        let mut snapshot = state.context_snapshot().await;
         snapshot
             .add_file("a.rs", ContextAccess::Editable)
             .expect("admit the fixture into the snapshot");
         assert!(
             !state
-                .context
-                .read()
+                .context_snapshot()
                 .await
                 .contains("a.rs")
                 .expect("the shared context reads"),
@@ -742,8 +554,7 @@ mod tests {
 
         assert!(
             state
-                .context
-                .read()
+                .context_snapshot()
                 .await
                 .contains("a.rs")
                 .expect("the shared context reads"),
@@ -764,7 +575,7 @@ mod tests {
             Arc::new(MockLlmProvider::scripted([MockResponse::text("unused")]));
         *state.provider_override.lock().await = Some(installed.clone());
 
-        let config = state.config.lock().await.config.clone();
+        let config = state.application.configuration().await.config.clone();
         let resolver = ArchitectProviderResolver::new(Arc::clone(&state), config);
 
         let resolved = resolver

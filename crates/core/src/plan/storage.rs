@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanRejection, PlanSummary};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanRejection, PlanSummary};
 use tauqe_tools::atomic_write::write_atomic;
 
 mod apply;
@@ -617,7 +617,7 @@ impl PlanStorage {
         };
 
         fn visit_concept_mut(
-            items: &mut [tauqe_protocol::ConceptItem],
+            items: &mut [crate::plan::ConceptItem],
             target_id: &str,
             title: Option<&str>,
             details: Option<&str>,
@@ -780,7 +780,8 @@ pub struct PlanApplicationOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate, PlanRejectionKind};
+    use crate::plan::PlanRejectionKind;
+    use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
     use tempfile::tempdir;
 
     /// Renders the reported wording of a batch of typed rejections, so an
@@ -907,7 +908,7 @@ mod tests {
             None,
             100,
             100,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Original title".to_string(),
                 details: None,
@@ -980,7 +981,7 @@ mod tests {
             None,
             100,
             100,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant 1".to_string(),
                 details: None,
@@ -1003,7 +1004,7 @@ mod tests {
             None,
             100,
             100,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-2".to_string(),
                 title: "Invariant 2".to_string(),
                 details: None,
@@ -1330,7 +1331,7 @@ mod tests {
             None,
             0,
             0,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
@@ -1595,7 +1596,7 @@ mod tests {
             id: Some("barrier-structured".to_string()),
             title: Some("Barrier Structured".to_string()),
             description: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,

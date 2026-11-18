@@ -369,3 +369,25 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 5. **Rationale (Why):**
    - An unbounded body cache turns every node a session ever expanded into permanently retained memory, and that cost stays invisible until the process is already large. A hard ceiling with an explicit release path bounds the memory by construction and keeps the release decision in the view that knows which items left its window.
    - The history window follows the same argument one level up: a session that appends a record per prompt and per answer would otherwise keep every rendered row of the whole run in memory. Bounding the view while compensating the reading position keeps a long session both legible and cheap.
+
+## Client Projections over Wire DTOs
+
+`projection` is the pure client library shared by the TUI binary and parity
+tests. Its extension traits operate directly on `tauqe_protocol` DTOs; widgets
+import the traits where they render or optimistically update document state.
+Keep readiness, progress, derived statuses, leaf normalization, tree lookup,
+Markdown rendering, review group fallback, and picker cycles here. Protocol
+must not implement these computations or export their local evaluation types.
+
+These projections predict presentation and interaction only. They perform no
+I/O and never enforce or authorize persisted transitions. Core owns durable
+validation, scheduling, and completed-step immutability. Integration tests in
+server compare the real projection library against core, without adding a core
+dependency to TUI or a runtime TUI dependency to server. Wire encoding tests stay
+in protocol; client behavior tests live beside the projections.
+
+
+Shared utility matching uses `tauqe_tools::path_patterns` in context filters and
+review pattern previews. TUI depends on protocol for wire data and tools for
+utilities, and never on core. Client previews use the same matcher implementation
+as engine enforcement; they must not introduce a private copy of its rules.

@@ -12,19 +12,6 @@ pub enum PlanItemStatus {
     Cancelled,
 }
 
-impl PlanItemStatus {
-    pub fn next(&self) -> Self {
-        match self {
-            Self::Discussion => Self::Todo,
-            Self::Todo => Self::InProgress,
-            Self::InProgress => Self::Done,
-            Self::Done => Self::Blocked,
-            Self::Blocked => Self::Cancelled,
-            Self::Cancelled => Self::Discussion,
-        }
-    }
-}
-
 impl std::fmt::Display for PlanItemStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -53,12 +40,6 @@ pub struct ConceptItem {
     pub children: Vec<ConceptItem>,
 }
 
-impl ConceptItem {
-    pub fn is_leaf(&self) -> bool {
-        self.children.is_empty()
-    }
-}
-
 /// An actionable engineering step in the implementation blueprint ("How").
 ///
 /// Implementation items are formed and refined by autonomous deep analysis.
@@ -79,9 +60,7 @@ pub struct PlanItem {
     /// could not proceed, so the reason survives the interrupted turn on disk
     /// and in the interface instead of being lost with the transient session.
     ///
-    /// A report carried by a step that is no longer `Blocked` is dropped by
-    /// `PlanImplementation::normalize_lifecycle_provenance`, so the field never
-    /// describes a stall the step already left behind.
+    /// Core clears this report when a durable step leaves `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     /// Identifier of the Git commit that completed this step.
@@ -92,10 +71,7 @@ pub struct PlanItem {
     /// no commit, and the value is part of the immutable record of a completed
     /// step.
     ///
-    /// A value supplied for a step that is not `Done` is dropped by
-    /// `PlanImplementation::normalize_lifecycle_provenance` before the step
-    /// reaches disk, so a mutation can never assert a change set it did not
-    /// produce.
+    /// Core refuses unearned lifecycle claims before persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,10 +95,4 @@ pub struct PlanItem {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<PlanItem>,
-}
-
-impl PlanItem {
-    pub fn is_leaf(&self) -> bool {
-        self.children.is_empty()
-    }
 }

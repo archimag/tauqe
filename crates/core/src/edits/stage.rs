@@ -1,19 +1,20 @@
 //! The engine's staging adapter.
 //!
 //! The virtual-staging state machine itself is deterministic substrate and lives
-//! in `tauqe_tools::edits`: it works from a protocol context snapshot and a
+//! in `tauqe_tools::edits`: it works from explicit context paths and a
 //! resolved project configuration and writes nothing on its own. This module is
 //! the adapter the engine keeps, because two inputs are cognitive:
 //!
-//! - the live [`ContextManager`] is captured into the `ContextState` snapshot the
-//!   substrate reads, so staging never borrows a mutable engine;
+//! - the live [`ContextManager`] is projected into repository-relative paths,
+//!   so the substrate receives no context DTO or mutable engine;
 //! - `tauqe.toml` governs the environment a change set is verified in, so the
 //!   in-memory validation of a staged configuration file stays with the crate
 //!   that owns the harness configuration and reaches the substrate as a hook.
 
+use crate::config::project::ProjectConfig;
 use std::path::Path;
 
-use tauqe_protocol::{EditOperation, ProjectConfig};
+use crate::edits::EditOperation;
 use tokio::sync::watch;
 
 use super::{StageEditsResult, StagedEditsState};
@@ -92,16 +93,26 @@ pub fn stage_and_validate_edits(
     // Resolving the project configuration reads `tauqe.toml` from disk, which is
     // blocking work, so the whole attempt runs off the async executor thread.
     crate::blocking::run_blocking(|| {
-        let context = context_manager.get_state();
+        let context: Vec<String> = context_manager
+            .get_state()
+            .items
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
         let project = project_config(repo_root);
         tauqe_tools::edits::stage_and_validate_edits_with(
             repo_root,
             &project,
             &context,
-            edits,
+            &edits
+                .iter()
+                .cloned()
+                .map(super::substrate::tool_operation)
+                .collect::<Vec<_>>(),
             initial_staged,
             Some(validate_project_config),
         )
+        .into()
     })
 }
 
@@ -147,15 +158,25 @@ pub async fn prepare_staged_edits_with_config(
     initial_staged: Option<&StagedEditsState>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> StageEditsResult {
-    let context = context_manager.get_state();
+    let context: Vec<String> = context_manager
+        .get_state()
+        .items
+        .into_iter()
+        .map(|item| item.path)
+        .collect();
     tauqe_tools::edits::prepare_staged_edits_with_config_and_validator(
         repo_root,
         project,
         &context,
-        edits,
+        &edits
+            .iter()
+            .cloned()
+            .map(super::substrate::tool_operation)
+            .collect::<Vec<_>>(),
         initial_staged,
         Some(validate_project_config),
         cancel_rx,
     )
     .await
+    .into()
 }

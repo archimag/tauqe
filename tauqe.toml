@@ -17,7 +17,7 @@
 [providers.openrouter]
 models = [
   { model = "google/gemini-3.8-flash", alias = "Gemini Flash" },
-  { model = "google/gemini-4-carbon", alias = "Gemini Carbon" },  
+  { model = "google/gemini-4-hydrogen", alias = "Gemini Hydrogen" },  
   { model = "~anthropic/claude-sonnet-latest", alias = "Claude Sonnet" },
   { model = "~anthropic/claude-haiku-latest", alias = "Claude Haiku" },
   { model = "~deepseek/deepseek-flash-latest", alias = "DeepSeek Flash" },
@@ -32,7 +32,7 @@ repl = [
   "DeepSeek Flash",
   "GLM",
   "Gemini Flash",
-  "Gemini Carbon"
+  "Gemini Hydrogen"
 ]
 
 coder = [

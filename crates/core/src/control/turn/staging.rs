@@ -17,7 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tauqe_protocol::{EditOperation, LlmCommand, PatchStrategy};
+use crate::edits::EditOperation;
+use crate::llm::LlmCommand;
+use crate::workflow::PatchStrategy;
 
 use crate::control::context::LoopContext;
 use crate::control::outcome::ResponseEnvelope;
@@ -171,14 +173,16 @@ fn extract_file_edits(envelope: &mut ResponseEnvelope) -> Vec<EditOperation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
+    use crate::edits::EditReplace;
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::llm::{LlmCommand, TextCommand};
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::MockLlmProvider;
-    use tauqe_protocol::{
-        CapabilityTree, ContextAccess, EditReplace, LlmCapability, LlmCommand, ModelRef,
-        TextCommand,
-    };
 
     const TARGET: &str = "pub fn compute() -> i32 { 0 }\n";
     const CORRECTED: &str = "pub fn compute() -> i32 { 42 }\n";

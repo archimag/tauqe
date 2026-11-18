@@ -1,8 +1,8 @@
-//! Code review domain model exposed behind a single facade.
+//! Review RPC documents, requests, results, and events.
 //!
 //! The review subsystem is decomposed into focused submodules: the finding
 //! leaf types (`item`), the session aggregate (`session`), the wire DTOs
-//! (`dto`), the post-analysis payload (`analysis`), and the streaming events
+//! (`dto`), and the streaming events
 //! (`events`). Every public item is
 //! re-exported here through an explicit list, so external paths such as
 //! `tauqe_protocol::review::ReviewIssue` remain stable and an accidental name
@@ -10,28 +10,18 @@
 //! silently ambiguous glob. Keeping the submodules private avoids leaking
 //! their names onto the crate root.
 //!
-//! The post-analysis payload (`analysis`) is the wire contract of the model
-//! output the Architect role produces, so it lives next to the review domain
-//! model it describes.
-
-mod analysis;
 mod dto;
 mod events;
 mod group;
 mod item;
 mod session;
 
-#[cfg(test)]
-mod tests;
-
-pub use analysis::{PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput};
 pub use dto::{
     ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewCancelParams, ReviewDeleteParams,
     ReviewDeleteResult, ReviewExecuteParams, ReviewExecuteTarget, ReviewFindingTarget,
-    ReviewFindingsTarget, ReviewGetParams, ReviewGetResult, ReviewGroupTarget, ReviewListParams,
-    ReviewListResult, ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult,
-    ReviewPreviewWindow, ReviewSessionTarget, ReviewStartParams, ReviewUpdateItemParams,
-    ReviewUpdateItemResult,
+    ReviewFindingsTarget, ReviewGetParams, ReviewGetResult, ReviewGroupTarget, ReviewListResult,
+    ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult, ReviewPreviewWindow,
+    ReviewSessionTarget, ReviewStartParams, ReviewUpdateItemParams, ReviewUpdateItemResult,
 };
 pub use events::{
     ReviewAnalyzeFinishedEvent, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,
@@ -44,8 +34,11 @@ pub use group::{
     ReviewPostAnalysis,
 };
 pub use group::{LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE};
-pub use item::{
-    IssueStatus, IssueType, ReviewDecisionStatus, ReviewIssue, ReviewItem, ReviewItemStatus,
-    ReviewSeverity, ReviewUpdateProposal,
-};
-pub use session::{ReviewSession, ReviewSummary};
+pub use item::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSeverity};
+pub use session::ReviewSession;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) use session::ReviewSummary;

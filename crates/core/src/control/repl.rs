@@ -4,7 +4,12 @@
 //! discovery context enrichment via [`run_research_loop`], and code modification
 //! with toolchain verification via [`run_edit_loop`].
 
-use tauqe_protocol::{CapabilityTree, LlmCapability, LlmCommand};
+mod execution;
+pub use execution::{run_repl_execution, ReplExecutionConfig};
+
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
 
 use super::context::LoopContext;
 use super::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
@@ -30,12 +35,12 @@ impl ReplLoopConfig {
 
 /// Builds the algebraic capability expression for the interactive REPL loop.
 pub(crate) fn repl_capability_expr(
-    focus: Option<&tauqe_protocol::DiscussionTarget>,
+    focus: Option<&crate::discussion::DiscussionTarget>,
 ) -> CapabilityTree {
     let (plan_update, review_decision) = match focus {
-        Some(tauqe_protocol::DiscussionTarget::Plan { .. }) => (true, false),
-        Some(tauqe_protocol::DiscussionTarget::Review { .. })
-        | Some(tauqe_protocol::DiscussionTarget::ReviewGroup { .. }) => (false, true),
+        Some(crate::discussion::DiscussionTarget::Plan { .. }) => (true, false),
+        Some(crate::discussion::DiscussionTarget::Review { .. })
+        | Some(crate::discussion::DiscussionTarget::ReviewGroup { .. }) => (false, true),
         None => (false, false),
     };
     dialogue_capability_expr(plan_update, review_decision)
@@ -163,7 +168,7 @@ pub(crate) fn abort_branch() -> CapabilityTree {
 }
 
 /// Returns the capability tree supported by the interactive REPL loop.
-pub fn repl_capabilities(focus: Option<&tauqe_protocol::DiscussionTarget>) -> CapabilityTree {
+pub fn repl_capabilities(focus: Option<&crate::discussion::DiscussionTarget>) -> CapabilityTree {
     repl_capability_expr(focus)
 }
 
@@ -175,7 +180,7 @@ pub struct ReplArtifact {
     /// Whether plan mutations were applied and saved.
     pub plans_applied: bool,
     /// Rejections or errors encountered when applying plan mutations.
-    pub plan_rejections: Vec<tauqe_protocol::PlanRejection>,
+    pub plan_rejections: Vec<crate::plan::PlanRejection>,
     /// Status adjustments or warnings emitted during plan mutations.
     pub plan_warnings: Vec<String>,
     /// IDs of review findings updated by review decisions during this turn.
@@ -189,7 +194,7 @@ pub struct ReplArtifact {
 pub async fn run_repl_loop(
     ctx: &mut LoopContext<'_>,
     config: &ReplLoopConfig,
-    focus: Option<&tauqe_protocol::DiscussionTarget>,
+    focus: Option<&crate::discussion::DiscussionTarget>,
 ) -> Result<LoopResult<ReplArtifact>, SystemError> {
     ctx.check_cancelled()?;
 
@@ -241,8 +246,8 @@ pub async fn run_repl_loop(
 async fn apply_plan_mutations(
     ctx: &LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
-    focus: Option<&tauqe_protocol::DiscussionTarget>,
-) -> (bool, Vec<tauqe_protocol::PlanRejection>, Vec<String>) {
+    focus: Option<&crate::discussion::DiscussionTarget>,
+) -> (bool, Vec<crate::plan::PlanRejection>, Vec<String>) {
     let mut plan_cmds = envelope.take(LlmCapability::PlanCreation);
     plan_cmds.extend(envelope.take(LlmCapability::PlanUpdate));
 
@@ -264,7 +269,7 @@ async fn apply_plan_mutations(
     // The mode is a property of the turn, decided by the focus the dialogue was
     // opened with and never derived from the payload.
     let mode = match focus {
-        Some(tauqe_protocol::DiscussionTarget::Plan { .. }) => {
+        Some(crate::discussion::DiscussionTarget::Plan { .. }) => {
             crate::plan::storage::PlanMutationMode::Discussion
         }
         _ => crate::plan::storage::PlanMutationMode::Repl,
@@ -304,8 +309,8 @@ async fn apply_plan_mutations(
 async fn apply_plan_commands(
     ctx: &mut LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
-    focus: Option<&tauqe_protocol::DiscussionTarget>,
-) -> Result<(bool, Vec<tauqe_protocol::PlanRejection>, Vec<String>), SystemError> {
+    focus: Option<&crate::discussion::DiscussionTarget>,
+) -> Result<(bool, Vec<crate::plan::PlanRejection>, Vec<String>), SystemError> {
     let mut plans_applied = false;
     let mut plan_rejections = Vec::new();
     let mut plan_warnings = Vec::new();
@@ -325,7 +330,7 @@ async fn apply_plan_commands(
         let mut defects = Vec::new();
         for rejection in rejections {
             match rejection.kind {
-                tauqe_protocol::PlanRejectionKind::PayloadDefect => {
+                crate::plan::PlanRejectionKind::PayloadDefect => {
                     defects.push(rejection.message);
                 }
                 _ => plan_rejections.push(rejection),
@@ -363,7 +368,7 @@ async fn apply_plan_commands(
                 plan_rejections.extend(
                     defects
                         .into_iter()
-                        .map(tauqe_protocol::PlanRejection::payload_defect),
+                        .map(crate::plan::PlanRejection::payload_defect),
                 );
                 return Ok((plans_applied, plan_rejections, plan_warnings));
             }
@@ -389,7 +394,7 @@ fn plan_correction_prompt(defects: &[String], correction: usize) -> String {
 async fn apply_review_commands(
     ctx: &LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
-    focus: Option<&tauqe_protocol::DiscussionTarget>,
+    focus: Option<&crate::discussion::DiscussionTarget>,
 ) -> Vec<u32> {
     let review_cmds = envelope.take(LlmCapability::ReviewUpdate);
     if review_cmds.is_empty() {
@@ -397,8 +402,8 @@ async fn apply_review_commands(
     }
 
     let review_id = match focus {
-        Some(tauqe_protocol::DiscussionTarget::Review { id }) => id.clone(),
-        Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
+        Some(crate::discussion::DiscussionTarget::Review { id }) => id.clone(),
+        Some(crate::discussion::DiscussionTarget::ReviewGroup { session_id, .. }) => {
             session_id.clone()
         }
         _ => {
@@ -466,13 +471,14 @@ fn extract_text_message(envelope: &mut ResponseEnvelope) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
     use crate::control::turn::{EDIT_CAPABILITIES, RESEARCH_CAPABILITIES};
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{ContextAccess, ModelRef};
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -646,13 +652,13 @@ mod tests {
         assert!(base.contains(LlmCapability::Blocked));
         assert!(base.contains(LlmCapability::Abort));
 
-        let plan_focus = tauqe_protocol::DiscussionTarget::Plan { id: "p1".into() };
+        let plan_focus = crate::discussion::DiscussionTarget::Plan { id: "p1".into() };
         let with_plan = repl_capabilities(Some(&plan_focus));
         assert!(with_plan.contains(LlmCapability::PlanCreation));
         assert!(with_plan.contains(LlmCapability::PlanUpdate));
         assert!(!with_plan.contains(LlmCapability::ReviewUpdate));
 
-        let rev_focus = tauqe_protocol::DiscussionTarget::Review { id: "r1".into() };
+        let rev_focus = crate::discussion::DiscussionTarget::Review { id: "r1".into() };
         let with_rev = repl_capabilities(Some(&rev_focus));
         assert!(with_rev.contains(LlmCapability::PlanCreation));
         assert!(!with_rev.contains(LlmCapability::PlanUpdate));
@@ -698,7 +704,7 @@ mod tests {
 
     #[test]
     fn a_plan_focused_dialogue_wraps_the_plan_capabilities_in_one_union() {
-        let focused = repl_capability_expr(Some(&tauqe_protocol::DiscussionTarget::Plan {
+        let focused = repl_capability_expr(Some(&crate::discussion::DiscussionTarget::Plan {
             id: "p1".into(),
         }));
         let CapabilityTree::Set(_, items) = &focused else {
@@ -877,7 +883,7 @@ mod tests {
         assert_eq!(success.value.plan_rejections.len(), 1);
         assert_eq!(
             success.value.plan_rejections[0].kind,
-            tauqe_protocol::PlanRejectionKind::PayloadDefect
+            crate::plan::PlanRejectionKind::PayloadDefect
         );
         assert_eq!(
             plan_correction_directives(&fixture.provider).len(),

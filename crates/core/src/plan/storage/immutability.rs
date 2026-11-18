@@ -1,5 +1,5 @@
+use crate::plan::{Plan, PlanItem, PlanItemStatus};
 use anyhow::Result;
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
 
 use super::PlanStorage;
 
@@ -102,7 +102,7 @@ impl PlanStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate};
+    use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
     use tempfile::tempdir;
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
             None,
             10,
             10,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Done invariant".to_string(),
                 details: None,
@@ -261,7 +261,7 @@ mod tests {
             None,
             10,
             10,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
@@ -314,7 +314,7 @@ mod tests {
             id: Some("guard-plan".to_string()),
             title: Some("Guard".to_string()),
             description: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,

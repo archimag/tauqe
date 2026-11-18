@@ -11,6 +11,7 @@ pub(crate) mod turn;
 #[cfg(test)]
 mod tests;
 
+use crate::contracts::Project;
 use std::sync::Arc;
 
 use tauqe_protocol::model::{CancelMode, ModelCancelParams};
@@ -21,8 +22,8 @@ use tauqe_protocol::{
 
 use crate::state::AppState;
 
-pub(crate) use turn::{emit_legacy_usage_event, unwind_grace};
-pub use turn::{start_model_turn, ModelTurnResult};
+pub use turn::start_model_turn;
+pub(crate) use turn::unwind_grace;
 
 pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
     let params: ModelAskParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -67,7 +68,7 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
     // the identical state change is guarded with the identical strength.
     // Sampling the slot once would let a turn register between the check and the
     // write and then run against a selection it never resolved.
-    let _operation = match crate::handlers::begin_exclusive_operation(
+    let operation = match crate::handlers::begin_configuration_change(
         &req.id,
         state,
         "Cannot change model while an operation is in progress",
@@ -88,46 +89,25 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
             }
         };
 
-    let (selection, effective_model, roles, previous_model) = {
-        let mut guard = state.config.lock().await;
-        // The model that was effective before the switch decides whether the
-        // dialogue session stays warm: a provider's prompt prefix cache belongs
-        // to one concrete model, so only a real model change invalidates it.
-        let previous_model = guard.config.resolve_model(&guard.selection);
-        // Restrict the selection to the configured model pools: a role resolves
-        // to its base model and an explicit model must already be configured,
-        // so a client can only activate a model it was offered.
-        let effective = guard.config.resolve_model(&params.selection);
-        let available = guard.config.available_models();
-        if !available.contains(&effective) {
+    let change = match operation.select_model(params.selection.project()).await {
+        Ok(change) => change,
+        Err(error) => {
             return Response::err(
                 req.id,
                 tauqe_protocol::errors::INVALID_MODEL,
-                format!(
-                    "Unknown model '{}'. Available models: {}",
-                    effective,
-                    available
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            );
+                error.to_string(),
+            )
         }
-        guard.selection = params.selection.clone();
-        let roles = crate::handlers::config::effective_roles_summary(&guard.config);
-        (guard.selection.clone(), effective, roles, previous_model)
     };
-
-    state
-        .maybe_rotate_session_on_model_change(&previous_model, &effective_model)
-        .await;
+    let selection = change.snapshot.selection;
+    let effective_model = change.snapshot.config.resolve_model(&selection);
+    let roles = crate::handlers::config::effective_roles_summary(&change.snapshot.config);
 
     state.out.send_event(&Event {
         method: events::MODEL_CHANGED.to_string(),
         params: serde_json::to_value(tauqe_protocol::ModelChangedEvent {
-            selection: selection.clone(),
-            effective_model: effective_model.clone(),
+            selection: selection.clone().project(),
+            effective_model: effective_model.clone().project(),
             roles: Some(roles.clone()),
         })
         .ok(),
@@ -136,15 +116,15 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
     Response::ok_typed(
         req.id,
         &tauqe_protocol::ModelSelectResult {
-            selection,
-            effective_model,
+            selection: selection.project(),
+            effective_model: effective_model.project(),
             roles: Some(roles),
         },
     )
 }
 
 pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Response {
-    let guard = state.config.lock().await;
+    let guard = state.application.configuration().await;
     let selection = guard.selection.clone();
     let effective_model = guard.config.resolve_model(&selection);
     let available_models = guard.config.available_models();
@@ -153,10 +133,13 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
     Response::ok_typed(
         req.id,
         &tauqe_protocol::ModelCurrentResult {
-            selection,
-            effective_model,
+            selection: selection.project(),
+            effective_model: effective_model.project(),
             roles: Some(roles),
-            available_models,
+            available_models: available_models
+                .into_iter()
+                .map(crate::contracts::Project::project)
+                .collect(),
         },
     )
 }
@@ -184,7 +167,7 @@ pub async fn handle_usage_reset(req: Request, state: &Arc<AppState>) -> Response
     }
 
     let snapshot = state.reset_lifetime_usage().await;
-    Response::ok_typed(req.id, &snapshot)
+    Response::ok_typed(req.id, &crate::usage::wire_snapshot(&snapshot))
 }
 
 /// Sets the active discussion focus anchor and broadcasts the change.
@@ -265,38 +248,24 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> Response {
-    // A bounded turn records its result against a private clone of the history
-    // manager and adopts that clone back when it ends. A turn that registered
-    // between an advisory check and the truncation would therefore swap the
-    // pre-truncation clone over the cleared journal, resurrecting every removed
-    // record and a stale identifier watermark, while the session rotation below
-    // raced its session resolution. The slot is claimed instead of sampled, so a
-    // running turn and this mutation are mutually exclusive by construction.
-    let _operation = match crate::handlers::begin_exclusive_operation(
+    let operation = match crate::handlers::begin_history_change(
         &req.id,
         state,
         "Cannot clear history while a model operation is in progress",
     ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
+        Ok(operation) => operation,
+        Err(response) => return *response,
     };
-
-    // Clearing the history truncates `history.jsonl` behind an `fsync` barrier,
-    // so the mutation runs on the blocking pool with the exclusive history
-    // guard held instead of stalling an async worker.
-    let cleared = crate::handlers::with_history_mutation(state, |history| history.clear()).await;
-    if let Err(err) = cleared {
-        tracing::warn!(error = %err, "Failed to clear the interaction history");
+    let outcome = operation.clear().await;
+    if let Some(error) = outcome.persistence_error {
+        tracing::warn!(error = %error, "Failed to clear the interaction history");
     }
-    // Clearing the dialogue session also detaches the discussion focus so the
-    // REPL returns to the free, unfocused mode, and rotates the provider session
-    // identifier so the discarded transcript can never warm the prompt-prefix
-    // cache of the next dialogue.
-    state.clear_discussion_focus().await;
-    state.reset_session_uuid().await;
+    state.publish_focus_update(outcome.focus_update);
     Response {
         id: req.id,
         result: Some(serde_json::json!({ "cleared": true })),
         error: None,
     }
 }
+
+mod result;

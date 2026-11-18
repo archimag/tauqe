@@ -1,9 +1,14 @@
+use crate::config::project::ProjectConfig;
+use crate::models::{
+    ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ReasoningEffort,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::{
-    ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig,
-    ReasoningEffort,
-};
+
+/// Resolved project command declarations used by the engine and tools.
+pub mod project {
+    pub use tauqe_tools::toolchain::config::*;
+}
 
 mod context;
 mod credentials;
@@ -19,12 +24,11 @@ mod review;
 
 pub use context::ContextConfig;
 pub(crate) use context::{
-    DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_SCRATCHPAD_CHARS,
-    DEFAULT_TOKEN_BUDGET,
+    DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_TOKEN_BUDGET,
 };
 #[cfg(test)]
 pub(crate) use context::{
-    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
+    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
     DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
 };
 pub use credentials::default_credentials_path;
@@ -33,7 +37,6 @@ pub use history::HistoryConfig;
 pub use models::ModelsConfig;
 #[cfg(test)]
 pub(crate) use models::BUILTIN_DEFAULT_REPL_MODEL;
-pub(crate) use models::BUILTIN_DEFAULT_SCRIBE_MODEL;
 pub use modules::{ensure_no_module_conflict, module_owners, ModuleOwners};
 pub use outer_docs::{OuterDocEntry, OuterDocSource};
 pub use repl::ReplConfig;
@@ -247,6 +250,32 @@ impl AppConfig {
     pub fn roles_summary(&self) -> ModelRolesSummary {
         let fallback = self.configured_models().into_iter().next();
         self.models.roles_summary_with_fallback(fallback)
+    }
+
+    /// Resolves effective roles with their configured effort, ladders, and catalog.
+    pub fn effective_roles_summary(&self) -> ModelRolesSummary {
+        use crate::models::{ModelRolesEffort, ModelRolesEntries};
+        let mut summary = self.roles_summary();
+        summary.efforts = Some(ModelRolesEffort {
+            scribe: self.models.resolve_effort(ModelRole::Scribe),
+            coder: self.models.resolve_effort(ModelRole::Coder),
+            architect: self.models.resolve_effort(ModelRole::Architect),
+            repl: self.models.resolve_effort(ModelRole::REPL),
+            reviewer: self.models.resolve_effort(ModelRole::Reviewer),
+        });
+        summary.entries = Some(ModelRolesEntries {
+            scribe: self.models.role_entries(ModelRole::Scribe),
+            coder: self.models.role_entries(ModelRole::Coder),
+            architect: self.models.role_entries(ModelRole::Architect),
+            repl: self.models.role_entries(ModelRole::REPL),
+            reviewer: self.models.role_entries(ModelRole::Reviewer),
+            catalog: if self.model_catalog().is_empty() {
+                None
+            } else {
+                Some(self.model_catalog().to_vec())
+            },
+        });
+        summary
     }
 
     /// The default active model based on `Primary` role.
@@ -471,8 +500,8 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::PostAnalysisMode;
-    use tauqe_protocol::WorkflowKind;
+    use crate::review::PostAnalysisMode;
+    use crate::workflow::WorkflowKind;
     #[test]
     fn test_models_config_and_roles_resolution() {
         let toml_str = r#"
@@ -1206,7 +1235,7 @@ args = ["check", "--all-targets"]
         assert!(reused.validate().is_ok());
         assert_eq!(
             reused.project.verify_command().expect("verify resolves"),
-            tauqe_protocol::ResolvedProjectCommand {
+            crate::config::project::ResolvedProjectCommand {
                 command: "cargo".to_string(),
                 args: vec!["check".to_string(), "--all-targets".to_string()],
                 ..Default::default()

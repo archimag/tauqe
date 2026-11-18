@@ -16,7 +16,7 @@ use super::EditError;
 pub struct LineSpan {
     pub start: usize,
     pub content_end: usize,
-    pub end: usize,
+    pub(crate) end: usize,
 }
 
 /// Splits a text into the byte spans of its lines.

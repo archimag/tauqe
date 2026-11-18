@@ -1,61 +1,20 @@
-use std::path::{Path, PathBuf};
+use crate::contracts::Project;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauqe_core::config::{
-    default_config_path, default_credentials_path, ensure_no_module_conflict, find_config_file,
-    find_credentials_file, load_config_with_options, module_owners, AppConfig, ConfigLoadOptions,
-    DEFAULT_CONFIG_TEMPLATE,
-};
+use tauqe_core::config::AppConfig;
+use tauqe_core::models::ModelSelection;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
     errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, Event,
-    ModelCatalogEntry, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
-    ModelSelection, Request, Response, ReviewPresetSummary, SystemStatusResult,
+    Request, Response, ReviewPresetSummary, SystemStatusResult,
 };
 
 use crate::state::AppState;
 
-/// Returns the provider catalog as carried by a role summary.
-///
-/// A model's display alias is declared once, in the provider catalog, so the
-/// client receives that declaration instead of deriving a display name from the
-/// model string. An empty catalog is reported as absent, so a summary of a
-/// project without a declared catalog adds no field to the wire.
-fn provider_catalog(cfg: &AppConfig) -> Option<Vec<ModelCatalogEntry>> {
-    let catalog = cfg.model_catalog();
-    if catalog.is_empty() {
-        None
-    } else {
-        Some(catalog.to_vec())
-    }
-}
-
-/// Builds the client-facing role summary, enriching each role's effective
-/// concrete model with the reasoning effort resolved from its role list and
-/// with the provider catalog that declares the models' display aliases.
-///
-/// Every role-bearing response and event carries this summary so a client can
-/// render each semantic role and its reasoning depth without re-reading the
-/// configuration, and resolve a display name from the single catalog
-/// declaration instead of stating an alias of its own.
-pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
-    let mut summary = cfg.roles_summary();
-    summary.efforts = Some(ModelRolesEffort {
-        scribe: cfg.models.resolve_effort(ModelRole::Scribe),
-        coder: cfg.models.resolve_effort(ModelRole::Coder),
-        architect: cfg.models.resolve_effort(ModelRole::Architect),
-        repl: cfg.models.resolve_effort(ModelRole::REPL),
-        reviewer: cfg.models.resolve_effort(ModelRole::Reviewer),
-    });
-    summary.entries = Some(ModelRolesEntries {
-        scribe: cfg.models.role_entries(ModelRole::Scribe),
-        coder: cfg.models.role_entries(ModelRole::Coder),
-        architect: cfg.models.role_entries(ModelRole::Architect),
-        repl: cfg.models.role_entries(ModelRole::REPL),
-        reviewer: cfg.models.role_entries(ModelRole::Reviewer),
-        catalog: provider_catalog(cfg),
-    });
-    summary
+/// Projects the core's resolved model-role configuration into the RPC contract.
+pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> tauqe_protocol::ModelRolesSummary {
+    cfg.effective_roles_summary().project()
 }
 
 /// Projects the declared review presets into the compact snapshot a client
@@ -88,15 +47,22 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
     let effective = cfg.resolve_model(&sel);
     let roles = effective_roles_summary(cfg);
     ConfigState {
-        workflow: cfg.repl.workflow,
+        workflow: cfg.repl.workflow.project(),
         edit_protocol: EditProtocolKind::Structured,
-        model: effective,
-        selection: Some(sel),
+        model: effective.project(),
+        selection: Some(sel.project()),
         roles: Some(roles),
-        history_model: Some(cfg.history_model()),
-        available_workflows: WorkflowFactory::available_workflows(),
+        history_model: Some(cfg.history_model().project()),
+        available_workflows: WorkflowFactory::available_workflows()
+            .into_iter()
+            .map(Project::project)
+            .collect(),
         available_edit_protocols: Vec::new(),
-        available_models: cfg.available_models(),
+        available_models: cfg
+            .available_models()
+            .into_iter()
+            .map(crate::contracts::Project::project)
+            .collect(),
         review_presets: review_preset_summaries(cfg),
     }
 }
@@ -113,219 +79,48 @@ async fn resolved_repo_root(state: &Arc<AppState>) -> Option<PathBuf> {
     }
 }
 
-/// Returns the explicit `--config` and `--credentials` paths captured by the
-/// server binary at startup.
-///
-/// The core engine never reads process arguments; the binary parses them once
-/// and records them in the loaded [`AppConfig`] so every later reload keeps
-/// honoring the same overrides.
-pub(crate) async fn explicit_cli_paths(
-    state: &Arc<AppState>,
-) -> (Option<PathBuf>, Option<PathBuf>) {
-    let guard = state.config.lock().await;
-    (
-        guard.config.explicit_config_path.clone(),
-        guard.config.explicit_credentials_path.clone(),
-    )
-}
-
-/// Builds the fallback configuration used when a reload fails.
-///
-/// The daemon's `--config` and `--credentials` overrides are stored inside
-/// [`AppConfig`], so falling back to bare defaults would permanently erase them
-/// for the rest of the daemon's lifetime. Re-attaching the captured overrides
-/// keeps every later reload honoring the same CLI paths.
-fn fallback_config_with_cli_paths(
-    explicit_config: Option<PathBuf>,
-    explicit_credentials: Option<PathBuf>,
-) -> AppConfig {
-    AppConfig {
-        explicit_config_path: explicit_config,
-        explicit_credentials_path: explicit_credentials,
-        ..AppConfig::default()
-    }
-}
-
-/// Reloads configuration for `repo_root`, re-applying the explicit path
-/// overrides captured at startup.
-pub(crate) async fn reload_config_with_overrides(
-    state: &Arc<AppState>,
-    repo_root: Option<&Path>,
-) -> AppConfig {
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    // Keep the CLI overrides alongside the closure inputs so a failed reload
-    // can restore them: callers replace `state.config` with whatever this
-    // function returns, so the `--config` / `--credentials` paths captured at
-    // daemon startup must survive on every code path, including the fallback.
-    let fallback_config = explicit_config.clone();
-    let fallback_credentials = explicit_credentials.clone();
-    let repo_root = repo_root.map(Path::to_path_buf);
-    // Loading configuration reads files from disk; offload it so the async
-    // worker thread is never blocked.
-    match super::offload(move || {
-        load_config_with_options(ConfigLoadOptions {
-            repo_root: repo_root.as_deref(),
-            explicit_config: explicit_config.as_deref(),
-            explicit_credentials: explicit_credentials.as_deref(),
-        })
-    })
-    .await
-    {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Failed to reload configuration; keeping defaults with CLI overrides preserved"
-            );
-            fallback_config_with_cli_paths(fallback_config, fallback_credentials)
-        }
-    }
-}
-
-/// Probes whether the repository is a Git working tree, off the async worker.
-///
-/// The probe shells out to git, so it runs on the blocking pool and resolves
-/// the repository from the authoritative shared root instead of the process CWD.
-async fn repo_has_git(repo_opt: Option<&Path>) -> bool {
-    let root = repo_opt.map(Path::to_path_buf);
-    super::offload(move || tauqe_core::git::is_git_repository(root.as_deref()))
-        .await
-        .unwrap_or(false)
-}
-
-/// Filesystem-derived locations reported by [`SystemStatusResult`].
-///
-/// The lookup walks candidate directories and checks whether each candidate
-/// exists, so the values are resolved once on the blocking pool and then
-/// carried as plain in-memory data. A handler that has just written a file
-/// replaces the discovered location with the written one, so the report never
-/// names a stale path.
-struct StatusPaths {
-    /// The configuration file the status reports, absent when none was found.
-    config: Option<String>,
-    /// The credentials file the status reports, absent when none was found.
-    credentials: Option<String>,
-    /// The path a configuration file would take if it were created now.
-    default_config: String,
-    /// The path a credentials file would take if it were saved now.
-    default_credentials: String,
-}
-
-impl StatusPaths {
-    /// Runs every location probe against the filesystem and the environment.
-    ///
-    /// The lookup compares the metadata of every candidate location, and the
-    /// default-path resolution reads the process environment, so this belongs
-    /// on the blocking pool and never on an async worker thread.
-    fn resolve(
-        repo_root: Option<&Path>,
-        explicit_config: Option<&Path>,
-        explicit_credentials: Option<&Path>,
-    ) -> Self {
-        let config = find_config_file(repo_root, explicit_config);
-        let credentials = find_credentials_file(repo_root, explicit_credentials);
-        let default_config = default_config_path(repo_root, explicit_config);
-        let default_credentials = default_credentials_path(repo_root, explicit_credentials);
-        Self {
-            config: config.map(|p| p.to_string_lossy().to_string()),
-            credentials: credentials.map(|p| p.to_string_lossy().to_string()),
-            default_config: default_config.to_string_lossy().to_string(),
-            default_credentials: default_credentials.to_string_lossy().to_string(),
-        }
-    }
-
-    /// The report used when the probes themselves cannot run.
-    ///
-    /// The blocking task fails only if the probe panicked, so the status still
-    /// answers with an empty location report instead of failing the request.
-    fn unknown() -> Self {
-        Self {
-            config: None,
-            credentials: None,
-            default_config: String::new(),
-            default_credentials: String::new(),
-        }
-    }
-}
-
-/// Resolves the reported status locations on the blocking pool.
-///
-/// The probes behind [`StatusPaths::resolve`] walk candidate directories,
-/// compare metadata, and read the process environment. They are offloaded for
-/// the same reason [`repo_has_git`] offloads its git subprocess: the async
-/// worker keeps serving other requests, and no caller holds the shared
-/// configuration guard across directory I/O — the guard is taken only for the
-/// in-memory assembly that follows.
-async fn resolve_status_paths(
-    repo_opt: Option<&Path>,
-    explicit_config: Option<PathBuf>,
-    explicit_credentials: Option<PathBuf>,
-) -> StatusPaths {
-    let root = repo_opt.map(Path::to_path_buf);
-    super::offload(move || {
-        StatusPaths::resolve(
-            root.as_deref(),
-            explicit_config.as_deref(),
-            explicit_credentials.as_deref(),
-        )
-    })
-    .await
-    .unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "Failed to resolve the status paths");
-        StatusPaths::unknown()
-    })
-}
-
-/// Assembles the authoritative [`SystemStatusResult`] from a single source so
-/// derived fields such as `ready` (which requires both a Git repository and an
-/// API key) stay consistent across every status-producing handler.
-///
-/// Every filesystem-derived value arrives pre-resolved in `paths`, so the
-/// assembly is pure in-memory work: a caller holds the configuration guard only
-/// for these reads instead of across directory probes.
-fn build_system_status(
-    cfg: &AppConfig,
-    selection: &ModelSelection,
-    has_git: bool,
-    paths: &StatusPaths,
-) -> SystemStatusResult {
-    let has_api_key = tauqe_core::config::has_openrouter_key(cfg);
-
+/// Converts a completed application status to the existing RPC shape.
+fn system_status_dto(status: tauqe_core::api::SystemStatus) -> SystemStatusResult {
+    let cfg = &status.configuration.config;
+    let selection = status.configuration.selection;
     SystemStatusResult {
-        has_git,
-        has_config: paths.config.is_some(),
-        config_path: paths.config.clone(),
-        default_config_path: paths.default_config.clone(),
-        has_api_key,
-        credentials_path: paths.credentials.clone(),
-        default_credentials_path: paths.default_credentials.clone(),
-        ready: has_git && has_api_key,
-        model: cfg.resolve_model(selection),
-        selection: Some(selection.clone()),
+        has_git: status.has_git,
+        has_config: status.locations.config.is_some(),
+        config_path: status
+            .locations
+            .config
+            .map(|path| path.to_string_lossy().to_string()),
+        default_config_path: status
+            .locations
+            .default_config
+            .to_string_lossy()
+            .to_string(),
+        has_api_key: status.has_api_key,
+        credentials_path: status
+            .locations
+            .credentials
+            .map(|path| path.to_string_lossy().to_string()),
+        default_credentials_path: status
+            .locations
+            .default_credentials
+            .to_string_lossy()
+            .to_string(),
+        ready: status.ready,
+        model: cfg.resolve_model(&selection).project(),
+        selection: Some(selection.project()),
         roles: Some(effective_roles_summary(cfg)),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
+        history_model: Some(cfg.history_model().project()),
+        available_models: cfg
+            .available_models()
+            .into_iter()
+            .map(crate::contracts::Project::project)
+            .collect(),
         config_error: cfg.config_error.clone(),
     }
 }
-/// Configuration keys a `config/set` request writes.
-///
-/// The model selection is runtime state rather than configuration, so it names
-/// no key here: only the fields that reach `tauqe.toml` can collide with a
-/// `tauqe.d` module.
-fn written_config_keys(params: &ConfigSetParams) -> Vec<&'static str> {
-    let mut keys = Vec::new();
-    if params.history_model.is_some() {
-        keys.push("models.scribe");
-    }
-    if params.workflow.is_some() {
-        keys.push("repl.workflow");
-    }
-    keys
-}
 
 pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
-    let guard = state.config.lock().await;
+    let guard = state.application.configuration().await;
     let result = config_state(&guard.config, Some(&guard.selection));
     Response::ok_typed(req.id, &result)
 }
@@ -334,7 +129,7 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
     // The mutation replaces the shared configuration and model selection, so
     // the slot is claimed: a turn registering right after a plain check would
     // observe a configuration swapped underneath its running batch.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot change workflow or model while a model operation is in progress",
@@ -354,125 +149,35 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         }
     };
 
-    // A key declared by a `tauqe.d` module belongs to that module: the module
-    // is re-read on the next configuration load, so an in-memory change would
-    // be overwritten instead of taking effect. The request is refused with the
-    // module named, so the developer edits the layer that owns the key.
-    let written = written_config_keys(&params);
-    if !written.is_empty() {
-        if let Some(root) = resolved_repo_root(state).await {
-            let owners = match super::offload(move || module_owners(&root)).await {
-                Ok(Ok(owners)) => owners,
-                Ok(Err(err)) => return Response::err(req.id, errors::MODULE_CONFLICT, err),
-                Err(err) => return Response::err(req.id, errors::MODULE_CONFLICT, err),
-            };
-            if let Some((key, module)) = written
-                .iter()
-                .find_map(|key| owners.get(*key).map(|module| (*key, module)))
-            {
-                return Response::err(
-                    req.id,
-                    errors::MODULE_CONFLICT,
-                    format!(
-                        "The key `{}` is declared by the module {}; edit that file instead",
-                        key,
-                        module.display()
-                    ),
-                );
-            }
-        }
-    }
-
-    let (updated_state, previous_model) = {
-        let mut guard = state.config.lock().await;
-        // The model that was effective before the change decides whether the
-        // dialogue session stays warm: a provider's prompt prefix cache belongs
-        // to one concrete model, so only a real model change invalidates it.
-        let previous_model = guard.config.resolve_model(&guard.selection);
-
-        // Validate every requested field into local candidates before mutating
-        // shared state, so a single invalid field cannot leave the config
-        // partially applied and desynchronized from the client.
-        let mut new_selection = guard.selection.clone();
-        if let Some(ref sel) = params.selection {
-            let effective = guard.config.resolve_model(sel);
-            let available = guard.config.available_models();
-            if !available.contains(&effective) {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_MODEL,
-                    format!(
-                        "Unknown model '{}'. Available models: {}",
-                        effective,
-                        available
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-            }
-            new_selection = sel.clone();
-        } else if let Some(ref requested_model) = params.model {
-            let available = guard.config.available_models();
-            if !available.contains(requested_model) {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_MODEL,
-                    format!(
-                        "Unknown model '{}'. Available models: {}",
-                        requested_model,
-                        available
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-            }
-            new_selection = ModelSelection::Specific(requested_model.clone());
-        }
-
-        let mut new_scribe = guard.config.models.scribe.clone();
-        if let Some(ref hist_model) = params.history_model {
-            let available = guard.config.available_models();
-            if !available.contains(hist_model) {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_MODEL,
-                    format!(
-                        "Unknown history model '{}'. Available models: {}",
-                        hist_model,
-                        available
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-            }
-            new_scribe = Some(hist_model.clone());
-        }
-
-        let mut new_workflow = guard.config.repl.workflow;
-        if let Some(wf) = params.workflow {
-            new_workflow = wf;
-        }
-
-        // Every requested field is valid: commit the whole change atomically.
-        guard.selection = new_selection;
-        guard.config.models.scribe = new_scribe;
-        guard.config.repl.workflow = new_workflow;
-
-        (
-            config_state(&guard.config, Some(&guard.selection)),
-            previous_model,
+    let root = resolved_repo_root(state).await;
+    let change = match operation
+        .update_project_configuration(
+            root.as_deref(),
+            tauqe_core::api::ConfigurationPatch {
+                selection: params.selection.map(crate::contracts::Project::project),
+                model: params.model.map(crate::contracts::Project::project),
+                history_model: params.history_model.map(crate::contracts::Project::project),
+                workflow: params.workflow.map(Project::project),
+            },
         )
+        .await
+    {
+        Ok(change) => change,
+        Err(error) => {
+            let code = match &error {
+                tauqe_core::api::ConfigurationError::UnknownModel { .. }
+                | tauqe_core::api::ConfigurationError::UnknownHistoryModel { .. } => {
+                    errors::INVALID_MODEL
+                }
+                tauqe_core::api::ConfigurationError::ModuleRead(_)
+                | tauqe_core::api::ConfigurationError::ModuleConflict { .. } => {
+                    errors::MODULE_CONFLICT
+                }
+            };
+            return Response::err(req.id, code, error.to_string());
+        }
     };
-
-    state
-        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
-        .await;
+    let updated_state = config_state(&change.snapshot.config, Some(&change.snapshot.selection));
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
@@ -486,11 +191,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let has_git = repo_has_git(repo_opt).await;
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    let paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
-    let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &guard.selection, has_git, &paths);
+    let status = system_status_dto(state.application.system_status(repo_opt).await);
 
     Response::ok_typed(req.id, &status)
 }
@@ -498,7 +199,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
 pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Response {
     // The reload replaces the shared configuration for every later turn, so the
     // slot is claimed for the whole reload instead of sampled once.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot reload configuration while a model operation is in progress",
@@ -510,30 +211,15 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
-    let (updated_state, previous_model, cur_sel_val) = {
-        let mut guard = state.config.lock().await;
-        let previous_model = guard.config.resolve_model(&guard.selection);
-        guard.selection = new_cfg.default_selection();
-        guard.config = new_cfg;
-        let st = config_state(&guard.config, Some(&guard.selection));
-        (st, previous_model, guard.selection.clone())
-    };
-
-    state
-        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
-        .await;
+    let snapshot = operation.reload_configuration(repo_opt).await;
+    let updated_state = config_state(&snapshot.config, Some(&snapshot.selection));
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let has_git = repo_has_git(repo_opt).await;
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    let paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
-    let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
+    let status = system_status_dto(state.application.system_status(repo_opt).await);
 
     Response::ok_typed(req.id, &status)
 }
@@ -541,7 +227,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
 pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Response {
     // Creating the file is followed by the same full rebind a reload performs,
     // so the slot is claimed for both halves of the operation.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot create configuration while a model operation is in progress",
@@ -553,70 +239,31 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    let target_path = tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
-
-    // The created document is the template and the repository modules stay in
-    // place: a template key a module already declares would collide on the next
-    // load, so the collision is reported before a byte reaches disk.
-    let guard_target = target_path.clone();
-    let guard_root = repo_root.clone();
-    let conflict = match super::offload(move || {
-        ensure_no_module_conflict(
-            DEFAULT_CONFIG_TEMPLATE,
-            &guard_target,
-            guard_root.as_deref(),
-        )
-    })
-    .await
-    {
-        Ok(conflict) => conflict,
-        Err(err) => return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err),
+    let result = match operation.create_configuration(repo_opt).await {
+        Ok(result) => result,
+        Err(error) => {
+            let code = match &error {
+                tauqe_core::api::ConfigurationFileError::ModuleConflict(_) => {
+                    errors::MODULE_CONFLICT
+                }
+                _ => errors::CONFIG_CREATE_FAILED,
+            };
+            return Response::err(req.id, code, error.to_string());
+        }
     };
-    if let Err(message) = conflict {
-        return Response::err(req.id, errors::MODULE_CONFLICT, message);
-    }
-
-    let write_path = target_path.clone();
-    let write_outcome =
-        match super::offload(move || tauqe_core::config::write_default_config(&write_path)).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err);
-            }
-        };
-    if let Err(err) = write_outcome {
-        return Response::err(
-            req.id,
-            errors::CONFIG_CREATE_FAILED,
-            format!("Failed to create config file at {:?}: {}", target_path, err),
-        );
-    }
-
-    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
-    let (updated_state, previous_model, cur_sel_val) = {
-        let mut guard = state.config.lock().await;
-        let previous_model = guard.config.resolve_model(&guard.selection);
-        guard.selection = new_cfg.default_selection();
-        guard.config = new_cfg;
-        let st = config_state(&guard.config, Some(&guard.selection));
-        (st, previous_model, guard.selection.clone())
-    };
-
-    state
-        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
-        .await;
+    let updated_state = config_state(&result.snapshot.config, Some(&result.snapshot.selection));
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let has_git = repo_has_git(repo_opt).await;
-    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
-    paths.config = Some(target_path.to_string_lossy().to_string());
-    let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
+    let status = system_status_dto(
+        state
+            .application
+            .system_status_after_write(repo_opt, &result)
+            .await,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -624,7 +271,7 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
 pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Response {
     // Saving credentials reloads the configuration that every later turn reads,
     // so the slot is claimed for the write and the reload together.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot save credentials while a model operation is in progress",
@@ -648,55 +295,29 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
             }
         };
 
-    let api_key = params.api_key.trim();
-    if api_key.is_empty() {
-        return Response::err(req.id, errors::INVALID_KEY, "API key cannot be empty");
-    }
-
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    let target_path =
-        tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
-    let write_path = target_path.clone();
-    let api_key_owned = api_key.to_string();
-    let write_outcome = match super::offload(move || {
-        tauqe_core::config::write_credentials_file(&write_path, &api_key_owned)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return Response::err(req.id, errors::CREDENTIALS_SAVE_FAILED, err);
+    let result = match operation.save_credentials(repo_opt, params.api_key).await {
+        Ok(result) => result,
+        Err(error) => {
+            let code = match &error {
+                tauqe_core::api::ConfigurationFileError::InvalidKey => errors::INVALID_KEY,
+                _ => errors::CREDENTIALS_SAVE_FAILED,
+            };
+            return Response::err(req.id, code, error.to_string());
         }
     };
-    if let Err(err) = write_outcome {
-        return Response::err(
-            req.id,
-            errors::CREDENTIALS_SAVE_FAILED,
-            format!(
-                "Failed to write credentials file at {:?}: {}",
-                target_path, err
-            ),
-        );
-    }
-
-    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
-    let (updated_state, cur_sel_val) = {
-        let mut guard = state.config.lock().await;
-        guard.config = new_cfg;
-        let st = config_state(&guard.config, Some(&guard.selection));
-        (st, guard.selection.clone())
-    };
+    let updated_state = config_state(&result.snapshot.config, Some(&result.snapshot.selection));
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let has_git = repo_has_git(repo_opt).await;
-    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
-    paths.credentials = Some(target_path.to_string_lossy().to_string());
-    let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
+    let status = system_status_dto(
+        state
+            .application
+            .system_status_after_write(repo_opt, &result)
+            .await,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -704,7 +325,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
 pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>) -> Response {
     // The stub replaces a file the configuration loader reads, so the slot is
     // claimed for the write instead of being observed once before it.
-    let _operation = match super::begin_exclusive_operation(
+    let operation = match super::begin_configuration_change(
         &req.id,
         state,
         "Cannot create a credentials stub while a model operation is in progress",
@@ -716,34 +337,19 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    let target_path =
-        tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
-    let write_path = target_path.clone();
-    let write_outcome =
-        match super::offload(move || tauqe_core::config::write_credentials_stub(&write_path)).await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, err);
-            }
-        };
-    if let Err(err) = write_outcome {
-        return Response::err(
-            req.id,
-            errors::CREDENTIALS_STUB_FAILED,
-            format!(
-                "Failed to write credentials stub at {:?}: {}",
-                target_path, err
-            ),
-        );
-    }
+    let result = match operation.create_credentials_stub(repo_opt).await {
+        Ok(result) => result,
+        Err(error) => {
+            return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, error.to_string())
+        }
+    };
 
-    let has_git = repo_has_git(repo_opt).await;
-    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
-    paths.credentials = Some(target_path.to_string_lossy().to_string());
-    let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &guard.selection, has_git, &paths);
+    let status = system_status_dto(
+        state
+            .application
+            .system_status_after_write(repo_opt, &result)
+            .await,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -752,7 +358,9 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
 mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
-    use tauqe_protocol::{ModelRef, WorkflowKind};
+    use tauqe_core::models::ModelRef;
+    use tauqe_core::models::{ModelCatalogEntry, ModelRole};
+    use tauqe_protocol::WorkflowKind;
 
     #[tokio::test]
     async fn test_config_state_roles_and_scribe_history() {
@@ -772,26 +380,29 @@ mod tests {
         let st = config_state(&cfg, None);
         assert_eq!(
             st.history_model,
-            Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"))
+            Some(ModelRef::openrouter("anthropic/claude-3.5-haiku").project())
         );
 
         let roles = st.roles.expect("roles summary must be present");
         assert_eq!(
             roles.scribe,
-            ModelRef::openrouter("anthropic/claude-3.5-haiku")
+            ModelRef::openrouter("anthropic/claude-3.5-haiku").project()
         );
         assert_eq!(
             roles.coder,
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").project()
         );
         assert_eq!(
             roles.architect,
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").project()
         );
-        assert_eq!(roles.repl, ModelRef::openrouter("google/gemini-2.5-flash"));
+        assert_eq!(
+            roles.repl,
+            ModelRef::openrouter("google/gemini-2.5-flash").project()
+        );
         assert_eq!(
             roles.reviewer,
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").project()
         );
     }
 
@@ -817,7 +428,7 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             catalog[0].model,
-            ModelRef::openrouter("deepseek/deepseek-chat")
+            ModelRef::openrouter("deepseek/deepseek-chat").project()
         );
         assert_eq!(catalog[0].alias.as_deref(), Some("Deep"));
 
@@ -841,13 +452,13 @@ mod tests {
                 name: "backend".to_string(),
                 title: Some("Backend audit".to_string()),
                 groups: Vec::new(),
-                post_analysis: tauqe_protocol::review::PostAnalysisMode::None,
+                post_analysis: tauqe_core::review::PostAnalysisMode::None,
             },
             tauqe_core::config::ReviewPreset {
                 name: "frontend".to_string(),
                 title: None,
                 groups: Vec::new(),
-                post_analysis: tauqe_protocol::review::PostAnalysisMode::None,
+                post_analysis: tauqe_core::review::PostAnalysisMode::None,
             },
         ];
 
@@ -886,7 +497,7 @@ mod tests {
                     workflow: None,
                     edit_protocol: None,
                     model: None,
-                    selection: Some(ModelSelection::Role(ModelRole::Scribe)),
+                    selection: Some(ModelSelection::Role(ModelRole::Scribe).project()),
                     history_model: None,
                 })
                 .unwrap(),
@@ -899,9 +510,12 @@ mod tests {
         let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(
             res_state.selection,
-            Some(ModelSelection::Role(ModelRole::Scribe))
+            Some(ModelSelection::Role(ModelRole::Scribe).project())
         );
-        assert_eq!(res_state.model, ModelRef::openrouter("model/scribe"));
+        assert_eq!(
+            res_state.model,
+            ModelRef::openrouter("model/scribe").project()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -935,86 +549,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A failed reload must not erase the CLI overrides captured at daemon
-    /// startup, or every later reload would silently stop honoring the explicit
-    /// `--config` / `--credentials` paths.
     #[test]
-    fn fallback_config_preserves_explicit_cli_paths() {
-        let cfg_path = PathBuf::from("/tmp/tauqe/custom.toml");
-        let creds_path = PathBuf::from("/tmp/tauqe/credentials.toml");
-
-        let fallback =
-            fallback_config_with_cli_paths(Some(cfg_path.clone()), Some(creds_path.clone()));
-
-        assert_eq!(fallback.explicit_config_path, Some(cfg_path));
-        assert_eq!(fallback.explicit_credentials_path, Some(creds_path));
-    }
-    /// The status locations are resolved off the async worker, so the
-    /// repository root and the explicit CLI overrides must reach both the
-    /// location probe and the default-path computation.
-    #[tokio::test]
-    async fn test_resolve_status_paths_reports_discovered_and_default_locations() {
-        let root = scratch_root("status-paths");
-        let repo_config = root.join("tauqe.toml");
-        // The lookup only checks that a candidate is a file, so the fixture
-        // carries no configuration.
-        std::fs::write(&repo_config, "").unwrap();
-
-        let paths = resolve_status_paths(Some(&root), None, None).await;
-        let expected = repo_config.to_string_lossy().to_string();
-        assert_eq!(paths.config, Some(expected.clone()));
+    fn status_projection_preserves_paths_and_application_readiness() {
+        let config = AppConfig::default();
+        let selection = config.default_selection();
+        let status = system_status_dto(tauqe_core::api::SystemStatus {
+            configuration: tauqe_core::api::ConfigurationSnapshot { config, selection },
+            locations: tauqe_core::api::ConfigurationLocations {
+                config: Some(PathBuf::from("/resolved/tauqe.toml")),
+                credentials: Some(PathBuf::from("/resolved/credentials.toml")),
+                default_config: PathBuf::from("/default/tauqe.toml"),
+                default_credentials: PathBuf::from("/default/credentials.toml"),
+            },
+            has_git: true,
+            has_api_key: true,
+            ready: true,
+        });
+        assert!(status.has_git && status.has_api_key && status.has_config && status.ready);
+        assert_eq!(status.config_path.as_deref(), Some("/resolved/tauqe.toml"));
         assert_eq!(
-            paths.default_config, expected,
-            "the default location matches the file discovered in the repository"
+            status.credentials_path.as_deref(),
+            Some("/resolved/credentials.toml")
         );
-
-        // An explicit override wins over the repository candidates for both
-        // the discovered file and the location a new file would take.
-        let explicit = root.join("custom.toml");
-        std::fs::write(&explicit, "").unwrap();
-        let paths = resolve_status_paths(Some(&root), Some(explicit.clone()), None).await;
-        let expected = explicit.to_string_lossy().to_string();
-        assert_eq!(paths.config, Some(expected.clone()));
-        assert_eq!(paths.default_config, expected);
-
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(status.default_config_path, "/default/tauqe.toml");
+        assert_eq!(status.default_credentials_path, "/default/credentials.toml");
     }
 
-    /// `build_system_status` consumes the pre-resolved locations, so a caller
-    /// holds the configuration guard only for in-memory reads while a freshly
-    /// written file still replaces the discovered one.
-    #[test]
-    fn test_build_system_status_consumes_the_resolved_locations() {
-        let cfg = AppConfig::default();
-        let selection = cfg.default_selection();
-        let paths = StatusPaths {
-            config: Some("/resolved/tauqe.toml".to_string()),
-            credentials: None,
-            default_config: "/default/tauqe.toml".to_string(),
-            default_credentials: "/default/creds.toml".to_string(),
-        };
-
-        let status = build_system_status(&cfg, &selection, true, &paths);
-        assert_eq!(status.config_path, paths.config);
-        assert!(status.has_config);
-        assert!(status.credentials_path.is_none());
-        assert_eq!(status.default_config_path, "/default/tauqe.toml");
-        assert_eq!(status.default_credentials_path, "/default/creds.toml");
-        assert!(status.has_git);
-
-        // A create/save handler replaces the discovered location with the file
-        // it has just written before the status is assembled.
-        let written = StatusPaths {
-            config: Some("/fresh/tauqe.toml".to_string()),
-            credentials: Some("/fresh/creds.toml".to_string()),
-            ..paths
-        };
-        let status = build_system_status(&cfg, &selection, false, &written);
-        assert_eq!(status.config_path, written.config);
-        assert_eq!(status.credentials_path, written.credentials);
-        assert_eq!(status.default_config_path, "/default/tauqe.toml");
-        assert!(!status.has_git);
-    }
     #[tokio::test]
     async fn test_credentials_create_stub_rejected_while_operation_active() {
         let (out, _rx) = crate::transport::OutChannel::new();
@@ -1057,7 +617,7 @@ mod tests {
         let operation = state
             .try_begin_operation()
             .expect("operation slot must be free");
-        let before = state.config.lock().await.selection.clone();
+        let before = state.application.configuration().await.selection.clone();
 
         let resp = handle_config_set(
             config_set_request(ModelSelection::Specific(ModelRef::openrouter("beta/model"))),
@@ -1068,7 +628,7 @@ mod tests {
         assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
 
         assert_eq!(
-            state.config.lock().await.selection,
+            state.application.configuration().await.selection,
             before,
             "a refused config/set must not change the selection"
         );
@@ -1092,7 +652,7 @@ mod tests {
                     workflow: None,
                     edit_protocol: None,
                     model: None,
-                    selection: Some(selection),
+                    selection: Some(selection.project()),
                     history_model: None,
                 })
                 .unwrap(),
@@ -1195,7 +755,7 @@ mod tests {
         let status: SystemStatusResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(
             status.model,
-            ModelRef::openrouter("deepseek/deepseek-chat"),
+            ModelRef::openrouter("deepseek/deepseek-chat").project(),
             "the reload must adopt the configured model"
         );
         assert_ne!(
@@ -1246,7 +806,7 @@ mod tests {
                     edit_protocol: None,
                     model: None,
                     selection: None,
-                    history_model: Some(ModelRef::openrouter("scribe/model")),
+                    history_model: Some(ModelRef::openrouter("scribe/model").project()),
                 })
                 .unwrap(),
             ),

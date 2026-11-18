@@ -15,9 +15,6 @@ use crate::plan::PlanImplementation;
 /// Stable identifier of the implicit group a single-audit session audits.
 pub const DEFAULT_REVIEW_GROUP_ID: &str = "default";
 
-/// Title of the implicit single-audit group.
-const DEFAULT_REVIEW_GROUP_TITLE: &str = "Default";
-
 /// Stable identifier of the group collecting the findings that share no root
 /// cause with another finding.
 ///
@@ -126,29 +123,6 @@ pub struct ReviewGroup {
     /// The findings it collects stay untouched: the horizon belongs to the
     /// group, and the findings merely describe what the group manifests.
     pub implementation: PlanImplementation,
-}
-
-impl ReviewGroup {
-    /// The implicit group a single-audit session audits.
-    ///
-    /// A session created before grouping existed, or one launched as a single
-    /// audit, carries no explicit groups. It is the degenerate case of one
-    /// `Default` group covering every session target file, so consumers resolve
-    /// it through `ReviewSession::effective_groups` instead of branching on
-    /// "legacy or grouped".
-    pub fn single_default(paths: Vec<String>) -> Self {
-        Self {
-            id: DEFAULT_REVIEW_GROUP_ID.to_string(),
-            title: DEFAULT_REVIEW_GROUP_TITLE.to_string(),
-            paths,
-            prompt: None,
-            description: None,
-            blocked_reason: None,
-            resolution_notes: None,
-            kind: ReviewGroupKind::Simple,
-            implementation: PlanImplementation::default(),
-        }
-    }
 }
 
 /// A cluster of findings that share one architectural root cause.

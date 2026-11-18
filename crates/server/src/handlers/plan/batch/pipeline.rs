@@ -6,14 +6,12 @@
 
 use std::sync::Arc;
 
-use tauqe_core::plan::storage::PlanStorage;
-use tauqe_protocol::{errors, PlanExecutePipelineParams, PlanScopeEvaluation, Request, Response};
+use tauqe_protocol::{errors, PlanExecutePipelineParams, Request, Response};
 
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 
-use super::super::common::offload_plan;
-use super::supervisor::{run_plan_batch_with, BatchOutcome, PlanBatchOptions};
+use super::supervisor::PlanBatchOptions;
 
 /// Runs a queue of plans sequentially under one registered operation.
 ///
@@ -35,64 +33,20 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
             }
         };
 
-    if params.plan_ids.is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Pipeline must reference at least one plan",
-        );
-    }
-
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-
-    // Every plan is loaded and scheduled before the first turn starts, so an
-    // unknown or unschedulable plan rejects the whole pipeline instead of
-    // surfacing halfway through it.
-    let mut scheduled: Vec<(String, Vec<String>)> = Vec::new();
-    for plan_id in &params.plan_ids {
-        let load_root = repo_root.clone();
-        let load_plan_id = plan_id.clone();
-        let plan =
-            match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
-                Ok(Some(plan)) => plan,
-                Ok(None) => {
-                    return Response::err(
-                        req.id,
-                        errors::NOT_FOUND,
-                        format!("Plan '{}' not found", plan_id),
-                    );
-                }
-                Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
+    let queue = match state.application.prepare_plan_queue(&params.plan_ids).await {
+        Ok(queue) => queue,
+        Err(error) => {
+            let code = match error.kind {
+                tauqe_core::api::PlanQueueFailure::Empty => errors::INVALID_PARAMS,
+                tauqe_core::api::PlanQueueFailure::Load => errors::PLAN_LOAD_FAILED,
+                tauqe_core::api::PlanQueueFailure::NotFound => errors::NOT_FOUND,
+                tauqe_core::api::PlanQueueFailure::Blocked => errors::STEP_BLOCKED,
+                tauqe_core::api::PlanQueueFailure::Completed => errors::NOTHING_TO_EXECUTE,
             };
-
-        let step_ids: Vec<String> = match plan.implementation.evaluate_scope(None) {
-            PlanScopeEvaluation::Ready(steps) => steps.into_iter().map(|step| step.id).collect(),
-            PlanScopeEvaluation::AllCompleted
-                if plan.implementation.items.is_empty() && !plan.concept.is_empty() =>
-            {
-                // Concept-only plan: the supervisor projects its horizon.
-                Vec::new()
-            }
-            PlanScopeEvaluation::AllCompleted => continue,
-            other => {
-                return Response::err(
-                    req.id,
-                    errors::STEP_BLOCKED,
-                    format!("Plan '{}' cannot be executed: {:?}", plan.id, other),
-                );
-            }
-        };
-
-        scheduled.push((plan.id, step_ids));
-    }
-
-    if scheduled.is_empty() {
-        return Response::err(
-            req.id,
-            errors::NOTHING_TO_EXECUTE,
-            "Every plan in the pipeline is already completed",
-        );
-    }
+            return Response::err(req.id, code, error.message);
+        }
+    };
+    let repo_root = state.repo_root().await;
 
     let operation = match state.try_begin_operation() {
         Ok(guard) => Arc::new(guard),
@@ -133,7 +87,8 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     // survives into code generation.
     state.clear_discussion_focus().await;
 
-    let plan_ids: Vec<String> = scheduled
+    let plan_ids: Vec<String> = queue
+        .scheduled
         .iter()
         .map(|(plan_id, _)| plan_id.clone())
         .collect();
@@ -146,7 +101,7 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     // starts from the chosen ladder rung. The plan itself is the single source
     // of per-step instructions (concept #c-1).
     let options = PlanBatchOptions {
-        model: params.model,
+        model: params.model.map(crate::contracts::Project::project),
         step_id: None,
     };
     let response = Response::ok(
@@ -157,24 +112,16 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
         }),
     );
 
-    let state = Arc::clone(state);
+    let observer = Arc::new(super::supervisor::Observer {
+        state: state.clone(),
+        operation: operation.clone(),
+        operation_id: format!("op-{}", operation.id()),
+    });
+    let application = state.application.clone();
     tokio::spawn(async move {
-        for (plan_id, step_ids) in scheduled {
-            let outcome =
-                run_plan_batch_with(&state, &plan_id, step_ids, &operation, &options).await;
-            match outcome {
-                BatchOutcome::Completed { steps } => {
-                    tracing::info!("Pipeline plan '{}' completed: {} step(s)", plan_id, steps);
-                }
-                other => {
-                    // A failed, blocked, cancelled, or stopped plan ends the
-                    // queue: the later plans depend on the state it never
-                    // reached.
-                    tracing::warn!("Pipeline stopped at plan '{}': {:?}", plan_id, other);
-                    break;
-                }
-            }
-        }
+        application
+            .execute_plan_queue(queue, operation, options, observer)
+            .await;
     });
 
     response

@@ -48,19 +48,29 @@ This document specifies mandatory engineering and architectural conventions for 
 
 ## 2. Workspace Architecture and Crate Responsibilities
 
-The TAUQE workspace is decomposed into five specialized crates with strict, unidirectional dependency boundaries. Dependencies flow one way only (`tui` -> `protocol`, `server` -> `core` -> `tools` -> `protocol`), and code must never drift across these boundaries:
+The TAUQE workspace is decomposed into specialized crates with strict, unidirectional dependency boundaries. The enforced dependency graph is `tui -> protocol + tools`,
+`server -> protocol + core`, and `core -> tools`. Tools owns shared utilities,
+including the pure `tools::path_patterns` matcher used by the engine and TUI.
+Core has no dependency on protocol. The dependency gate enforces this boundary;
+server projects domain models explicitly without changing RPC or stored formats.
+Infrastructure remains inside core, behind application-owned ports. Tools owns
+technical inputs and results; core owns domain rules and execution; server owns
+RPC adaptation, transport, and logging setup. Do not add new engine-only contracts
+to protocol. Client-side computations belong to TUI, never to protocol.
+Code must preserve these boundaries:
 
-1. **`crates/protocol` (Pure Wire Contract and Shared Domain DTOs):**
+1. **`crates/protocol` (Pure Wire Contract):**
    - **Mandate:** Authoritative single source of truth strictly for server–client (TUI) inter-process communication contracts. Contains JSON-RPC request, response, and event data structures, error codes, and pure data transfer objects (DTOs) exchanged across the server–client boundary.
-   - **Allowed:** Serde serialization and deserialization, JSON schema generators, pure validation logic, and self-contained stateless string/path helpers (e.g., glob matching, XML escaping).
+   - **Allowed:** Serde serialization and deserialization, JSON schema generators, pure validation logic, and wire-specific stateless string/path helpers. Shared path matching belongs to `tools::path_patterns`.
    - **Strict Prohibitions:** Strictly NO internal LLM-facing or engine-only protocol contracts (such as model command types, capability trees, or LLM response schemas not exchanged between server and client), NO file system or disk I/O, NO OS command execution, NO network or HTTP clients, NO async runtime (`tokio`) dependencies, and NO workspace dependencies. Must remain a lightweight, fast-compiling leaf crate.
-   - **Documented Exception — Plan Evaluation Surface:** A small, pure surface of plan and review computations lives in `protocol` even though it resembles domain logic. It comprises the read-only plan queries (`Plan::evaluate_scope`, `Plan::compute_items_status`, `Plan::count_stats`), the derived-state normalizers that recompute a value from existing structure (`Plan::normalize_leaf_files`, `Plan::refresh_parent_statuses`), and the leaf-scoped assignment helper used for optimistic UI updates (`Plan::update_item_status`). The `tui` crate depends only on `protocol` and must render plan readiness, progress, leaf file badges, and optimistic status changes without an RPC round-trip, so these deterministic, allocation-only functions over the shared plan DTOs are allowed here. They perform no I/O and never touch disk, Git, or the network. All durable plan transitions, persistence, and `Done` immutability enforcement remain in `core`.
-   - **Status Cycling Is Presentation-Only:** The `PlanItemStatus::next` and `ReviewItemStatus::next` helpers define the UI cycle order for the status picker and intentionally allow transitions such as `Done -> Blocked`. They are not a permission model. The authoritative guard against mutating or regressing a finished step lives in `core` (`validate_done_immutability`), never in the protocol cycler.
+   - **Model Payload Ownership:** Discussion output, discussion plan/review mutation proposals, directory-list model requests, and patch strategy belong only to core. Protocol retains only client-visible nested payloads of RPC results; unused model-only DTOs and their converters must not return. Server delegates model ask preparation and focus fallback to Application.
+   - **Document Ownership:** Core owns stored plan/review models and authoritative graph/lifecycle rules. Protocol has separate DTOs; TUI owns pure client projections for rendering and optimistic interaction. Compatibility tests pin the actual TUI library against core; the server maps every field explicitly. Post-analysis model-output payloads and durable lifecycle-provenance normalization belong only to core.
+   - **Status Cycling Is Presentation-Only:** TUI's `PlanStatusProjection::next` and `ReviewStatusProjection::next` helpers define the UI cycle order for the status picker and intentionally allow transitions such as `Done -> Blocked`. They are not a permission model. The authoritative guard against mutating or regressing a finished step lives in `core` (`validate_done_immutability`), never in a client projection.
 
 2. **`crates/tools` (Deterministic Substrate):**
    - **Mandate:** Every operation the harness performs without model judgement. Owns virtual staging and its patch algorithms, atomic file writes, Git transactions and checkpoints, the toolchain command runners and task-runner integration, and the Tree-sitter repository map.
-   - **Allowed:** Interacting with Git, the file system, and toolchain processes, and consuming the shared wire contract from `protocol`. It holds no cognitive state and drives no turn.
-   - **Strict Prohibitions:** NO dependency on `core`, NO LLM provider client, NO bounded turn FSM, NO prompt assembly, NO history or context management.
+   - **Allowed:** Interacting with Git, the file system, and toolchain processes, and consuming its own technical types and utilities. It holds no cognitive state and drives no turn.
+   - **Strict Prohibitions:** NO dependency on `core` or `protocol`, NO LLM provider client, NO bounded turn FSM, NO prompt assembly, NO history or context management.
 
 3. **`crates/core` (Deterministic Harness and Domain Engine):**
    - **Mandate:** The headless engine implementing the literal harness paradigm. Owns the bounded turn FSM, model-facing protocol decoding, prompt assembly, context and history management, LLM provider communication and streaming, plan and review storage engines, and the adapters that hand the substrate its declared inputs.
@@ -71,12 +81,39 @@ The TAUQE workspace is decomposed into five specialized crates with strict, unid
    - `crates/protocol` remains a lightweight leaf crate. It declares only
      `serde`, `serde_json`, and `schemars`, carries no workspace dependency, and
      pulls in no file-system, process, network, or async runtime crate.
-   - `schemars` derives the JSON Schema of a command from the command type
-     itself, so the strict schema a model is constrained by and the type the
-     decoder reads are one declaration. Deriving a schema is pure data
-     processing: it reads no file, spawns no process, and opens no socket.
+   - `schemars` describes wire DTO schemas without I/O. Model-facing schema
+     composition and command decoding belong to core. A wire DTO that also
+     appears in model output does not transfer execution policy to protocol.
    - Introducing any dependency that performs I/O into `crates/protocol` is
      forbidden; such work belongs to `tools`, `core`, or `server`.
    - Rationale (Why): the wire contract must stay the cheapest crate to compile
-     and the fastest to load, because every other crate depends on it and the
+     and the fastest to load, because the
      client frontend links it directly.
+
+
+Architecture dependency gates run in `crates/server/tests/architecture_tests.rs`
+with the regular server suite. A new workspace crate requires an explicit
+boundary review. Core must never import protocol or hide a transport dependency through a
+re-export, source inclusion, or a shared transport crate.
+
+
+The clean-boundary migration is complete for the audited workspace surface.
+Application owns repository queries/initialization, Git diff and squash-preview
+selection, document reads and mutations, refinement/replan preparation, and turn
+lifecycle policy. Server owns RPC parsing/error-code mapping, transport admission
+messages, typed event projection/publication, provider test injection, logging,
+and runtime signal/connection handling. Production server sources may not call
+stored-document engines, blocking Git primitives, model schemas, or domain
+normalizers directly. Architecture gates exclude test fixtures and the logging
+module's authorized filesystem work; they run with every server test suite.
+
+
+TUI's `projection` library owns client readiness/progress, tree lookup and
+normalization, optimistic status updates, Markdown rendering, review grouping,
+and status picker cycles as extension traits over protocol DTOs. They perform
+no I/O and cannot authorize a durable transition. Protocol owns only wire data,
+serde/validation of its encoding, and data construction/conversion helpers.
+The former client-computation exception has been removed. Server's integration
+tests have one reviewed dev-only dependency on the TUI projection library to
+compare its actual behavior against core. Neither release binary gains a new
+runtime dependency, and TUI still has no dependency on core, including in tests.

@@ -15,7 +15,7 @@ pub enum ReasoningEffort {
 
 impl ReasoningEffort {
     /// Canonical lowercase wire representation.
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
@@ -70,9 +70,7 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
 }
 
 /// Deserializes an optional reasoning effort, treating blank strings as absence.
-pub(super) fn deserialize_effort_opt<'de, D>(
-    deserializer: D,
-) -> Result<Option<ReasoningEffort>, D::Error>
+fn deserialize_effort_opt<'de, D>(deserializer: D) -> Result<Option<ReasoningEffort>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

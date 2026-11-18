@@ -1,9 +1,10 @@
+use crate::models::ArchitectTier;
+use crate::plan::{PlanImplementation, PlanItem};
+use crate::review::{
+    IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession, DEFAULT_REVIEW_GROUP_ID,
+};
 use anyhow::Result;
 use std::path::Path;
-use tauqe_protocol::{
-    ArchitectTier, IssueStatus, PlanImplementation, PlanItem, ReviewGroup, ReviewIssue, ReviewItem,
-    ReviewSession, DEFAULT_REVIEW_GROUP_ID,
-};
 
 use super::ReviewStorage;
 
@@ -30,7 +31,7 @@ impl ReviewStorage {
     ///
     /// Returns `None` when the named session does not exist or declares no
     /// group with that identifier.
-    pub fn replace_uncompleted_group_subplan(
+    pub(crate) fn replace_uncompleted_group_subplan(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
@@ -97,7 +98,7 @@ impl ReviewStorage {
     ///
     /// Returns `None` when the named session does not exist or declares no group
     /// with that identifier.
-    pub fn update_group_subplan(
+    pub(crate) fn update_group_subplan(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
@@ -160,7 +161,8 @@ impl ReviewStorage {
     /// group are never observed by `updater`.
     ///
     /// Returns the number of findings the update reached.
-    pub fn update_session_group_findings<F>(
+    #[cfg(test)]
+    pub(crate) fn update_session_group_findings<F>(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
@@ -177,6 +179,7 @@ impl ReviewStorage {
 
     /// Lock-free core of [`Self::update_session_group_findings`]; the caller
     /// must hold the storage lock.
+    #[cfg(test)]
     fn update_session_group_findings_unlocked<F>(
         repo_root: &Path,
         review_id: &str,
@@ -287,7 +290,8 @@ impl ReviewStorage {
     /// leave the next decomposition with a blocker it cannot interpret.
     /// Findings of other groups are never touched, and a group the session does
     /// not declare resolves to `None` without any write.
-    pub fn apply_group_decision(
+    #[cfg(test)]
+    pub(crate) fn apply_group_decision(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
@@ -301,6 +305,7 @@ impl ReviewStorage {
 
     /// Lock-free core of [`Self::apply_group_decision`]; the caller must hold
     /// the storage lock.
+    #[cfg(test)]
     fn apply_group_decision_unlocked(
         repo_root: &Path,
         review_id: &str,

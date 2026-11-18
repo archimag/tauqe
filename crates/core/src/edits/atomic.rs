@@ -168,14 +168,18 @@ pub(crate) fn commit_staged_edits(
 #[cfg(test)]
 mod tests {
     use super::commit_staged_edits;
+    use crate::context::ContextAccess;
     use crate::context::ContextManager;
+    use crate::edits::EditCreate;
+    use crate::edits::EditDelete;
+    use crate::edits::EditMove;
+    use crate::edits::EditOperation;
+    use crate::edits::EditProposal;
+    use crate::edits::EditReplace;
     use crate::edits::{
         apply_edit_proposal, stage_and_validate_edits, EditError, StagedEditsState,
     };
     use std::path::Path;
-    use tauqe_protocol::{
-        ContextAccess, EditCreate, EditDelete, EditMove, EditOperation, EditProposal, EditReplace,
-    };
     use tempfile::tempdir;
 
     /// Names of the staging siblings currently present in `dir`.

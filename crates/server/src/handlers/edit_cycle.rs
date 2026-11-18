@@ -14,9 +14,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::contracts::Project;
 use crate::handlers::common::emit;
 use crate::transport::OutChannel;
-use tauqe_protocol::edit::{EditFinishedEvent, EditOutcome, EditStartedEvent, VerificationVerdict};
+use tauqe_core::edits::{EditOutcome, VerificationVerdict};
+use tauqe_protocol::edit::{EditFinishedEvent, EditStartedEvent};
 use tauqe_protocol::events;
 
 /// Typed reason a cycle ended.
@@ -35,8 +37,6 @@ pub(crate) enum EditTermination {
     Answered,
     /// The turn proposed file edits, but they could not be converged or applied by virtual staging.
     StagingRefused,
-    /// The turn streamed edits in an earlier round, but a subsequent round completed without edits.
-    Superseded,
     /// The operation was cancelled by the developer.
     Cancelled,
     /// The streamed attempt was withdrawn and its edits are void.
@@ -48,7 +48,6 @@ pub(crate) enum EditTermination {
     /// Built from the typed protocol-failure fact of the turn, never from the
     /// wording of the diagnostic that explains it.
     ProtocolFailure,
-    Blocked,
     /// The turn was aborted before it could close the cycle itself.
     Aborted,
 }
@@ -57,17 +56,17 @@ impl EditTermination {
     /// Human-readable reason carried by an unapplied closing.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Answered => "The turn concluded with an answer without proposing any file change.",
-            Self::StagingRefused => "The proposed edits could not be staged or applied to the repository.",
-            Self::Superseded => {
-                "Edits proposed in an earlier round were superseded when the turn finished without edits."
+            Self::Answered => {
+                "The turn concluded with an answer without proposing any file change."
+            }
+            Self::StagingRefused => {
+                "The proposed edits could not be staged or applied to the repository."
             }
             Self::Cancelled => "The operation was cancelled before the edits were applied.",
             Self::Withdrawn => {
                 "The streamed attempt was withdrawn, so its proposed edits were discarded."
             }
             Self::ProviderError => "The model provider failed before the edits could be applied.",
-            Self::Blocked => "The model reported a blocker instead of proposing file changes.",
             Self::ProtocolFailure => {
                 "The model response violated the edit protocol, so no change set was applied."
             }
@@ -94,6 +93,7 @@ impl EditCycle {
     }
 
     /// Reports whether the cycle is currently open.
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.open.load(Ordering::SeqCst)
     }
@@ -192,7 +192,7 @@ impl EditCycle {
             events::EDIT_FINISHED,
             serde_json::to_value(EditFinishedEvent {
                 operation_id: self.operation_id.clone(),
-                outcome,
+                outcome: outcome.project(),
             })
             .ok(),
         );
@@ -213,14 +213,12 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    const ALL: [EditTermination; 9] = [
+    const ALL: [EditTermination; 7] = [
         EditTermination::Answered,
         EditTermination::StagingRefused,
-        EditTermination::Superseded,
         EditTermination::Cancelled,
         EditTermination::Withdrawn,
         EditTermination::ProviderError,
-        EditTermination::Blocked,
         EditTermination::ProtocolFailure,
         EditTermination::Aborted,
     ];
@@ -249,21 +247,6 @@ mod tests {
                 "{termination:?} must explain itself"
             );
         }
-    }
-    #[test]
-    fn silent_endings_carry_distinct_descriptions() {
-        assert_ne!(
-            EditTermination::Answered.description(),
-            EditTermination::StagingRefused.description()
-        );
-        assert_ne!(
-            EditTermination::Answered.description(),
-            EditTermination::Superseded.description()
-        );
-        assert_ne!(
-            EditTermination::StagingRefused.description(),
-            EditTermination::Superseded.description()
-        );
     }
 
     #[test]
@@ -391,7 +374,7 @@ mod tests {
         let (out, mut rx) = OutChannel::new();
         let cycle = EditCycle::new(out, "op-6");
         cycle.open();
-        cycle.close_unapplied(EditTermination::Blocked, Vec::new(), None);
+        cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
         drop(cycle);
         assert_eq!(
             methods(&drain(&mut rx)),

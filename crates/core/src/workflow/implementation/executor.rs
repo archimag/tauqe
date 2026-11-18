@@ -14,23 +14,24 @@
 use std::path::Path;
 
 use crate::config::ModelsConfig;
+use crate::models::{ModelEntry, ModelRole, ModelSelection, ReasoningEffort};
 use crate::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 use crate::plan::storage::PlanStorage;
+use crate::plan::{PlanItem, PlanItemStatus, PlanScopeEvaluation};
 use crate::providers::{
     format_session_id, StreamEvent, SESSION_PREFIX_PLAN, SESSION_PREFIX_REVIEW,
 };
 use crate::review::storage::ReviewStorage;
+use crate::review::IssueStatus;
 use crate::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
 use crate::workflow::implementation::{
     classify_scope_stall, ExecutionScope, ImplementationFrame, ImplementationHost, StepFailure,
     StepTurnRequest, StepTurnResult,
 };
+use crate::workflow::turn::TurnWorkItem;
+use crate::workflow::turn::TurnWorkQueue;
+use crate::workflow::EditProtocolKind;
 use async_trait::async_trait;
-use tauqe_protocol::model::TurnWorkQueue;
-use tauqe_protocol::{
-    EditProtocolKind, IssueStatus, ModelEntry, ModelRole, ModelSelection, PlanItem, PlanItemStatus,
-    PlanScopeEvaluation, ReasoningEffort, TurnWorkItem,
-};
 use tokio::sync::{mpsc, watch};
 
 /// Configuration of one implementation run.
@@ -42,21 +43,21 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone)]
 pub struct ImplementationRunConfig {
     /// Coder ladder and the automatic escalation policy of the run.
-    pub models: ModelsConfig,
+    pub(crate) models: ModelsConfig,
     /// Protocol that shapes the step prompts and their control tags.
-    pub protocol: EditProtocolKind,
+    pub(crate) protocol: EditProtocolKind,
     /// Turn marker bound to the tagged control channel.
-    pub marker: Option<String>,
+    pub(crate) marker: Option<String>,
     /// Coder selection the run starts from.
-    pub selection: Option<ModelSelection>,
+    pub(crate) selection: Option<ModelSelection>,
     /// Additional instructions of the run, forwarded to every step turn.
-    pub instructions: Option<String>,
+    pub(crate) instructions: Option<String>,
     /// Ordered identifiers of the scheduled leaves, the running one included.
     ///
     /// The queue drives the work marker and the `[i/N]` position a client
     /// renders. A step the queue does not list is appended to it, so the
     /// running leaf is always declared and its position is always exact.
-    pub queue: Vec<String>,
+    pub(crate) queue: Vec<String>,
 }
 
 /// Executes the leaves of one implementation horizon as bounded step turns.
@@ -73,7 +74,7 @@ pub struct PlanImplementationStepExecutor<'a> {
 
 impl<'a> PlanImplementationStepExecutor<'a> {
     /// Creates an executor for the horizon `scope` resolves to.
-    pub fn new(
+    pub(crate) fn new(
         repo_root: &'a Path,
         scope: ExecutionScope,
         host: &'a dyn ImplementationHost,
@@ -738,22 +739,23 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use crate::config::ModelsConfig;
+    use crate::models::{
+        ArchitectTier, ModelEntry, ModelRef, ModelRole, ModelSelection, ReasoningEffort,
+    };
     use crate::plan::storage::PlanStorage;
+    use crate::plan::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
     use crate::providers::StreamEvent;
     use crate::review::storage::ReviewStorage;
+    use crate::review::{IssueStatus, IssueType, ReviewIssue};
+    use crate::review::{ReviewGroup, ReviewItem, ReviewSession};
     use crate::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepStatus};
     use crate::workflow::implementation::{
         ExecutionScope, ImplementationHost, ImplementationRunConfig,
         PlanImplementationStepExecutor, RefinementRequest, RefinementResult, StepFailure,
         StepTurnRequest, StepTurnResult,
     };
+    use crate::workflow::EditProtocolKind;
     use async_trait::async_trait;
-    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewIssue};
-    use tauqe_protocol::{
-        ArchitectTier, EditProtocolKind, ModelEntry, ModelRef, ModelRole, ModelSelection, Plan,
-        PlanImplementation, PlanItem, PlanItemStatus, ReasoningEffort, ReviewGroup, ReviewItem,
-        ReviewSession,
-    };
     use tempfile::tempdir;
     use tokio::sync::{mpsc, watch};
 
@@ -1535,7 +1537,7 @@ mod tests {
 
     #[test]
     fn saturation_message_distinguishes_the_excluded_rung_from_its_sibling() {
-        use tauqe_protocol::ReasoningEffort;
+        use crate::models::ReasoningEffort;
 
         let shared = ModelRef::openrouter("shared/model");
         let mut excluded = ModelEntry::new(shared.clone(), Some(ReasoningEffort::Max));

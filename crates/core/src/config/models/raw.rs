@@ -8,8 +8,8 @@
 //! them first and resolves afterwards, so no role resolves against a half-read
 //! catalog.
 
+use crate::models::{ModelCatalogEntry, ModelRef, ReasoningEffort};
 use serde::Deserialize;
-use tauqe_protocol::{ModelCatalogEntry, ModelRef, ReasoningEffort};
 
 use super::ModelsConfig;
 

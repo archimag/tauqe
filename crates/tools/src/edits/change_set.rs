@@ -6,19 +6,21 @@
 //! restores exactly the paths it touched, and the remaining members continue
 //! independently.
 //!
-//! The machine reads only wire values: the operations of the change set, the
+//! The machine reads the operations of the change set, the
 //! resolved [`ProjectConfig`] that declares the trust boundaries, and the
-//! [`ContextState`] snapshot that says which paths are in context. It therefore
+//! explicit list of paths available in context. It therefore
 //! never observes a live context engine, and the one check it cannot make itself
 //! — the in-memory validation of a repository configuration file — arrives as the
 //! [`StagedConfigValidator`] hook.
 
+use crate::edits::operation::{
+    EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOverwrite,
+    EditReplace,
+};
+use crate::path_patterns::GlobPattern;
+use crate::toolchain::config::ProjectConfig;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tauqe_protocol::{
-    ContextState, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation,
-    EditOverwrite, EditReplace, GlobPattern, ProjectConfig,
-};
 
 use super::admission::{admit_move_destination, admit_write, ignored_target_paths, IgnoreAnswer};
 use super::error::EditError;
@@ -171,17 +173,21 @@ impl StagingFailureLog {
 /// it found, so a member that applied earlier keeps its own effect. Other members
 /// succeed independently. Pass the returned staged state into the next attempt to
 /// retain earlier successes.
-pub fn stage_and_validate_edits(
+#[cfg(test)]
+fn stage_and_validate_edits(
     repo_root: &Path,
     project: &ProjectConfig,
-    context: &ContextState,
+    context: &[String],
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
 ) -> StageEditsResult {
     stage_and_validate_edits_with(repo_root, project, context, edits, initial_staged, None)
 }
 
-/// Stages `edits` and hands every staged file to `config_validator`.
+/// Stages `edits` against the supplied context paths and validates staged files.
+///
+/// `context` contains repository-relative paths. The engine owns context access
+/// policy; this list preserves the membership snapshot for one staging attempt.
 ///
 /// The hook is the only harness-specific input of the attempt: a repository
 /// configuration governs the environment the change set is verified in, and only
@@ -189,7 +195,7 @@ pub fn stage_and_validate_edits(
 pub fn stage_and_validate_edits_with(
     repo_root: &Path,
     project: &ProjectConfig,
-    context: &ContextState,
+    context: &[String],
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
     config_validator: Option<StagedConfigValidator>,
@@ -227,7 +233,7 @@ pub fn stage_and_validate_edits_with(
 pub(crate) fn stage_and_validate_edits_inner(
     repo_root: &Path,
     project: &ProjectConfig,
-    context: &ContextState,
+    context: &[String],
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
     config_validator: Option<StagedConfigValidator>,
@@ -236,11 +242,7 @@ pub(crate) fn stage_and_validate_edits_inner(
     let protected = protected_patterns(project);
     // The context answers every membership question of the attempt, so its paths
     // are collected once instead of scanning the whole item list per lookup.
-    let context_paths: HashSet<&str> = context
-        .items
-        .iter()
-        .map(|item| item.path.as_str())
-        .collect();
+    let context_paths: HashSet<&str> = context.iter().map(String::as_str).collect();
     let (units, mut failures) = build_staging_units(repo_root, edits);
     // The ignore probe is one batched `git check-ignore` call, so the whole
     // change set is resolved against Git before the first member applies. A

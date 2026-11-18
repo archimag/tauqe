@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use tauqe_tui::projection::*;
 
 use tauqe_protocol::{
     ArchitectTier, ConceptItem, DiscussionFocus, DiscussionTarget, ModelEntry, ModelRole, Plan,

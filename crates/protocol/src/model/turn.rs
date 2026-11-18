@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::command::DocTopic;
+use super::topic::DocTopic;
 use crate::discussion::{
     deserialize_null_as_default, deserialize_repo_path_list, deserialize_repo_search_requests,
     DiscussionContextRequest, DiscussionRequest, RepoSearchRequest,
@@ -108,7 +108,8 @@ impl TurnWorkQueue {
     }
 
     /// One-based position of the active member together with the queue length.
-    pub fn position(&self) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    fn position(&self) -> Option<(usize, usize)> {
         self.active()
             .map(|_| (self.active_index + 1, self.items.len()))
     }
@@ -269,18 +270,21 @@ pub struct StructuredOutcomeProposal {
 
 impl StructuredOutcomeProposal {
     /// Reports whether the status represents a skipped outcome ("skip" or "skipped").
-    pub fn is_skip(&self) -> bool {
+    #[cfg(test)]
+    fn is_skip(&self) -> bool {
         let s = self.status.trim();
         s.eq_ignore_ascii_case("skip") || s.eq_ignore_ascii_case("skipped")
     }
 
     /// Reports whether the status represents a successful outcome ("success").
-    pub fn is_success(&self) -> bool {
+    #[cfg(test)]
+    fn is_success(&self) -> bool {
         self.status.trim().eq_ignore_ascii_case("success")
     }
 
     /// Reports whether the status represents an error outcome ("error").
-    pub fn is_error(&self) -> bool {
+    #[cfg(test)]
+    fn is_error(&self) -> bool {
         self.status.trim().eq_ignore_ascii_case("error")
     }
 }

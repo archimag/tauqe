@@ -1219,11 +1219,7 @@ impl PathCompletion {
     }
 
     /// Number of real directory scans served since the dialog was built.
-    ///
-    /// Only the regression test reads this, exactly like `computations` of
-    /// `PatternMatchMemo`, so the allowance keeps the zero-warning gate green
-    /// instead of widening the module surface for a counter.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn scans(&self) -> u64 {
         self.scans
     }
@@ -1265,7 +1261,7 @@ pub struct ReviewDialogState {
     /// Repository file list the handshake delivered.
     ///
     /// The live match counter evaluates the target text against exactly this
-    /// list with the same `tauqe_protocol::glob::GlobPattern` the server
+    /// list with the same `tauqe_tools::path_patterns::GlobPattern` the server
     /// applies, so a local preview can never predict a selection the server
     /// resolves differently (c-2).
     pub repo_files: Vec<String>,

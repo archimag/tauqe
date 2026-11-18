@@ -1,9 +1,15 @@
 use super::*;
+use crate::context::{ContextAccess, ContextLayer};
+use crate::edits::EditCreate;
+use crate::edits::EditDelete;
+use crate::edits::EditLineAnchor;
+use crate::edits::EditMove;
+use crate::edits::EditMoveDir;
+use crate::edits::EditOperation;
+use crate::edits::EditOverwrite;
+use crate::edits::EditProposal;
+use crate::edits::EditReplace;
 use std::path::Path;
-use tauqe_protocol::{
-    ContextAccess, ContextLayer, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
-    EditOperation, EditOverwrite, EditProposal, EditReplace,
-};
 use tempfile::tempdir;
 
 use crate::context::ContextManager;
@@ -1351,8 +1357,8 @@ fn replace_without_a_needle_is_reported_as_a_typed_rejection() {
 /// field name its own instructions declare.
 #[test]
 fn rejected_change_set_reaches_the_model_in_the_active_strategy_dialect() {
+    use crate::workflow::PatchStrategy;
     use std::collections::{HashMap, HashSet};
-    use tauqe_protocol::PatchStrategy;
 
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -1568,8 +1574,8 @@ fn a_repository_without_a_boundary_declaration_protects_nothing() {
 
 #[test]
 fn the_boundary_rejection_reaches_the_retry_request_verbatim() {
+    use crate::workflow::PatchStrategy;
     use std::collections::HashMap;
-    use tauqe_protocol::PatchStrategy;
 
     let error = EditError::ProtectedPath("docs/specs/auth.md".to_string());
     let message = error.to_string();

@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use tauqe_protocol::glob::GlobPattern;
 use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, OuterDocsCacheEntry};
+use tauqe_tools::path_patterns::GlobPattern;
 
 use crate::editor::InputEditor;
 pub mod input;
@@ -491,11 +491,7 @@ impl CandidateScanMemo {
     }
 
     /// Number of real scans served since the picker was built.
-    ///
-    /// Only the regression test reads this, exactly like `PatternMatchMemo` in
-    /// `crate::dialogs::pattern`, so the allowance keeps the zero-warning gate
-    /// green instead of widening the module surface for a counter.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn computations(&self) -> u64 {
         self.computations.get()
     }

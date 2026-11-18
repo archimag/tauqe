@@ -1,3 +1,6 @@
+mod projection;
+pub(crate) use projection::history_item_dto;
+
 use std::sync::Arc;
 
 use tauqe_protocol::{errors, HistoryGetParams, HistoryGetResult, Request, Response};
@@ -21,40 +24,21 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
         },
         None => HistoryGetParams::default(),
     };
-    let limit = params.limit.unwrap_or(10);
-    let before_id = params.before_id;
-
-    // The page slice reads `history.jsonl`, so it runs on the blocking pool
-    // while the exclusive history guard is held, keeping it serialized against
-    // the mutations served through the same guard. The token estimate is
-    // maintained by the manager as it appends, so pricing the page costs no
-    // extra journal read here. A running turn works on its own clone of the
-    // manager and therefore never holds this guard, so the page reports the
-    // journal as it stands — including the entries the turn has already
-    // appended — instead of waiting for the bounded turn to finish. Compaction
-    // and rollback replace the journal atomically, so a concurrent read sees
-    // either the previous or the next journal, never a partial one.
-    let loaded = crate::handlers::with_history_mutation(state, move |history| {
-        let estimated_tokens = history.estimated_tokens();
-        history
-            .get_ui_slice(limit, before_id)
-            .map(|(items, has_more, total_count)| (items, has_more, total_count, estimated_tokens))
-            .map_err(|err| err.to_string())
-    })
-    .await;
-
-    match loaded {
-        Ok(Ok((items, has_more, total_count, estimated_tokens))) => {
-            let result = HistoryGetResult {
-                items,
-                has_more,
-                total_count,
-                estimated_tokens,
-            };
-            Response::ok_typed(req.id, &result)
-        }
-        Ok(Err(err)) => Response::err(req.id, errors::HISTORY_GET_FAILED, err),
-        Err(err) => Response::err(req.id, errors::HISTORY_GET_FAILED, err),
+    match state
+        .application
+        .history_page(params.limit, params.before_id)
+        .await
+    {
+        Ok(page) => Response::ok_typed(
+            req.id,
+            &HistoryGetResult {
+                items: page.items.into_iter().map(history_item_dto).collect(),
+                has_more: page.has_more,
+                total_count: page.total_count,
+                estimated_tokens: page.estimated_tokens,
+            },
+        ),
+        Err(error) => Response::err(req.id, errors::HISTORY_GET_FAILED, error.to_string()),
     }
 }
 
@@ -115,19 +99,22 @@ mod tests {
     /// `[5, 6, 7, 8]`; the Summary receives id `4`.
     async fn compacted_state(dir: &TestDir) -> Arc<AppState> {
         let state = test_state(dir);
-        {
-            let mut history = state.history.lock().await;
-            for i in 1..=4 {
-                history.record_turn(format!("Task {}", i), vec![]).unwrap();
+        state
+            .application
+            .test_mutate_history(|history| {
+                for i in 1..=4 {
+                    history.record_turn(format!("Task {}", i), vec![]).unwrap();
+                    history
+                        .record_response(format!("Done {}", i), None, None, vec![])
+                        .unwrap();
+                }
+                let (_, tail) = history.prepare_compaction(2).unwrap().unwrap();
                 history
-                    .record_response(format!("Done {}", i), None, None, vec![])
+                    .apply_compaction("Earlier tasks summarized.", tail)
                     .unwrap();
-            }
-            let (_, tail) = history.prepare_compaction(2).unwrap().unwrap();
-            history
-                .apply_compaction("Earlier tasks summarized.", tail)
-                .unwrap();
-        }
+            })
+            .await
+            .unwrap();
         state
     }
 
@@ -223,10 +210,13 @@ mod tests {
     async fn test_history_get_rejects_malformed_payloads() {
         let dir = TestDir::new();
         let state = test_state(&dir);
-        {
-            let mut history = state.history.lock().await;
-            history.record_turn("Task".to_string(), Vec::new()).unwrap();
-        }
+        state
+            .application
+            .test_mutate_history(|history| {
+                history.record_turn("Task".to_string(), Vec::new()).unwrap();
+            })
+            .await
+            .unwrap();
 
         for payload in [
             serde_json::json!({ "limit": "ten" }),

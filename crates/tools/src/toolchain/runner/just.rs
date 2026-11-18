@@ -20,10 +20,10 @@
 //! A recipe that cannot be invoked by name — a private one — is skipped, so the
 //! published tool list never advertises a command the harness cannot run.
 
+use crate::toolchain::config::{ProjectCommandSpec, ProjectParameterSpec};
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use tauqe_protocol::{ProjectCommandSpec, ProjectParameterSpec};
 
 use super::{RunnerCommand, RunnerManifest, RunnerManifestError, TaskRunner};
 

@@ -12,34 +12,38 @@
 
 pub mod analysis;
 pub mod discussion;
-pub mod group_context;
+pub(crate) mod group_context;
 pub mod refine;
-pub mod step;
+#[cfg(test)]
+pub(crate) mod step;
 
 #[cfg(test)]
 mod group_prompt_tests;
 pub use analysis::{build_post_analysis_system_prompt, build_post_analysis_user_prompt};
 pub use discussion::{
-    build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
-    format_review_discussion_prompt_items, format_review_group_discussion_prompt,
-    REVIEW_DISCUSSION_PREFIX,
+    build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt_items,
+    format_review_group_discussion_prompt,
 };
-pub use group_context::apply_group_architectural_context;
-pub use refine::{
+pub(crate) use group_context::apply_group_architectural_context;
+
+#[cfg(test)]
+pub(crate) use discussion::format_review_discussion_prompt;
+#[cfg(test)]
+pub(crate) use refine::{
     build_review_group_refine_system_prompt, build_review_group_refine_user_prompt,
-    ReviewGroupRefineDiagnostics, MAX_REVIEW_IMPLEMENTATION_DEPTH,
 };
-pub use step::{
+#[cfg(test)]
+pub(crate) use step::{
     format_review_step_execution_prompt, format_review_step_failure_note,
-    format_review_step_retry_prompt, REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
+    format_review_step_retry_prompt,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::ReviewSession;
     use crate::workflow::implementation::StepFailure;
-    use tauqe_protocol::review::ReviewSession;
-    use tauqe_protocol::EditProtocolKind;
+    use crate::workflow::EditProtocolKind;
 
     #[test]
     fn test_format_review_step_retry_prompt() {
@@ -65,13 +69,13 @@ mod tests {
 
     #[test]
     fn test_format_review_step_execution_prompt() {
-        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
+        use crate::review::{IssueType, ReviewItem, ReviewItemStatus};
 
         let session = ReviewSession {
             id: "rev-7".to_string(),
             title: "Performance Review".to_string(),
             created_at: 100,
-            model: tauqe_protocol::ModelRef::openrouter("model-x"),
+            model: crate::models::ModelRef::openrouter("model-x"),
             description: Some("Optimize string copies".to_string()),
             user_prompt: None,
             target_files: vec!["crates/tui/src/view.rs".to_string()],
@@ -83,7 +87,7 @@ mod tests {
                 group: None,
                 model: None,
                 issue_type: IssueType::Performance,
-                severity: tauqe_protocol::ReviewSeverity::Warning,
+                severity: crate::review::ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
                 recommendations: vec![],
                 files: vec!["crates/tui/src/view.rs".to_string()],
@@ -110,8 +114,8 @@ mod tests {
 
     #[test]
     fn test_review_discussion_prompt_formatting() {
-        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
-        use tauqe_protocol::ModelRef;
+        use crate::models::ModelRef;
+        use crate::review::{IssueType, ReviewItem, ReviewItemStatus};
 
         let session = ReviewSession {
             id: "rev-42".to_string(),
@@ -129,7 +133,7 @@ mod tests {
                 group: None,
                 model: None,
                 issue_type: IssueType::Bug,
-                severity: tauqe_protocol::ReviewSeverity::Critical,
+                severity: crate::review::ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 recommendations: vec![],
                 files: vec!["src/lib.rs".to_string()],

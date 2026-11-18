@@ -10,7 +10,8 @@ use std::path::Path;
 
 use tokio::sync::watch;
 
-use tauqe_protocol::{IssueStatus, Plan, PlanItemStatus};
+use crate::plan::{Plan, PlanItemStatus};
+use crate::review::IssueStatus;
 
 use crate::control::context::LoopContext;
 use crate::control::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
@@ -396,10 +397,12 @@ mod tests {
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::review::ReviewStorage;
 
-    use tauqe_protocol::{
-        CapabilityTree, ConceptItem, EditProtocolKind, LlmCapability, ModelRef, Plan,
-        PlanImplementation, PlanItem, PlanItemStatus, ReviewGroup, ReviewSession,
-    };
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::models::ModelRef;
+    use crate::plan::{ConceptItem, Plan, PlanImplementation, PlanItem, PlanItemStatus};
+    use crate::review::{ReviewGroup, ReviewSession};
+    use crate::workflow::EditProtocolKind;
 
     use crate::config::ModelsConfig;
     use crate::context::ContextManager;

@@ -1,14 +1,30 @@
+use crate::config::project::ProjectConfig;
 use std::borrow::Cow;
 
-use tauqe_protocol::{
-    CapabilityTree, EditDelete, EditLineAnchor, EditMove, EditOperation, EditOverwrite,
-    EditReplace, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
-};
 #[cfg(test)]
-use tauqe_protocol::{
-    EditCreate, EditFileOp, EditMoveDir, EditOutcome, ModelResult, ModelResultProposal,
-    StructuredChangeProposal,
-};
+use crate::edits::EditCreate;
+use crate::edits::EditDelete;
+#[cfg(test)]
+use crate::edits::EditFileOp;
+use crate::edits::EditLineAnchor;
+use crate::edits::EditMove;
+#[cfg(test)]
+use crate::edits::EditMoveDir;
+use crate::edits::EditOperation;
+#[cfg(test)]
+use crate::edits::EditOutcome;
+use crate::edits::EditOverwrite;
+use crate::edits::EditReplace;
+#[cfg(test)]
+use crate::edits::StructuredChangeProposal;
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
+#[cfg(test)]
+use crate::llm::ModelResult;
+#[cfg(test)]
+use crate::llm::ModelResultProposal;
+use crate::workflow::PatchStrategy;
 
 #[cfg(test)]
 use crate::capabilities::decode_capability_expr;
@@ -492,7 +508,7 @@ fn change_to_operation(
     // of a directory move is normalized instead of resolved.
     let moves_directory = op == EditFileOp::MoveDir;
     let target_path = if moves_directory {
-        tauqe_protocol::edit::normalize_repo_path(&change.path)?
+        crate::edits::normalize_repo_path(&change.path)?
     } else if is_create {
         resolve_target_path_for_op(&change.path, editable_paths, true)?
     } else {
@@ -526,7 +542,7 @@ pub(crate) fn resolve_decoded_edits(
 ) -> Result<Vec<LlmCommand>, String> {
     let mut resolved = Vec::with_capacity(commands.len());
     for command in commands {
-        if is_edit_capability(command.capability()) {
+        if is_edit_capability(crate::llm::command_capability(&command)) {
             if let Some(operation) = command.into_edit_operation() {
                 let op = resolve_operation_target(operation, editable_paths)?;
                 resolved.push(match op {
@@ -639,6 +655,7 @@ fn parse_anchor_edits(body: &str, editable_paths: &[String]) -> Result<Vec<EditO
 /// payload that is itself one structured response collapses to its `message`
 /// channel, so neither XML control tags nor JSON scaffolding can leak into
 /// conversational text, session history, or the streamed interface.
+#[cfg(test)]
 pub(crate) fn clean_raw_json_or_text(raw: &str) -> String {
     StructuredPayload::parse(raw).clean_text()
 }

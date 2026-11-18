@@ -1,8 +1,8 @@
-use serde::Serialize;
-use tauqe_protocol::{
+use crate::models::{
     ArchitectTier, ModelCatalogEntry, ModelEntry, ModelRef, ModelRole, ModelRolesSummary,
     ModelSelection, ReasoningEffort,
 };
+use serde::Serialize;
 
 mod raw;
 #[cfg(test)]

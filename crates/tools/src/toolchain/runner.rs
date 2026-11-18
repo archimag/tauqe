@@ -17,10 +17,10 @@
 //! is missing, fails, or answers with an unreadable dump yields a typed error
 //! and never a partially trusted command list.
 
+use crate::toolchain::config::{ProjectCommandSpec, TaskRunnerKind};
 use std::fmt;
 use std::path::Path;
 
-use tauqe_protocol::{ProjectCommandSpec, TaskRunnerKind};
 use tokio::sync::watch;
 
 mod just;
@@ -31,33 +31,34 @@ use just::JUST;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerCommand {
     /// Name the runner addresses the command by.
-    pub name: String,
+    pub(crate) name: String,
     /// Concrete command line the harness executes together with the contract
     /// the runner declares for it.
     ///
     /// The description and the parameter contract travel inside the command
     /// line itself, so a merged command carries one authoritative declaration
     /// of what it does and which values it accepts.
-    pub spec: ProjectCommandSpec,
+    pub(crate) spec: ProjectCommandSpec,
 }
 
 /// Commands a task runner exports, split by the role they fill.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunnerManifest {
     /// Command bound to the verification lifecycle, when the runner exports one.
-    pub verify: Option<RunnerCommand>,
+    pub(crate) verify: Option<RunnerCommand>,
     /// Command bound to the in-memory formatting filter, when the runner
     /// exports one.
-    pub format: Option<RunnerCommand>,
+    pub(crate) format: Option<RunnerCommand>,
     /// Command bound to the disk-side post-hook, when the runner exports one.
-    pub post_hook: Option<RunnerCommand>,
+    pub(crate) post_hook: Option<RunnerCommand>,
     /// Remaining commands, in name order, published as typed custom tools.
-    pub commands: Vec<RunnerCommand>,
+    pub(crate) commands: Vec<RunnerCommand>,
 }
 
 impl RunnerManifest {
     /// Reports whether the runner exported no command at all.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.verify.is_none()
             && self.format.is_none()
             && self.post_hook.is_none()
@@ -73,7 +74,10 @@ impl RunnerManifest {
 /// one stage in `tauqe.toml` and let the runner provide the rest. A merged
 /// command keeps the description and the parameter contract the runner declares
 /// for it, because both travel inside the exported command line itself.
-pub fn merge_manifest(project: &mut tauqe_protocol::ProjectConfig, manifest: RunnerManifest) {
+pub fn merge_manifest(
+    project: &mut crate::toolchain::config::ProjectConfig,
+    manifest: RunnerManifest,
+) {
     if project.verify.is_none() {
         if let Some(verify) = manifest.verify {
             project.verify = Some(verify.spec);
@@ -196,7 +200,8 @@ pub async fn load_manifest(
 
 #[cfg(test)]
 mod tests {
-    use tauqe_protocol::TaskRunnerKind;
+    use crate::toolchain::config::TaskRunnerKind;
+    use crate::toolchain::config::{ProjectCommandSpec, ProjectConfig, ProjectParameterSpec};
     use tokio::sync::watch;
 
     use super::{
@@ -289,8 +294,6 @@ mod tests {
 
     #[test]
     fn test_merge_manifest_preserves_declarations_over_exports() {
-        use tauqe_protocol::{ProjectCommandSpec, ProjectConfig, ProjectParameterSpec};
-
         let declared_parameter = ProjectParameterSpec {
             name: "target".to_string(),
             default: None,
@@ -382,15 +385,15 @@ mod tests {
 
     #[test]
     fn test_merge_manifest_fills_format_and_post_hook() {
-        use tauqe_protocol::ProjectConfig;
+        use crate::toolchain::config::ProjectConfig;
 
-        let format_spec = tauqe_protocol::ProjectCommandSpec {
+        let format_spec = crate::toolchain::config::ProjectCommandSpec {
             command: "just".to_string(),
             args: vec!["--quiet".to_string(), "format".to_string()],
             timeout_secs: None,
             ..Default::default()
         };
-        let post_hook_spec = tauqe_protocol::ProjectCommandSpec {
+        let post_hook_spec = crate::toolchain::config::ProjectCommandSpec {
             command: "just".to_string(),
             args: vec!["post-hook".to_string()],
             timeout_secs: None,
@@ -417,7 +420,7 @@ mod tests {
         assert!(project.commands.is_empty());
 
         // A declared stage wins over the export of the same role.
-        let declared = tauqe_protocol::ProjectCommandSpec {
+        let declared = crate::toolchain::config::ProjectCommandSpec {
             command: "rustfmt".to_string(),
             args: Vec::new(),
             timeout_secs: Some(30),

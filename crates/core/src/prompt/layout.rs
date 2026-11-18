@@ -263,10 +263,12 @@ fn push_round_replay(messages: &mut Vec<ChatMessage>, record: &HistoryEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
     use crate::context::ContextFileContent;
     use crate::history::HistorySnapshot;
+    use crate::history::TurnRoundRecord;
     use crate::prompt::json::JsonPromptProtocol;
-    use tauqe_protocol::{ContextAccess, EditProtocolKind, TurnRoundRecord};
+    use crate::workflow::EditProtocolKind;
     /// Builds a context file carrying the arrival watermark it received.
     ///
     /// The fixture states the chronology it analyzes explicitly, because the

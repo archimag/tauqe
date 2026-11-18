@@ -380,6 +380,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
     use tauqe_protocol::methods;
+    use tauqe_tui::projection::PlanImplementationProjection;
 
     #[test]
     fn test_rect_contains_and_check_confirm_hit() {

@@ -1,542 +1,167 @@
-//! Group audit supervisor: one isolated bounded audit per review group.
-//!
-//! A grouped session is audited group by group under the core [`BatchExecution`]
-//! supervisor, so queue semantics stay the ones the engine already owns: ordered
-//! traversal, fail-fast on an infrastructure failure, aggregated usage, and
-//! cancellation observed between members.
-//!
-//! Transactional isolation (#c-1) is the reason one group runs as one batch
-//! member instead of a single monolithic audit. A group that yields no usable
-//! result — an empty answer, an unparsable payload, a path set that selects no
-//! repository file — is a *domain* failure: it is reported on that group's
-//! terminal event and the queue advances to the next group, because the remaining
-//! groups audit their own slices and their findings stay valid. Only an
-//! *infrastructure* failure (the provider cannot be reached, the stream breaks,
-//! the findings cannot be written) stops the queue, since nothing later can
-//! succeed while the transport or the storage is broken. Findings a group already
-//! appended stay on disk either way, so a cancelled or failed run never discards
-//! completed work.
-//!
-//! Findings are immutable and reference their origin (#c-3): every group appends
-//! through `ReviewStorage::append_group_findings`, which stamps a fresh UUIDv7
-//! identity together with the identifier of the group that produced the finding,
-//! so a later post-analysis layer can classify findings by reference without
-//! rewriting one. The supervisor assigns only the item ordinals, keeping
-//! identifiers unique across the whole session.
-//!
-//! A session that carries no explicit groups is audited as its single implicit
-//! `Default` group, so the pre-grouping single audit stays the degenerate case of
-//! the same path instead of a second implementation (#c-4).
-
-use std::path::Path;
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
-use tauqe_core::providers::{
-    create_provider, format_session_id, ChatMessage, LlmProvider, StreamEvent,
-    SESSION_PREFIX_REVIEW,
-};
-use tauqe_core::review::parser::ReviewFindingsOutput;
-use tauqe_core::review::{
-    build_review_system_prompt, build_review_user_prompt, parse_review_output,
-    review_findings_response_format, ReviewStorage,
-};
-use tauqe_core::workflow::batch::{
-    BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome,
-};
-use tauqe_protocol::{
-    events, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo, ReviewGroup,
-    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewReasoningDeltaEvent, ReviewSession,
-};
-use tokio::sync::{mpsc, watch};
-
-use crate::reap::abort_and_reap;
+//! RPC publication for core-owned grouped review execution.
+use super::common::{emit, publish_review};
 use crate::state::{AppState, OperationGuard};
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tauqe_core::api::{GroupAuditObserver, ReviewObserver, UsageTotalsSnapshot};
+use tauqe_core::providers::StreamEvent;
+use tauqe_core::review::stream::ReviewStreamUpdate;
+use tauqe_core::review::{ReviewGroup, ReviewSession};
+#[cfg(test)]
+use tauqe_core::workflow::batch::BatchReport;
+use tauqe_protocol::{
+    events, ModelUsageEvent, ReviewGroupFinishedEvent, ReviewGroupStartedEvent,
+    ReviewReasoningDeltaEvent,
+};
+use tokio::sync::watch;
 
-use super::common::{emit, offload_review, publish_review};
-use super::window::{expand_window, WindowBudgets, WindowContext};
-
-/// Why one group's audit did not produce findings.
-///
-/// The distinction is what keeps the batch isolated: a domain failure concerns
-/// the group alone, while an infrastructure failure makes every later group
-/// futile.
-enum GroupFailure {
-    /// The group produced no usable result; the queue continues.
-    Domain(String),
-    /// The environment could not deliver the audit; the queue stops.
-    Infrastructure(String),
-    /// The developer interrupted the run.
-    Cancelled,
+pub(super) struct Observer {
+    state: Arc<AppState>,
+    root: PathBuf,
+    id: String,
 }
-
-/// Executor that audits one review group per batch step.
-struct GroupAuditExecutor<'a> {
-    state: &'a Arc<AppState>,
-    repo_root: &'a Path,
-    /// Snapshot of the audited session: it supplies the model, the identifier
-    /// bound to the provider session, and the groups themselves.
-    session: &'a ReviewSession,
-    /// Groups of that snapshot, matched by the step identifier.
-    groups: &'a [ReviewGroup],
-    /// Provider every group streams through.
-    provider: Arc<dyn LlmProvider>,
-    budgets: WindowBudgets,
-    /// Registered operation, so a stalled streamed call can be aborted by the
-    /// hard-cancel watchdog instead of outliving its turn.
-    operation: &'a Arc<OperationGuard>,
-    /// Identifier of the registered operation, carried by every published event.
-    operation_id: String,
-    /// Next item ordinal, kept unique across groups.
-    next_item_id: u32,
-}
-
-impl GroupAuditExecutor<'_> {
-    /// Audits one group in isolation and appends its findings to the session.
-    ///
-    /// Returns the number of findings the group appended.
-    async fn audit_group(
-        &mut self,
-        group: &ReviewGroup,
-        cancel_rx: &mut watch::Receiver<bool>,
-    ) -> Result<usize, GroupFailure> {
-        // The group audit expands its declared paths through the same shared
-        // projection the plain launch and the read-only preview consume, so a
-        // preset never applies its own selection order or its own limits
-        // (#c-1, #c-5).
-        let expanded = expand_window(
-            self.repo_root,
-            WindowContext::empty(),
-            &group.paths,
-            self.budgets,
-        )
-        .await
-        .map_err(GroupFailure::Infrastructure)?;
-
-        emit_group_started(
-            self.state,
-            &self.operation_id,
-            group,
-            expanded.files.len(),
-            expanded.estimated_tokens,
-        );
-        if expanded.window.omitted_files > 0 {
-            tracing::warn!(
-                review_id = self.session.id.as_str(),
-                group_id = group.id.as_str(),
-                omitted = expanded.window.omitted_files,
-                "review group expansion exhausted the configured file token budget; remaining matched files were not loaded"
+#[async_trait]
+impl ReviewObserver for Observer {
+    async fn pace(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
+        self.state.out.pace_event(event, cancel).await;
+    }
+    fn publish(&self, update: ReviewStreamUpdate) {
+        if let ReviewStreamUpdate::Reasoning(delta) = update {
+            emit(
+                &self.state.out,
+                events::REVIEW_REASONING_DELTA,
+                serde_json::to_value(ReviewReasoningDeltaEvent {
+                    operation_id: self.id.clone(),
+                    delta,
+                })
+                .ok(),
             );
         }
-        if expanded.files.is_empty() {
-            return Err(GroupFailure::Domain(format!(
-                "Review group '{}' selected no repository files from paths: {}",
-                group.title,
-                group.paths.join(", ")
-            )));
-        }
-        let files = expanded.files;
-
-        let messages = vec![
-            ChatMessage::system(build_review_system_prompt()),
-            ChatMessage::user(build_review_user_prompt(&files, group.prompt.as_deref())),
-        ];
-        // A group audit is a non-code operation: the enforced JSON schema turns
-        // the reviewer output into machine-readable findings.
-        let response_format = review_findings_response_format();
-        // Every group of one audit extends the same provider prefix cache, so the
-        // session identifier is derived from the review, not from the group.
-        let session_id = format_session_id(SESSION_PREFIX_REVIEW, &self.session.id);
-        let model_name = self.session.model.name.clone();
-        let reasoning_effort = {
-            let config = self.state.config.lock().await.config.clone();
-            config.models.resolve_selection_effort(
-                ModelRole::Reviewer,
-                &ModelSelection::Specific(self.session.model.clone()),
-            )
-        };
-
-        // The guard opens the accounting window before the provider call so the
-        // group reports both the usage the provider returns and the duration the
-        // harness measures itself.
-        let usage_guard = self.state.begin_usage(&self.operation_id).await;
-
-        let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
-        let err_tx = tx.clone();
-        let provider = Arc::clone(&self.provider);
-        let stream_cancel = cancel_rx.clone();
-        let stream_task = tokio::spawn(async move {
-            if let Err(err) = provider
-                .stream_chat_with_session(
-                    &model_name,
-                    messages,
-                    Some(response_format),
-                    reasoning_effort,
-                    Some(session_id.as_str()),
-                    tx,
-                    stream_cancel,
-                )
-                .await
-            {
-                let _ = err_tx.send(StreamEvent::Error(err.to_string())).await;
-            }
-        });
-        self.operation.set_abort_handle(stream_task.abort_handle());
-
-        // The provider streams raw Structured Output JSON; the filter decodes the
-        // `summary` string so the accumulated body keeps its contract shape while
-        // JSON syntax never has to be inspected by hand.
-        let mut filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-        let mut failure: Option<String> = None;
-        let mut stream_cancelled = false;
-
-        // The group audit applies the transport-owned pacing policy instead of
-        // restating an exemption set of its own: a terminal notice publishes
-        // immediately, and every other variant waits for the writer to catch up,
-        // so a client that keeps its pipe open but stopped reading pauses the
-        // audit here instead of growing the outbound queue for the rest of the
-        // batch.
-        while let Some(event) = rx.recv().await {
-            self.state.out.pace_event(&event, cancel_rx).await;
-            match event {
-                StreamEvent::TextDelta(chunk) => {
-                    // A group audit renders no live text, so the decoded delta is
-                    // discarded while the filter keeps accumulating the payload.
-                    let _ = filter.push_chunk(&chunk);
-                }
-                // The reviewer reasons before it writes, and a grouped audit runs
-                // the same reviewer model as a plain launch: forwarding the
-                // deltas makes each group show the live thinking the single
-                // audit already shows (#c-review-reasoning-stream).
-                StreamEvent::ReasoningDelta(delta) => emit(
-                    &self.state.out,
-                    events::REVIEW_REASONING_DELTA,
-                    serde_json::to_value(ReviewReasoningDeltaEvent {
-                        operation_id: self.operation_id.clone(),
-                        delta,
-                    })
-                    .ok(),
-                ),
-                // Fold every report the provider makes into the accounting window
-                // as it arrives: a group that reported usage on an intermediate
-                // chunk, or whose retry resumed after an aborted attempt had
-                // already reported its tokens, must not lose the earlier reports.
-                StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
-                StreamEvent::Done => break,
-                StreamEvent::Cancelled => {
-                    stream_cancelled = true;
-                    break;
-                }
-                StreamEvent::Error(err) => {
-                    failure = Some(err);
-                    break;
-                }
-                // The retry decorator withdrew the previous attempt because it
-                // broke after partial output: the filter holds a prefix of a
-                // document the retry regenerates from its beginning, so it is
-                // restarted instead of accumulating both payloads into one
-                // unparsable body. A group streams no text to the client, so
-                // there is nothing to withdraw there.
-                StreamEvent::ResetStream => {
-                    filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-                }
-                _ => {}
-            }
-        }
-
-        // The streamed call has resolved, so the slot must stop pointing at it: a
-        // later hard-cancel would otherwise abort an already finished task.
-        self.operation.clear_abort_handle();
-
-        // Account for the tokens, cost, and duration the group consumed before
-        // any early return, so a failed or cancelled group is still charged.
-        // Every report was already folded into the window as it arrived, so the
-        // flush below charges the whole group instead of its last report alone.
-        usage_guard.flush().await;
-        let usage_snapshot = self.state.usage_snapshot().await;
-        // Both totals are read from the authoritative ledger: the operation scope
-        // the flush just closed and the session scope it was folded into.
-        let operation_usage: ModelUsageInfo = usage_snapshot.prev.to_usage_info();
-        let session_total_cost = usage_snapshot.session.cost;
-        let current_cost = usage_snapshot.prev.cost;
+    }
+    fn publish_usage_totals(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
+        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
+    }
+    fn publish_usage(&self, snapshot: &UsageTotalsSnapshot) {
         emit(
             &self.state.out,
             events::MODEL_USAGE,
             serde_json::to_value(ModelUsageEvent {
-                operation_id: self.operation_id.clone(),
-                usage: operation_usage,
-                session_total_cost,
-                current_cost: Some(current_cost),
+                operation_id: self.id.clone(),
+                usage: crate::usage::wire_usage(&snapshot.prev.to_usage_info()),
+                session_total_cost: snapshot.session.cost,
+                current_cost: Some(snapshot.prev.cost),
             })
             .ok(),
         );
-
-        if *cancel_rx.borrow() || stream_cancelled {
-            let _ = abort_and_reap(&self.operation_id, "review-group-stream", stream_task).await;
-            return Err(GroupFailure::Cancelled);
-        }
-        if let Some(message) = failure {
-            let _ = abort_and_reap(&self.operation_id, "review-group-stream", stream_task).await;
-            return Err(GroupFailure::Infrastructure(message));
-        }
-
-        // Capture the raw payload before finalizing: `finish` consumes the filter,
-        // while the shared parser still needs the full body to map the findings.
-        let raw_buffer = filter.buffer().to_string();
-        if raw_buffer.trim().is_empty() {
-            return Err(GroupFailure::Domain(format!(
-                "Model returned an empty review for group '{}'",
-                group.title
-            )));
-        }
-        // A payload that deserializes strictly into the review schema is
-        // authoritative; one that does not is a domain failure of this group
-        // rather than a fabricated finding, because the tolerant text fallback
-        // would record the raw model prose as a review result.
-        if let Err(err) = filter.finish() {
-            return Err(GroupFailure::Domain(format!(
-                "Review group '{}' returned an unparsable payload: {}",
-                group.title, err
-            )));
-        }
-        let mut findings = parse_review_output(&raw_buffer).2;
-
-        // Item identifiers are unique across the whole session: the parser
-        // numbers the findings of one group from one, so the supervisor continues
-        // the session's sequence instead of letting groups collide on `id`.
-        let first_item_id = self.next_item_id;
-        for (index, finding) in findings.iter_mut().enumerate() {
-            finding.id = first_item_id.saturating_add(index as u32);
-        }
-        let appended = findings.len();
-
-        let save_root = self.repo_root.to_path_buf();
-        let review_id = self.session.id.clone();
-        let group_id = group.id.clone();
-        let stored = offload_review(move || {
-            ReviewStorage::append_group_findings(&save_root, &review_id, &group_id, findings)
-        })
-        .await;
-        match stored {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(GroupFailure::Infrastructure(format!(
-                    "Review session '{}' disappeared before group '{}' findings were appended",
-                    self.session.id, group.title
-                )))
-            }
-            Err(err) => return Err(GroupFailure::Infrastructure(err)),
-        }
-        self.next_item_id = first_item_id.saturating_add(appended as u32);
-
-        // The appended findings are the group's durable result: publishing the
-        // session and the refreshed list makes them visible immediately, so a
-        // cancelled or failed run still shows every completed group.
-        publish_review(self.state, self.repo_root, &self.session.id).await;
-
-        Ok(appended)
     }
 }
-
 #[async_trait]
-impl BatchStepExecutor for GroupAuditExecutor<'_> {
-    async fn execute_step(
-        &mut self,
-        step: &BatchStep,
-        _stream_tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<BatchStepOutcome> {
-        // The slice is a shared reference with its own lifetime, so the lookup
-        // result does not borrow the executor and `audit_group` can take `&mut self`.
-        let groups = self.groups;
-        let Some(group) = groups.iter().find(|group| group.id == step.id) else {
-            return Ok(BatchStepOutcome::failed(format!(
-                "Review group '{}' is not part of the audited session '{}'",
-                step.id, self.session.id
-            )));
-        };
-
-        let outcome = match self.audit_group(group, &mut cancel_rx).await {
-            Ok(findings) => {
-                emit_group_finished(self.state, &self.operation_id, group, findings, None);
-                BatchStepOutcome::succeeded()
-            }
-            Err(GroupFailure::Domain(reason)) => {
-                // A domain failure is confined to its own group: the terminal
-                // event carries the diagnostic and the step reports success, so
-                // the supervisor advances to the next group instead of
-                // invalidating work the other groups can still complete.
-                tracing::warn!(
-                    review_id = self.session.id.as_str(),
-                    group_id = group.id.as_str(),
-                    reason = %reason,
-                    "review group audit failed; the batch continues"
-                );
-                emit_group_finished(self.state, &self.operation_id, group, 0, Some(reason));
-                BatchStepOutcome::succeeded()
-            }
-            Err(GroupFailure::Infrastructure(reason)) => {
-                tracing::error!(
-                    review_id = self.session.id.as_str(),
-                    group_id = group.id.as_str(),
-                    reason = %reason,
-                    "review infrastructure failure stopped the group batch"
-                );
-                emit_group_finished(
-                    self.state,
-                    &self.operation_id,
-                    group,
-                    0,
-                    Some(reason.clone()),
-                );
-                BatchStepOutcome::failed(reason)
-            }
-            Err(GroupFailure::Cancelled) => {
-                emit_group_finished(
-                    self.state,
-                    &self.operation_id,
-                    group,
-                    0,
-                    Some(format!(
-                        "Review group '{}' audit was cancelled",
-                        group.title
-                    )),
-                );
-                BatchStepOutcome::cancelled()
-            }
-        };
-        Ok(outcome)
+impl GroupAuditObserver for Observer {
+    fn group_started(&self, group: &ReviewGroup, files_count: usize, estimated_tokens: usize) {
+        emit(
+            &self.state.out,
+            events::REVIEW_GROUP_STARTED,
+            serde_json::to_value(ReviewGroupStartedEvent {
+                operation_id: self.id.clone(),
+                group_id: group.id.clone(),
+                group_title: group.title.clone(),
+                files_count,
+                estimated_tokens,
+            })
+            .ok(),
+        );
+    }
+    fn group_finished(&self, group: &ReviewGroup, findings_count: usize, error: Option<String>) {
+        emit(
+            &self.state.out,
+            events::REVIEW_GROUP_FINISHED,
+            serde_json::to_value(ReviewGroupFinishedEvent {
+                operation_id: self.id.clone(),
+                group_id: group.id.clone(),
+                findings_count,
+                success: error.is_none(),
+                error,
+            })
+            .ok(),
+        );
+    }
+    async fn publish_review(&self, id: &str) {
+        publish_review(&self.state, &self.root, id).await;
     }
 }
 
-/// Emits the event announcing that one group started auditing its own slice.
-fn emit_group_started(
-    state: &AppState,
-    operation_id: &str,
-    group: &ReviewGroup,
-    files_count: usize,
-    estimated_tokens: usize,
-) {
-    emit(
-        &state.out,
-        events::REVIEW_GROUP_STARTED,
-        serde_json::to_value(ReviewGroupStartedEvent {
-            operation_id: operation_id.to_string(),
-            group_id: group.id.clone(),
-            group_title: group.title.clone(),
-            files_count,
-            estimated_tokens,
-        })
-        .ok(),
-    );
+pub(super) fn observer(state: &Arc<AppState>, root: &Path, id: &str) -> Arc<Observer> {
+    Arc::new(Observer {
+        state: Arc::clone(state),
+        root: root.into(),
+        id: id.into(),
+    })
 }
-
-/// Emits the terminal event of one group, carrying its failure when it has one.
-fn emit_group_finished(
-    state: &AppState,
-    operation_id: &str,
-    group: &ReviewGroup,
-    findings_count: usize,
-    error: Option<String>,
-) {
-    emit(
-        &state.out,
-        events::REVIEW_GROUP_FINISHED,
-        serde_json::to_value(ReviewGroupFinishedEvent {
-            operation_id: operation_id.to_string(),
-            group_id: group.id.clone(),
-            findings_count,
-            success: error.is_none(),
-            error,
-        })
-        .ok(),
-    );
+#[async_trait]
+impl tauqe_core::api::PresetReviewObserver for Observer {
+    async fn reviewer(
+        &self,
+        resolved: &tauqe_core::api::ResolvedReviewSynthesis,
+    ) -> Result<Arc<dyn tauqe_core::providers::LlmProvider>, String> {
+        #[cfg(test)]
+        if let Some(provider) = self.state.provider_override.lock().await.clone() {
+            return Ok(provider);
+        }
+        resolved.provider().map_err(|error| error.to_string())
+    }
+    async fn post_analysis(
+        &self,
+        session: &ReviewSession,
+        operation: &OperationGuard,
+    ) -> Result<ReviewSession, String> {
+        super::analysis::run_review_post_analysis(
+            &self.state,
+            &self.root,
+            session,
+            None,
+            operation,
+            true,
+        )
+        .await
+        .map_err(|error| error.message)
+    }
 }
-
-/// Audits every group of a session snapshot as an isolated batch member.
-///
-/// The steps are the session's effective groups, so a session that carries no
-/// explicit groups audits its single implicit `Default` group and keeps the
-/// pre-grouping behavior (#c-4). The returned report is what a caller needs to
-/// decide whether a post-analysis layer may follow: the terminal stop reason and
-/// the steps that actually ran.
+#[cfg(test)]
 pub(crate) async fn run_group_audits(
     state: &Arc<AppState>,
-    repo_root: &Path,
+    root: &Path,
     session: &ReviewSession,
     operation: Arc<OperationGuard>,
 ) -> Result<BatchReport, String> {
-    let groups = session.effective_groups();
-    let steps: Vec<BatchStep> = groups
-        .iter()
-        .map(|group| BatchStep::new(group.id.clone(), group.title.clone()))
-        .collect();
-
-    let (provider, budgets) = {
-        let config = state.config.lock().await.config.clone();
-        let budgets = WindowBudgets {
-            files_tokens: config.context.token_budget,
-        };
-        // Deterministic unit tests inject a scripted provider through the state's
-        // test seam; production builds construct a real network provider from
-        // configuration.
-        #[cfg(test)]
-        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
-            Some(provider) => provider,
-            None => match create_provider(session.model.provider, &config) {
-                Ok(provider) => Arc::from(provider),
-                Err(err) => return Err(err.to_string()),
-            },
-        };
-        #[cfg(not(test))]
-        let provider: Arc<dyn LlmProvider> = match create_provider(session.model.provider, &config)
-        {
-            Ok(provider) => Arc::from(provider),
-            Err(err) => return Err(err.to_string()),
-        };
-        (provider, budgets)
-    };
-
-    let mut executor = GroupAuditExecutor {
-        state,
-        repo_root,
-        session,
-        groups: &groups,
-        provider,
-        budgets,
-        operation: &operation,
-        operation_id: format!("op-{}", operation.id()),
-        next_item_id: session
-            .items
-            .iter()
-            .map(|item| item.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1),
-    };
-
-    let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
-    // The batch borrows the caller's registered operation, so a cancellation
-    // delivered between groups stops the queue and a soft stop drains it after the
-    // group that is already running — the engine's supervisor semantics.
-    let cancel_rx = operation.cancel_receiver();
-    let soft_stop_rx = operation.soft_stop_receiver();
-
-    let report = BatchExecution::new()
-        .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+    let resolved = state
+        .application
+        .resolve_review_synthesis(Some(&tauqe_core::models::ModelSelection::Specific(
+            session.model.clone(),
+        )))
         .await;
-
-    tracing::info!(
-        review_id = session.id.as_str(),
-        groups = steps.len(),
-        executed = report.executed.len(),
-        stop = ?report.stop,
-        total_tokens = report.usage.total_tokens,
-        "review group batch finished"
-    );
-
-    Ok(report)
+    #[cfg(test)]
+    let provider = match state.provider_override.lock().await.clone() {
+        Some(provider) => provider,
+        None => resolved.provider().map_err(|e| e.to_string())?,
+    };
+    #[cfg(not(test))]
+    let provider = resolved.provider().map_err(|e| e.to_string())?;
+    let observer = Arc::new(Observer {
+        state: Arc::clone(state),
+        root: root.into(),
+        id: format!("op-{}", operation.id()),
+    });
+    tauqe_core::api::run_group_audits(
+        &state.application,
+        root,
+        session,
+        operation,
+        provider,
+        observer,
+        crate::reap::task_exit_deadline(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -547,13 +172,16 @@ mod tests {
         await_published, stall_outbound_transport, RecordingSink,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tauqe_core::providers::{ChatMessage, LlmProvider};
+    use tauqe_core::review::ReviewStorage;
+    use tokio::sync::mpsc;
 
     use serde_json::Value;
     use tauqe_core::config::AppConfig;
+    use tauqe_core::models::{ModelRef, ProviderKind};
     use tauqe_core::providers::mock::MockResponse;
     use tauqe_core::providers::{MockLlmProvider, ResponseFormat};
     use tauqe_core::workflow::batch::BatchStop;
-    use tauqe_protocol::{ModelRef, ProviderKind};
 
     /// Scratch repository, its daemon state, and the published event stream.
     struct GroupFixture {

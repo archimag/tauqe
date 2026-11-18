@@ -8,14 +8,19 @@
 //! loop of its own, so a turn is never terminated by the exhaustion of a local retry
 //! counter instead of by the budget the developer configured.
 
+use crate::config::project::ProjectConfig;
+
 pub mod edit;
 pub mod research;
 pub mod staging;
+#[cfg(test)]
+mod step_outcome_tests;
 
-use tauqe_protocol::{
-    CapabilityTree, LlmCapability, LlmCommand, ProjectConfig, TextCommand, TurnPhase,
-    VerificationVerdict,
-};
+use crate::edits::VerificationVerdict;
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::llm::{LlmCommand, TextCommand};
+use crate::workflow::turn::TurnPhase;
 
 use super::context::LoopContext;
 use super::outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
@@ -506,13 +511,17 @@ async fn run_turn_loop_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::llm::LlmCommand;
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::prompt::TurnBrief;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{CapabilityTree, ContextAccess, LlmCapability, LlmCommand, ModelRef};
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -1007,3 +1016,6 @@ mod tests {
         assert!(success.response.has(LlmCapability::TextMessage));
     }
 }
+
+#[cfg(test)]
+mod step_edit_completion_tests;

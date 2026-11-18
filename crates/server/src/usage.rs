@@ -1,266 +1,26 @@
-//! Session-wide usage accounting for every operation kind.
-//!
-//! Token, cost, and duration totals previously lived wherever an operation
-//! happened to need them: the session cost was a bare `f64` on the state, and
-//! every handler derived its own view of the tokens it had spent. That made the
-//! interface unable to answer a simple question — *what has this session cost
-//! so far, and what is the current operation spending right now?* — without
-//! replaying per-operation events.
-//!
-//! This module owns the single authoritative [`UsageLedger`] behind
-//! [`AppState::usage`]. An operation opens a [`UsageGuard`], reports the usage
-//! each provider call returns through [`UsageGuard::observe`], and closes the
-//! window with [`UsageGuard::flush`], which folds the operation into the
-//! session totals together with the duration the harness measured itself.
-//! While the window is open, a per-second heartbeat republishes the snapshot
-//! with the live in-flight duration, so a client renders a running clock for
-//! the current operation instead of a dash. Every transition publishes a
-//! `model/usageTotals` event under the operation identifier its caller already
-//! announces through `model/started` and `model/finished`, so a client renders
-//! one consistent snapshot attributed to the operation it renders instead of
-//! correlating a second identifier of its own.
-//!
-//! Every window carries an identity that lives beside the snapshot under the
-//! same mutex, so the two can never disagree. The accounting layer itself
-//! therefore decides who may act on the in-flight scope: the heartbeat
-//! publishes only while the recorded identity is verifiably its own, and a
-//! flush folds only the window it still owns. Stopping the heartbeat task is a
-//! best-effort optimization on top of that guarantee, never its substitute: an
-//! abort lands only at the task's next suspension point, so a superseded task
-//! may still reach the lock once, and it must find itself dispossessed there.
-//!
-//! The project lifetime scope outlives the process. It accumulates every
-//! completed operation and is persisted in `<repo_root>/.tauqe/usage.json`,
-//! a directory Git ignores. The document is read once when the state is
-//! created and rewritten after every flush through the atomic-write policy of
-//! the core engine, so a crash publishes either the previous complete document
-//! or the new complete one, never a truncated one. Reading and writing run on
-//! the blocking pool: the daemon runtime must never stall on the file system.
+//! Usage RPC publication and adapters for core-owned accounting.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::state::AppState;
+use crate::transport::OutChannel;
 use std::sync::Arc;
-use std::time::Duration;
-
-use tokio::time::Instant;
-
-use tauqe_protocol::model::{
-    ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,
-};
+pub use tauqe_core::api::UsageGuard;
+use tauqe_core::api::{UsageTotals, UsageTotalsSnapshot};
+use tauqe_protocol::model::ModelUsageTotalsEvent;
 use tauqe_protocol::{events, Event};
 
-use crate::state::{next_operation_id, AppState};
-
-/// Directory, relative to the repository root, holding the project telemetry.
-const TELEMETRY_DIR: &str = ".tauqe";
-
-/// File inside [`TELEMETRY_DIR`] carrying the project lifetime totals.
-const TELEMETRY_FILE: &str = "usage.json";
-
-/// Resolves the telemetry file of a repository.
-fn telemetry_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(TELEMETRY_DIR).join(TELEMETRY_FILE)
+fn publisher(out: OutChannel) -> impl Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static {
+    move |operation_id, snapshot| publish_snapshot(&out, operation_id, snapshot)
 }
 
-/// Loads the persisted project lifetime totals of a repository.
-///
-/// A missing file, an unreadable file, or a document written by an
-/// incompatible version is a normal state, not an error: the totals start from
-/// zero and the next flush rewrites the document. Only the lifetime scope is
-/// persisted, because the session and per-operation scopes restart with the
-/// daemon and restoring them would resurrect stale counters.
-pub(crate) fn load_initial_snapshot(repo_root: &Path) -> UsageTotalsSnapshot {
-    let path = telemetry_path(repo_root);
-    // `AppState::new` runs inside the daemon runtime, so the synchronous read
-    // is handed to the blocking-aware helper instead of occupying a worker.
-    let loaded = tauqe_core::blocking::run_blocking(move || read_document(&path));
-    match loaded {
-        Some((lifetime, lifetime_operations)) => UsageTotalsSnapshot {
-            lifetime,
-            lifetime_operations,
-            ..UsageTotalsSnapshot::default()
-        },
-        None => UsageTotalsSnapshot::default(),
-    }
-}
-
-/// Reads the telemetry document, returning its lifetime totals.
-///
-/// Returns `None` when no document exists yet, when it cannot be read, or when
-/// it is not valid JSON; every one of those cases is reported and degraded to
-/// zero totals rather than failing the daemon startup.
-fn read_document(path: &Path) -> Option<(UsageTotals, u64)> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "Failed to read the project telemetry",
-            );
-            return None;
-        }
-    };
-    let document: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(document) => document,
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "Discarding unreadable project telemetry",
-            );
-            return None;
-        }
-    };
-    let lifetime = document
-        .get("lifetime")
-        .and_then(|value| serde_json::from_value::<UsageTotals>(value.clone()).ok())
-        .unwrap_or_default();
-    let lifetime_operations = document
-        .get("lifetime_operations")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    Some((lifetime, lifetime_operations))
-}
-
-/// Writes the telemetry document atomically under `<repo_root>/.tauqe`.
-///
-/// The directory is created on demand, so a repository that has never recorded
-/// a turn still gains its telemetry file on the first flush. The payload is
-/// handed to the core atomic-write policy, which stages, syncs, and renames it,
-/// so a concurrent reader never observes a partial document.
-fn write_document(path: &Path, lifetime: &UsageTotals, operations: u64) -> Result<(), String> {
-    let lifetime = serde_json::to_value(lifetime)
-        .map_err(|err| format!("Failed to encode the project telemetry: {}", err))?;
-    let document = serde_json::json!({
-        "lifetime": lifetime,
-        "lifetime_operations": operations,
+pub(crate) fn publish_snapshot(
+    out: &OutChannel,
+    operation_id: &str,
+    snapshot: &UsageTotalsSnapshot,
+) {
+    out.send_event(&Event {
+        method: events::MODEL_USAGE_TOTALS.to_string(),
+        params: snapshot_event_params(operation_id, snapshot),
     });
-    let payload = serde_json::to_vec_pretty(&document)
-        .map_err(|err| format!("Failed to encode the project telemetry: {}", err))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
-    }
-    tauqe_tools::atomic_write::write_atomic(path, &payload).map_err(|err| format!("{:#}", err))
-}
-
-/// Persists the project lifetime totals off the async worker pool.
-async fn persist_lifetime(state: &Arc<AppState>, lifetime: &UsageTotals, operations: u64) {
-    let path = telemetry_path(state.repo_root().await.as_path());
-    let lifetime = lifetime.clone();
-    let written = tauqe_core::blocking::run_blocking_async(move || {
-        write_document(&path, &lifetime, operations)
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "Failed to persist the project telemetry");
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "Project telemetry write task failed");
-        }
-    }
-}
-
-/// Identity of one usage accounting window.
-pub(crate) type WindowId = u64;
-
-/// Monotonic source of window identities.
-static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Mints the identity of the next accounting window.
-fn next_window_id() -> WindowId {
-    WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Authoritative accounting state of the daemon.
-///
-/// The snapshot and the identity of the window that owns its in-flight scope
-/// live under one mutex, so identity and window can never disagree. Ownership
-/// is the guarantee the accounting layer itself provides: the heartbeat, an
-/// observation, and a flush act on the in-flight scope only while the recorded
-/// identity is their own, so a window a successor already replaced can neither
-/// publish nor fold anything that belongs to that successor, whatever order the
-/// two tasks reach the lock in. The guarantee therefore never depends on the
-/// operation slot or on a task abort having taken effect.
-pub struct UsageLedger {
-    snapshot: UsageTotalsSnapshot,
-    window: Option<WindowId>,
-}
-
-impl UsageLedger {
-    /// Wraps the snapshot the daemon starts from.
-    ///
-    /// No window owns the in-flight scope before the first operation opens
-    /// one, so a fresh ledger carries the persisted project totals alone.
-    pub(crate) fn new(snapshot: UsageTotalsSnapshot) -> Self {
-        Self {
-            snapshot,
-            window: None,
-        }
-    }
-
-    /// Returns the authoritative snapshot.
-    pub(crate) fn snapshot(&self) -> &UsageTotalsSnapshot {
-        &self.snapshot
-    }
-
-    /// Returns the authoritative snapshot for the lifetime scopes to mutate.
-    pub(crate) fn snapshot_mut(&mut self) -> &mut UsageTotalsSnapshot {
-        &mut self.snapshot
-    }
-
-    /// Reports whether `window` still owns the in-flight scope.
-    pub(crate) fn owns(&self, window: WindowId) -> bool {
-        self.window == Some(window)
-    }
-
-    /// Opens a fresh window, discarding an abandoned in-flight scope.
-    ///
-    /// A window left behind by an operation that failed before flushing is
-    /// discarded here, and the identity minted for its successor is what makes
-    /// the abandoned heartbeat find itself dispossessed instead of publishing
-    /// the successor's state under its own identifier and clock.
-    fn begin(&mut self) -> WindowId {
-        let window = next_window_id();
-        self.window = Some(window);
-        self.snapshot.cur = Some(UsageTotals::default());
-        window
-    }
-
-    /// Adds one provider report to `window`'s in-flight totals.
-    ///
-    /// A window that no longer owns the scope reports nothing: its successor
-    /// installed its own in-flight totals, and folding a stale report into them
-    /// would attribute one operation's spend to another.
-    fn observe(&mut self, window: WindowId, usage: &UsageTotals) -> bool {
-        if !self.owns(window) {
-            return false;
-        }
-        self.snapshot
-            .cur
-            .get_or_insert_with(UsageTotals::default)
-            .accumulate(usage);
-        true
-    }
-
-    /// Closes `window`, returning the totals it observed.
-    ///
-    /// Only a window that still owns the scope is closed. Every other window is
-    /// absent for its guard, so the successor's in-flight totals are never
-    /// taken by a flush that finished after its own window was discarded.
-    fn close(&mut self, window: WindowId, elapsed_ms: u64) -> Option<UsageTotals> {
-        if !self.owns(window) {
-            return None;
-        }
-        self.window = None;
-        let mut completed = self.snapshot.cur.take().unwrap_or_default();
-        completed.duration_ms = completed.duration_ms.saturating_add(elapsed_ms);
-        Some(completed)
-    }
 }
 
 /// Encodes one snapshot publication for the wire.
@@ -270,287 +30,78 @@ fn snapshot_event_params(
 ) -> Option<serde_json::Value> {
     serde_json::to_value(ModelUsageTotalsEvent {
         operation_id: operation_id.to_string(),
-        snapshot: snapshot.clone(),
+        snapshot: wire_snapshot(snapshot),
     })
     .ok()
 }
 
-/// Publishes the current snapshot to the client.
-async fn publish_snapshot(state: &AppState, operation_id: &str) {
-    let snapshot = state.usage_snapshot().await;
-    state.out.send_event(&Event {
-        method: events::MODEL_USAGE_TOTALS.to_string(),
-        params: snapshot_event_params(operation_id, &snapshot),
-    });
-}
-
-/// Cadence of the live in-flight duration heartbeat.
-///
-/// While an accounting window is open, its heartbeat republishes the snapshot
-/// once per tick with the duration measured so far. The daemon owns the clock,
-/// so a client only mirrors the published value instead of running a timer of
-/// its own, mirroring the reconnect countdown contract.
-const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
-
-/// Open accounting window for one operation.
-///
-/// The window starts when the operation begins and closes on
-/// [`UsageGuard::flush`]. Dropping it without flushing abandons the window; the
-/// next [`AppState::begin_usage`] discards the abandoned totals, so a failed
-/// operation can never leave a permanently in-flight window behind. While the
-/// window is open, its heartbeat republishes the snapshot with the live
-/// in-flight duration, so a client renders a running clock for the current
-/// operation instead of a dash.
-///
-/// The guard carries two identities. The operation identifier is the one the
-/// caller already announces through its own lifecycle events, so every snapshot
-/// this window publishes names the operation a client is rendering. The window
-/// identifier stays internal: every operation the guard performs is checked
-/// against it under the accounting lock, so the guard can never publish or fold
-/// a scope a successor already replaced.
-pub struct UsageGuard {
-    state: Arc<AppState>,
-    /// Identifier the window publishes under: the one the caller announces
-    /// through its own lifecycle events.
-    operation_id: String,
-    /// Identity of the accounting window this guard owns.
-    window: WindowId,
-    started: Instant,
-    /// Live duration heartbeat of this window, silenced on flush and on drop.
-    ticker: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for UsageGuard {
-    fn drop(&mut self) {
-        // The heartbeat belongs to the window: an abandoned guard silences its
-        // own heartbeat, so a dropped window never keeps publishing a running
-        // clock for an operation that is no longer executing.
-        self.ticker.abort();
+/// Projects application accounting into the stable RPC contract.
+pub(crate) fn wire_snapshot(snapshot: &UsageTotalsSnapshot) -> tauqe_protocol::UsageTotalsSnapshot {
+    tauqe_protocol::UsageTotalsSnapshot {
+        session: wire_totals(&snapshot.session),
+        prev: wire_totals(&snapshot.prev),
+        cur: snapshot.cur.as_ref().map(wire_totals),
+        operations: snapshot.operations,
+        lifetime: wire_totals(&snapshot.lifetime),
+        lifetime_operations: snapshot.lifetime_operations,
     }
 }
 
-/// Spawns the live duration heartbeat of one accounting window.
-///
-/// The published duration is derived, never stored: the authoritative
-/// `cur.duration_ms` stays zero until [`UsageGuard::flush`] folds in the final
-/// measurement, so a heartbeat can never leak into the session totals. The
-/// heartbeat holds the accounting lock across its synchronous send and checks
-/// the window identity under that very lock, which keeps it strictly ordered
-/// against both the flush and the successor's `begin`: the moment the identity
-/// it was spawned with stops owning the in-flight scope it exits without
-/// publishing, so neither a closed window nor a replaced one can produce a
-/// stale "still running" snapshot. The cadence arrives as `tick`, so a test can
-/// compress it without touching the production default.
-fn spawn_live_duration_ticker(
-    state: &Arc<AppState>,
-    window: WindowId,
-    operation_id: &str,
-    started: Instant,
-    tick: Duration,
-) -> tokio::task::JoinHandle<()> {
-    let state = Arc::clone(state);
-    let operation_id = operation_id.to_string();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tick).await;
-            // The lock is held across the send because the send is
-            // synchronous: the heartbeat stays strictly ordered against
-            // flush without ever awaiting on a locked window. Ownership is
-            // read under the same lock, so a heartbeat whose window a
-            // successor already replaced observes that it no longer owns the
-            // in-flight scope and exits without publishing anything — least of
-            // all the successor's state under its own identifier and clock.
-            let ledger = state.usage.lock().await;
-            if !ledger.owns(window) {
-                break;
-            }
-            let mut live = ledger.snapshot().clone();
-            if let Some(cur) = live.cur.as_mut() {
-                cur.duration_ms = started.elapsed().as_millis() as u64;
-            }
-            state.out.send_event(&Event {
-                method: events::MODEL_USAGE_TOTALS.to_string(),
-                params: snapshot_event_params(&operation_id, &live),
-            });
-        }
-    })
+/// Projects provider metrics without replacing unknown values with zeros.
+pub(crate) fn wire_usage(
+    usage: &tauqe_core::providers::ModelUsageInfo,
+) -> tauqe_protocol::ModelUsageInfo {
+    tauqe_protocol::ModelUsageInfo {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        cached_tokens: usage.cached_tokens,
+        cost: usage.cost,
+    }
+}
+
+fn wire_totals(totals: &UsageTotals) -> tauqe_protocol::UsageTotals {
+    tauqe_protocol::UsageTotals {
+        prompt_tokens: totals.prompt_tokens,
+        completion_tokens: totals.completion_tokens,
+        total_tokens: totals.total_tokens,
+        reasoning_tokens: totals.reasoning_tokens,
+        cached_tokens: totals.cached_tokens,
+        cost: totals.cost,
+        duration_ms: totals.duration_ms,
+    }
 }
 
 impl AppState {
-    /// Opens a usage accounting window for the operation named by `operation_id`.
-    ///
-    /// The identifier is the one the caller already announces through its own
-    /// lifecycle events, so the in-flight totals, the running-clock heartbeat,
-    /// and the final flush of this window name the operation a client is
-    /// rendering instead of a second identity it would have to correlate.
-    ///
-    /// Ownership stays a separate, internal identity minted under the lock that
-    /// installs the window, so a window left behind by an operation that failed
-    /// before flushing is discarded here and its abandoned heartbeat can never
-    /// mistake the successor's totals for its own.
     pub async fn begin_usage(self: &Arc<Self>, operation_id: &str) -> UsageGuard {
-        self.begin_usage_with_tick(operation_id, LIVE_DURATION_TICK)
+        self.application
+            .begin_usage(operation_id, publisher(self.out.clone()))
             .await
     }
 
-    /// Opens a usage accounting window whose heartbeat runs on `tick`.
-    ///
-    /// [`AppState::begin_usage`] passes the production cadence, while a test
-    /// passes a compressed one, so no assertion has to wait a whole production
-    /// tick. The seam is private to this module and never changes the cadence
-    /// the daemon publishes with.
+    #[cfg(test)]
     async fn begin_usage_with_tick(
         self: &Arc<Self>,
         operation_id: &str,
-        tick: Duration,
+        tick: std::time::Duration,
     ) -> UsageGuard {
-        let window = {
-            let mut ledger = self.usage.lock().await;
-            ledger.begin()
-        };
-        let started = Instant::now();
-        let ticker = spawn_live_duration_ticker(self, window, operation_id, started, tick);
-        let guard = UsageGuard {
-            state: Arc::clone(self),
-            operation_id: operation_id.to_string(),
-            window,
-            started,
-            ticker,
-        };
-        guard.publish().await;
-        guard
+        self.application
+            .test_begin_usage_with_tick(operation_id, tick, publisher(self.out.clone()))
+            .await
     }
 
-    /// Clears the persisted project lifetime totals.
-    ///
-    /// Only the lifetime scope is cleared. The session counters keep describing
-    /// what this process has already spent, so a reset never makes the running
-    /// session appear free. The cleared totals are written to disk immediately
-    /// and the resulting snapshot is published before it is returned, so a
-    /// client renders the same state the next restart will read.
     pub async fn reset_lifetime_usage(self: &Arc<Self>) -> UsageTotalsSnapshot {
-        let snapshot = {
-            let mut ledger = self.usage.lock().await;
-            {
-                let snapshot = ledger.snapshot_mut();
-                snapshot.lifetime = UsageTotals::default();
-                snapshot.lifetime_operations = 0;
-            }
-            ledger.snapshot().clone()
-        };
-        persist_lifetime(self, &snapshot.lifetime, snapshot.lifetime_operations).await;
-        let operation_id = format!("reset-{}", next_operation_id());
-        publish_snapshot(self, &operation_id).await;
-        snapshot
+        self.application
+            .reset_lifetime_usage(publisher(self.out.clone()))
+            .await
     }
 
-    /// Adopts the project lifetime totals stored in the current repository.
-    ///
-    /// Rebinding to a repository must adopt the telemetry stored there.
-    /// Keeping the previous repository's lifetime would present its counters
-    /// as belonging to the new project, and the next flush would overwrite the
-    /// new telemetry with those stale totals. Only the lifetime scope is
-    /// replaced: the session totals describe this process and keep their
-    /// values.
+    #[cfg(test)]
     pub async fn reload_usage_lifetime(self: &Arc<Self>) {
-        let path = telemetry_path(self.repo_root().await.as_path());
-        // The document is read from disk, so the read goes to the blocking
-        // pool instead of stalling an async worker thread on the file system.
-        let loaded =
-            match tauqe_core::blocking::run_blocking_async(move || read_document(&path)).await {
-                Ok(Some((lifetime, lifetime_operations))) => (lifetime, lifetime_operations),
-                Ok(None) => (UsageTotals::default(), 0),
-                Err(err) => {
-                    tracing::warn!(error = %err, "Project telemetry read task failed");
-                    (UsageTotals::default(), 0)
-                }
-            };
-        {
-            let mut ledger = self.usage.lock().await;
-            let snapshot = ledger.snapshot_mut();
-            snapshot.lifetime = loaded.0;
-            snapshot.lifetime_operations = loaded.1;
-        }
-        let operation_id = format!("rebind-{}", next_operation_id());
-        publish_snapshot(self, &operation_id).await;
-    }
-}
-
-impl UsageGuard {
-    /// Adds the usage reported by one provider call to the in-flight totals.
-    ///
-    /// A provider may answer with token counts only, a cost only, or nothing at
-    /// all; the totals accumulate whatever was reported and stay additive
-    /// across the several calls a multi-round operation makes. A window that no
-    /// longer owns the in-flight scope records and publishes nothing, because
-    /// the totals installed under the lock belong to its successor.
-    pub async fn observe(&self, usage: &ModelUsageInfo) {
-        let applied = {
-            let mut ledger = self.state.usage.lock().await;
-            ledger.observe(self.window, &UsageTotals::from_usage(usage))
-        };
-        if applied {
-            self.publish().await;
-        } else {
-            tracing::warn!(
-                operation_id = self.operation_id.as_str(),
-                "Usage window was already replaced; the observation is discarded",
-            );
-        }
-    }
-
-    /// Closes the window, folding the operation into both totals and persisting
-    /// the project total.
-    ///
-    ///
-    /// The duration is measured by the harness rather than reported by the
-    /// provider, so it reflects how long the operation actually held the
-    /// developer's turn. The project lifetime is accumulated under the same
-    /// lock as the session totals, so the two scopes can never disagree about
-    /// the operation that just finished. The heartbeat is silenced first and
-    /// the window it was spawned with is closed under the same lock, so the
-    /// final publish below is the last snapshot this operation can ever
-    /// produce.
-    ///
-    /// Only the window this guard owns is folded and cleared: a guard whose
-    /// window a successor already discarded treats its own scope as absent, so
-    /// it can neither take the successor's in-flight totals nor publish them
-    /// under an identifier they do not belong to.
-    pub async fn flush(self) {
-        self.ticker.abort();
-        let elapsed_ms = self.started.elapsed().as_millis() as u64;
-        let folded = {
-            let mut ledger = self.state.usage.lock().await;
-            match ledger.close(self.window, elapsed_ms) {
-                Some(completed) => {
-                    let snapshot = ledger.snapshot_mut();
-                    snapshot.session.accumulate(&completed);
-                    snapshot.operations = snapshot.operations.saturating_add(1);
-                    snapshot.lifetime.accumulate(&completed);
-                    let operations = snapshot.lifetime_operations.saturating_add(1);
-                    snapshot.lifetime_operations = operations;
-                    snapshot.prev = completed;
-                    Some((snapshot.lifetime.clone(), operations))
-                }
-                None => None,
-            }
-        };
-        let Some((lifetime, lifetime_operations)) = folded else {
-            tracing::warn!(
-                operation_id = self.operation_id.as_str(),
-                "Usage window was already replaced; the flush folds nothing",
-            );
-            return;
-        };
-        // Persist before publishing: the announced snapshot then always
-        // matches what a restarted daemon would load.
-        persist_lifetime(&self.state, &lifetime, lifetime_operations).await;
-        self.publish().await;
-    }
-
-    /// Publishes the current snapshot to the client.
-    async fn publish(&self) {
-        publish_snapshot(&self.state, &self.operation_id).await;
+        self.application
+            .reload_usage_lifetime(publisher(self.out.clone()))
+            .await;
     }
 }
 
@@ -559,8 +110,10 @@ mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use tauqe_core::config::AppConfig;
+    use tauqe_core::providers::ModelUsageInfo;
 
     fn usage(prompt: u32, completion: u32) -> ModelUsageInfo {
         ModelUsageInfo {
@@ -598,7 +151,8 @@ mod tests {
     }
 
     fn read_stored_lifetime(root: &Path) -> serde_json::Value {
-        let raw = std::fs::read_to_string(telemetry_path(root)).expect("telemetry file exists");
+        let raw =
+            std::fs::read_to_string(root.join(".tauqe/usage.json")).expect("telemetry file exists");
         serde_json::from_str(&raw).expect("telemetry file is valid JSON")
     }
 
@@ -612,6 +166,76 @@ mod tests {
             return None;
         }
         serde_json::from_value(value.get("params")?.clone()).ok()
+    }
+
+    #[test]
+    fn provider_usage_publication_preserves_unknown_and_zero_metrics() {
+        for (reasoning_tokens, cached_tokens, cost) in [
+            (None, None, None),
+            (Some(0), Some(0), Some(0.0)),
+            (Some(7), Some(11), Some(0.125)),
+        ] {
+            let report = ModelUsageInfo {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+                reasoning_tokens,
+                cached_tokens,
+                cost,
+            };
+            let event = tauqe_protocol::ModelUsageEvent {
+                operation_id: "op-provider".into(),
+                usage: wire_usage(&report),
+                session_total_cost: 0.5,
+                current_cost: cost,
+            };
+            let encoded = serde_json::to_value(event).unwrap();
+            let decoded: tauqe_protocol::ModelUsageEvent = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.usage.reasoning_tokens, reasoning_tokens);
+            assert_eq!(decoded.usage.cached_tokens, cached_tokens);
+            assert_eq!(decoded.usage.cost, cost);
+            assert_eq!(decoded.usage.total_tokens, 120);
+            assert_eq!(decoded.current_cost, cost);
+        }
+    }
+
+    #[test]
+    fn accounting_projection_preserves_wire_and_storage_fields() {
+        let totals = UsageTotals {
+            prompt_tokens: 120,
+            completion_tokens: 30,
+            total_tokens: 150,
+            reasoning_tokens: Some(8),
+            cached_tokens: Some(0),
+            cost: 0.125,
+            duration_ms: 1_234,
+        };
+        let mut snapshot = UsageTotalsSnapshot {
+            session: totals.clone(),
+            prev: UsageTotals::default(),
+            cur: Some(totals.clone()),
+            operations: 3,
+            lifetime: totals,
+            lifetime_operations: 42,
+        };
+        for active in [true, false] {
+            if !active {
+                snapshot.cur = None;
+            }
+            let wire = wire_snapshot(&snapshot);
+            assert_eq!(
+                serde_json::to_value(&wire).unwrap(),
+                serde_json::to_value(&snapshot).unwrap(),
+            );
+            // Persisted core totals remain readable as the previous wire type.
+            let restored: tauqe_protocol::UsageTotals =
+                serde_json::from_value(serde_json::to_value(&snapshot.lifetime).unwrap()).unwrap();
+            assert_eq!(restored, wire.lifetime);
+            let params = snapshot_event_params("op-projection", &snapshot).unwrap();
+            let event: ModelUsageTotalsEvent = serde_json::from_value(params).unwrap();
+            assert_eq!(event.operation_id, "op-projection");
+            assert_eq!(event.snapshot, wire);
+        }
     }
 
     /// Every flushed operation folds into the session totals, and the previous
@@ -803,13 +427,13 @@ mod tests {
         let (state, mut rx, root) = test_state();
 
         let abandoned = state.begin_usage_with_tick("op-abandoned", TEST_TICK).await;
-        let abandoned_id = abandoned.operation_id.clone();
+        let abandoned_id = "op-abandoned";
         abandoned.observe(&usage(100, 40)).await;
 
         // The successor installs its own window while the abandoned guard is
         // still alive: the abandoned totals are discarded with that window.
         let successor = state.begin_usage_with_tick("op-successor", TEST_TICK).await;
-        let successor_id = successor.operation_id.clone();
+        let successor_id = "op-successor";
         successor.observe(&usage(3, 2)).await;
         while rx.try_recv().is_ok() {}
 
@@ -939,13 +563,13 @@ mod tests {
 
     /// A corrupt telemetry document never blocks startup: the totals start from
     /// zero and the next flush rewrites the document.
-    #[test]
-    fn unreadable_telemetry_falls_back_to_empty_totals() {
+    #[tokio::test]
+    async fn unreadable_telemetry_falls_back_to_empty_totals() {
         let root = scratch_root("usage-corrupt");
-        let _ = std::fs::create_dir_all(root.join(TELEMETRY_DIR));
-        std::fs::write(telemetry_path(&root), "{ not telemetry").unwrap();
+        let _ = std::fs::create_dir_all(root.join(".tauqe"));
+        std::fs::write(root.join(".tauqe/usage.json"), "{ not telemetry").unwrap();
 
-        let snapshot = load_initial_snapshot(&root);
+        let snapshot = state_at(&root).usage_snapshot().await;
         assert!(snapshot.lifetime.is_empty());
         assert_eq!(snapshot.lifetime_operations, 0);
 

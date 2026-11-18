@@ -9,27 +9,18 @@
 //! repository listing and file read runs on the blocking pool so the stdin read
 //! loop keeps accepting requests.
 
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
 use tauqe_core::config::AppConfig;
-use tauqe_protocol::review::{
-    ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult, ReviewPreviewWindow,
-};
+use tauqe_protocol::review::{ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult};
 use tauqe_protocol::{errors, Request, Response};
 
 use crate::state::AppState;
 
-use super::window::{expand_window, WindowBudgets, WindowContext};
-
-/// One configured preset group as the projection reads it.
-///
-/// A launch mints fresh group identifiers, so the projection names the
-/// configured title instead of an identity that does not exist yet.
-struct ConfiguredGroup {
-    title: String,
-    paths: Vec<String>,
-}
+use super::window::window_dto;
 
 /// Projects the audit window `review/start` would read for the same parameters.
 pub async fn handle_review_preview(mut req: Request, state: &Arc<AppState>) -> Response {
@@ -51,149 +42,33 @@ pub async fn handle_review_preview(mut req: Request, state: &Arc<AppState>) -> R
         },
     };
 
-    // The budgets and the repository root are the only server-side facts the
-    // projection reads, and neither is taken exclusively: a concurrently running
-    // turn keeps its operation registration and its context mutation rights.
-    let config = state.config.lock().await.config.clone();
-    let budgets = WindowBudgets {
-        files_tokens: config.context.token_budget,
-    };
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-
-    let preset_name = params
-        .preset
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-
-    let projection = match preset_name {
-        Some(name) => match configured_groups(&config, name) {
-            Some(groups) => preview_preset(&repo_root, &groups, budgets).await,
-            None => {
-                return Response::err(
-                    req.id,
-                    errors::NOT_FOUND,
-                    format!("Review preset '{}' not found", name),
-                );
-            }
-        },
-        None => preview_single(state, &repo_root, &params.path_patterns, budgets).await,
-    };
-
-    match projection {
-        Ok(result) => Response::ok_typed(req.id, &result),
-        Err(err) => Response::err(req.id, errors::REVIEW_PREVIEW_FAILED, err),
-    }
-}
-
-/// Resolves a configured preset into the groups the projection measures.
-///
-/// The lookup matches the launch exactly — the trimmed requested name against
-/// the trimmed configured name — so a preview never describes a preset the
-/// launch would fail to resolve and never falls back to a preset the developer
-/// did not name.
-fn configured_groups(config: &AppConfig, name: &str) -> Option<Vec<ConfiguredGroup>> {
-    let preset = config
-        .review
-        .presets
-        .iter()
-        .find(|preset| preset.name.trim() == name)?;
-    Some(
-        preset
-            .groups
-            .iter()
-            .map(|group| ConfiguredGroup {
-                title: group.name.clone(),
-                paths: group.paths.clone(),
-            })
-            .collect(),
-    )
-}
-
-/// Measures the window a plain launch reads: the active context and patterns.
-async fn preview_single(
-    state: &Arc<AppState>,
-    repo_root: &Path,
-    path_patterns: &[String],
-    budgets: WindowBudgets,
-) -> Result<ReviewPreviewResult, String> {
-    let (context_snapshot, context_tokens) = {
-        let context = state.context.read().await;
-        (
-            context.clone(),
-            context.get_state().total_estimated_tokens as usize,
-        )
-    };
-    // Reading the active context touches the file system, so it runs on the
-    // blocking pool exactly as the launch reads it.
-    let files = crate::handlers::offload(move || context_snapshot.read_context_files())
+    match state
+        .application
+        .preview_review(params.preset.as_deref(), &params.path_patterns)
         .await
-        .map_err(|err| format!("Failed to read the active context: {}", err))?;
-
-    let expanded = expand_window(
-        repo_root,
-        WindowContext {
-            files: &files,
-            tokens: context_tokens,
-        },
-        path_patterns,
-        budgets,
-    )
-    .await?;
-
-    Ok(ReviewPreviewResult {
-        window: expanded.window,
-        groups: Vec::new(),
-    })
-}
-
-/// Measures every configured group and folds the windows into one projection.
-///
-/// Groups audit their own slices, so the aggregate sums the counters of the
-/// per-group windows: the confirmation a client renders then describes the whole
-/// session instead of one slice of it.
-async fn preview_preset(
-    repo_root: &Path,
-    groups: &[ConfiguredGroup],
-    budgets: WindowBudgets,
-) -> Result<ReviewPreviewResult, String> {
-    let mut aggregated = ReviewPreviewWindow::default();
-    let mut projected = Vec::with_capacity(groups.len());
-    for group in groups {
-        // A preset launch reads no interactive context, so every group expands
-        // from an empty base exactly as the grouped audit does.
-        let expanded =
-            expand_window(repo_root, WindowContext::empty(), &group.paths, budgets).await?;
-        accumulate(&mut aggregated, &expanded.window);
-        projected.push(ReviewPreviewGroup {
-            title: group.title.clone(),
-            window: expanded.window,
-        });
+    {
+        Ok(result) => Response::ok_typed(
+            req.id,
+            &ReviewPreviewResult {
+                window: window_dto(&result.window),
+                groups: result
+                    .groups
+                    .into_iter()
+                    .map(|group| ReviewPreviewGroup {
+                        title: group.title,
+                        window: window_dto(&group.window),
+                    })
+                    .collect(),
+            },
+        ),
+        Err(error) => {
+            let code = match error {
+                tauqe_core::api::ReviewPreviewError::PresetNotFound(_) => errors::NOT_FOUND,
+                tauqe_core::api::ReviewPreviewError::Read(_) => errors::REVIEW_PREVIEW_FAILED,
+            };
+            Response::err(req.id, code, error.to_string())
+        }
     }
-    // Every group window obeys its own configured file budget, so the aggregate
-    // allowance is what each group may spend; comparing a summed spend against a
-    // single group's limit would misreport the whole session.
-    aggregated.files_token_budget = budgets.files_tokens.saturating_mul(groups.len());
-    Ok(ReviewPreviewResult {
-        window: aggregated,
-        groups: projected,
-    })
-}
-
-/// Folds one group window into the aggregate projection.
-fn accumulate(total: &mut ReviewPreviewWindow, window: &ReviewPreviewWindow) {
-    total.context_files = total.context_files.saturating_add(window.context_files);
-    total.context_tokens = total.context_tokens.saturating_add(window.context_tokens);
-    total.matched_files = total.matched_files.saturating_add(window.matched_files);
-    total.selected_files = total.selected_files.saturating_add(window.selected_files);
-    total.selected_tokens = total.selected_tokens.saturating_add(window.selected_tokens);
-    total.omitted_files = total.omitted_files.saturating_add(window.omitted_files);
-    total.omitted_by_budget = total
-        .omitted_by_budget
-        .saturating_add(window.omitted_by_budget);
-    total.unreadable_files = total
-        .unreadable_files
-        .saturating_add(window.unreadable_files);
 }
 
 #[cfg(test)]
@@ -312,7 +187,7 @@ mod tests {
                 as usize;
         let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
             "alpha/a.rs",
-            tauqe_protocol::ContextAccess::ReadOnly,
+            tauqe_core::context::ContextAccess::ReadOnly,
         );
         config.context.token_budget = content_tokens.saturating_add(wrapper);
         let budget = config.context.token_budget;

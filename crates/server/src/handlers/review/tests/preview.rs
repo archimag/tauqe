@@ -7,6 +7,7 @@
 //! tree, and the operation slot untouched.
 
 use std::sync::Arc;
+use tauqe_core::context::ContextAccess;
 
 use super::super::handle_review_preview;
 use super::{init_repo_with_files, init_repo_with_uniform_files, test_config, TestDir};
@@ -15,7 +16,7 @@ use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::config::AppConfig;
 use tauqe_protocol::review::ReviewPreviewResult;
-use tauqe_protocol::{methods, ContextAccess, Request, RequestId, Response};
+use tauqe_protocol::{methods, Request, RequestId, Response};
 
 /// Content of every fixture file.
 ///
@@ -84,10 +85,9 @@ async fn preview_without_patterns_reports_the_active_context_and_omits_nothing()
     init_repo_with_files(&dir, &[("src/lib.rs", TARGET_FILE)]);
     let state = state_for(&dir, test_config());
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("src/lib.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("src/lib.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
     let result =
@@ -246,14 +246,15 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
     config.context.token_budget = per_file_tokens().saturating_add(per_file_cost());
     let state = state_for(&dir, config);
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_file("src/a.rs", ContextAccess::ReadOnly))
         .await
-        .add_file("src/a.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
 
-    let context_before = serde_json::to_value(state.context.read().await.get_state())
-        .expect("the context snapshot serializes");
+    let context_before = serde_json::to_value(crate::handlers::context::context_state_dto(
+        &state.context_state().await,
+    ))
+    .expect("the context snapshot serializes");
     let tree_before = working_tree(&dir);
 
     let result = projection(
@@ -273,8 +274,10 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
     assert_eq!(result.window.omitted_by_budget, 1);
     assert_eq!(result.window.omitted_files, 1);
 
-    let context_after = serde_json::to_value(state.context.read().await.get_state())
-        .expect("the context snapshot serializes");
+    let context_after = serde_json::to_value(crate::handlers::context::context_state_dto(
+        &state.context_state().await,
+    ))
+    .expect("the context snapshot serializes");
     assert_eq!(
         context_after, context_before,
         "a read RPC never mutates the context"

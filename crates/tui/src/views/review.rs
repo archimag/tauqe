@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use tauqe_tui::projection::*;
 
 use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
 use tauqe_protocol::{

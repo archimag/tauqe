@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tauqe_tui::projection::*;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::methods;
@@ -406,7 +407,7 @@ fn execute_scope_action(
     }
 
     match plan.implementation.evaluate_scope(scope_id) {
-        tauqe_protocol::PlanScopeEvaluation::BlockedByDiscussion(items) => {
+        tauqe_tui::projection::PlanScopeEvaluation::BlockedByDiscussion(items) => {
             let preview = if items.len() <= 2 {
                 items.join(", ")
             } else {
@@ -418,7 +419,7 @@ fn execute_scope_action(
                     .replace("{}", &preview),
             );
         }
-        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
+        tauqe_tui::projection::PlanScopeEvaluation::BlockedByBlockers(items) => {
             let preview = if items.len() <= 2 {
                 items.join(", ")
             } else {
@@ -430,10 +431,10 @@ fn execute_scope_action(
                     .replace("{}", &preview),
             );
         }
-        tauqe_protocol::PlanScopeEvaluation::AllCompleted => {
+        tauqe_tui::projection::PlanScopeEvaluation::AllCompleted => {
             st.notify_info(active_t("notify.plan_scope_all_completed"));
         }
-        tauqe_protocol::PlanScopeEvaluation::BlockedByDependencies(items) => {
+        tauqe_tui::projection::PlanScopeEvaluation::BlockedByDependencies(items) => {
             let preview = if items.len() <= 2 {
                 items.join(", ")
             } else {
@@ -445,16 +446,16 @@ fn execute_scope_action(
                     .replace("{}", &preview),
             );
         }
-        tauqe_protocol::PlanScopeEvaluation::StepBlocked => {
+        tauqe_tui::projection::PlanScopeEvaluation::StepBlocked => {
             st.notify_warning(active_t("notify.plan_step_blocked"));
         }
-        tauqe_protocol::PlanScopeEvaluation::Cancelled => {
+        tauqe_tui::projection::PlanScopeEvaluation::Cancelled => {
             st.notify_warning(active_t("notify.plan_step_cancelled"));
         }
-        tauqe_protocol::PlanScopeEvaluation::NotFound => {
+        tauqe_tui::projection::PlanScopeEvaluation::NotFound => {
             st.notify_error(active_t("notify.plan_item_not_found"));
         }
-        tauqe_protocol::PlanScopeEvaluation::Ready(steps) => {
+        tauqe_tui::projection::PlanScopeEvaluation::Ready(steps) => {
             let coder_entries = st.coder_entries();
             st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             st.modals.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
@@ -732,7 +733,7 @@ pub async fn handle_plans_key(
                     continue;
                 }
                 let evaluation = plan.implementation.evaluate_scope(None);
-                if let tauqe_protocol::PlanScopeEvaluation::Ready(ready) = evaluation {
+                if let tauqe_tui::projection::PlanScopeEvaluation::Ready(ready) = evaluation {
                     plan_ids.push(plan.id.clone());
                     plan_titles.push(plan.title.clone());
                     steps.extend(ready);
@@ -990,7 +991,7 @@ pub async fn handle_plans_key(
                     // once, seeding the instruction with every blocked step the
                     // scope reports (c-1, c-3).
                     let seed = match plan.implementation.evaluate_scope(None) {
-                        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
+                        tauqe_tui::projection::PlanScopeEvaluation::BlockedByBlockers(items) => {
                             Some(format!(
                                 "Replan the uncompleted horizon addressing every blocked step:\n{}",
                                 items.join("\n")

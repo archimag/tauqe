@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tauqe_tui::projection::*;
 
 use crate::app::{
     AppState, ConfirmReviewAnalyzeState, GroupDialoguePurpose, PromptModalState, PromptModalTarget,

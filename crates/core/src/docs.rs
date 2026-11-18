@@ -4,7 +4,7 @@
 //! Every chapter is a sovereign concept file under `docs/src/`, so a topic maps
 //! to a small, cohesive set of chapters instead of one umbrella narrative.
 
-use tauqe_protocol::DocTopic;
+use crate::llm::DocTopic;
 
 const INTRO: &str = include_str!("../../../docs/src/intro.md");
 const SEMANTIC_HARNESS: &str =

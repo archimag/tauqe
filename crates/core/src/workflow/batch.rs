@@ -19,8 +19,8 @@
 //! inside the executor, keeping the batch free of transport and storage
 //! concerns while still returning a single aggregate report.
 
+use crate::providers::ModelUsageInfo;
 use async_trait::async_trait;
-use tauqe_protocol::ModelUsageInfo;
 use tokio::sync::{mpsc, watch};
 
 use crate::providers::StreamEvent;
@@ -31,7 +31,7 @@ pub struct BatchStep {
     /// Stable identifier used for diagnostics and status synchronization.
     pub id: String,
     /// Prompt that drives the bounded turn for this step.
-    pub prompt: String,
+    prompt: String,
 }
 
 impl BatchStep {
@@ -68,13 +68,11 @@ pub struct BatchStepOutcome {
     /// Terminal status of the step.
     pub status: BatchStepStatus,
     /// Token usage reported for the step, when the transport provides it.
-    pub usage: Option<ModelUsageInfo>,
+    usage: Option<ModelUsageInfo>,
     /// Failure diagnostic reported for a failed step, when present.
     pub error: Option<String>,
     /// Block reason reported for a blocked step, when present.
-    pub blocked_reason: Option<String>,
-    /// Skip reason reported for a skipped step, when present.
-    pub skip_reason: Option<String>,
+    pub(crate) blocked_reason: Option<String>,
 }
 
 impl BatchStepOutcome {
@@ -85,7 +83,6 @@ impl BatchStepOutcome {
             usage: None,
             error: None,
             blocked_reason: None,
-            skip_reason: None,
         }
     }
 
@@ -96,18 +93,16 @@ impl BatchStepOutcome {
             usage: None,
             error: Some(error.into()),
             blocked_reason: None,
-            skip_reason: None,
         }
     }
 
     /// Reports a step that cannot proceed, carrying the coder's block report.
-    pub fn blocked(reason: impl Into<String>) -> Self {
+    pub(crate) fn blocked(reason: impl Into<String>) -> Self {
         Self {
             status: BatchStepStatus::Blocked,
             usage: None,
             error: None,
             blocked_reason: Some(reason.into()),
-            skip_reason: None,
         }
     }
 
@@ -118,32 +113,32 @@ impl BatchStepOutcome {
             usage: None,
             error: None,
             blocked_reason: None,
-            skip_reason: None,
         }
     }
 
     /// Reports a step that its own preconditions excluded from execution.
     ///
     /// The step produced no work and failed nothing, so the supervisor records
-    /// it with the reported reason and continues with the next scheduled step.
-    pub fn skipped(reason: impl Into<String>) -> Self {
+    /// it and continues with the next scheduled step.
+    pub fn skipped() -> Self {
         Self {
             status: BatchStepStatus::Skipped,
             usage: None,
             error: None,
             blocked_reason: None,
-            skip_reason: Some(reason.into()),
         }
     }
 
     /// Attaches token usage to the outcome, returning the updated value.
-    pub fn with_usage(mut self, usage: ModelUsageInfo) -> Self {
+    #[cfg(test)]
+    fn with_usage(mut self, usage: ModelUsageInfo) -> Self {
         self.usage = Some(usage);
         self
     }
 
     /// Whether the outcome represents a successful step.
-    pub fn is_success(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_success(&self) -> bool {
         matches!(self.status, BatchStepStatus::Succeeded)
     }
 }
@@ -191,7 +186,7 @@ impl BatchUsage {
     /// Token counters saturate. The cost total stays known only while every
     /// accumulated step reports a cost; once a step omits it, the total
     /// degrades to `None`.
-    pub fn accumulate(&mut self, usage: &ModelUsageInfo) {
+    fn accumulate(&mut self, usage: &ModelUsageInfo) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_tokens);
         self.completion_tokens = self
             .completion_tokens
@@ -272,7 +267,8 @@ impl BatchExecution {
     }
 
     /// Stable identifier used in diagnostics.
-    pub fn name(&self) -> &'static str {
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
         "batch"
     }
 
@@ -600,7 +596,7 @@ mod tests {
         let steps = make_steps(&["1", "2", "3"]);
         let mut executor = ScriptedExecutor::new(vec![
             BatchStepOutcome::succeeded(),
-            BatchStepOutcome::skipped("no matching files"),
+            BatchStepOutcome::skipped(),
             BatchStepOutcome::succeeded(),
         ]);
         let (stream_tx, _stream_rx) = channel();
@@ -617,7 +613,6 @@ mod tests {
         assert_eq!(executor.seen, vec!["1", "2", "3"]);
         let skipped = &report.executed[1].outcome;
         assert_eq!(skipped.status, BatchStepStatus::Skipped);
-        assert_eq!(skipped.skip_reason.as_deref(), Some("no matching files"));
         assert!(!skipped.is_success());
     }
 
@@ -625,7 +620,7 @@ mod tests {
     async fn skipped_step_still_accumulates_usage() {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![
-            BatchStepOutcome::skipped("filtered").with_usage(usage(7, 3, 0.01)),
+            BatchStepOutcome::skipped().with_usage(usage(7, 3, 0.01)),
             BatchStepOutcome::succeeded().with_usage(usage(10, 5, 0.02)),
         ]);
         let (stream_tx, _stream_rx) = channel();
@@ -645,10 +640,9 @@ mod tests {
     }
 
     #[test]
-    fn skipped_outcome_carries_reason_without_failure_diagnostics() {
-        let outcome = BatchStepOutcome::skipped("nothing to do");
+    fn skipped_outcome_has_no_failure_diagnostics() {
+        let outcome = BatchStepOutcome::skipped();
         assert_eq!(outcome.status, BatchStepStatus::Skipped);
-        assert_eq!(outcome.skip_reason.as_deref(), Some("nothing to do"));
         assert!(outcome.usage.is_none());
         assert!(outcome.error.is_none());
         assert!(outcome.blocked_reason.is_none());
@@ -659,8 +653,8 @@ mod tests {
     async fn batch_of_skipped_steps_completes() {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![
-            BatchStepOutcome::skipped("nothing to do"),
-            BatchStepOutcome::skipped("nothing to do"),
+            BatchStepOutcome::skipped(),
+            BatchStepOutcome::skipped(),
         ]);
         let (stream_tx, _stream_rx) = channel();
         let (_cancel_tx, cancel_rx) = watch::channel(false);

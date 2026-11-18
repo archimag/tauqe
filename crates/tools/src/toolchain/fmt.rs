@@ -19,9 +19,9 @@
 //! neither keeps its argument list exactly as written, so a plain filter such as
 //! `rustfmt` still reads the staged text on standard input and nothing else.
 
+use crate::toolchain::config::{ProjectConfig, ProjectParameterSpec};
 use std::path::Path;
 
-use tauqe_protocol::{ProjectConfig, ProjectParameterSpec};
 use tokio::sync::watch;
 
 use super::exec::{run_streaming_command, CommandLine, StreamingOutcome};
@@ -36,11 +36,11 @@ pub struct InMemoryFormatOutcome {
     /// whenever the command failed, timed out, or was cancelled.
     pub content: String,
     /// Command line that was invoked.
-    pub command: String,
+    command: String,
     /// Whether the invocation was interrupted before it finished.
-    pub is_cancelled: bool,
+    pub(crate) is_cancelled: bool,
     /// Compact failure reason when the content could not be rewritten.
-    pub error: Option<String>,
+    error: Option<String>,
 }
 
 /// Streams one file's content through the in-memory formatter a project names.
@@ -289,7 +289,7 @@ fn compact(text: &str) -> String {
 mod tests {
     use super::super::exec::PROCESS_GROUP_STABILITY_WINDOW;
     use super::*;
-    use tauqe_protocol::ProjectCommandSpec;
+    use crate::toolchain::config::ProjectCommandSpec;
 
     /// Parses a `[project]` declaration from its JSON form.
     ///

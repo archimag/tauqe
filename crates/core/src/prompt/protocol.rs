@@ -7,9 +7,12 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use tauqe_protocol::{
-    CapabilityTree, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
-};
+use crate::config::project::ProjectConfig;
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
+use crate::workflow::EditProtocolKind;
+use crate::workflow::PatchStrategy;
 
 /// Decodes raw model output into normalized core commands.
 ///
@@ -146,7 +149,7 @@ pub trait PromptProtocol: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::TextCommand;
+    use crate::llm::TextCommand;
 
     /// Minimal protocol used to exercise the trait contract in tests.
     struct TextOnlyProtocol;

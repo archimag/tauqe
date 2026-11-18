@@ -19,7 +19,9 @@ mod entry;
 mod reference;
 mod role;
 mod selection;
+mod topic;
 mod turn;
+pub use topic::DocTopic;
 mod usage;
 
 pub use batch::{
@@ -27,8 +29,9 @@ pub use batch::{
 };
 pub use catalog::ModelCatalogEntry;
 pub use effort::{ModelRolesEffort, ReasoningEffort};
-pub use entry::{ArchitectTier, CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary};
-pub use reference::{deserialize_model_ref_lenient, ModelRef, ProviderKind};
+pub use entry::{ArchitectTier, ModelEntry, ModelRolesEntries, ModelRolesSummary};
+pub(crate) use reference::deserialize_model_ref_lenient;
+pub use reference::{ModelRef, ProviderKind};
 pub use role::ModelRole;
 pub use selection::{
     ModelChangedEvent, ModelCurrentResult, ModelSelectParams, ModelSelectResult, ModelSelection,

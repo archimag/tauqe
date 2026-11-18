@@ -13,6 +13,7 @@ name = "tauqe"
 path = "src/main.rs"
 
 [dependencies]
+tauqe-tools.workspace = true
 tauqe-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

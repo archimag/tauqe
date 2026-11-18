@@ -4,7 +4,9 @@
 //! structured instruction without a `CapabilityModule` trait or `CapabilityRegistry`
 //! indirection.
 
-use tauqe_protocol::{CapabilityTree, LlmCapability, ProjectConfig, ProjectParameterSpec};
+use crate::config::project::{ProjectConfig, ProjectParameterSpec};
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
 
 use crate::edits::strategy::StrategyProfile;
 use crate::prompt::ContourKind;
@@ -603,7 +605,7 @@ mod tests {
         assert!(repl_delta.body.contains("ONLY propose new plans"));
 
         let disc_expr = crate::control::repl::repl_capability_expr(Some(
-            &tauqe_protocol::DiscussionTarget::Plan { id: "p1".into() },
+            &crate::discussion::DiscussionTarget::Plan { id: "p1".into() },
         ));
         let disc_delta =
             delta_rule(LlmCapability::PlanCreation, &disc_expr).expect("discussion delta rendered");
@@ -632,7 +634,7 @@ mod tests {
             (
                 "plan_discussion",
                 crate::control::repl::repl_capability_expr(Some(
-                    &tauqe_protocol::DiscussionTarget::Plan {
+                    &crate::discussion::DiscussionTarget::Plan {
                         id: "p-1".to_string(),
                     },
                 )),
@@ -641,7 +643,7 @@ mod tests {
             (
                 "review_discussion",
                 crate::control::repl::repl_capability_expr(Some(
-                    &tauqe_protocol::DiscussionTarget::Review {
+                    &crate::discussion::DiscussionTarget::Review {
                         id: "r-1".to_string(),
                     },
                 )),

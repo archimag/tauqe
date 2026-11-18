@@ -18,7 +18,7 @@ pub(super) fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
 }
 
 /// Collapses every whitespace run into one space and trims the result.
-pub(super) fn collapse_whitespace(text: &str) -> String {
+fn collapse_whitespace(text: &str) -> String {
     let mut collapsed = String::with_capacity(text.len());
     let mut in_whitespace = false;
     for character in text.chars() {

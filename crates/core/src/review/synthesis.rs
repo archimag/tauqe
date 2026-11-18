@@ -1,0 +1,261 @@
+//! Decode a single audit and materialize its review session.
+
+use crate::edits::stream::json::JsonFieldStreamFilter;
+use crate::models::ModelRef;
+use crate::review::parser::{parse_review_findings, parse_review_output, ReviewFindingsOutput};
+use crate::review::uuid::generate_uuid_v7;
+use crate::review::{ReviewIssue, ReviewItem, ReviewSession};
+
+/// Launch values captured before provider execution, including its cache identity.
+pub struct ReviewSynthesisMetadata {
+    pub id: String,
+    pub created_at: u64,
+    pub model: ModelRef,
+    pub user_prompt: Option<String>,
+    pub target_files: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Model returned an empty review")]
+pub struct EmptyReviewResponse;
+
+pub struct ReviewSynthesisResponse {
+    filter: JsonFieldStreamFilter<ReviewFindingsOutput>,
+}
+
+impl Default for ReviewSynthesisResponse {
+    fn default() -> Self {
+        Self {
+            filter: JsonFieldStreamFilter::new("summary"),
+        }
+    }
+}
+
+impl ReviewSynthesisResponse {
+    pub(crate) fn from_filter(filter: JsonFieldStreamFilter<ReviewFindingsOutput>) -> Self {
+        Self { filter }
+    }
+
+    pub fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+        self.filter.push_chunk(chunk)
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Preserve tolerant parsing, title fallback, and original provider text.
+    /// Only a wholly empty response is refused; unstructured text remains a finding.
+    pub fn finish(
+        self,
+        metadata: ReviewSynthesisMetadata,
+    ) -> Result<ReviewSession, EmptyReviewResponse> {
+        let raw_buffer = self.filter.buffer().to_string();
+        if raw_buffer.trim().is_empty() {
+            return Err(EmptyReviewResponse);
+        }
+        let (parsed_title, summary, issues) = match self.filter.finish() {
+            Ok(output) => {
+                let trimmed = output.summary.trim();
+                let summary = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                let title = output.title.trim();
+                let title = if title.is_empty() {
+                    None
+                } else {
+                    Some(title.to_string())
+                };
+                (title, summary, parse_review_findings(&raw_buffer))
+            }
+            Err(_) => parse_review_output(&raw_buffer),
+        };
+        let title = parsed_title
+            .or_else(|| {
+                metadata
+                    .user_prompt
+                    .as_deref()
+                    .and_then(|prompt| prompt.lines().next())
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.chars().take(60).collect::<String>())
+            })
+            .unwrap_or_else(|| format!("Review {}", metadata.created_at));
+        Ok(ReviewSession {
+            id: metadata.id,
+            title,
+            created_at: metadata.created_at,
+            model: metadata.model,
+            description: summary.or_else(|| metadata.user_prompt.clone()),
+            user_prompt: metadata.user_prompt,
+            target_files: metadata.target_files,
+            items: with_finding_identities(issues),
+            raw_markdown: raw_buffer,
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
+        })
+    }
+}
+
+/// Projects synthesized findings into review items carrying a UUIDv7 identity.
+///
+/// The reviewer emits findings without identifiers, while the post-analysis
+/// layer and the Architect decomposition reference a finding by its UUIDv7.
+/// Minting the identity before the session is persisted guarantees that every
+/// stored finding of a single audit is addressable, exactly as the grouped
+/// audit guarantees it through `ReviewStorage::append_group_findings`. An
+/// identity a finding already carries is preserved, so a projection never
+/// mints a second one for the same finding.
+fn with_finding_identities(issues: Vec<ReviewIssue>) -> Vec<ReviewItem> {
+    let mut items = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let mut item = ReviewItem::from(issue);
+        if item.uuid.is_none() {
+            item.uuid = Some(generate_uuid_v7());
+        }
+        items.push(item);
+    }
+    items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::review::uuid::is_valid_uuid_v7;
+    use crate::review::{IssueStatus, IssueType};
+
+    /// Builds a finding exactly as the reviewer parser emits it: a complete
+    /// issue without an identity.
+    fn synthesized_issue(id: u32, title: &str) -> ReviewIssue {
+        ReviewIssue {
+            id,
+            title: title.to_string(),
+            uuid: None,
+            commit: None,
+            group: None,
+            model: None,
+            issue_type: IssueType::Quality,
+            status: IssueStatus::Discussion,
+            description: "Description".to_string(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn every_synthesized_finding_receives_a_valid_uuid_v7() {
+        let first = synthesized_issue(1, "First finding");
+        let second = synthesized_issue(2, "Second finding");
+        let items = with_finding_identities(vec![first, second]);
+        assert_eq!(items.len(), 2);
+
+        let mut identities = Vec::new();
+        for item in &items {
+            let identity = item.uuid.clone().expect("finding identity");
+            assert!(is_valid_uuid_v7(&identity), "not a UUIDv7: {identity}");
+            identities.push(identity);
+        }
+        assert_ne!(identities[0], identities[1], "identities are unique");
+        assert_eq!(items[0].title, "First finding");
+        assert_eq!(items[1].id, 2);
+        assert_eq!(items[0].status, IssueStatus::Discussion);
+    }
+
+    #[test]
+    fn an_identity_a_finding_already_carries_is_preserved() {
+        let existing = generate_uuid_v7();
+        let mut issue = synthesized_issue(1, "Carried identity");
+        issue.uuid = Some(existing.clone());
+
+        let items = with_finding_identities(vec![issue]);
+        assert_eq!(items[0].uuid.as_deref(), Some(existing.as_str()));
+    }
+
+    fn metadata(prompt: Option<&str>) -> ReviewSynthesisMetadata {
+        ReviewSynthesisMetadata {
+            id: "launch-review".into(),
+            created_at: 42,
+            model: ModelRef::openrouter("test/reviewer"),
+            user_prompt: prompt.map(str::to_string),
+            target_files: vec!["src/lib.rs".into()],
+        }
+    }
+
+    #[test]
+    fn materializes_the_single_audit_shape_and_preserves_launch_metadata_and_raw_text() {
+        let raw = serde_json::json!({
+            "title": " Model title ", "summary": " Summary\n\"quoted\" ",
+            "findings": [{"title": "Avoid cloning", "type": "quality",
+                "description": "Borrow instead", "files": ["src/lib.rs"],
+                "recommendations": ["Use a reference"], "readonly_files": []}]
+        })
+        .to_string();
+        let mut response = ReviewSynthesisResponse::default();
+        let mut streamed = String::new();
+        for ch in raw.chars() {
+            if let Some(delta) = response.push_chunk(&ch.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, " Summary\n\"quoted\" ");
+        let review = response.finish(metadata(Some("Prompt fallback"))).unwrap();
+        assert_eq!(review.id, "launch-review");
+        assert_eq!(review.created_at, 42);
+        assert_eq!(review.model, ModelRef::openrouter("test/reviewer"));
+        assert_eq!(review.title, "Model title");
+        assert_eq!(review.description.as_deref(), Some("Summary\n\"quoted\""));
+        assert_eq!(review.user_prompt.as_deref(), Some("Prompt fallback"));
+        assert_eq!(review.target_files, ["src/lib.rs"]);
+        assert_eq!(review.raw_markdown, raw);
+        assert_eq!(review.items.len(), 1);
+        assert!(is_valid_uuid_v7(review.items[0].uuid.as_deref().unwrap()));
+        assert!(review.groups.is_empty());
+        assert!(review.post_analysis.is_none());
+        assert!(review.launch_config.is_none());
+    }
+
+    #[test]
+    fn title_and_description_fallback_keep_first_line_and_unicode_limits() {
+        let prompt = format!("  {}  \nIgnored second line", "界".repeat(70));
+        let mut response = ReviewSynthesisResponse::default();
+        response.push_chunk(r#"{"title":" ","summary":" ","findings":[]}"#);
+        let review = response.finish(metadata(Some(&prompt))).unwrap();
+        assert_eq!(review.title, "界".repeat(60));
+        assert_eq!(review.description.as_deref(), Some(prompt.as_str()));
+        let mut response = ReviewSynthesisResponse::default();
+        response.push_chunk(r#"{"findings":[]}"#);
+        let review = response
+            .finish(metadata(Some("  \nDo not use the second line")))
+            .unwrap();
+        assert_eq!(review.title, "Review 42");
+        assert!(review.items.is_empty());
+    }
+
+    #[test]
+    fn reset_discards_partial_json_and_nonempty_unstructured_output_stays_a_finding() {
+        let mut response = ReviewSynthesisResponse::default();
+        response.push_chunk("{\"summary\":\"abandoned prefix");
+        response.reset();
+        let raw = "A non-JSON review that must remain visible.";
+        response.push_chunk(raw);
+        let review = response.finish(metadata(None)).unwrap();
+        assert_eq!(review.raw_markdown, raw);
+        assert_eq!(review.items.len(), 1);
+        assert!(review.items[0].body.contains(raw));
+        assert!(is_valid_uuid_v7(review.items[0].uuid.as_deref().unwrap()));
+        assert!(!review.raw_markdown.contains("abandoned"));
+    }
+
+    #[test]
+    fn empty_response_retains_its_existing_refusal() {
+        let mut response = ReviewSynthesisResponse::default();
+        response.push_chunk(" \n ");
+        let error = response.finish(metadata(None)).unwrap_err();
+        assert_eq!(error.to_string(), "Model returned an empty review");
+    }
+}

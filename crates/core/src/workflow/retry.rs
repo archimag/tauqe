@@ -1,8 +1,13 @@
+use crate::edits::EditCreate;
+use crate::edits::EditDelete;
+use crate::edits::EditLineAnchor;
+use crate::edits::EditMove;
+use crate::edits::EditMoveDir;
+use crate::edits::EditOperation;
+use crate::edits::EditOverwrite;
+use crate::edits::EditReplace;
+use crate::workflow::PatchStrategy;
 use std::collections::{HashMap, HashSet};
-use tauqe_protocol::{
-    EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOverwrite,
-    EditReplace, PatchStrategy,
-};
 
 use crate::context::ContextManager;
 use crate::edits::strategy::StrategyProfile;

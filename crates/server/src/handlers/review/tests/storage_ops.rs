@@ -13,9 +13,10 @@ use crate::state::AppState;
 use crate::transport::OutChannel;
 
 use tauqe_core::config::AppConfig;
+use tauqe_core::review::ReviewSession;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::discussion::DiscussionFocus;
-use tauqe_protocol::{errors, events, Request, RequestId, ReviewGetResult, ReviewSession};
+use tauqe_protocol::{errors, events, Request, RequestId, ReviewGetResult};
 
 /// Builds the harness state a read-path regression test runs against.
 fn state_over(root: std::path::PathBuf) -> Arc<AppState> {

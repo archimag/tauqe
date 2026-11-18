@@ -1,4 +1,5 @@
-use tauqe_protocol::{ContextAccess, EditProtocolKind};
+use crate::context::ContextAccess;
+use crate::workflow::EditProtocolKind;
 
 pub mod structured;
 pub(crate) mod utils;

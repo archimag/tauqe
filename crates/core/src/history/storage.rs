@@ -165,7 +165,7 @@ impl SessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::HistoryFileChange;
+    use crate::history::HistoryFileChange;
     use tempfile::tempdir;
 
     #[test]

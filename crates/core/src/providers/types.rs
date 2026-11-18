@@ -1,9 +1,26 @@
 use std::borrow::Cow;
 
+use crate::models::{ModelRef, ModelRole};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{EditFileOp, EditFileStatus, ModelRef, ModelRole, ModelUsageInfo};
 
-pub use tauqe_protocol::ReasoningEffort;
+use crate::edits::EditFileOp;
+use crate::edits::EditFileStatus;
+
+pub use crate::models::ReasoningEffort;
+
+/// Token and cost metrics reported by a model provider.
+///
+/// Missing optional metrics remain unknown until the provider supplies them.
+/// This engine value has no RPC serialization contract.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelUsageInfo {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub reasoning_tokens: Option<u32>,
+    pub cached_tokens: Option<u32>,
+    pub cost: Option<f64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -56,10 +73,6 @@ impl ChatMessage {
             content: content.into(),
         }
     }
-
-    pub fn text(&self) -> &str {
-        &self.content
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,7 +99,7 @@ pub enum StreamEvent {
     TextDelta(String),
 
     // Context streaming events
-    ContextChanged(tauqe_protocol::ContextState),
+    ContextChanged(crate::context::ContextState),
 
     // Semantic edit streaming events
     EditStarted,
@@ -127,7 +140,7 @@ pub enum StreamEvent {
 
     // Turn phase and toolchain telemetry
     TurnPhase {
-        phase: tauqe_protocol::TurnPhase,
+        phase: crate::workflow::turn::TurnPhase,
         round: Option<usize>,
         max_rounds: Option<usize>,
         detail: Option<String>,

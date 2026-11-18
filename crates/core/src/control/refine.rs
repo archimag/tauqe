@@ -39,10 +39,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::models::{ArchitectTier, ModelRole, ProviderKind};
+use crate::workflow::turn::TurnPhase;
 use async_trait::async_trait;
-use tauqe_protocol::{
-    ArchitectTier, CapabilityTree, LlmCapability, ModelRole, ProviderKind, TurnPhase,
-};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::ModelsConfig;

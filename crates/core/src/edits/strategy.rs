@@ -17,7 +17,7 @@
 //! field of a profile is required, so a partially described strategy cannot be
 //! introduced by accident.
 
-use tauqe_protocol::PatchStrategy;
+use crate::workflow::PatchStrategy;
 
 use super::EditError;
 

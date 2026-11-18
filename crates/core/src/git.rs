@@ -355,7 +355,7 @@ pub mod state {
 
     use std::path::Path;
 
-    use tauqe_protocol::RepositoryState;
+    pub use tauqe_tools::git::state::RepositoryState;
 
     pub use tauqe_tools::git::state::{
         changed_worktree_paths, detect_upstream_branch, get_repository_state, gitignored_paths,
@@ -392,6 +392,15 @@ pub use state::{
     detect_upstream_branch, get_repository_state, init_repository, is_git_repository,
     list_repository_files,
 };
+
+/// Reject option-shaped or empty revisions before invoking Git plumbing.
+pub fn validate_revision(revision: &str) -> Result<String, &'static str> {
+    let revision = revision.trim();
+    if revision.is_empty() || revision.starts_with('-') {
+        return Err("Invalid revision: expected a non-empty revision not starting with '-'");
+    }
+    Ok(revision.into())
+}
 
 #[cfg(test)]
 mod tests {

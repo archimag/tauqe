@@ -1,6 +1,8 @@
 //! Prompt assembly and model round execution for control loops.
 
-use tauqe_protocol::{ContextAccess, ModelRef, PatchStrategy, ReasoningEffort};
+use crate::context::ContextAccess;
+use crate::models::{ModelRef, ReasoningEffort};
+use crate::workflow::PatchStrategy;
 use tokio::sync::mpsc;
 
 use super::context::LoopContext;
@@ -33,7 +35,7 @@ pub struct PromptBuilder<'a> {
     pub(crate) patch_strategy: PatchStrategy,
     workflow: String,
     pub(crate) outer_docs: Vec<OuterDocEntry>,
-    pub(crate) project_config: Option<tauqe_protocol::ProjectConfig>,
+    pub(crate) project_config: Option<crate::config::project::ProjectConfig>,
     /// Introductory brief of the turn, owned by the loop that drives it.
     pub(crate) turn_brief: Option<TurnBrief>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -554,7 +556,7 @@ async fn execute_round_inner(
         let protocol_errors: Vec<_> = commands
             .iter()
             .filter_map(|c| match c {
-                tauqe_protocol::LlmCommand::ProtocolError { message, .. } => Some(message.as_str()),
+                crate::llm::LlmCommand::ProtocolError { message, .. } => Some(message.as_str()),
                 _ => None,
             })
             .collect();
@@ -628,11 +630,13 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink, LoopContext};
+    use crate::llm::CapabilityTree;
+    use crate::llm::LlmCapability;
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{CapabilityTree, LlmCapability, ModelRef};
 
     /// A round appends its own pair and never rewrites the head of the turn.
     ///
@@ -712,10 +716,10 @@ mod tests {
 
         let mut context = ContextManager::new(root.clone());
         context
-            .add_file("a.rs", tauqe_protocol::ContextAccess::Editable)
+            .add_file("a.rs", crate::context::ContextAccess::Editable)
             .unwrap();
         context
-            .add_file("b.rs", tauqe_protocol::ContextAccess::ReadOnly)
+            .add_file("b.rs", crate::context::ContextAccess::ReadOnly)
             .unwrap();
 
         let mut journal = TurnResearchJournal::default();

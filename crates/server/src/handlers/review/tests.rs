@@ -12,9 +12,10 @@ use std::time::Duration;
 use crate::handlers::common::test_support::scratch_root;
 use crate::state::AppState;
 use crate::transport::{OutChannel, BACKLOG_HIGH_WATER};
+use tauqe_core::plan::PlanItemStatus;
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{IssueStatus, PlanItemStatus, ReviewItem, ReviewSession};
+use tauqe_core::review::{IssueStatus, ReviewItem, ReviewSession};
 use tokio::sync::{mpsc, watch};
 
 mod batch;
@@ -115,15 +116,15 @@ fn test_state(dir: &TestDir) -> Arc<AppState> {
     )
 }
 
-fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_protocol::ReviewIssue {
-    tauqe_protocol::ReviewIssue {
+fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_core::review::ReviewIssue {
+    tauqe_core::review::ReviewIssue {
         id,
         title: format!("Finding {}", id),
         uuid: None,
         commit: None,
         group: None,
         model: None,
-        issue_type: tauqe_protocol::IssueType::Quality,
+        issue_type: tauqe_core::review::IssueType::Quality,
         status,
         description: "Details".to_string(),
         recommendations: Vec::new(),
@@ -137,12 +138,12 @@ fn make_tasks(review_id: &str, ids: &[u32]) -> Vec<(String, u32)> {
     ids.iter().map(|id| (review_id.to_string(), *id)).collect()
 }
 
-fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSession {
+fn test_session(id: &str, items: Vec<tauqe_core::review::ReviewIssue>) -> ReviewSession {
     ReviewSession {
         id: id.to_string(),
         title: format!("Session {}", id),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: tauqe_core::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec!["foo.rs".to_string()],
@@ -156,7 +157,7 @@ fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSess
 
 fn test_config() -> tauqe_core::config::AppConfig {
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = false;
     config
 }
@@ -215,8 +216,8 @@ fn subplan_item(
     title: &str,
     status: PlanItemStatus,
     files: Vec<&str>,
-) -> tauqe_protocol::PlanItem {
-    tauqe_protocol::PlanItem {
+) -> tauqe_core::plan::PlanItem {
+    tauqe_core::plan::PlanItem {
         id: id.to_string(),
         title: title.to_string(),
         status,
@@ -231,16 +232,16 @@ fn save_grouped_session(
     dir: &TestDir,
     review_id: &str,
     group_id: &str,
-    subplan: Vec<tauqe_protocol::PlanItem>,
+    subplan: Vec<tauqe_core::plan::PlanItem>,
 ) {
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.group = Some(group_id.to_string());
     let mut session = test_session(review_id, vec![item]);
-    session.groups = vec![tauqe_protocol::ReviewGroup {
+    session.groups = vec![tauqe_core::review::ReviewGroup {
         id: group_id.to_string(),
         title: format!("Group {group_id}"),
-        kind: tauqe_protocol::review::ReviewGroupKind::Architectural,
-        implementation: tauqe_protocol::PlanImplementation {
+        kind: tauqe_core::review::ReviewGroupKind::Architectural,
+        implementation: tauqe_core::plan::PlanImplementation {
             items: subplan,
             ..Default::default()
         },
@@ -254,10 +255,10 @@ fn architectural_session(review_id: &str, group_id: &str) -> ReviewSession {
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.group = Some(group_id.to_string());
     let mut session = test_session(review_id, vec![item]);
-    session.groups = vec![tauqe_protocol::ReviewGroup {
+    session.groups = vec![tauqe_core::review::ReviewGroup {
         id: group_id.to_string(),
         title: format!("Group {group_id}"),
-        kind: tauqe_protocol::review::ReviewGroupKind::Architectural,
+        kind: tauqe_core::review::ReviewGroupKind::Architectural,
         ..Default::default()
     }];
     session
@@ -302,8 +303,8 @@ impl InterruptedAttemptProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for InterruptedAttemptProvider {
-    fn kind(&self) -> tauqe_protocol::ProviderKind {
-        tauqe_protocol::ProviderKind::OpenRouter
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
     }
 
     async fn stream_chat(

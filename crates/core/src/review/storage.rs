@@ -7,8 +7,8 @@ pub use post_analysis::FindingAssignment;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::review::ReviewSession;
 use std::sync::{Mutex, MutexGuard};
-use tauqe_protocol::{ReviewSession, ReviewSummary};
 use tauqe_tools::atomic_write::write_atomic;
 
 pub struct ReviewStorage;
@@ -36,12 +36,12 @@ impl ReviewStorage {
     }
 
     /// Returns the directory path for local review sessions: `<repo_root>/.tauqe/reviews`.
-    pub fn reviews_dir(repo_root: &Path) -> PathBuf {
+    fn reviews_dir(repo_root: &Path) -> PathBuf {
         repo_root.join(".tauqe").join("reviews")
     }
 
     /// Sanitizes an arbitrary ID into a safe file name.
-    pub fn sanitize_id(id: &str) -> String {
+    fn sanitize_id(id: &str) -> String {
         let sanitized: String = id
             .chars()
             .map(|c| {
@@ -60,12 +60,6 @@ impl ReviewStorage {
         }
     }
 
-    /// Lists summaries of all review sessions, ordered chronologically.
-    pub fn list_summaries(repo_root: &Path) -> Result<Vec<ReviewSummary>> {
-        let reviews = Self::load_all(repo_root)?;
-        Ok(reviews.into_iter().map(|r| r.summary()).collect())
-    }
-
     /// Lists all review sessions from `.tauqe/reviews`, ordered by `created_at` descending.
     pub fn list_reviews(repo_root: &Path) -> Result<Vec<ReviewSession>> {
         Self::load_all(repo_root)
@@ -74,8 +68,8 @@ impl ReviewStorage {
     /// Migrates a legacy single-file review dump into per-session files.
     ///
     /// Earlier Tauqe versions kept the latest review session in a single
-    /// `.tauqe/reviews/latest.json` file. This runs exactly once at daemon
-    /// startup: when the legacy file is present it is read, written back as
+    /// `.tauqe/reviews/latest.json` file. This runs when core opens a repository
+    /// session: when the legacy file is present it is read, written back as
     /// `<session-id>.json`, and removed. Keeping the migration on the startup
     /// path (and never on reads) keeps listing and loading free of write side
     /// effects and preserves deterministic read behavior.

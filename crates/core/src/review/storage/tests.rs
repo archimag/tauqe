@@ -1,10 +1,11 @@
 use super::*;
-use std::path::Path;
-use tauqe_protocol::{
-    ArchitectTier, IssueStatus, IssueType, PlanImplementation, PlanItem, ReviewGroup,
-    ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession, ReviewSeverity,
-    DEFAULT_REVIEW_GROUP_ID,
+use crate::models::ArchitectTier;
+use crate::plan::{PlanImplementation, PlanItem};
+use crate::review::{
+    IssueStatus, IssueType, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
+    ReviewSeverity, DEFAULT_REVIEW_GROUP_ID,
 };
+use std::path::Path;
 use tempfile::tempdir;
 
 /// Canonical finding identifier exercised by the identity assertions.
@@ -12,7 +13,7 @@ const FINDING_UUID: &str = "018f9c1e-6b3a-7c1e-8b3a-000000000001";
 
 /// Architect provenance recorded by the synthesis primitive under test.
 fn test_architect() -> ArchitectTier {
-    ArchitectTier::new(tauqe_protocol::ModelRef::openrouter("test/architect"), None)
+    ArchitectTier::new(crate::models::ModelRef::openrouter("test/architect"), None)
 }
 
 #[test]
@@ -24,7 +25,7 @@ fn test_review_storage_crud_and_active() {
         id: "rev-sec-1".to_string(),
         title: "Security Audit".to_string(),
         created_at: 1000,
-        model: tauqe_protocol::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+        model: crate::models::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
         description: Some("Initial security scan".to_string()),
         user_prompt: Some("focus on security".to_string()),
         target_files: vec!["crates/core/src/lib.rs".to_string()],
@@ -131,8 +132,8 @@ fn test_concurrent_review_updates_are_serialized_without_lost_writes() {
             commit: None,
             group: None,
             model: None,
-            issue_type: tauqe_protocol::IssueType::Quality,
-            severity: tauqe_protocol::ReviewSeverity::Suggestion,
+            issue_type: crate::review::IssueType::Quality,
+            severity: crate::review::ReviewSeverity::Suggestion,
             status: IssueStatus::Todo,
             recommendations: vec![],
             files: vec![],
@@ -146,7 +147,7 @@ fn test_concurrent_review_updates_are_serialized_without_lost_writes() {
         id: "concurrent-review".to_string(),
         title: "Concurrent Review".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -194,7 +195,7 @@ fn test_load_all_skips_corrupted_files() {
         id: "valid-review".to_string(),
         title: "Valid Review".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -221,7 +222,7 @@ fn test_save_session_reuses_differing_filename_instead_of_duplicating() {
         id: "Review One".to_string(),
         title: "First".to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -240,7 +241,7 @@ fn test_save_session_reuses_differing_filename_instead_of_duplicating() {
         id: "review one".to_string(),
         title: "Second".to_string(),
         created_at: 2,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -276,7 +277,7 @@ fn test_delete_review_resolves_differing_filename() {
         id: "Legacy Review".to_string(),
         title: "Legacy".to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -302,7 +303,7 @@ fn test_save_session_detects_sanitized_id_collision() {
         id: "team/auth".to_string(),
         title: "Team Auth".to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -317,7 +318,7 @@ fn test_save_session_detects_sanitized_id_collision() {
         id: "team-auth".to_string(),
         title: "Team Auth Alternate".to_string(),
         created_at: 2,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -347,7 +348,7 @@ fn test_load_and_delete_respect_sanitized_id_collision() {
         id: "team/auth".to_string(),
         title: "Team Auth".to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -378,7 +379,7 @@ fn test_update_session_item_targets_only_the_named_session() {
         id: id.to_string(),
         title: id.to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -435,7 +436,7 @@ fn test_atomic_writes_leave_no_temp_files() {
         id: "atomic-review".to_string(),
         title: "Atomic".to_string(),
         created_at: 1,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -471,7 +472,7 @@ async fn test_review_storage_lifecycle_on_multi_thread_runtime() {
         id: "runtime-review".to_string(),
         title: "Runtime Review".to_string(),
         created_at: 500,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -538,7 +539,7 @@ fn test_review_storage_extended_fields_persistence() {
         id: "rev-ext-1".to_string(),
         title: "Extended Fields Audit".to_string(),
         created_at: 2000,
-        model: tauqe_protocol::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+        model: crate::models::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
         description: Some("Persistence check".to_string()),
         user_prompt: None,
         target_files: vec!["crates/core/src/lib.rs".to_string()],
@@ -644,7 +645,7 @@ fn test_update_session_item_preserves_the_exact_issue_category() {
         id: "rev-category-fidelity".to_string(),
         title: "Category Fidelity".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: None,
         user_prompt: None,
         target_files: vec![],
@@ -697,7 +698,7 @@ fn test_regroup_session_replaces_groups_and_keeps_findings() {
         id: "rev-post-analysis".to_string(),
         title: "Post Analysis".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         items: vec![ReviewItem {
             id: 1,
             title: "Finding".to_string(),
@@ -819,7 +820,7 @@ fn test_append_group_findings_stamps_uuid_and_group() {
         id: "rev-group-append".to_string(),
         title: "Group Append".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         items: Vec::new(),
         raw_markdown: String::new(),
         ..Default::default()
@@ -886,7 +887,7 @@ fn grouped_layer_session(review_id: &str, subplan: Vec<PlanItem>) -> ReviewSessi
         id: review_id.to_string(),
         title: "Grouped Audit".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         description: Some("One shared root cause.".to_string()),
         groups: vec![ReviewGroup {
             id: "arch-1".to_string(),
@@ -914,18 +915,18 @@ fn test_update_group_subplan_normalizes_derived_container_statuses() {
     let subplan = vec![PlanItem {
         id: "phase-1".to_string(),
         title: "Phase".to_string(),
-        status: tauqe_protocol::PlanItemStatus::Done,
+        status: crate::plan::PlanItemStatus::Done,
         children: vec![
             PlanItem {
                 id: "p-1".to_string(),
                 title: "Finished step".to_string(),
-                status: tauqe_protocol::PlanItemStatus::Done,
+                status: crate::plan::PlanItemStatus::Done,
                 ..Default::default()
             },
             PlanItem {
                 id: "p-2".to_string(),
                 title: "Pending step".to_string(),
-                status: tauqe_protocol::PlanItemStatus::Todo,
+                status: crate::plan::PlanItemStatus::Todo,
                 ..Default::default()
             },
         ],
@@ -937,7 +938,7 @@ fn test_update_group_subplan_normalizes_derived_container_statuses() {
     assert_eq!(updated.implementation.items.len(), 1);
     assert_eq!(
         updated.implementation.items[0].status,
-        tauqe_protocol::PlanItemStatus::InProgress
+        crate::plan::PlanItemStatus::InProgress
     );
 
     // The horizon belongs to the group, so it survives a reload with the
@@ -946,7 +947,7 @@ fn test_update_group_subplan_normalizes_derived_container_statuses() {
     assert_eq!(stored.groups[0].implementation.items.len(), 1);
     assert_eq!(
         stored.groups[0].implementation.items[0].status,
-        tauqe_protocol::PlanItemStatus::InProgress
+        crate::plan::PlanItemStatus::InProgress
     );
 
     // An unknown group resolves to nothing and never rewrites the layer.
@@ -968,13 +969,13 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
         PlanItem {
             id: "s-1".to_string(),
             title: "Finished step".to_string(),
-            status: tauqe_protocol::PlanItemStatus::Done,
+            status: crate::plan::PlanItemStatus::Done,
             ..Default::default()
         },
         PlanItem {
             id: "s-2".to_string(),
             title: "Old step".to_string(),
-            status: tauqe_protocol::PlanItemStatus::Todo,
+            status: crate::plan::PlanItemStatus::Todo,
             ..Default::default()
         },
     ];
@@ -984,13 +985,13 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
         PlanItem {
             id: "s-1".to_string(),
             title: "Stale duplicate".to_string(),
-            status: tauqe_protocol::PlanItemStatus::Todo,
+            status: crate::plan::PlanItemStatus::Todo,
             ..Default::default()
         },
         PlanItem {
             id: "s-3".to_string(),
             title: "New step".to_string(),
-            status: tauqe_protocol::PlanItemStatus::Todo,
+            status: crate::plan::PlanItemStatus::Todo,
             files: vec!["src/new_step.rs".to_string()],
             ..Default::default()
         },
@@ -1010,7 +1011,7 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
     let finished = &updated.implementation.items[0];
     let synthesized = &updated.implementation.items[1];
     assert_eq!(finished.id, "s-1");
-    assert_eq!(finished.status, tauqe_protocol::PlanItemStatus::Done);
+    assert_eq!(finished.status, crate::plan::PlanItemStatus::Done);
     assert_eq!(synthesized.id, "s-3");
     assert_eq!(updated.implementation.architect, Some(test_architect()));
     assert_eq!(
@@ -1075,7 +1076,7 @@ fn architectural_group(id: &str) -> ReviewGroup {
             items: vec![PlanItem {
                 id: "step-1".to_string(),
                 title: "Fix the root cause".to_string(),
-                status: tauqe_protocol::PlanItemStatus::Todo,
+                status: crate::plan::PlanItemStatus::Todo,
                 files: vec!["src/root_cause.rs".to_string()],
                 ..Default::default()
             }],
@@ -1116,7 +1117,7 @@ fn test_update_session_group_findings_transitions_the_whole_group() {
         id: review.to_string(),
         title: "Grouped Lifecycle".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![architectural_group("arch-1"), simple_group("local")],
         items: vec![
             group_finding(1, Some("arch-1")),
@@ -1189,7 +1190,7 @@ fn test_update_session_group_findings_resolves_the_implicit_default_group() {
         id: review.to_string(),
         title: "Implicit Default".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![
             simple_group(DEFAULT_REVIEW_GROUP_ID),
             architectural_group("arch-1"),
@@ -1226,7 +1227,7 @@ fn test_update_session_group_findings_rejects_unknown_targets() {
         id: review.to_string(),
         title: "Unknown Targets".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![architectural_group("arch-1"), simple_group("local")],
         items: vec![group_finding(1, Some("arch-1"))],
         ..Default::default()
@@ -1267,7 +1268,7 @@ fn test_set_group_blocked_reason_records_and_clears_the_blocker() {
         id: review.to_string(),
         title: "Group Blocker".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![architectural_group("arch-1"), simple_group("local")],
         items: vec![group_finding(1, Some("arch-1"))],
         ..Default::default()
@@ -1344,7 +1345,7 @@ fn test_apply_group_decision_clears_the_blocker_and_stamps_the_members() {
         id: review.to_string(),
         title: "Group Decision".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![blocked_group, simple_group("local")],
         items: vec![
             group_finding(1, Some("arch-1")),
@@ -1457,7 +1458,7 @@ fn test_close_group_implementation_closes_only_open_findings() {
         id: review.to_string(),
         title: "Group Completion".to_string(),
         created_at: 100,
-        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        model: crate::models::ModelRef::openrouter("test-model"),
         groups: vec![blocked, simple_group("local")],
         items: vec![
             finding_with(1, Some("arch-1"), IssueStatus::Discussion, None),

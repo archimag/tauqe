@@ -22,8 +22,14 @@
 //! Nothing is detected here: a repository either declares the commands it runs
 //! or runs nothing at all.
 
+use crate::toolchain::config::{ProjectConfig, ProjectParameterSpec};
 mod commands;
+pub mod config;
+mod diagnostic;
 mod diagnostics;
+pub use diagnostic::{
+    format_diagnostics, Diagnostic, DiagnosticSeverity, ProjectHookOutcome, ProjectPostHookResponse,
+};
 pub(crate) mod exec;
 mod fmt;
 mod report;
@@ -32,9 +38,6 @@ pub mod runner;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tauqe_protocol::{
-    Diagnostic, ProjectConfig, ProjectHookOutcome, ProjectParameterSpec, ProjectPostHookResponse,
-};
 use tokio::sync::watch;
 
 pub use fmt::{format_with_project_config, InMemoryFormatOutcome};

@@ -24,7 +24,7 @@
 
 use crate::context::ContextFileContent;
 use crate::prompt::ContextBlockCache;
-use tauqe_protocol::PatchStrategy;
+use crate::workflow::PatchStrategy;
 
 use super::{AddedFileContent, ResearchRoundOutcome};
 
@@ -64,15 +64,14 @@ impl TurnResearchJournal {
     /// [`Self::render_round_feedback`] renders that round alone. The cumulative
     /// tail keeps the whole turn's investigation, so the boundary narrows what a
     /// round reports without losing what an earlier round learned.
-    pub fn begin_round(&mut self, index: usize) {
+    pub(crate) fn begin_round(&mut self, index: usize) {
         self.round = RoundSection {
             index: Some(index),
             ..RoundSection::default()
         };
     }
 
-    /// Returns the ordinal of the round currently open, `0` before the first.
-    pub fn round_index(&self) -> usize {
+    pub(crate) fn round_index(&self) -> usize {
         self.round.index.unwrap_or(0)
     }
 
@@ -81,7 +80,7 @@ impl TurnResearchJournal {
     /// Under [`PatchStrategy::LineAnchor`] an element carries the opaque anchor
     /// of every line, exactly as the context block of the round does, so the
     /// feedback of a round addresses the bytes it delivered.
-    pub fn set_patch_strategy(&mut self, patch_strategy: PatchStrategy) {
+    pub(crate) fn set_patch_strategy(&mut self, patch_strategy: PatchStrategy) {
         self.patch_strategy = patch_strategy;
     }
 
@@ -90,7 +89,7 @@ impl TurnResearchJournal {
     /// Blank blocks carry no knowledge and are dropped. A block identical to one
     /// already recorded is dropped too: the turn tail only ever grows with
     /// genuinely new findings.
-    pub fn push_block(&mut self, block: impl Into<String>) {
+    pub(crate) fn push_block(&mut self, block: impl Into<String>) {
         let block = block.into();
         let block = block.trim();
         if block.is_empty() {
@@ -109,7 +108,7 @@ impl TurnResearchJournal {
     /// learned and never rewrites the context the round already applied. The
     /// delivered files travel beside the blocks, because the feedback of the
     /// round is where the model reads the bytes it just gained.
-    pub fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
+    pub(crate) fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
             self.push_block(block.as_str());
         }
@@ -141,7 +140,7 @@ impl TurnResearchJournal {
     /// of the files it added to the context. Rendering is a pure function of
     /// those records, so rendering the same round twice produces the very same
     /// bytes and never moves a token the provider already cached.
-    pub fn render_round_feedback(&self) -> String {
+    pub(crate) fn render_round_feedback(&self) -> String {
         let mut parts = self.round.blocks.clone();
         if let Some(files) = self.render_round_files() {
             parts.push(files);
@@ -174,17 +173,19 @@ impl TurnResearchJournal {
     }
 
     /// Reports whether the journal holds no findings.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Returns the recorded blocks in the order they were learned.
-    pub fn entries(&self) -> &[String] {
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[String] {
         &self.entries
     }
 
     /// Renders the whole journal as one delimited tail, or `None` when empty.
-    pub fn rendered(&self) -> Option<String> {
+    pub(crate) fn rendered(&self) -> Option<String> {
         if self.entries.is_empty() {
             return None;
         }
@@ -316,7 +317,7 @@ mod tests {
         let mut outcome = ResearchRoundOutcome::default();
         outcome.added_file_contents.push(AddedFileContent {
             path: "src/a.rs".to_string(),
-            access: tauqe_protocol::ContextAccess::ReadOnly,
+            access: crate::context::ContextAccess::ReadOnly,
             content: "alpha\nbeta\n".to_string(),
         });
         journal.record_outcome(&outcome);
@@ -349,7 +350,7 @@ mod tests {
         let mut outcome = ResearchRoundOutcome::default();
         outcome.added_file_contents.push(AddedFileContent {
             path: "src/a.rs".to_string(),
-            access: tauqe_protocol::ContextAccess::Editable,
+            access: crate::context::ContextAccess::Editable,
             content: "alpha\n".to_string(),
         });
         journal.record_outcome(&outcome);

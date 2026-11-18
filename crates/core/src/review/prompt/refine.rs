@@ -1,12 +1,17 @@
-use crate::escape::{escape_xml_text, single_line};
-use tauqe_protocol::review::{ReviewGroup, ReviewItem, ReviewSession};
-use tauqe_protocol::PlanItem;
+use crate::escape::escape_xml_text;
+#[cfg(test)]
+use crate::escape::single_line;
+#[cfg(test)]
+use crate::plan::PlanItem;
+#[cfg(test)]
+use crate::review::ReviewGroup;
+use crate::review::ReviewItem;
+#[cfg(test)]
+use crate::review::ReviewSession;
 
 /// Target size range (in changed lines) for one cohesive leaf implementation step.
+#[cfg(test)]
 const LEAF_STEP_TARGET_LINES: (usize, usize) = (150, 400);
-
-/// Maximum supported hierarchy nesting depth for structured plan refinement output.
-pub const MAX_REVIEW_IMPLEMENTATION_DEPTH: usize = 5;
 
 /// A question the engineer already answered on one finding.
 ///
@@ -16,18 +21,18 @@ pub const MAX_REVIEW_IMPLEMENTATION_DEPTH: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedDecision<'a> {
     /// Identifier of the finding the decision resolves.
-    pub finding_id: u32,
+    pub(crate) finding_id: u32,
     /// Title of the finding, as the review stated it.
-    pub title: &'a str,
+    title: &'a str,
     /// The decision itself, as the engineer recorded it.
-    pub decision: &'a str,
+    pub(crate) decision: &'a str,
 }
 
 /// Collects the decisions the engineer already recorded on the findings.
 ///
 /// Every collected decision is the answer the engineer gave in review
 /// discussion, so the questions it settles are no longer open ones.
-pub fn recorded_decisions(findings: &[ReviewItem]) -> Vec<RecordedDecision<'_>> {
+pub(crate) fn recorded_decisions(findings: &[ReviewItem]) -> Vec<RecordedDecision<'_>> {
     findings
         .iter()
         .filter_map(|finding| {
@@ -45,7 +50,8 @@ pub fn recorded_decisions(findings: &[ReviewItem]) -> Vec<RecordedDecision<'_>> 
 ///
 /// A fully decided group has no open question left: every question it raised was
 /// answered by the engineer, so the Architect has nothing to escalate.
-pub fn all_decisions_recorded(findings: &[ReviewItem]) -> bool {
+#[cfg(test)]
+fn all_decisions_recorded(findings: &[ReviewItem]) -> bool {
     if findings.is_empty() {
         return false;
     }
@@ -78,7 +84,8 @@ pub fn has_recorded_decision(finding: &ReviewItem) -> bool {
 /// Dispatched to the Architect role when the findings of one group share a root
 /// cause: the group is the unit of remediation, so the Architect answers with a
 /// single implementation horizon that removes the cause instead of one plan per symptom.
-pub fn build_review_group_refine_system_prompt() -> String {
+#[cfg(test)]
+pub(crate) fn build_review_group_refine_system_prompt() -> String {
     let mut out = String::new();
     out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
     out.push_str("Your mission is Architectural Root-Cause Group Decomposition: analyzing a group of code review findings that share one architectural root cause and synthesizing a single actionable, verifiable implementation plan that eliminates that cause across the whole codebase.\n\n");
@@ -117,6 +124,7 @@ pub fn build_review_group_refine_system_prompt() -> String {
 }
 
 /// Pushes the granularity contract every decomposition prompt states as rule 5.
+#[cfg(test)]
 fn push_step_granularity_contract(out: &mut String) {
     out.push_str("5. Step Granularity and Compilability Invariants:\n");
     out.push_str("   - Every leaf step is executed in an isolated turn with its own toolchain verification gates.\n");
@@ -132,6 +140,7 @@ fn push_step_granularity_contract(out: &mut String) {
 }
 
 /// Pushes the research contract every decomposition prompt states as rule 7.
+#[cfg(test)]
 fn push_architect_research_contract(out: &mut String) {
     out.push_str("7. Architect Research Protocol (Mandatory Contract Verification):\n");
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
@@ -145,6 +154,7 @@ fn push_architect_research_contract(out: &mut String) {
 }
 
 /// Pushes the output contract every decomposition prompt states as rule 8.
+#[cfg(test)]
 fn push_output_format_contract(out: &mut String) {
     out.push_str("8. Output Format:\n");
     out.push_str("   - Output strictly according to the specified JSON schema.\n");
@@ -155,12 +165,13 @@ fn push_output_format_contract(out: &mut String) {
 /// A group replan is the same Architect operation as its initial decomposition:
 /// the failed approach is named in the prompt, so the remaining horizon is
 /// reprojected around it instead of being repeated step by step.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewGroupRefineDiagnostics<'a> {
     /// Identifier of the sub-step whose execution failed.
-    pub failed_step_id: &'a str,
+    failed_step_id: &'a str,
     /// Diagnostic reported by the failed execution, when one is available.
-    pub failure_reason: Option<&'a str>,
+    failure_reason: Option<&'a str>,
 }
 
 /// Renders repository paths as escaped, backticked breadcrumbs.
@@ -173,6 +184,7 @@ pub(super) fn render_path_list(paths: &[String]) -> String {
 }
 
 /// Renders the session preamble every refinement prompt opens with.
+#[cfg(test)]
 fn push_session_preamble(out: &mut String, session: &ReviewSession) {
     out.push_str("## Target Review Session:\n");
     let clean_title = single_line(&session.title);
@@ -192,6 +204,7 @@ fn push_session_preamble(out: &mut String, session: &ReviewSession) {
 }
 
 /// Renders the replanning diagnostics of a failed sub-step.
+#[cfg(test)]
 fn push_replan_diagnostics(
     out: &mut String,
     failed_step: Option<&PlanItem>,
@@ -234,6 +247,7 @@ fn push_replan_diagnostics(
 /// files, and the findings discovery accumulated — is composed by the turn kernel
 /// of the structured contour, so this builder renders the directives alone and
 /// never restates material the kernel already provides.
+#[cfg(test)]
 fn push_developer_directives(out: &mut String, instructions: Option<&str>) {
     if let Some(ins) = instructions {
         let trimmed = ins.trim();
@@ -255,7 +269,8 @@ fn push_developer_directives(out: &mut String, instructions: Option<&str>) {
 /// files — is composed by the turn kernel of the structured contour, so the
 /// builder renders only the group, its findings, the replanning diagnostics, and
 /// the developer directives.
-pub fn build_review_group_refine_user_prompt(
+#[cfg(test)]
+pub(crate) fn build_review_group_refine_user_prompt(
     session: &ReviewSession,
     group: &ReviewGroup,
     findings: &[ReviewItem],
@@ -320,6 +335,7 @@ pub fn build_review_group_refine_user_prompt(
 }
 
 /// Renders one finding of a group as decomposition input.
+#[cfg(test)]
 fn push_group_finding(out: &mut String, finding: &ReviewItem) {
     out.push_str(&format!(
         "### Finding `#{}` [{}] {}\n",
@@ -358,6 +374,7 @@ fn push_group_finding(out: &mut String, finding: &ReviewItem) {
 ///
 /// A recorded decision is one answer the group can no longer ask for, so it is
 /// stated as a requirement ("What") beside the findings it settles.
+#[cfg(test)]
 fn push_recorded_decisions(out: &mut String, decisions: &[RecordedDecision<'_>]) {
     if decisions.is_empty() {
         return;
@@ -376,7 +393,7 @@ fn push_recorded_decisions(out: &mut String, decisions: &[RecordedDecision<'_>])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewIssue};
+    use crate::review::{IssueStatus, IssueType, ReviewIssue};
 
     /// Builds a finding that carries the given recorded decision.
     fn finding(decision: Option<&str>) -> ReviewItem {

@@ -5,7 +5,7 @@
 //! distinct source paths they reference. Raw build noise stays out of the log
 //! while the summary stays analytically useful.
 
-use tauqe_protocol::DiagnosticSeverity;
+use super::DiagnosticSeverity;
 
 use super::ToolchainCheckResult;
 
@@ -269,7 +269,7 @@ warning: unused import: `std::fmt`
 
     #[test]
     fn test_summarize_toolchain_failure_prefers_structured_diagnostics() {
-        use tauqe_protocol::Diagnostic;
+        use super::super::Diagnostic;
 
         let result = ToolchainCheckResult {
             success: false,

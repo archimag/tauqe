@@ -74,7 +74,7 @@ where
     /// Returns the accumulated raw JSON buffer received so far, including any
     /// surrounding markdown code fence.
     #[cfg(test)]
-    pub(crate) fn raw_buffer(&self) -> &str {
+    fn raw_buffer(&self) -> &str {
         &self.buffer
     }
 

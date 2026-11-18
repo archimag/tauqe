@@ -1,5 +1,8 @@
+use crate::context::ContextAccess;
+use crate::git::state::RepositoryState;
 pub mod json;
 pub(crate) mod layout;
+pub mod outer_docs;
 pub mod protocol;
 pub mod refine;
 
@@ -11,12 +14,13 @@ use crate::context::ContextFileContent;
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::history::HistorySnapshot;
+use crate::llm::CapabilityTree;
+use crate::plan::Plan;
 use crate::prompt::layout::assemble_chronological_messages;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
-use tauqe_protocol::{
-    CapabilityTree, ContextAccess, EditProtocolKind, PatchStrategy, Plan, RepositoryState,
-};
+use crate::workflow::EditProtocolKind;
+use crate::workflow::PatchStrategy;
 
 /// Typed kind of the contour that drives a turn.
 ///
@@ -440,7 +444,7 @@ pub(crate) struct PromptAssembly {
     pub(crate) turn_scratchpad: Option<String>,
     max_scratchpad_chars: usize,
     patch_strategy: PatchStrategy,
-    project: Option<tauqe_protocol::ProjectConfig>,
+    project: Option<crate::config::project::ProjectConfig>,
     outer_docs: Vec<crate::config::OuterDocEntry>,
 }
 
@@ -473,7 +477,10 @@ impl PromptAssembly {
         }
     }
 
-    pub(crate) fn with_project(mut self, project: Option<tauqe_protocol::ProjectConfig>) -> Self {
+    pub(crate) fn with_project(
+        mut self,
+        project: Option<crate::config::project::ProjectConfig>,
+    ) -> Self {
         self.project = project;
         self
     }
@@ -523,7 +530,7 @@ impl PromptAssembly {
             self.patch_strategy,
         ));
 
-        if capabilities.contains(tauqe_protocol::LlmCapability::OuterDocRequest) {
+        if capabilities.contains(crate::llm::LlmCapability::OuterDocRequest) {
             if let Some(catalog) = self.format_outer_docs_catalog_block() {
                 prompt.push('\n');
                 prompt.push_str(&catalog);
@@ -942,10 +949,11 @@ mod tests {
 
     #[test]
     fn test_discussion_renders_stub_protocol_instructions_without_json_schema() {
+        use crate::llm::CapabilityTree;
+        use crate::llm::LlmCapability;
+        use crate::llm::{LlmCommand, TextCommand};
         use crate::prompt::protocol::PromptProtocol;
-        use tauqe_protocol::{
-            CapabilityTree, LlmCapability, LlmCommand, PatchStrategy, TextCommand,
-        };
+        use crate::workflow::PatchStrategy;
 
         /// Protocol stub whose only mode text is its own heading.
         struct StubWireProtocol;
@@ -1291,7 +1299,7 @@ mod tests {
             0,
             0,
             vec![],
-            vec![tauqe_protocol::PlanItem {
+            vec![crate::plan::PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 ..Default::default()
@@ -1683,7 +1691,7 @@ mod tests {
     }
     #[test]
     fn test_system_prompt_anchors_project_configuration() {
-        use tauqe_protocol::LlmCapability;
+        use crate::llm::LlmCapability;
 
         let assembly = PromptAssembly::new(
             None,
@@ -2086,7 +2094,7 @@ mod tests {
 
     #[test]
     fn test_outer_docs_catalog_follows_the_capability_surface() {
-        use tauqe_protocol::LlmCapability;
+        use crate::llm::LlmCapability;
 
         let declared = vec![outer_doc("vendor/api.md", "Upstream API notes", None)];
         let built = PromptAssembly::new(

@@ -20,6 +20,7 @@ pub mod plan;
 pub mod prompt;
 pub mod refine;
 pub mod repl;
+pub mod step;
 pub mod turn;
 
 pub use context::{CancellationToken, EventSink, LoopContext};

@@ -1,5 +1,5 @@
+use crate::review::{PostAnalysisMode, ReviewGroup};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::review::{PostAnalysisMode, ReviewGroup};
 
 use crate::review::uuid::generate_uuid_v7;
 

@@ -43,7 +43,7 @@ impl HistoryEntryStatus {
     /// The predicate backs the wire encoding: the ordinary committed state adds
     /// no field, and every payload written before the status existed
     /// deserializes into it.
-    pub fn is_committed(&self) -> bool {
+    fn is_committed(&self) -> bool {
         matches!(self, Self::Committed)
     }
 }
@@ -112,23 +112,6 @@ pub struct HistoryFileChange {
     pub to: Option<String>,
 }
 
-/// Retired display prefix of a move record, whose remainder is `from -> to`.
-const LEGACY_MOVE_PREFIX: &str = "[MOVE] ";
-
-/// Separator between the move source and its destination in the retired format.
-const LEGACY_MOVE_ARROW: &str = " -> ";
-
-/// Retired display prefixes and the operations they denoted.
-///
-/// The prefixes are disjoint, so the table is a direct decoding of the format
-/// that existing sessions already contain on disk.
-const LEGACY_DISPLAY_PREFIXES: &[(&str, EditFileOp)] = &[
-    ("[NEW] ", EditFileOp::Create),
-    ("[DEL] ", EditFileOp::Delete),
-    ("[OVERWRITE] ", EditFileOp::Overwrite),
-    ("[EDIT] ", EditFileOp::Replace),
-];
-
 impl HistoryFileChange {
     /// Builds a record that only names a path.
     pub fn plain(path: impl Into<String>) -> Self {
@@ -164,33 +147,6 @@ impl HistoryFileChange {
             op: Some(EditFileOp::MoveDir),
             to: Some(to.into()),
         }
-    }
-
-    /// Decodes one file entry written by the retired display-prefix format.
-    ///
-    /// Compatibility note (Conventions §1.5): history records persisted before
-    /// this type existed flattened the file operation into display prefixes
-    /// (`[NEW] `, `[DEL] `, `[OVERWRITE] `, `[MOVE] from -> to`, `[EDIT] `).
-    /// This parser exists solely to migrate those already-stored strings into
-    /// typed records on read. It never participates in writing or rendering new
-    /// data: the operation is authored once by the producer and travels typed.
-    ///
-    /// A legacy string that genuinely begins with a prefix is indistinguishable
-    /// from an annotated one, which is exactly why the format is retired; such a
-    /// value decodes into the operation its prefix names. Anything unrecognized
-    /// falls back to a plain record so a foreign entry never fails to load.
-    pub fn from_legacy_display(raw: &str) -> Self {
-        if let Some(rest) = raw.strip_prefix(LEGACY_MOVE_PREFIX) {
-            if let Some((from, to)) = rest.split_once(LEGACY_MOVE_ARROW) {
-                return Self::moved(from, to);
-            }
-        }
-        for (prefix, op) in LEGACY_DISPLAY_PREFIXES {
-            if let Some(path) = raw.strip_prefix(prefix) {
-                return Self::operated(*op, path);
-            }
-        }
-        Self::plain(raw)
     }
 }
 
@@ -391,62 +347,6 @@ mod tests {
         let parsed: HistoryFileChange =
             serde_json::from_value(serde_json::json!({ "path": "src/lib.rs" })).unwrap();
         assert_eq!(parsed, HistoryFileChange::plain("src/lib.rs"));
-    }
-
-    #[test]
-    fn test_history_file_change_from_legacy_display_prefixes() {
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[NEW] src/new.rs"),
-            HistoryFileChange::operated(EditFileOp::Create, "src/new.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[DEL] src/old.rs"),
-            HistoryFileChange::operated(EditFileOp::Delete, "src/old.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[OVERWRITE] src/gen.rs"),
-            HistoryFileChange::operated(EditFileOp::Overwrite, "src/gen.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[EDIT] src/lib.rs"),
-            HistoryFileChange::operated(EditFileOp::Replace, "src/lib.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[MOVE] src/a.rs -> src/b.rs"),
-            HistoryFileChange::moved("src/a.rs", "src/b.rs")
-        );
-    }
-
-    #[test]
-    fn test_history_file_change_from_legacy_display_move_arrow_split() {
-        // The split happens on the first arrow, so an arrow inside the source or
-        // destination path does not shift where the destination begins.
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[MOVE] a -> b -> c"),
-            HistoryFileChange::moved("a", "b -> c")
-        );
-
-        // A move marker without an arrow is not a move and stays a plain record.
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[MOVE] src/a.rs"),
-            HistoryFileChange::plain("[MOVE] src/a.rs")
-        );
-    }
-
-    #[test]
-    fn test_history_file_change_from_legacy_display_falls_back_to_plain() {
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("src/plain.rs"),
-            HistoryFileChange::plain("src/plain.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display("[EDIT]src/no-space.rs"),
-            HistoryFileChange::plain("[EDIT]src/no-space.rs")
-        );
-        assert_eq!(
-            HistoryFileChange::from_legacy_display(""),
-            HistoryFileChange::plain("")
-        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use super::ToolchainCheckResult;
 
 /// Environment variable that carries the repository-relative path of the file
 /// whose staged content is streamed through a project filter.
-pub(super) const FILE_PATH_ENV: &str = "TAUQE_FILE_PATH";
+const FILE_PATH_ENV: &str = "TAUQE_FILE_PATH";
 
 /// A program together with its literal argument list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,7 +386,7 @@ pub(crate) fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_pid: u32) {}
 
-pub(super) async fn wait_for_cancel(mut rx: watch::Receiver<bool>) {
+async fn wait_for_cancel(mut rx: watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
     }
@@ -679,7 +679,7 @@ where
 /// descendant tree is killed. The child is then terminated on every platform and
 /// collected so no zombie survives and its PID is released only after the group
 /// signal has been delivered.
-pub(super) async fn kill_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
+async fn kill_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         kill_process_group(pid);
     }

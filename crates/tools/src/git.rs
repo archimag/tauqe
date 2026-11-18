@@ -47,7 +47,7 @@ pub enum GitHooks {
 
 impl GitHooks {
     /// Reports whether a commit must bypass the repository hooks.
-    pub fn bypasses(self) -> bool {
+    fn bypasses(self) -> bool {
         matches!(self, Self::Bypass)
     }
 }

@@ -17,7 +17,24 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use tauqe_protocol::{LocaleGenerateParams, LocaleGenerateResult};
+/// Input catalog owned by the translation engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleCatalogItem {
+    pub key: String,
+    pub english: String,
+    pub context: String,
+    pub max_width: Option<u16>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleGenerateParams {
+    pub language: String,
+    pub items: Vec<LocaleCatalogItem>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleGenerateResult {
+    pub language: String,
+    pub translations: BTreeMap<String, String>,
+}
 
 use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -247,7 +264,6 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::LocaleCatalogItem;
 
     fn item(key: &str, english: &str, max_width: Option<u16>) -> LocaleCatalogItem {
         LocaleCatalogItem {

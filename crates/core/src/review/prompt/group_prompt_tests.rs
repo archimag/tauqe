@@ -6,10 +6,11 @@
 //! the prompts the Architect and the sub-step turn actually render.
 
 use super::*;
-use tauqe_protocol::review::{
+use crate::plan::{Plan, PlanItem, PlanItemStatus};
+use crate::review::{
     IssueType, ReviewGroup, ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
 };
-use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
+use crate::workflow::EditProtocolKind;
 
 /// Builds a group whose shared root cause every prompt must carry.
 fn group() -> ReviewGroup {

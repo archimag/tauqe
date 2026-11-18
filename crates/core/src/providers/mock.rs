@@ -9,8 +9,9 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use crate::models::ProviderKind;
+use crate::providers::ModelUsageInfo;
 use async_trait::async_trait;
-use tauqe_protocol::{ModelUsageInfo, ProviderKind};
 use tokio::sync::{mpsc, watch};
 
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};

@@ -288,7 +288,8 @@ impl ResponseError {
         }
     }
 
-    pub fn with_data(
+    #[cfg(test)]
+    fn with_data(
         code: impl Into<String>,
         message: impl Into<String>,
         data: serde_json::Value,

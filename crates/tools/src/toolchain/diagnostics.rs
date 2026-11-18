@@ -13,13 +13,13 @@
 
 use serde_json::Value;
 
-use tauqe_protocol::{Diagnostic, DiagnosticSeverity};
+use super::{Diagnostic, DiagnosticSeverity};
 
 /// Upper bound on the findings one verification command may report.
 ///
 /// A failing build repeats the same finding for every generic instantiation, so
 /// the bound keeps the rendered report a predictable part of the model context.
-pub(super) const MAX_DIAGNOSTICS: usize = 256;
+const MAX_DIAGNOSTICS: usize = 256;
 
 /// Parses the combined output of one verification command.
 pub(super) fn parse_diagnostics(output: &str) -> Vec<Diagnostic> {

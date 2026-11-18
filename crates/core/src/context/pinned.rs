@@ -1,9 +1,9 @@
+use crate::context::{ContextAccess, ContextItem, ContextLayer};
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::prompt::estimate_tokens_from_bytes;
-use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
 
 use super::ContextManager;
 

@@ -25,13 +25,17 @@
 //! message. One protocol therefore serves the initial synthesis, a replanning
 //! wave, and a review decomposition without restating any of them here.
 
+use crate::config::project::ProjectConfig;
+use crate::context::ContextAccess;
 use std::borrow::Cow;
 
-use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextAccess,
-    ContextRequestCommand, EditProtocolKind, LlmCommand, PatchStrategy, ProjectConfig,
+use crate::llm::CapabilityTree;
+use crate::llm::{
+    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, LlmCommand,
     RepoMapCommand, RepoSearchCommand, TextCommand,
 };
+use crate::workflow::EditProtocolKind;
+use crate::workflow::PatchStrategy;
 
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::json::decode::first_json_object_str;
@@ -340,9 +344,8 @@ impl PromptProtocol for PlanRefinePromptProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{
-        AbortCommand, BlockedCommand, CommitMessageCommand, LlmCapability, TextCommand,
-    };
+    use crate::llm::LlmCapability;
+    use crate::llm::{AbortCommand, BlockedCommand, CommitMessageCommand, TextCommand};
 
     /// A round that still needs evidence instead of a horizon.
     const NEEDS_CONTEXT: &str = r#"{

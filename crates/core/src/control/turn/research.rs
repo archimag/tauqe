@@ -7,11 +7,14 @@
 //! [`crate::control::turn::run_turn_loop`]: the phase owns no loop of its own, so a
 //! discovery round can never terminate the turn.
 
+use crate::context::ContextAccess;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::llm::LlmCapability;
+use crate::llm::{ContextRequestCommand, LlmCommand};
+use crate::workflow::turn::TurnPhase;
 use serde_json::Value;
-use tauqe_protocol::{ContextAccess, ContextRequestCommand, LlmCapability, LlmCommand, TurnPhase};
 
 use crate::control::context::LoopContext;
 use crate::control::outcome::{ResponseEnvelope, SystemError};
@@ -114,7 +117,7 @@ fn drain_scratchpad(ctx: &mut LoopContext<'_>, envelope: &mut ResponseEnvelope) 
     recorded
 }
 
-pub(crate) async fn handle_research_commands(
+async fn handle_research_commands(
     ctx: &mut LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
@@ -427,7 +430,7 @@ pub(super) fn envelope_has_text(envelope: &ResponseEnvelope) -> bool {
 /// Executes one custom tool invocation against the declared project allowlist.
 async fn execute_custom_tool(
     repo_root: &Path,
-    project: &tauqe_protocol::ProjectConfig,
+    project: &crate::config::project::ProjectConfig,
     name: &str,
     args: &Value,
     cancel: &crate::control::context::CancellationToken,
@@ -505,13 +508,13 @@ mod tests {
     use super::*;
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink};
+    use crate::llm::CapabilityTree;
+    use crate::llm::DocTopic;
+    use crate::llm::{ContextRequestCommand, DocRequestCommand, ScratchpadCommand, TextCommand};
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
-    use tauqe_protocol::{
-        CapabilityTree, ContextAccess, ContextRequestCommand, DocRequestCommand, DocTopic,
-        ModelRef, ScratchpadCommand, TextCommand,
-    };
 
     struct Fixture {
         dir: tempfile::TempDir,

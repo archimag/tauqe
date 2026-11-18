@@ -4,38 +4,6 @@ use super::catalog::ModelCatalogEntry;
 use super::effort::{parse_effort_opt, ModelRolesEffort, ReasoningEffort};
 use super::reference::ModelRef;
 
-/// Generation-attempt budget of a coder entry that declares none.
-///
-/// A cheap model usually needs more repair rounds than an expensive one, so the
-/// budget belongs to the model entry itself. An entry that omits the field
-/// keeps this default, unless it opted out of ladder escalation, where the
-/// excluded default applies instead.
-const DEFAULT_CODER_ATTEMPTS: u32 = 3;
-
-/// Generation-attempt budget of an Architect tier that declares none.
-const DEFAULT_ARCHITECT_ATTEMPTS: u32 = 2;
-
-/// Generation-attempt budget of a role entry that opted out of escalation.
-///
-/// A model the developer reserved for a manual run (`level_up = false`) is
-/// never levelled up automatically, so it runs a single attempt. Granting it
-/// the role default would let a repair round silently escalate the very model
-/// the developer excluded.
-const DEFAULT_EXCLUDED_ATTEMPTS: u32 = 1;
-
-/// Resolves the generation-attempt budget a role entry runs within.
-///
-/// An explicit budget always wins, so a configured `attempts` keeps priority
-/// over every default. An entry that opted out of ladder escalation runs a
-/// single attempt; every other entry keeps the default of its own role, which
-/// differs between the coder and the architect contours.
-fn resolve_attempts(attempts: Option<u32>, level_up: Option<bool>, role_default: u32) -> u32 {
-    attempts.unwrap_or(match level_up {
-        Some(false) => DEFAULT_EXCLUDED_ATTEMPTS,
-        _ => role_default,
-    })
-}
-
 /// A model entry configured for a semantic role.
 ///
 /// Pairs the model a role slot runs on with the runtime parameters of that
@@ -51,12 +19,7 @@ pub struct ModelEntry {
     pub effort: Option<ReasoningEffort>,
     /// Explicit generation-attempt budget, absent by default.
     ///
-    /// An absent budget is resolved adaptively from the level-up marker: an
-    /// entry that participates in escalation falls back to the coder default of
-    /// three attempts, while an entry that opted out runs a single attempt. A
-    /// role entry is the coder ladder rung whose budget the step executors
-    /// read, so the fallback belongs to the entry and every consumer reads one
-    /// authoritative value.
+    /// The engine resolves an absent budget; the wire preserves its absence.
     pub attempts: Option<u32>,
     /// Explicit level-up marker, absent by default.
     ///
@@ -82,23 +45,12 @@ impl ModelEntry {
     /// Returns the explicit level-up marker the entry was configured with.
     ///
     /// An absent marker means the entry participates in ladder escalation:
-    /// `level_up = true` reserves the entry for an explicit level-up, and
-    /// `level_up = false` is the explicit form of that default. Consumers
+    /// `level_up = false` excludes the entry from automatic escalation;
+    /// `level_up = true` explicitly allows it. Consumers
     /// read the marker through this accessor so the participation rule has
     /// a single authoritative statement.
     pub fn level_up(&self) -> Option<bool> {
         self.level_up
-    }
-
-    /// Returns the generation-attempt budget the entry runs within.
-    ///
-    /// An explicit budget the entry declares wins; an absent one resolves from
-    /// the level-up marker, so an entry excluded from escalation runs a single
-    /// attempt instead of the coder default. Every consumer reads the value
-    /// through this accessor, so the adaptive default has one authoritative
-    /// statement instead of a repeated number.
-    pub fn attempts(&self) -> u32 {
-        resolve_attempts(self.attempts, self.level_up, DEFAULT_CODER_ATTEMPTS)
     }
 
     /// Renders the entry as the canonical model specification, with the
@@ -127,8 +79,8 @@ impl From<ModelRef> for ModelEntry {
 /// A configured entry is either a bare model string or a table with a
 /// mandatory `model` field and optional `effort`, `attempts`, and `level_up`
 /// fields.
-/// `ModelEntry`, `CoderTier`, and `ArchitectTier` all deserialize through
-/// this single type, so the three kinds cannot drift apart.
+/// `ModelEntry` and `ArchitectTier` both deserialize through
+/// this single type, so the two kinds cannot drift apart.
 ///
 /// The value is dispatched on its runtime shape with a visitor rather than an
 /// untagged enum. An untagged enum reports every malformed field as the opaque
@@ -319,74 +271,9 @@ impl Serialize for ModelEntry {
     }
 }
 
-/// A single rung of the coder escalation ladder.
-///
-/// Pairs a concrete model with an optional reasoning depth, an optional
-/// generation-attempt budget, and an optional level-up marker. Deserializes
-/// from either a bare model string or a `{ model, effort, attempts, level_up }`
-/// table, so a ladder may mix terse and detailed rungs. A rung without the
-/// marker participates in escalation, and a rung without the budget keeps the
-/// coder default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoderTier {
-    pub model: ModelRef,
-    pub effort: Option<ReasoningEffort>,
-    /// Explicit generation-attempt budget, absent by default.
-    ///
-    /// An absent budget resolves adaptively from the level-up marker: a rung
-    /// that participates in escalation keeps the coder default, while a rung
-    /// that opted out runs a single attempt.
-    pub attempts: Option<u32>,
-    /// Explicit level-up marker, absent by default.
-    ///
-    /// An absent marker means the rung participates in ladder escalation.
-    pub level_up: Option<bool>,
-}
-
-impl CoderTier {
-    /// Creates a coder rung from a model and an optional reasoning depth.
-    ///
-    /// The created rung carries neither an attempt budget nor a level-up
-    /// marker, so it keeps the coder default budget and participates in ladder
-    /// escalation.
-    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
-        Self {
-            model,
-            effort,
-            attempts: None,
-            level_up: None,
-        }
-    }
-
-    /// Returns the explicit level-up marker the rung was configured with.
-    ///
-    /// An absent marker means the rung participates in ladder escalation:
-    /// `level_up = true` reserves the rung for an explicit level-up, and
-    /// `level_up = false` is the explicit form of that default.
-    pub fn level_up(&self) -> Option<bool> {
-        self.level_up
-    }
-
-    /// Returns the generation-attempt budget the rung runs within.
-    ///
-    /// A budget the rung declares wins; an absent one resolves from the
-    /// level-up marker, so escalation always knows how many attempts the next
-    /// tier grants without consulting configuration again.
-    pub fn attempts(&self) -> u32 {
-        resolve_attempts(self.attempts, self.level_up, DEFAULT_CODER_ATTEMPTS)
-    }
-}
-
-impl From<ModelRef> for CoderTier {
-    fn from(model: ModelRef) -> Self {
-        Self {
-            model,
-            effort: None,
-            attempts: None,
-            level_up: None,
-        }
-    }
-}
+// Coder ladders use the same entry type as other configured roles.
+#[cfg(test)]
+type CoderTier = ModelEntry;
 
 /// Serializes a `{ model, effort, attempts, level_up }` rung.
 ///
@@ -434,7 +321,7 @@ where
 ///
 /// Deserializes from either a bare model string or a `{ model, effort,
 /// attempts, level_up }` table through the shared entry spec, exactly like
-/// [`CoderTier`]. A tier without the marker participates in escalation, and a
+/// [`ModelEntry`]. A tier without the marker participates in escalation, and a
 /// tier without the budget keeps the Architect default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchitectTier {
@@ -442,11 +329,7 @@ pub struct ArchitectTier {
     pub effort: Option<ReasoningEffort>,
     /// Explicit generation-attempt budget, absent by default.
     ///
-    /// An absent budget resolves adaptively from the level-up marker: a tier
-    /// that participates in escalation keeps the Architect default, which is
-    /// lower than the coder default because a plan synthesis is expected to
-    /// converge in fewer rounds, while a tier that opted out runs a single
-    /// attempt.
+    /// The engine resolves an absent budget; the wire preserves its absence.
     pub attempts: Option<u32>,
     /// Explicit level-up marker, absent by default.
     ///
@@ -473,19 +356,10 @@ impl ArchitectTier {
     /// Returns the explicit level-up marker the tier was configured with.
     ///
     /// An absent marker means the tier participates in ladder escalation:
-    /// `level_up = true` reserves the tier for an explicit level-up, and
-    /// `level_up = false` is the explicit form of that default.
+    /// `level_up = false` excludes the entry from automatic escalation;
+    /// `level_up = true` explicitly allows it.
     pub fn level_up(&self) -> Option<bool> {
         self.level_up
-    }
-
-    /// Returns the generation-attempt budget the tier runs within.
-    ///
-    /// A budget the tier declares wins; an absent one resolves from the
-    /// level-up marker, so every synthesis round starts from the budget of the
-    /// tier that actually produced the decomposition.
-    pub fn attempts(&self) -> u32 {
-        resolve_attempts(self.attempts, self.level_up, DEFAULT_ARCHITECT_ATTEMPTS)
     }
 }
 
@@ -497,37 +371,6 @@ impl From<ModelRef> for ArchitectTier {
             attempts: None,
             level_up: None,
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for CoderTier {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let spec = ModelEntrySpec::deserialize(deserializer)?;
-        Ok(CoderTier {
-            model: spec.model,
-            effort: spec.effort,
-            attempts: spec.attempts,
-            level_up: spec.level_up,
-        })
-    }
-}
-
-impl Serialize for CoderTier {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serialize_rung(
-            &self.model,
-            self.effort,
-            self.attempts,
-            self.level_up,
-            "CoderTier",
-            serializer,
-        )
     }
 }
 
@@ -934,27 +777,11 @@ mod tests {
         assert!(err.contains("level_up"), "got: {err}");
     }
     #[test]
-    fn test_attempts_default_to_the_role_budget() {
-        // A bare model string declares no budget, so each role default applies.
-        let entry: ModelEntry = serde_json::from_str("\"openrouter:base/model\"").unwrap();
-        assert_eq!(entry.attempts, None);
-        assert_eq!(entry.attempts(), 3);
-        assert_eq!(
-            CoderTier::from(ModelRef::openrouter("base/model")).attempts(),
-            3
-        );
-        assert_eq!(
-            ArchitectTier::from(ModelRef::openrouter("planner/model")).attempts(),
-            2
-        );
-    }
-
-    #[test]
     fn test_attempts_round_trip_through_every_role_entry() {
         let entry: ModelEntry =
             serde_json::from_str(r#"{"model":"openrouter:cheap/model","attempts":5}"#).unwrap();
         assert_eq!(entry.attempts, Some(5));
-        assert_eq!(entry.attempts(), 5);
+        assert_eq!(entry.attempts, Some(5));
         let entry_json = serde_json::to_string(&entry).unwrap();
         assert_eq!(
             entry_json,
@@ -969,7 +796,7 @@ mod tests {
             r#"{"model":"openrouter:cheap/model","effort":"low","attempts":5}"#,
         )
         .unwrap();
-        assert_eq!(coder.attempts(), 5);
+        assert_eq!(coder.attempts, Some(5));
         assert_eq!(
             serde_json::to_string(&coder).unwrap(),
             r#"{"model":"openrouter:cheap/model","effort":"low","attempts":5}"#
@@ -977,7 +804,7 @@ mod tests {
 
         let architect: ArchitectTier =
             serde_json::from_str(r#"{"model":"openrouter:planner/model","attempts":1}"#).unwrap();
-        assert_eq!(architect.attempts(), 1);
+        assert_eq!(architect.attempts, Some(1));
         assert_eq!(
             serde_json::to_string(&architect).unwrap(),
             r#"{"model":"openrouter:planner/model","attempts":1}"#
@@ -989,7 +816,7 @@ mod tests {
             r#"{"model":"openrouter:strong/model","effort":"high","level_up":true}"#,
         )
         .unwrap();
-        assert_eq!(marked.attempts(), 3);
+        assert_eq!(marked.attempts, None);
         assert_eq!(
             serde_json::to_string(&marked).unwrap(),
             r#"{"model":"openrouter:strong/model","effort":"high","level_up":true}"#
@@ -1036,77 +863,5 @@ mod tests {
         .to_string();
         assert!(err.contains("duplicate field"), "got: {err}");
         assert!(err.contains("attempts"), "got: {err}");
-    }
-
-    #[test]
-    fn test_attempts_adapt_to_the_level_up_marker() {
-        // An entry that participates in escalation keeps the default of its
-        // role, so an unmarked declaration behaves exactly as before.
-        let entry: ModelEntry = serde_json::from_str("\"openrouter:a/b\"").unwrap();
-        assert_eq!(entry.level_up(), None);
-        assert_eq!(entry.attempts(), 3);
-
-        let coder: CoderTier = serde_json::from_str("\"openrouter:a/b\"").unwrap();
-        assert_eq!(coder.attempts(), 3);
-        let architect: ArchitectTier = serde_json::from_str("\"openrouter:a/b\"").unwrap();
-        assert_eq!(architect.attempts(), 2);
-
-        // An explicit `true` is the explicit form of the same default.
-        let marked: CoderTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":true}"#).unwrap();
-        assert_eq!(marked.attempts(), 3);
-        let marked: ArchitectTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":true}"#).unwrap();
-        assert_eq!(marked.attempts(), 2);
-    }
-
-    #[test]
-    fn test_attempts_of_an_opted_out_entry_default_to_one() {
-        // A model reserved for a manual run is never levelled up, so it runs a
-        // single attempt instead of the budget of a ladder rung.
-        let entry: ModelEntry =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false}"#).unwrap();
-        assert_eq!(entry.attempts(), DEFAULT_EXCLUDED_ATTEMPTS);
-        assert_eq!(entry.attempts(), 1);
-
-        let coder: CoderTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false}"#).unwrap();
-        assert_eq!(coder.attempts(), 1);
-
-        let architect: ArchitectTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false}"#).unwrap();
-        assert_eq!(architect.attempts(), 1);
-
-        // The constructors keep the marker absent, so a promoted reference is
-        // unaffected by the adaptive default.
-        assert_eq!(
-            ArchitectTier::new(ModelRef::openrouter("a/b"), None).attempts(),
-            2
-        );
-        assert_eq!(
-            CoderTier::new(ModelRef::openrouter("a/b"), None).attempts(),
-            3
-        );
-    }
-
-    #[test]
-    fn test_explicit_attempts_win_over_the_adaptive_default() {
-        // An explicit budget keeps unconditional priority, so a model excluded
-        // from escalation may still be granted the number of rounds the
-        // developer chose for it.
-        let entry: ModelEntry =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false,"attempts":4}"#)
-                .unwrap();
-        assert_eq!(entry.attempts(), 4);
-
-        let coder: CoderTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false,"attempts":2}"#)
-                .unwrap();
-        assert_eq!(coder.attempts(), 2);
-
-        let architect: ArchitectTier =
-            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false,"attempts":5}"#)
-                .unwrap();
-        assert_eq!(architect.attempts(), 5);
     }
 }

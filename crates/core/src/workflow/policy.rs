@@ -1,7 +1,10 @@
+use crate::config::project::ProjectConfig;
+
 use std::path::Path;
 
+use crate::edits::EditOperation;
+use crate::edits::EditProposal;
 use async_trait::async_trait;
-use tauqe_protocol::{EditOperation, EditProposal, ProjectConfig};
 use tokio::sync::watch;
 
 use crate::context::ContextManager;
@@ -118,8 +121,12 @@ impl ApplyPolicy for DirectApplyPolicy {
 #[cfg(test)]
 mod tests {
     use super::{ApplyPolicy, DirectApplyPolicy};
+    use crate::config::project::ProjectConfig;
+    use crate::context::ContextAccess;
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, EditReplace, ProjectConfig};
+    use crate::edits::EditOperation;
+    use crate::edits::EditProposal;
+    use crate::edits::EditReplace;
 
     #[tokio::test]
     async fn direct_policy_stages_applies_and_finalizes_without_commit() {

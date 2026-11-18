@@ -1,5 +1,5 @@
 use super::entry::HistoryEntry;
-use tauqe_protocol::TurnRoundRecord;
+use crate::history::TurnRoundRecord;
 
 /// Default budget of tokens for interaction history before compaction is triggered.
 pub(crate) const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 20_000;

@@ -5,11 +5,12 @@
 //! rendering.
 //!
 //! Lives in `crates/core` because decoding and sanitization touch domain
-//! parsers and edit state, while the wire DTOs stay in `crates/protocol`.
+//! parsers and edit state. Operational trees and normalized model commands live
+//! in `crate::llm`, separate from the TUI RPC DTOs.
 
-use tauqe_protocol::{PatchStrategy, ProjectConfig};
+use crate::config::project::ProjectConfig;
+use crate::workflow::PatchStrategy;
 
-#[allow(dead_code)]
 mod decode;
 mod regime;
 mod rules;

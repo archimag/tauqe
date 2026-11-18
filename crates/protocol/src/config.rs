@@ -31,7 +31,7 @@ impl std::convert::TryFrom<String> for WorkflowKind {
 
 impl WorkflowKind {
     /// Canonical lower-case identifier used on the wire.
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Git => "git",
             Self::Naive => "naive",
@@ -82,7 +82,7 @@ impl std::convert::TryFrom<String> for EditProtocolKind {
 
 impl EditProtocolKind {
     /// Canonical lower-case identifier used on the wire.
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Structured => "structured",
         }
@@ -105,63 +105,6 @@ impl FromStr for EditProtocolKind {
             "xml" | "mixed" | "auto" => Ok(Self::Structured),
             other => Err(format!(
                 "Unknown edit protocol '{}'. Expected 'structured'",
-                other
-            )),
-        }
-    }
-}
-
-/// Strategy that decides how a change set addresses the lines it replaces.
-///
-/// The strategy is orthogonal to the transport. Both the XML and the structured
-/// contour serialize the same edit vocabulary, and the strategy only decides
-/// which fields address a line range: `SearchReplace` echoes the replaced text
-/// and matches it exactly, while `LineAnchor` names a range through the compact
-/// opaque anchors rendered beside every context line, so the model never has to
-/// reproduce the lines it replaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", try_from = "String")]
-pub enum PatchStrategy {
-    /// Search/replace blocks that echo the replaced lines.
-    SearchReplace,
-    /// Opaque line anchors naming a range of lines without echoing them (default).
-    #[default]
-    LineAnchor,
-}
-
-impl std::convert::TryFrom<String> for PatchStrategy {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        value.parse()
-    }
-}
-
-impl PatchStrategy {
-    /// Canonical lower-case identifier used on the wire.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::SearchReplace => "search_replace",
-            Self::LineAnchor => "line_anchor",
-        }
-    }
-}
-
-impl fmt::Display for PatchStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for PatchStrategy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "search_replace" => Ok(Self::SearchReplace),
-            "line_anchor" => Ok(Self::LineAnchor),
-            other => Err(format!(
-                "Unknown patch strategy '{}'. Expected 'search_replace' or 'line_anchor'",
                 other
             )),
         }
@@ -227,7 +170,7 @@ pub struct ConfigSetParams {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -404,37 +347,6 @@ mod tests {
         );
         assert!("".parse::<EditProtocolKind>().is_err());
         assert!("bogus".parse::<EditProtocolKind>().is_err());
-    }
-
-    #[test]
-    fn test_patch_strategy_serde_default_and_parsing() {
-        assert_eq!(PatchStrategy::default(), PatchStrategy::LineAnchor);
-        assert_eq!(
-            serde_json::to_string(&PatchStrategy::SearchReplace).unwrap(),
-            "\"search_replace\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PatchStrategy::LineAnchor).unwrap(),
-            "\"line_anchor\""
-        );
-        assert_eq!(
-            serde_json::from_str::<PatchStrategy>("\"line_anchor\"").unwrap(),
-            PatchStrategy::LineAnchor
-        );
-        assert_eq!(
-            serde_json::from_str::<PatchStrategy>("\"  LINE_ANCHOR \"").unwrap(),
-            PatchStrategy::LineAnchor
-        );
-        assert!(serde_json::from_str::<PatchStrategy>("\"anchors\"").is_err());
-
-        assert_eq!(PatchStrategy::SearchReplace.as_str(), "search_replace");
-        assert_eq!(PatchStrategy::LineAnchor.to_string(), "line_anchor");
-        assert_eq!(
-            "line_anchor".parse::<PatchStrategy>().unwrap(),
-            PatchStrategy::LineAnchor
-        );
-        assert!("".parse::<PatchStrategy>().is_err());
-        assert!("bogus".parse::<PatchStrategy>().is_err());
     }
 
     /// Builds a `ConfigState` carrying every mandatory field, so a test can

@@ -1,6 +1,7 @@
-use tauqe_protocol::{
-    DiscussionContextRequest, DiscussionPlanUpdate, DiscussionResponse, RepoSearchRequest,
-};
+use crate::llm::discussion::DiscussionContextRequest;
+use crate::llm::discussion::DiscussionResponse;
+use crate::llm::discussion::RepoSearchRequest;
+use crate::plan::DiscussionPlanUpdate;
 use tracing::{info, warn};
 
 use super::json::decode::{balanced_object_end, StringFieldCursor};
@@ -294,7 +295,9 @@ impl EditStreamFilter for DiscussionStreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ContextAccess, DiscussionPlanAction, PlanItem, PlanItemStatus};
+    use crate::plan::DiscussionPlanAction;
+    use crate::plan::PlanItem;
+    use crate::plan::PlanItemStatus;
 
     #[test]
     fn test_discussion_stream_filter_character_by_character() {
@@ -429,7 +432,7 @@ mod tests {
             response.context_requests[0],
             DiscussionContextRequest {
                 path: "crates/core/src/lib.rs".to_string(),
-                access: ContextAccess::ReadOnly,
+                access: crate::context::ContextAccess::ReadOnly,
             }
         );
     }

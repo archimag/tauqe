@@ -9,6 +9,7 @@
 //! never drift apart (Conventions §6.6).
 
 use std::sync::Arc;
+use tauqe_tui::projection::*;
 
 use crossterm::event::{MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;

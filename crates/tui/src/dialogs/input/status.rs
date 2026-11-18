@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tauqe_tui::projection::*;
 
 use tauqe_protocol::methods;
 use tokio::sync::{Mutex, MutexGuard};

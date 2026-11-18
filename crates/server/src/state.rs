@@ -1,197 +1,27 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use tauqe_core::context::ContextState;
+#[cfg(test)]
+use tauqe_protocol::DiscussionTarget;
 
+use tauqe_core::api::UsageTotalsSnapshot;
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
-use tauqe_core::git::checkpoint::RecoveryOutcome;
-use tauqe_core::history::{HistoryManager, HistoryMutation};
-use tauqe_protocol::{
-    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, DiscussionTarget, Event,
-    ModelRef, ModelSelection, UsageTotalsSnapshot,
-};
-use tokio::sync::{watch, Mutex};
+use tauqe_core::history::HistoryMutation;
+use tauqe_protocol::{events, DiscussionFocus, DiscussionFocusChangedEvent, Event};
+#[cfg(test)]
+use tokio::sync::Mutex;
 
-use crate::reap::{abort_and_reap_with_deadline, task_exit_deadline, TaskExit};
+use crate::reap::task_exit_deadline;
 use crate::transport::OutChannel;
-use crate::usage::UsageLedger;
 
-/// Poll cadence while the last-resort hard-cancel abort waits for an in-flight
-/// git transaction to close.
-const HARD_CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Maximum time the last-resort hard-cancel abort is deferred while a git
-/// transaction stays open before the stalled workflow task is force-aborted
-/// anyway. A transaction open this long means the turn is wedged; core startup
-/// crash recovery unwinds any residue on the next launch.
-const HARD_CANCEL_TRANSACTION_DEFER_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
-
-pub struct ActiveOperation {
-    pub id: u64,
-    pub cancel_tx: watch::Sender<bool>,
-    /// Soft-stop signal observed by a running batch supervisor between members.
-    pub soft_stop_tx: watch::Sender<bool>,
-    pub abort_handle: Option<tokio::task::AbortHandle>,
-}
-
-/// RAII guard owning a registered active operation.
-///
-/// Registration is atomic through [`AppState::try_begin_operation`], which
-/// refuses to start a second operation while one is registered. The guard
-/// clears the shared slot on drop only when the slot still holds this
-/// operation's id, so a superseded or stale guard can never wipe a newer
-/// operation's registration or a cancellation delivered in between.
-pub struct OperationGuard {
-    state: Arc<AppState>,
-    id: u64,
-    cancel_rx: watch::Receiver<bool>,
-    soft_stop_rx: watch::Receiver<bool>,
-}
-
-impl OperationGuard {
-    /// Returns the identifier of the registered operation.
-    ///
-    /// Every lifecycle event a supervisor publishes — a replanning phase, a
-    /// step failure, and the terminal batch completion — carries this
-    /// identifier, so a client can attribute each of them to the operation its
-    /// request started instead of correlating an unregistered counter.
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Returns a receiver that observes this operation's cancellation signal.
-    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
-        self.cancel_rx.clone()
-    }
-
-    /// Returns a receiver that observes this operation's soft-stop signal.
-    ///
-    /// A batch supervisor checks it between members: the current member finishes
-    /// its bounded turn, compiler verification, and Git commit, and only then
-    /// does the queue stop before launching the next one.
-    pub fn soft_stop_receiver(&self) -> watch::Receiver<bool> {
-        self.soft_stop_rx.clone()
-    }
-
-    /// Installs the abort handle of the task currently driving this operation.
-    pub fn set_abort_handle(&self, handle: tokio::task::AbortHandle) {
-        let mut slot = self.state.lock_active_operation();
-        if let Some(op) = slot.as_mut() {
-            if op.id == self.id {
-                op.abort_handle = Some(handle);
-            }
-        }
-    }
-
-    /// Clears the abort handle installed by the task that just finished.
-    ///
-    /// A multi-round operation reuses one slot across several streamed provider
-    /// calls, and each call installs its own handle. Leaving a finished task's
-    /// handle behind lets a later hard-cancel target an already completed task
-    /// while the operation is in fact still working between rounds, so the slot
-    /// is emptied as soon as the streamed task resolves.
-    pub fn clear_abort_handle(&self) {
-        let mut slot = self.state.lock_active_operation();
-        if let Some(op) = slot.as_mut() {
-            if op.id == self.id {
-                op.abort_handle = None;
-            }
-        }
-    }
-}
-
-impl Drop for OperationGuard {
-    fn drop(&mut self) {
-        let released = {
-            let mut slot = self.state.lock_active_operation();
-            if slot.as_ref().map(|op| op.id) == Some(self.id) {
-                *slot = None;
-                true
-            } else {
-                false
-            }
-        };
-        if released {
-            tracing::info!(
-                operation_slot_id = self.id,
-                "Released active operation slot"
-            );
-        }
-    }
-}
-
-/// Model configuration and the active model selection guarded by a single mutex.
-///
-/// Keeping both values behind one lock makes it impossible to acquire them in
-/// conflicting orders: a `model/ask` racing a `config/set` previously deadlocked
-/// on two separate guards. Callers clone the values they need and drop the guard
-/// before any unrelated `.await` instead of holding it across subsystems.
-pub struct ConfigAndSelection {
-    pub config: AppConfig,
-    pub selection: ModelSelection,
-}
+pub use tauqe_core::api::{next_operation_id, OperationGuard};
 
 pub struct AppState {
-    pub config: Mutex<ConfigAndSelection>,
-    /// Shared context manager behind a read/write lock.
-    ///
-    /// The lock lives in an `Arc` so a mutation can move its owned write guard
-    /// into the blocking pool and keep the whole read-modify-write sequence
-    /// exclusive, instead of cloning the manager and overwriting it afterwards.
-    pub context: Arc<tokio::sync::RwLock<ContextManager>>,
-    /// Shared interaction history behind a mutex.
-    ///
-    /// The lock lives in an `Arc` so a mutation can move its owned guard into
-    /// the blocking pool and keep the whole read-modify-write sequence
-    /// exclusive, instead of cloning the manager and overwriting it afterwards.
-    ///
-    /// A bounded turn is the one exception: it works on a private clone adopted
-    /// back through [`AppState::adopt_history`] when it ends, so the guard is
-    /// never held across its provider rounds and a `history/get` served while
-    /// the turn streams reads this manager instead of waiting for the turn.
-    pub history: Arc<tokio::sync::Mutex<HistoryManager>>,
-    pub session_lock: Mutex<()>,
-    /// Single registration slot for the currently running operation.
-    ///
-    /// A synchronous mutex is used deliberately: an [`OperationGuard`] must
-    /// clear the slot from its `Drop`, and `std::sync::Mutex` can be locked
-    /// without an executor context. The lock is only ever held for brief,
-    /// non-awaiting critical sections.
-    pub active_cancel: std::sync::Mutex<Option<ActiveOperation>>,
-    /// Authoritative token, cost, and duration totals for the session.
-    ///
-    /// Every operation kind — an interactive turn, a plan batch, a review run,
-    /// a locale synthesis — reports through [`crate::usage::UsageGuard`], so the
-    /// interface renders one consistent snapshot instead of re-deriving totals
-    /// from per-handler counters. The project lifetime scope is loaded from
-    /// `<repo_root>/.tauqe/usage.json` at construction, so the counters survive
-    /// a daemon restart.
-    ///
-    /// Both the snapshot and the identity of the window that owns its in-flight
-    /// scope live in the ledger under this one mutex, so identity and window can
-    /// never disagree: a background task acting on the snapshot verifies it is
-    /// still that window before it publishes anything.
-    pub usage: Mutex<UsageLedger>,
-    /// Active discussion focus anchor shared by REPL discussion turns.
-    ///
-    /// While a focus is set, every plain discussion prompt is enriched with the
-    /// current state of the focused plan or review session, turning one-shot
-    /// comments into a continuous multi-turn dialogue.
-    pub discussion_focus: Mutex<DiscussionFocus>,
-    /// Identifier of the current REPL dialogue session.
-    ///
-    /// Every interactive turn binds its provider requests to this identifier so
-    /// the backend keeps its prompt-prefix cache warm across the rounds of one
-    /// dialogue. Clearing the history rotates the identifier, so the discarded
-    /// transcript can never warm the cache of the fresh dialogue.
-    pub session_uuid: Mutex<String>,
-    pub history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
+    /// Application facade owning the migrated session scenarios.
+    /// Discussion focus state and transition rules are private to core.
+    pub application: tauqe_core::api::Application,
     pub out: OutChannel,
-    /// Shared flag set while a git-backed apply policy holds an open
-    /// transaction. Turn supervisors consult it before force-aborting a
-    /// workflow task so a half-finished checkpoint or step commit is never
-    /// abandoned mid-transaction.
-    pub git_transaction_active: Arc<AtomicBool>,
     /// Test-only seam letting deterministic unit tests inject a scripted
     /// provider instead of building a real network provider from config.
     #[cfg(test)]
@@ -205,391 +35,52 @@ impl AppState {
         history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
         out: OutChannel,
     ) -> Arc<Self> {
-        // Crash recovery resolves any dangling checkpoint or step commit an
-        // interrupted workflow left behind, and the resolved shape decides how
-        // it is recorded: a completed recovery and a reclaimed artifact are
-        // informational, a skipped proof is a warning that names its reason,
-        // and a failed pass is an error that names the repository root. A skip
-        // is never presented as a completed recovery.
-        match tauqe_core::git::checkpoint::recover_interrupted_workflow(&repo_path) {
-            Ok(RecoveryOutcome::NothingToDo) => {}
-            Ok(RecoveryOutcome::Recovered { message }) => {
-                tracing::info!(
-                    repo_root = %repo_path.display(),
-                    "Recovered interrupted workflow: {}",
-                    message,
-                );
-            }
-            Ok(RecoveryOutcome::Skipped { reason }) => {
-                tracing::warn!(
-                    repo_root = %repo_path.display(),
-                    "Skipped crash recovery: {}",
-                    reason,
-                );
-            }
-            Ok(RecoveryOutcome::Cleaned { artifacts }) => {
-                tracing::info!(
-                    repo_root = %repo_path.display(),
-                    artifacts,
-                    "Reclaimed the artifacts of an interrupted workflow",
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    repo_root = %repo_path.display(),
-                    "Crash recovery failed: {:#}",
-                    error,
-                );
-            }
-        }
-
-        // Read RPCs are side-effect free: listing, loading, and resolving a
-        // plan or a review never writes to disk, and the read handlers
-        // (`plan/get`, `review/get`) never persist the fallback entity they
-        // resolve, so promoting one stays an explicit mutation. Review legacy
-        // migration therefore runs exactly once here at startup. Failures are
-        // logged by the core.
-        tauqe_core::review::ReviewStorage::migrate_legacy_if_needed(&repo_path);
-
-        let default_selection = config.default_selection();
-        // The project lifetime totals outlive the process, so they are read
-        // from `.tauqe/usage.json` before the repository root moves into the
-        // context manager.
-        let initial_usage = crate::usage::load_initial_snapshot(&repo_path);
-        let history_sender_init = history_sender.clone();
-        let mut initial_history_manager = HistoryManager::new(repo_path.clone());
-        // Forward every history mutation — appends and structural compactions —
-        // so the client rebuilds its session view from the authoritative
-        // result instead of inferring it from append events alone.
-        initial_history_manager.set_listener(move |mutation| {
-            let _ = history_sender_init.send(mutation);
-        });
+        let application =
+            tauqe_core::api::Application::for_repository(config, repo_path, history_sender);
 
         Arc::new(Self {
-            config: Mutex::new(ConfigAndSelection {
-                config,
-                selection: default_selection,
-            }),
-            context: Arc::new(tokio::sync::RwLock::new(ContextManager::new(repo_path))),
-            history: Arc::new(Mutex::new(initial_history_manager)),
-            session_lock: Mutex::new(()),
-            active_cancel: std::sync::Mutex::new(None),
-            usage: Mutex::new(UsageLedger::new(initial_usage)),
-            discussion_focus: Mutex::new(DiscussionFocus::None),
-            session_uuid: Mutex::new(tauqe_core::review::uuid::generate_uuid_v7()),
-            history_sender,
+            application,
             out,
-            git_transaction_active: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             provider_override: Mutex::new(None),
         })
     }
 
-    /// Locks the active-operation slot, recovering from a poisoned mutex instead
-    /// of panicking so an unexpected panic elsewhere cannot wedge the daemon.
-    fn lock_active_operation(&self) -> std::sync::MutexGuard<'_, Option<ActiveOperation>> {
-        self.active_cancel
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Atomically registers a new active operation.
-    ///
-    /// Returns `Err(())` when another operation is already registered. On
-    /// success it returns an [`OperationGuard`] that owns the registration and
-    /// clears the slot on drop.
+    /// Registers an exclusive operation in the application runtime.
     pub fn try_begin_operation(self: &Arc<Self>) -> Result<OperationGuard, ()> {
-        let mut slot = self.lock_active_operation();
-        if slot.is_some() {
-            drop(slot);
+        self.application.try_begin_operation().map_err(|_| {
             tracing::warn!(
                 code = tauqe_protocol::errors::OPERATION_IN_PROGRESS,
-                "Refused to register a new operation: a slot is already active",
+                "Refused to register a new operation: a slot is already active"
             );
-            return Err(());
-        }
-        let id = next_operation_id();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
-        *slot = Some(ActiveOperation {
-            id,
-            cancel_tx,
-            soft_stop_tx,
-            abort_handle: None,
-        });
-        drop(slot);
-        tracing::info!(operation_slot_id = id, "Registered active operation slot");
-        Ok(OperationGuard {
-            state: Arc::clone(self),
-            id,
-            cancel_rx,
-            soft_stop_rx,
         })
     }
 
-    /// Reports whether an operation is currently registered.
     pub fn is_operation_active(&self) -> bool {
-        self.lock_active_operation().is_some()
+        self.application.active_operation_id().is_some()
     }
 
-    /// Delivers the hard-cancel signal to the active operation and schedules the
-    /// last-resort force-abort watchdog.
-    ///
-    /// The operation slot is intentionally left registered: the cancelled
-    /// workflow keeps mutating state (rolling back its git transaction,
-    /// releasing the session lock) until it observes the cancel signal and drops
-    /// its [`OperationGuard`]. Clearing the slot immediately would let a client
-    /// start `git/undo`, `config/set`, or a new turn against a half-unwound turn
-    /// and would let the batch supervisor abort a later step. Only the
-    /// last-resort watchdog releases the registration on its own, and only when
-    /// its bounded exit confirmation expires: a task that never reaches a
-    /// suspension point would otherwise pin the slot for the daemon's lifetime.
+    /// Resolve caller-scoped budgets and delegate cancellation policy to core.
     pub fn hard_cancel_active_operation(self: &Arc<Self>) {
-        let Some(op_id) = self.signal_hard_cancel() else {
-            return;
-        };
-        let state = Arc::clone(self);
-        // Task-scoped values do not cross `tokio::spawn`, so both waits this
-        // watchdog spends are resolved here, in the caller's scope, and handed
-        // to it instead of being read inside it: the shared task-exit deadline
-        // and the unwind grace a test scopes to its own task tree.
-        let exit_deadline = task_exit_deadline();
-        let unwind_grace = crate::handlers::model::unwind_grace();
-        tokio::spawn(async move {
-            tokio::time::sleep(unwind_grace).await;
-            state
-                .abort_stalled_operation_with_deadline(op_id, exit_deadline)
-                .await;
-        });
+        self.application.hard_cancel_active_operation(
+            crate::handlers::model::unwind_grace(),
+            task_exit_deadline(),
+        );
     }
 
-    /// Force-aborts `op_id` under a deadline the caller has already resolved.
-    ///
-    /// A watchdog spawned by [`AppState::hard_cancel_active_operation`] cannot
-    /// read a task-scoped deadline: the value does not cross `tokio::spawn` and
-    /// would silently fall back to the production default. The spawner
-    /// therefore resolves it in the scope that actually carries the override
-    /// and hands it over here.
+    #[cfg(test)]
     pub(crate) async fn abort_stalled_operation_with_deadline(
         &self,
         op_id: u64,
         exit_deadline: std::time::Duration,
     ) {
-        let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
-        while self.git_transaction_active.load(Ordering::SeqCst)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
-        }
-
-        let handle = {
-            let slot = self.lock_active_operation();
-            match slot.as_ref() {
-                Some(op) if op.id == op_id => op.abort_handle.clone(),
-                _ => None,
-            }
-        };
-        let Some(handle) = handle else {
-            return;
-        };
-        tracing::warn!(
-            operation_slot_id = op_id,
-            "Hard-cancel grace period elapsed; aborting stalled workflow task",
-        );
-        handle.abort();
-
-        if self.confirm_operation_exit(op_id, exit_deadline).await == TaskExit::Orphaned {
-            self.release_stale_registration(op_id);
-        }
-    }
-
-    /// Force-aborts the registered operation at the very end of the shutdown
-    /// drain.
-    ///
-    /// The long-running work of this daemon does not live in the request
-    /// handler: `model/ask`, `plan/execute`, `plan/executePipeline`, and
-    /// `review/execute` spawn their turn or batch and return, so the handler
-    /// task set is typically empty while the operation slot still holds the task
-    /// that really runs. The slot is the only place that task is tracked —
-    /// through the abort handle a running turn installs — so a stalled drain
-    /// must reach through it instead of relying on the cooperative cancel
-    /// signal alone, which such a task may ignore indefinitely.
-    ///
-    /// Dropping the runtime at process exit is not a substitute: it abandons a
-    /// half-finished checkpoint or step commit instead of unwinding it. The
-    /// abort is therefore deferred, but never dropped, while a git transaction
-    /// is still open, and `budget` bounds that deferral because this runs inside
-    /// the daemon's own shutdown window. The slot is then polled, still within
-    /// the same budget, until the aborted task has really exited, so the caller
-    /// never returns while the task is mid-unwind.
-    pub async fn force_abort_active_operation(&self, budget: std::time::Duration) {
-        let deadline = tokio::time::Instant::now() + budget;
-
-        while self.git_transaction_active.load(Ordering::SeqCst)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
-        }
-
-        let (op_id, handle) = {
-            let slot = self.lock_active_operation();
-            match slot.as_ref() {
-                Some(op) => (Some(op.id), op.abort_handle.clone()),
-                None => (None, None),
-            }
-        };
-        let Some(op_id) = op_id else {
-            return;
-        };
-        let Some(handle) = handle else {
-            tracing::warn!(
-                operation_slot_id = op_id,
-                "Shutdown drain expired with an operation still registered but no abort handle installed",
-            );
-            return;
-        };
-
-        tracing::warn!(
-            operation_slot_id = op_id,
-            "Shutdown drain expired; force-aborting the registered operation",
-        );
-        handle.abort();
-
-        // The abort lands at the task's next suspension point. Waiting for the
-        // slot to clear keeps the runtime alive until that task has dropped, so
-        // an open transaction is unwound instead of abandoned by process exit.
-        while self.is_operation_active() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
-        }
-    }
-
-    /// Reaps a workflow task that outlived its turn's cooperative cancel grace
-    /// period while a git transaction was still open.
-    ///
-    /// The caller hands over the still-running task together with the operation
-    /// registration it owns, so the operation slot stays registered while the
-    /// task unwinds. Releasing it earlier — which is exactly what happens when a
-    /// turn returns with the task detached — would let a client start
-    /// `config/set`, `git/undo`, or a new turn against a half-unwound workflow,
-    /// and the next turn would then block on the session lock with no registered
-    /// operation left to cancel.
-    ///
-    /// Both phases are bounded. The deferral waits at most
-    /// [`HARD_CANCEL_TRANSACTION_DEFER_LIMIT`] for an open transaction, because
-    /// one open that long means the turn is wedged, and the reap that follows is
-    /// confirmed through the shared abort-and-reap primitive under the shared
-    /// task-exit deadline. A task wedged in a non-yielding stretch never reaches
-    /// the suspension point its abort lands at, so an expired confirmation
-    /// releases the registration — the guard is dropped either way — and records
-    /// the orphan in the journal. The abort stays delivered: the orphan dies at
-    /// its next suspension point and releases its session lock only then, while
-    /// waiting for it would pin the slot until process exit and refuse every
-    /// later request with `OPERATION_IN_PROGRESS`.
-    ///
-    /// The deadline is resolved by this spawner and handed to the watchdog,
-    /// because a task-scoped value does not cross `tokio::spawn`.
-    #[allow(dead_code)]
-    pub fn defer_abort_owning_operation<T>(
-        self: &Arc<Self>,
-        operation: Arc<OperationGuard>,
-        task: tokio::task::JoinHandle<T>,
-    ) where
-        T: Send + 'static,
-    {
-        let state = Arc::clone(self);
-        let exit_deadline = task_exit_deadline();
-        tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
-            while state.git_transaction_active.load(Ordering::SeqCst)
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
-            }
-            let op_id = operation.id;
-            if !task.is_finished() {
-                tracing::warn!(
-                    operation_slot_id = op_id,
-                    "Deferred cancel grace elapsed; aborting stalled workflow task",
-                );
-            }
-            let operation_label = op_id.to_string();
-            let exit = abort_and_reap_with_deadline(
-                &operation_label,
-                "deferred-operation",
-                exit_deadline,
-                task,
-            )
+        self.application
+            .abort_stalled_operation_with_deadline(op_id, exit_deadline)
             .await;
-            if exit == TaskExit::Orphaned {
-                tracing::warn!(
-                    operation_slot_id = op_id,
-                    "Releasing the operation registration of an orphaned task",
-                );
-            }
-            // The guard is dropped on both outcomes: a confirmed exit released
-            // its registration already, and an expired confirmation releases it
-            // here instead of pinning the slot for a task that may never yield.
-            drop(operation);
-        });
     }
 
-    /// Confirms, within the shared task-exit deadline, that the operation
-    /// `op_id` released its registration.
-    ///
-    /// The slot is the only evidence an external watchdog can observe: the
-    /// session lock is released only when the aborted task really stops, so a
-    /// registration that is gone — cleared by the task's own guard drop or
-    /// replaced by a newer operation — is the confirmation that this operation
-    /// no longer owns any state.
-    async fn confirm_operation_exit(
-        &self,
-        op_id: u64,
-        exit_deadline: std::time::Duration,
-    ) -> TaskExit {
-        let deadline = tokio::time::Instant::now() + exit_deadline;
-        loop {
-            let registered = {
-                let slot = self.lock_active_operation();
-                slot.as_ref().map(|op| op.id) == Some(op_id)
-            };
-            if !registered {
-                return TaskExit::Confirmed;
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                tracing::warn!(
-                    operation_slot_id = op_id,
-                    deadline_ms = exit_deadline.as_millis() as u64,
-                    "task-exit confirmation expired; the aborted task is still running",
-                );
-                return TaskExit::Orphaned;
-            }
-            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL.min(deadline - now)).await;
-        }
-    }
-
-    /// Releases the registration of `op_id` when its task never confirmed its
-    /// exit.
-    ///
-    /// The comparison is the id check an [`OperationGuard`] performs on drop, so
-    /// a registration a newer operation already took over is left untouched and
-    /// a superseded guard that drops later wipes nothing.
-    fn release_stale_registration(&self, op_id: u64) {
-        let released = {
-            let mut slot = self.lock_active_operation();
-            if slot.as_ref().map(|op| op.id) == Some(op_id) {
-                *slot = None;
-                true
-            } else {
-                false
-            }
-        };
-        if released {
-            tracing::warn!(
-                operation_slot_id = op_id,
-                "Released the operation registration of an orphaned task",
-            );
-        }
+    pub async fn force_abort_active_operation(&self, budget: std::time::Duration) {
+        self.application.force_abort_active_operation(budget).await;
     }
 
     /// Delivers a cancellation signal to the active operation without clearing
@@ -607,15 +98,7 @@ impl AppState {
     /// id, or `None` when no operation is registered. Shared by the shutdown
     /// drain and the interactive hard-cancel path.
     fn signal_hard_cancel(&self) -> Option<u64> {
-        let slot = self.lock_active_operation();
-        let op = slot.as_ref()?;
-        if !op.cancel_tx.send_replace(true) {
-            tracing::info!(
-                operation_slot_id = op.id,
-                "Delivered hard-cancel signal to active operation",
-            );
-        }
-        Some(op.id)
+        self.application.cancel_active_operation()
     }
 
     /// Requests a graceful stop of the active operation without clearing its
@@ -627,14 +110,7 @@ impl AppState {
     /// Unlike [`AppState::cancel_active_operation`], the request is advisory and
     /// never interrupts work that is already running.
     pub fn soft_stop_active_operation(&self) {
-        let slot = self.lock_active_operation();
-        if let Some(op) = slot.as_ref() {
-            let _ = op.soft_stop_tx.send(true);
-            tracing::info!(
-                operation_slot_id = op.id,
-                "Requested soft stop of active operation",
-            );
-        }
+        self.application.soft_stop_active_operation();
     }
 
     /// Returns the authoritative repository root shared by every handler.
@@ -643,7 +119,7 @@ impl AppState {
     /// from this single source instead of re-deriving it from the process CWD,
     /// which can drift from the initialized repository.
     pub async fn repo_root(&self) -> PathBuf {
-        self.context.read().await.repo_root().to_path_buf()
+        self.application.repository_root().await
     }
 
     /// Returns the authoritative usage snapshot of the daemon.
@@ -653,7 +129,7 @@ impl AppState {
     /// this accessor instead of reaching for the bare snapshot and silently
     /// dropping the identity that guards it.
     pub async fn usage_snapshot(&self) -> UsageTotalsSnapshot {
-        self.usage.lock().await.snapshot().clone()
+        self.application.usage_snapshot().await
     }
 
     /// Applies a mutation to the shared context atomically.
@@ -670,142 +146,59 @@ impl AppState {
     /// inside it would stall `context/get` and every `repo_root` lookup behind
     /// that spawn. Resolve such inputs on the blocking pool first and move the
     /// result into the closure.
+    #[cfg(test)]
     pub async fn mutate_context<T, F>(self: &Arc<Self>, mutate: F) -> Result<T, String>
     where
         F: FnOnce(&mut ContextManager) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let guard = Arc::clone(&self.context).write_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = guard;
-            mutate(&mut guard)
-        })
-        .await
-        .map_err(|err| format!("blocking task failed: {}", err))
-    }
-
-    /// Applies a mutation to the shared interaction history atomically.
-    ///
-    /// History records are persisted with an `fsync` barrier, so the mutation
-    /// runs on the blocking pool. The exclusive guard is acquired first and
-    /// moved into the blocking task together with the closure, so the whole
-    /// read-modify-write sequence stays serialized: cloning the manager under a
-    /// short guard and overwriting the slot afterwards would drop concurrent
-    /// appends and compactions.
-    pub async fn mutate_history<T, F>(self: &Arc<Self>, mutate: F) -> Result<T, String>
-    where
-        F: FnOnce(&mut HistoryManager) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let guard = Arc::clone(&self.history).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = guard;
-            mutate(&mut guard)
-        })
-        .await
-        .map_err(|err| format!("blocking task failed: {}", err))
-    }
-
-    /// Returns the token estimate the history manager maintains for the journal.
-    ///
-    /// The manager keeps the value current as it appends, compacts, rolls back,
-    /// and clears records, so this read neither re-reads `history.jsonl` nor
-    /// needs the exclusive mutation guard. A forwarding task can therefore
-    /// price every mutation it publishes while `history/get` page reads and a
-    /// finishing turn's adoption proceed concurrently, instead of excluding
-    /// them for the duration of a journal-wide recount.
-    pub async fn history_token_estimate(&self) -> u64 {
-        self.history.lock().await.estimated_tokens()
-    }
-    /// Adopts the history manager a bounded turn worked with.
-    ///
-    /// A turn never holds this guard: it clones the manager, records its prompt,
-    /// response, rollbacks, and compaction against that private clone, and hands
-    /// the clone back here. Adopting it under a short lock leaves the shared
-    /// manager carrying the identifier watermark the turn consumed — the journal
-    /// already holds the entries — so the next record can never reuse one of
-    /// them and a `history/get` served while the turn runs keeps reading a
-    /// coherent manager.
-    #[allow(dead_code)]
-    pub async fn adopt_history(&self, history: HistoryManager) {
-        let mut shared = self.history.lock().await;
-        *shared = history;
-    }
-
-    /// Rebuilds the shared history manager from the authoritative journal.
-    ///
-    /// A turn that panicked or was force-aborted never reached
-    /// [`AppState::adopt_history`], so its private clone — and the identifier
-    /// watermark it consumed — was dropped with it while the entries it already
-    /// appended stay in `<repo_root>/.tauqe/history.jsonl`. Rebuilding the
-    /// manager from that journal restores the watermark the daemon itself
-    /// derives at startup, so the next record can never reuse an identifier that
-    /// is already written. The journal is reread on the blocking pool, under the
-    /// same exclusive guard the mutations use.
-    #[allow(dead_code)]
-    pub async fn resync_history_from_journal(self: &Arc<Self>) -> Result<(), String> {
-        let repo_root = self.repo_root().await;
-        let mut rebuilt = tokio::task::spawn_blocking(move || HistoryManager::new(repo_root))
+        self.application
+            .test_mutate_context(mutate)
             .await
-            .map_err(|err| format!("blocking task failed: {}", err))?;
-        let sender = self.history_sender.clone();
-        rebuilt.set_listener(move |mutation| {
-            let _ = sender.send(mutation);
-        });
-        self.mutate_history(move |shared| *shared = rebuilt).await
+            .map_err(|error| error.to_string())
     }
 
-    /// Returns the current discussion focus anchor.
-    pub async fn discussion_focus(&self) -> DiscussionFocus {
-        self.discussion_focus.lock().await.clone()
+    pub async fn history_token_estimate(&self) -> u64 {
+        self.application.history_token_estimate().await
     }
-    /// Replaces the discussion focus anchor, broadcasting a change event only
-    /// when the anchor actually changes, and returns the resulting focus.
+    /// Adapts the application focus scenario for existing RPC callers.
+    pub async fn discussion_focus(&self) -> DiscussionFocus {
+        crate::discussion::focus_dto(self.application.discussion_focus().await)
+    }
+
     pub async fn set_discussion_focus(&self, focus: DiscussionFocus) -> DiscussionFocus {
-        let changed = {
-            let mut guard = self.discussion_focus.lock().await;
-            if *guard == focus {
-                false
-            } else {
-                *guard = focus.clone();
-                true
-            }
-        };
-        if changed {
+        let update = self
+            .application
+            .set_discussion_focus(crate::discussion::focus_from_dto(focus))
+            .await;
+        self.publish_focus_update(update)
+    }
+
+    pub async fn clear_discussion_focus(&self) -> DiscussionFocus {
+        let update = self.application.clear_discussion_focus().await;
+        self.publish_focus_update(update)
+    }
+
+    #[cfg(test)]
+    pub async fn release_discussion_focus_anchored_on(&self, anchor: &DiscussionTarget) -> bool {
+        let update = self
+            .application
+            .release_discussion_focus(&crate::discussion::target_from_dto(anchor.clone()))
+            .await;
+        let changed = update.changed;
+        self.publish_focus_update(update);
+        changed
+    }
+
+    pub(crate) fn publish_focus_update(
+        &self,
+        update: tauqe_core::api::FocusUpdate,
+    ) -> DiscussionFocus {
+        let focus = crate::discussion::focus_dto(update.focus);
+        if update.changed {
             self.broadcast_focus_change(&focus);
         }
         focus
-    }
-
-    /// Clears the discussion focus anchor, returning the resulting focus.
-    pub async fn clear_discussion_focus(&self) -> DiscussionFocus {
-        self.set_discussion_focus(DiscussionFocus::None).await
-    }
-
-    /// Releases the discussion focus when it is anchored on `anchor`,
-    /// returning whether the anchor was actually released.
-    ///
-    /// The comparison and the mutation are one critical section. Sampling the
-    /// anchor and clearing it afterwards, in a second lock acquisition, would
-    /// let a focus installed in between be wiped even though it never
-    /// addressed the released entity: `discussion/setFocus` shares no mutual
-    /// exclusion with the `plan/delete` and `review/delete` callers, so the
-    /// release would drop a live anchor and broadcast a change the client
-    /// cannot explain.
-    pub async fn release_discussion_focus_anchored_on(&self, anchor: &DiscussionTarget) -> bool {
-        let released = {
-            let mut guard = self.discussion_focus.lock().await;
-            if guard.target() == Some(anchor) {
-                *guard = DiscussionFocus::None;
-                true
-            } else {
-                false
-            }
-        };
-        if released {
-            self.broadcast_focus_change(&DiscussionFocus::None);
-        }
-        released
     }
 
     /// Publishes the resulting focus anchor so every client adopts or drops it.
@@ -819,163 +212,57 @@ impl AppState {
         });
     }
 
-    /// Returns the identifier of the current REPL dialogue session.
+    #[cfg(test)]
     pub async fn session_uuid(&self) -> String {
-        self.session_uuid.lock().await.clone()
-    }
-
-    /// Starts a fresh REPL dialogue session, returning its identifier.
-    ///
-    /// The identifier changes, so a provider-side prompt-prefix cache built
-    /// from the discarded transcript can never be reused by the new dialogue.
-    /// UUIDv7 is reused from the review subsystem so the workspace keeps a
-    /// single identifier generator.
-    pub async fn reset_session_uuid(&self) -> String {
-        let fresh = tauqe_core::review::uuid::generate_uuid_v7();
-        let previous = {
-            let mut guard = self.session_uuid.lock().await;
-            std::mem::replace(&mut *guard, fresh.clone())
-        };
-        tracing::info!(
-            previous_session = %previous,
-            session_id = %fresh,
-            "Rotated the dialogue session identifier",
-        );
-        fresh
-    }
-
-    /// Rotates the dialogue session identifier when the effective model changes.
-    ///
-    /// A provider keeps its prompt prefix cache bound to one concrete model: the
-    /// cached prefix was produced by another set of weights and tokenization,
-    /// so reusing the identifier across models addresses a cache the next
-    /// request can never match. The rotation therefore happens exactly when the
-    /// effective model differs, while reselecting the same model or changing
-    /// only a reasoning depth keeps the warm session.
-    pub async fn maybe_rotate_session_on_model_change(
-        &self,
-        old_model: &ModelRef,
-        new_model: &ModelRef,
-    ) -> bool {
-        if old_model == new_model {
-            return false;
-        }
-        let fresh = self.reset_session_uuid().await;
-        tracing::info!(
-            previous_model = %old_model,
-            model = %new_model,
-            session_id = %fresh,
-            "Rotated the dialogue session identifier after a model change",
-        );
-        true
+        self.application.session_uuid().await
     }
 
     /// Clears the transient auto context layer and starts a fresh dialogue
     /// session when files were actually removed.
-    ///
-    /// The Auto layer is the volatile part of the prompt prefix: while it is
-    /// preserved across the rounds of one dialogue, the provider reuses the
-    /// cached prefix. Removing its files shrinks that prefix, so the dialogue
-    /// session identifier is rotated exactly when the layer really changed,
-    /// while a repeated clear on an already empty layer keeps the warm session.
+    #[cfg(test)]
     pub async fn clear_auto_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(|ctx| ctx.clear_auto()).await
+        self.clear_context(tauqe_core::api::ContextClearScope::Auto)
+            .await
     }
 
-    /// Clears the task's transient context and starts a fresh dialogue session
-    /// when the transient layers actually held material.
-    ///
-    /// The Auto layer and the external documentation layer form one transient
-    /// context: the files a research round discovered and the documents the
-    /// registry materialized are provided so the model can decide, so they are
-    /// released together once that decision is fixed. Releasing only one of
-    /// them would leave half of the material that warmed the prompt prefix
-    /// resident, and every later round would keep paying for it.
+    #[cfg(test)]
     pub async fn clear_transient_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(|ctx| ctx.clear_transient()).await
+        self.clear_context(tauqe_core::api::ContextClearScope::Transient)
+            .await
     }
 
-    /// Clears the external documentation layer and starts a fresh dialogue
-    /// session when documents were actually removed.
-    ///
-    /// External documentation snapshots are part of the stable prompt prefix, so
-    /// dropping them shrinks it exactly like clearing the Auto layer does.
-    pub async fn clear_outer_docs_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(|ctx| ctx.clear_outer_docs()).await
-    }
-
-    /// Clears every mutable context layer and starts a fresh dialogue session
-    /// when files were actually removed.
+    #[cfg(test)]
     pub async fn clear_all_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(|ctx| ctx.clear()).await
+        self.clear_context(tauqe_core::api::ContextClearScope::All)
+            .await
     }
 
-    /// Applies one context-clearing mutation and rotates the dialogue session
-    /// identifier only when the mutation reports that files were really removed.
-    ///
-    /// Both clearing paths share it, so the rotation decision lives in exactly
-    /// one place: a clear that removed nothing leaves the cached prompt prefix
-    /// intact and therefore keeps the current session warm. The resulting
-    /// context snapshot is returned so the caller publishes one consistent
-    /// state instead of re-reading the manager.
-    async fn clear_context<T>(self: &Arc<Self>, clear: T) -> Result<ContextState, String>
-    where
-        T: FnOnce(&mut ContextManager) -> bool + Send + 'static,
-    {
-        let (removed, snapshot) = self
-            .mutate_context(move |ctx| {
-                let removed = clear(ctx);
-                (removed, ctx.get_state())
-            })
-            .await?;
-        if removed {
-            self.reset_session_uuid().await;
-        }
-        Ok(snapshot)
+    #[cfg(test)]
+    pub(crate) async fn clear_context(
+        &self,
+        scope: tauqe_core::api::ContextClearScope,
+    ) -> Result<ContextState, String> {
+        self.application
+            .clear_context(scope)
+            .await
+            .map_err(|error| error.to_string())
     }
 
-    /// Drops the documents one external-document cache removal addressed from
-    /// the OuterDocs layer, starting a fresh dialogue session when any of them
-    /// was really resident.
-    ///
-    /// The external documentation layer is part of the stable prompt prefix, so
-    /// a removal that took a document away shrinks it exactly like clearing the
-    /// layer does, and the session identifier rotates with it. A removal that
-    /// took nothing keeps the warm session. The report of what happened travels
-    /// with the resulting snapshot, so the caller publishes one consistent
-    /// state instead of re-reading the manager.
-    pub async fn remove_outer_docs_context(
-        self: &Arc<Self>,
-        documents: Vec<String>,
-    ) -> Result<(bool, ContextState), String> {
-        let (removed, snapshot) = self
-            .mutate_context(move |ctx| {
-                let mut removed = false;
-                for document in documents {
-                    if ctx.remove_file(&document).unwrap_or(false) {
-                        removed = true;
-                    }
-                }
-                (removed, ctx.get_state())
-            })
-            .await?;
-        if removed {
-            self.reset_session_uuid().await;
-        }
-        Ok((removed, snapshot))
+    pub(crate) async fn context_state(&self) -> ContextState {
+        self.application.context_state().await
+    }
+
+    /// Returns a detached copy for a turn-local workflow.
+    pub(crate) async fn context_snapshot(&self) -> ContextManager {
+        self.application.context_for_turn().await
     }
 }
-static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-pub fn next_operation_id() -> u64 {
-    OP_COUNTER.fetch_add(1, Ordering::SeqCst)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
-    use tauqe_protocol::ContextAccess;
+    use tauqe_core::context::ContextAccess;
+    use tauqe_core::models::ModelRef;
 
     /// Concurrent context mutations must all survive: a clone-then-overwrite
     /// sequence would drop the mutations that finished earlier and reset the
@@ -1013,7 +300,7 @@ mod tests {
             );
         }
 
-        let snapshot = state.context.read().await.get_state();
+        let snapshot = state.context_state().await;
         assert_eq!(
             snapshot.items.len(),
             8,
@@ -1043,26 +330,22 @@ mod tests {
             let state = Arc::clone(&state);
             tasks.push(tokio::spawn(async move {
                 state
-                    .mutate_history(move |hm| hm.record_turn(prompt, Vec::new()).map(|_| ()))
+                    .application
+                    .record_history_turn(prompt, Vec::new())
                     .await
             }));
         }
 
         for task in tasks {
             let outcome = task.await.expect("mutation task joins");
-            let applied = outcome.expect("mutation runs on the blocking pool");
-            assert!(
-                applied.is_ok(),
-                "history mutation failed: {:?}",
-                applied.err()
-            );
+            outcome.expect("history mutation persists on the blocking pool");
         }
 
         let entries = state
-            .history
-            .lock()
+            .application
+            .test_mutate_history(|history| history.get_entries())
             .await
-            .get_entries()
+            .unwrap()
             .expect("history reads back");
         assert_eq!(entries.len(), 8, "every concurrent mutation must survive");
 
@@ -1081,10 +364,9 @@ mod tests {
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         state
-            .context
-            .write()
+            .mutate_context(|context| context.add_auto_file("auto.rs", ContextAccess::ReadOnly))
             .await
-            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
         let warm_session = state.session_uuid().await;
 
@@ -1138,10 +420,9 @@ mod tests {
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         state
-            .context
-            .write()
+            .mutate_context(|context| context.add_file("user.rs", ContextAccess::Editable))
             .await
-            .add_file("user.rs", ContextAccess::Editable)
+            .expect("fixture context mutation runs")
             .unwrap();
         let warm_session = state.session_uuid().await;
 
@@ -1182,16 +463,14 @@ mod tests {
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         state
-            .context
-            .write()
+            .mutate_context(|context| context.add_auto_file("auto.rs", ContextAccess::ReadOnly))
             .await
-            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
         state
-            .context
-            .write()
+            .mutate_context(|context| context.add_outer_docs_file("ref.md"))
             .await
-            .add_outer_docs_file("ref.md")
+            .expect("fixture context mutation runs")
             .unwrap();
         let warm_session = state.session_uuid().await;
 
@@ -1297,100 +576,13 @@ mod tests {
         let task = tokio::spawn(async { std::future::pending::<()>().await });
         guard.set_abort_handle(task.abort_handle());
 
-        let installed = {
-            let slot = state.lock_active_operation();
-            slot.as_ref()
-                .and_then(|op| op.abort_handle.as_ref())
-                .is_some()
-        };
-        assert!(installed, "the handle must be installed while streaming");
-
         guard.clear_abort_handle();
-        let cleared = {
-            let slot = state.lock_active_operation();
-            slot.as_ref()
-                .and_then(|op| op.abort_handle.as_ref())
-                .is_none()
-        };
-        assert!(cleared, "the handle must be cleared once the task finished");
+        assert!(!state.application.abort_operation(guard.id()));
+        assert!(state.is_operation_active());
 
         task.abort();
         let _ = task.await;
         drop(guard);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Flips a flag when the owning task future is dropped, so a test can prove
-    /// that a force-aborted task really stopped running instead of lingering
-    /// detached.
-    struct ExitMarker(Arc<AtomicBool>);
-
-    impl Drop for ExitMarker {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// A workflow task that outlived the cancel grace period is handed to the
-    /// deferred watchdog together with the operation registration it owns: the
-    /// slot must stay registered until the task has truly exited, so a client
-    /// can never start `config/set`, `git/undo`, or a new turn against a
-    /// half-unwound workflow.
-    #[tokio::test]
-    async fn deferred_abort_holds_the_slot_until_the_task_exits() {
-        let root = scratch_root("state-defer");
-
-        let (out, _rx) = OutChannel::new();
-        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
-
-        let guard = state.try_begin_operation().expect("slot is free");
-        let exited = Arc::new(AtomicBool::new(false));
-        let marker = ExitMarker(Arc::clone(&exited));
-        let task = tokio::spawn(async move {
-            let _marker = marker;
-            std::future::pending::<()>().await
-        });
-
-        state.git_transaction_active.store(true, Ordering::SeqCst);
-        state.defer_abort_owning_operation(Arc::new(guard), task);
-
-        // While the transaction stays open the stalled task is never aborted,
-        // so the slot stays registered and a second operation is refused.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            state.is_operation_active(),
-            "the slot must stay registered while the stalled task is deferred"
-        );
-        assert!(
-            state.try_begin_operation().is_err(),
-            "a second operation must be refused while the slot is registered"
-        );
-        assert!(
-            !exited.load(Ordering::SeqCst),
-            "the deferred task must still be running"
-        );
-
-        // Releasing the transaction lets the watchdog force-abort the task and
-        // release the slot, and only after the task has really exited.
-        state.git_transaction_active.store(false, Ordering::SeqCst);
-        let mut released = false;
-        for _ in 0..300 {
-            if !state.is_operation_active() {
-                released = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            released,
-            "the watchdog must release the slot once the task exits"
-        );
-        assert!(
-            exited.load(Ordering::SeqCst),
-            "the aborted task must really have stopped running"
-        );
-
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1411,6 +603,7 @@ mod tests {
 
         assert!(
             !state
+                .application
                 .maybe_rotate_session_on_model_change(&alpha, &alpha)
                 .await,
             "an unchanged model must not rotate the session"
@@ -1419,6 +612,7 @@ mod tests {
 
         assert!(
             state
+                .application
                 .maybe_rotate_session_on_model_change(&alpha, &beta)
                 .await,
             "a model change must rotate the session"

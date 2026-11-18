@@ -13,13 +13,11 @@ workspace = true
 test-support = []
 
 [dependencies]
-tauqe-protocol.workspace = true
 tauqe-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# A turn composes its response format from the schemas the protocol crate
-# derives, so the engine carries the same single source of truth as the wire
-# contract instead of a parallel hand-written schema.
+# Core derives model-facing schemas from typed payloads and composes the
+# response formats enforced by provider requests.
 schemars.workspace = true
 tokio.workspace = true
 reqwest.workspace = true

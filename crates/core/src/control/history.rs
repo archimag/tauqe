@@ -9,39 +9,34 @@
 //! material they record, and the budget they apply is the project's, never a
 //! compile-time constant (`crates/core/Conventions.md` §3.5).
 
+#[cfg(test)]
+use crate::history::HistoryFileChange;
+#[cfg(test)]
+use crate::history::HistoryFileOperation;
 use tokio::sync::{mpsc, watch};
 
-use tauqe_protocol::ModelRef;
-use tauqe_protocol::{
-    EditCreate, EditDelete, EditFileOp, EditLineAnchor, EditMove, EditMoveDir, EditOperation,
-    EditOverwrite, EditReplace, HistoryFileChange, ModelResult,
-};
+#[cfg(test)]
+use crate::edits::EditCreate;
+#[cfg(test)]
+use crate::edits::EditDelete;
+#[cfg(test)]
+use crate::edits::EditLineAnchor;
+#[cfg(test)]
+use crate::edits::EditMove;
+#[cfg(test)]
+use crate::edits::EditMoveDir;
+#[cfg(test)]
+use crate::edits::EditOperation;
+#[cfg(test)]
+use crate::edits::EditOverwrite;
+#[cfg(test)]
+use crate::edits::EditReplace;
+#[cfg(test)]
+use crate::llm::ModelResult;
+use crate::models::ModelRef;
 
-use crate::history::{HistoryManager, DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT};
+use crate::history::HistoryManager;
 use crate::providers::{ChatMessage, LlmProvider, StreamEvent};
-
-/// Compacts session history if estimated tokens exceed the configured threshold using
-/// the default budgets.
-///
-/// A caller that owns the project configuration applies the budget the project
-/// declares through [`compact_history_if_needed_with_budget`] instead; this entry
-/// point exists for a caller that carries no configuration of its own.
-pub async fn compact_history_if_needed(
-    history_manager: &mut HistoryManager,
-    provider: &dyn LlmProvider,
-    model: &ModelRef,
-    cancel_rx: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    compact_history_if_needed_with_budget(
-        history_manager,
-        provider,
-        model,
-        cancel_rx,
-        DEFAULT_HISTORY_BUDGET_TOKENS,
-        DEFAULT_TAIL_TURNS_COUNT,
-    )
-    .await
-}
 
 /// Compacts session history if estimated tokens exceed a specific budget threshold.
 ///
@@ -142,7 +137,8 @@ pub async fn compact_history_if_needed_with_budget(
 }
 
 /// Records a finished turn into the session journal according to its result.
-pub fn record_workflow_response(
+#[cfg(test)]
+fn record_workflow_response(
     history_manager: &mut HistoryManager,
     result: &ModelResult,
     assistant_text: &str,
@@ -207,19 +203,19 @@ pub fn record_workflow_response(
             for edit in edits {
                 let entry = match edit {
                     EditOperation::Create(EditCreate { path, .. }) => {
-                        HistoryFileChange::operated(EditFileOp::Create, path.clone())
+                        HistoryFileChange::operated(HistoryFileOperation::Create, path.clone())
                     }
                     EditOperation::Delete(EditDelete { path }) => {
-                        HistoryFileChange::operated(EditFileOp::Delete, path.clone())
+                        HistoryFileChange::operated(HistoryFileOperation::Delete, path.clone())
                     }
                     EditOperation::Replace(EditReplace { path, .. }) => {
-                        HistoryFileChange::operated(EditFileOp::Replace, path.clone())
+                        HistoryFileChange::operated(HistoryFileOperation::Replace, path.clone())
                     }
                     EditOperation::LineAnchor(EditLineAnchor { path, .. }) => {
-                        HistoryFileChange::operated(EditFileOp::Replace, path.clone())
+                        HistoryFileChange::operated(HistoryFileOperation::Replace, path.clone())
                     }
                     EditOperation::Overwrite(EditOverwrite { path, .. }) => {
-                        HistoryFileChange::operated(EditFileOp::Overwrite, path.clone())
+                        HistoryFileChange::operated(HistoryFileOperation::Overwrite, path.clone())
                     }
                     EditOperation::Move(EditMove { from, to }) => {
                         HistoryFileChange::moved(from.clone(), to.clone())
@@ -262,13 +258,16 @@ pub fn record_workflow_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
+    use crate::edits::EditOperation;
+    use crate::edits::EditOutcome;
+    #[cfg(test)]
+    use crate::edits::EditReplace;
     use crate::history::HistoryEntry;
+    use crate::models::ModelRef;
     use crate::prompt::PromptAssembly;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_protocol::{
-        EditFileOp, EditOperation, EditOutcome, EditProtocolKind, EditReplace, HistoryFileChange,
-        ModelRef,
-    };
+    use crate::workflow::EditProtocolKind;
     use tokio::sync::watch;
 
     #[tokio::test]
@@ -411,7 +410,7 @@ mod tests {
                     commit: Some("abc1234".to_string()),
                     summary: Some(prompt.to_string()),
                     files: vec![HistoryFileChange::operated(
-                        EditFileOp::Replace,
+                        HistoryFileOperation::Replace,
                         "src/lib.rs",
                     )],
                 })
@@ -517,7 +516,10 @@ mod tests {
                 assert_eq!(summary.as_deref(), Some("Refactored module A"));
                 assert_eq!(
                     files,
-                    &vec![HistoryFileChange::operated(EditFileOp::Replace, "src/a.rs")]
+                    &vec![HistoryFileChange::operated(
+                        HistoryFileOperation::Replace,
+                        "src/a.rs"
+                    )]
                 );
             }
             _ => panic!("Expected Response entry"),
@@ -556,7 +558,10 @@ mod tests {
                 assert_eq!(message, "Need file a.rs\n\nUpdated file a.rs");
                 assert_eq!(
                     files,
-                    &vec![HistoryFileChange::operated(EditFileOp::Replace, "a.rs")]
+                    &vec![HistoryFileChange::operated(
+                        HistoryFileOperation::Replace,
+                        "a.rs"
+                    )]
                 );
                 assert!(!message.contains("changes"));
                 assert!(!message.contains("old_text"));
@@ -578,7 +583,7 @@ mod tests {
                 old_text: "bad()".to_string(),
                 new_text: "good()".to_string(),
             })],
-            proposal: Some(tauqe_protocol::ModelResultProposal {
+            proposal: Some(crate::llm::ModelResultProposal {
                 message: "I found the issue and fixed it.".to_string(),
                 ..Default::default()
             }),
@@ -711,7 +716,7 @@ mod tests {
                 assert_eq!(
                     files,
                     &vec![HistoryFileChange::operated(
-                        EditFileOp::Replace,
+                        HistoryFileOperation::Replace,
                         "src/config.rs"
                     )]
                 );

@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tauqe_protocol::CapabilityTree;
+use crate::llm::CapabilityTree;
 #[cfg(test)]
-use tauqe_protocol::LlmCapability;
+use crate::llm::LlmCapability;
 use tokio::sync::{mpsc, watch};
 
 use super::outcome::{ResponseEnvelope, SystemError};
@@ -548,10 +548,10 @@ impl<'a> LoopContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ModelRef;
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::MockLlmProvider;
     use crate::providers::types::ChatMessage;
-    use tauqe_protocol::ModelRef;
 
     #[test]
     fn test_cancellation_token_signalling() {
@@ -795,10 +795,10 @@ mod tests {
 
         let mut context = ContextManager::new(root);
         context
-            .add_file("b.rs", tauqe_protocol::ContextAccess::ReadOnly)
+            .add_file("b.rs", crate::context::ContextAccess::ReadOnly)
             .unwrap();
         context
-            .add_file("a.rs", tauqe_protocol::ContextAccess::Editable)
+            .add_file("a.rs", crate::context::ContextAccess::Editable)
             .unwrap();
 
         let mut journal = TurnResearchJournal::default();

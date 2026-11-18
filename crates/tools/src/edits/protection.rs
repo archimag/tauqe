@@ -1,7 +1,7 @@
 //! Trust boundaries enforced during virtual staging.
 //!
 //! A repository declares the paths a turn must never modify in
-//! `[project.boundaries.protected]` (`tauqe_protocol::ProjectBoundaries`). Such a
+//! `[project.boundaries.protected]` (`crate::toolchain::config::ProjectBoundaries`). Such a
 //! path stays tracked by Git and readable as a reference, yet a turn cannot
 //! create, rewrite, move, or delete it: the task manifest, the specifications,
 //! and the generated sources are exactly the artifacts a change set is verified
@@ -23,7 +23,8 @@
 //! but relocates a whole subtree, so the boundary is asked about every path the
 //! operation really changes rather than about the two names it was written with.
 
-use tauqe_protocol::{GlobPattern, ProjectConfig};
+use crate::path_patterns::GlobPattern;
+use crate::toolchain::config::ProjectConfig;
 
 /// Compiles the patterns declared by `[project.boundaries.protected]`.
 ///

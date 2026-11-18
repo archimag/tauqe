@@ -6,6 +6,8 @@
 //! logic and delegates concrete parsing to the structured edit protocol so the
 //! schema keeps a single source of truth.
 
+use crate::config::project::ProjectConfig;
+
 use std::borrow::Cow;
 
 use crate::capabilities::{
@@ -17,10 +19,11 @@ use crate::edits::protocol::structured::{
 };
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
-use tauqe_protocol::{
-    CapabilityTree, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
-    TextCommand,
-};
+use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
+use crate::llm::{LlmCommand, TextCommand};
+use crate::workflow::EditProtocolKind;
+use crate::workflow::PatchStrategy;
 
 use super::protocol::PromptProtocol;
 use crate::control::repl::dialogue_capability_expr;
@@ -175,7 +178,9 @@ impl PromptProtocol for JsonPromptProtocol {
                     // The module decodes paths but holds no working
                     // context, so the edit batch is resolved against the
                     // context paths of this round once the walk collected it.
-                    cmd if is_edit_capability(cmd.capability()) => edits.push(cmd),
+                    cmd if is_edit_capability(crate::llm::command_capability(&cmd)) => {
+                        edits.push(cmd)
+                    }
                     // The ambient message channel was already emitted above.
                     LlmCommand::Text(_) => {}
                     other => commands.push(other),
@@ -333,11 +338,13 @@ fn has_any_edit(capabilities: &CapabilityTree) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{
-        AbortCommand, CommitMessageCommand, ContextAccess, ContextRequestCommand,
-        CustomToolCommand, DirListCommand, DocRequestCommand, EditOperation, EditReplace,
-        OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand, RepoSearchCommand,
-        ScratchpadCommand, TurnErrorCommand, TurnSkipCommand,
+    use crate::context::ContextAccess;
+    use crate::edits::EditOperation;
+    use crate::edits::EditReplace;
+    use crate::llm::{
+        AbortCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
+        DirListCommand, DocRequestCommand, OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand,
+        RepoSearchCommand, ScratchpadCommand, TurnErrorCommand, TurnSkipCommand,
     };
 
     /// Capability tree of a dialogue contour, as the control loops declare it.
@@ -483,7 +490,7 @@ mod tests {
         assert!(
             !commands
                 .iter()
-                .any(|cmd| is_edit_capability(cmd.capability())),
+                .any(|cmd| is_edit_capability(crate::llm::command_capability(cmd))),
             "no edit reaches staging from a payload the decoder rejected"
         );
     }
@@ -960,7 +967,7 @@ mod tests {
         let research_commands = protocol.decode(research_output, &[]);
         assert!(
             research_commands.contains(&LlmCommand::DocRequest(DocRequestCommand {
-                topic: tauqe_protocol::DocTopic::Git,
+                topic: crate::llm::DocTopic::Git,
             }))
         );
         assert!(
@@ -975,7 +982,7 @@ mod tests {
         assert!(protocol
             .decode(&aliased, &[])
             .contains(&LlmCommand::DocRequest(DocRequestCommand {
-                topic: tauqe_protocol::DocTopic::Git,
+                topic: crate::llm::DocTopic::Git,
             })));
 
         let edit_output = r#"{
@@ -1143,7 +1150,7 @@ mod tests {
             .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
         assert!(!commands
             .iter()
-            .any(|command| is_edit_capability(command.capability())));
+            .any(|command| is_edit_capability(crate::llm::command_capability(command))));
     }
 
     #[test]
@@ -1168,7 +1175,7 @@ mod tests {
             })
             .expect("plan command");
         assert_eq!(plan.id.as_deref(), Some("p-9"));
-        assert_eq!(plan.action, tauqe_protocol::DiscussionPlanAction::Save);
+        assert_eq!(plan.action, crate::plan::DiscussionPlanAction::Save);
     }
 
     #[test]
@@ -1207,7 +1214,9 @@ mod tests {
         assert!(commands
             .iter()
             .any(|c| matches!(c, LlmCommand::ContextRequest(_))));
-        assert!(!commands.iter().any(|c| is_edit_capability(c.capability())));
+        assert!(!commands
+            .iter()
+            .any(|c| is_edit_capability(crate::llm::command_capability(c))));
     }
 
     #[test]
@@ -1378,7 +1387,7 @@ mod tests {
         assert_eq!(decision.item_id, 7);
         assert_eq!(
             decision.status,
-            tauqe_protocol::review::ReviewDecisionStatus::Rejected
+            crate::review::ReviewDecisionStatus::Rejected
         );
         assert_eq!(decision.note, "The guard is released after the await");
 

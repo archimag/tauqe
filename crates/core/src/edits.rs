@@ -16,12 +16,20 @@
 //! The re-exports below keep the paths the rest of the engine already addresses
 //! while the transition lasts.
 
+mod model;
+pub use model::operation;
+pub use model::{
+    normalize_repo_path, ChangeConversionError, EditCreate, EditDelete, EditFileOp, EditFileStatus,
+    EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOutcome, EditOverwrite, EditProposal,
+    EditReplace, StructuredChangeProposal, VerificationVerdict,
+};
 mod apply;
 pub(crate) mod atomic;
 pub mod protocol;
 mod stage;
 pub(crate) mod strategy;
 pub mod stream;
+mod substrate;
 
 #[cfg(test)]
 pub(crate) use apply::apply_edit_proposal;
@@ -33,10 +41,12 @@ pub(crate) use stage::{prepare_staged_edits_with_config, stage_and_validate_edit
 pub use tauqe_tools::edits::anchor;
 pub use tauqe_tools::edits::fuzzy;
 pub use tauqe_tools::edits::staging;
-pub use tauqe_tools::edits::{EditError, FailedFileEdit, StageEditsResult, StagedEditsState};
+pub use tauqe_tools::edits::{EditError, FailedFileEdit, StagedEditsState};
 
 pub(crate) use tauqe_tools::edits::fuzzy::apply_replace;
 pub(crate) use tauqe_tools::edits::staging::apply_anchor_edits;
 
 #[cfg(test)]
 mod tests;
+
+pub use substrate::StageEditsResult;

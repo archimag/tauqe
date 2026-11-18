@@ -39,11 +39,6 @@ pub struct PlanUpdateItemParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanUpdateItemResult {
-    pub plan: Plan,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanDeleteParams {
     pub id: String,
 }
@@ -51,12 +46,6 @@ pub struct PlanDeleteParams {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlanSetActiveParams {
     pub id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PlanSetActiveResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -192,22 +181,26 @@ pub enum PlanRefineResult {
 }
 
 impl PlanRefineResult {
-    pub fn is_success(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_success(&self) -> bool {
         matches!(self, Self::Success { .. })
     }
 
-    pub fn is_blocked(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_blocked(&self) -> bool {
         matches!(self, Self::Blocked { .. })
     }
 
-    pub fn plan(&self) -> Option<&Plan> {
+    #[cfg(test)]
+    pub(crate) fn plan(&self) -> Option<&Plan> {
         match self {
             Self::Success { plan, .. } => Some(plan),
             Self::Blocked { .. } => None,
         }
     }
 
-    pub fn reason(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn reason(&self) -> Option<&str> {
         match self {
             Self::Success { .. } => None,
             Self::Blocked { reason } => Some(reason),

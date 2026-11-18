@@ -2,10 +2,17 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
-use tauqe_protocol::{
-    EditCreate, EditDelete, EditFileOp, EditFileStatus, EditLineAnchor, EditMove, EditMoveDir,
-    EditOperation, EditOverwrite, EditReplace, StructuredChangeProposal,
-};
+use crate::edits::EditCreate;
+use crate::edits::EditDelete;
+use crate::edits::EditFileOp;
+use crate::edits::EditFileStatus;
+use crate::edits::EditLineAnchor;
+use crate::edits::EditMove;
+use crate::edits::EditMoveDir;
+use crate::edits::EditOperation;
+use crate::edits::EditOverwrite;
+use crate::edits::EditReplace;
+use crate::edits::StructuredChangeProposal;
 
 use super::{
     hunk_event, normalize_hunk, resolve_path, EditStreamFilter, HunkCoordinates, OwnedAnchor,

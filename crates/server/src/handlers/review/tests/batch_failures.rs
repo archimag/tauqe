@@ -8,8 +8,9 @@ use super::{test_item, test_session, test_state, TestDir};
 
 use super::super::handle_review_execute;
 
+use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{errors, IssueStatus, Request};
+use tauqe_protocol::{errors, Request};
 
 /// Builds a `review/execute` request for one stored session.
 fn execute_request(review_id: &str) -> Request {

@@ -13,8 +13,8 @@
 
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::escape::{escape_xml_text, single_line};
+use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
 use super::refine::PlanRefinementOutput;
 

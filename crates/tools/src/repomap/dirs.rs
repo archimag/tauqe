@@ -42,7 +42,8 @@ enum OutlineEntry<'a> {
 ///
 /// Only folders, root files, and pinned files are rendered. The output ends
 /// with a newline, and an empty input yields an empty string.
-pub fn generate_repo_dirs(available_files: &[String]) -> String {
+#[cfg(test)]
+pub(crate) fn generate_repo_dirs(available_files: &[String]) -> String {
     generate_repo_dirs_with_pinned(available_files, &[])
 }
 

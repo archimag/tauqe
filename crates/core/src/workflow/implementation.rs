@@ -1,6 +1,6 @@
 //! Unified implementation machinery shared by every source of work.
 //!
-//! A step graph (`tauqe_protocol::PlanImplementation`) declares *how* work is
+//! A step graph (`crate::plan::PlanImplementation`) declares *how* work is
 //! executed and is independent of *what* the work is: a local plan, an
 //! architectural review group, and a single review finding all execute through
 //! the same graph algebra. This module owns the parts of that execution which
@@ -25,6 +25,9 @@
 //!   leaves, reprojects the remaining horizon around a failed step, and reports
 //!   the whole run as one typed outcome.
 
+mod turn_outcome;
+pub use turn_outcome::{classify_refinement, classify_step_turn};
+
 mod executor;
 mod pipeline;
 mod scope;
@@ -36,9 +39,10 @@ pub use pipeline::{
 };
 pub use scope::{classify_scope_stall, ExecutionScope, ImplementationFrame};
 
+use crate::models::{ArchitectTier, ModelSelection, ReasoningEffort};
+use crate::plan::PlanItem;
+use crate::workflow::turn::TurnWorkQueue;
 use async_trait::async_trait;
-use tauqe_protocol::model::TurnWorkQueue;
-use tauqe_protocol::{ArchitectTier, ModelSelection, PlanItem, ReasoningEffort};
 use tokio::sync::watch;
 
 /// Category of an implementation step failure, controlling pipeline behavior.
@@ -94,7 +98,8 @@ impl StepFailure {
     /// Creates an unreverted-worktree failure: the failed change set was not
     /// rolled back, so the working tree carries bytes nobody verified and the
     /// run must stop instead of building on them.
-    pub fn unreverted(reason: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn unreverted(reason: impl Into<String>) -> Self {
         Self {
             kind: StepFailureKind::Unreverted,
             reason: reason.into(),
@@ -108,18 +113,18 @@ impl StepFailure {
     /// reproject the remaining horizon around the failed approach, so it is
     /// attached where the step actually failed instead of being reconstructed
     /// by the caller.
-    pub fn with_step(mut self, step_id: impl Into<String>) -> Self {
+    fn with_step(mut self, step_id: impl Into<String>) -> Self {
         self.failed_step = Some(step_id.into());
         self
     }
 
     /// The step whose execution failed, when the failure is attributable to one.
-    pub fn failed_step(&self) -> Option<&str> {
+    fn failed_step(&self) -> Option<&str> {
         self.failed_step.as_deref()
     }
 
     /// Whether the failure is confined to the current step.
-    pub fn is_domain(&self) -> bool {
+    pub(crate) fn is_domain(&self) -> bool {
         matches!(self.kind, StepFailureKind::Domain)
     }
 
@@ -128,12 +133,12 @@ impl StepFailure {
     /// The predicate is mutually exclusive with [`Self::is_domain`]: a dirty
     /// tree is a transaction failure of the harness, never a content verdict of
     /// the step.
-    pub fn is_unreverted(&self) -> bool {
+    fn is_unreverted(&self) -> bool {
         matches!(self.kind, StepFailureKind::Unreverted)
     }
 
     /// Human-readable diagnostic carried by the failure.
-    pub fn reason(&self) -> &str {
+    pub(crate) fn reason(&self) -> &str {
         &self.reason
     }
 
@@ -146,10 +151,9 @@ impl StepFailure {
 /// One bounded step turn requested from the [`ImplementationHost`].
 ///
 /// The request is a core-internal DTO, never a wire type: it carries exactly
-/// what the host needs in order to run one turn of a horizon leaf. Context
-/// preloading belongs to the implementation of the seam — the request only
-/// declares which files the step targets and which it reads — so the engine
-/// never touches the context layers itself.
+/// what the host needs in order to run one turn of a horizon leaf. Application
+/// preparation owns context preloading and prompt assembly; the host publishes
+/// snapshots and executes the prepared turn.
 pub struct StepTurnRequest {
     /// The scope whose horizon the turn executes.
     pub scope: ExecutionScope,
@@ -182,7 +186,7 @@ pub struct StepTurnRequest {
 pub enum StepTurnResult {
     /// The turn applied verified changes and satisfied the success contract.
     Success {
-        /// Summary of the completed work, rendered by the host.
+        /// Summary of the completed work, classified by core.
         summary: String,
         /// Identifier of the Git commit the successful turn produced.
         ///
@@ -220,10 +224,6 @@ pub struct RefinementRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Additional instructions the developer stated for the wave.
     pub instructions: Option<String>,
-    /// Turn marker bound to the tagged control channel.
-    pub marker: Option<String>,
-    /// Cancellation signal of the running batch.
-    pub cancel_rx: watch::Receiver<bool>,
 }
 
 /// Outcome of one Architect refinement wave.

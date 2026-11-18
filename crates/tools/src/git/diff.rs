@@ -14,6 +14,13 @@ pub struct CommitSummary {
     pub subject: String,
 }
 
+/// One file's patch over a pinned Git revision range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub diff: String,
+}
+
 /// Finds the most recent non-AI commit hash preceding the current session of AI commits.
 /// Returns Ok(Some(hash)) if a base non-AI commit was found, or Ok(None) if not.
 pub fn find_last_non_ai_commit(dir: &Path) -> Result<Option<String>> {
@@ -278,10 +285,7 @@ fn header_path(rest: &str) -> Option<String> {
 /// address the two pinned hashes, so neither observes a ref that moved between
 /// them: the block count and the path count describe one snapshot and the
 /// positional pairing cannot shift a name onto another file's block.
-fn pair_file_diffs(
-    dir: &Path,
-    pinned: &PinnedRange,
-) -> Result<Vec<tauqe_protocol::GitSquashFileDiff>> {
+fn pair_file_diffs(dir: &Path, pinned: &PinnedRange) -> Result<Vec<FileDiff>> {
     let range = pinned.rev_range();
     let raw_diff = diff_range(dir, &range, &[])?;
     if raw_diff.trim().is_empty() {
@@ -304,7 +308,7 @@ fn pair_file_diffs(
                 }
             };
             next_path += 1;
-            files.push(tauqe_protocol::GitSquashFileDiff {
+            files.push(FileDiff {
                 path,
                 diff: String::new(),
             });
@@ -334,10 +338,7 @@ fn pair_file_diffs(
 /// whatever the repository does meanwhile. The answer is only truthful while
 /// the endpoints still name that snapshot, which is why the drift check runs
 /// over the whole computation before the result reaches a caller.
-fn file_diffs_of_pinned_range(
-    dir: &Path,
-    pinned: &PinnedRange,
-) -> Result<Vec<tauqe_protocol::GitSquashFileDiff>> {
+fn file_diffs_of_pinned_range(dir: &Path, pinned: &PinnedRange) -> Result<Vec<FileDiff>> {
     let files = pair_file_diffs(dir, pinned)?;
     assert_range_pinned(dir, pinned)?;
     Ok(files)
@@ -353,10 +354,7 @@ fn file_diffs_of_pinned_range(
 /// the listings ran is a typed refusal naming the drift. The public signature
 /// and the shape of a file diff stay unchanged, so the squash preview handler
 /// keeps calling this entry point.
-pub fn get_cumulative_file_diffs(
-    dir: &Path,
-    base_ref: &str,
-) -> Result<Vec<tauqe_protocol::GitSquashFileDiff>> {
+pub fn get_cumulative_file_diffs(dir: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     let pinned = pin_range(dir, base_ref)?;
     file_diffs_of_pinned_range(dir, &pinned)
 }

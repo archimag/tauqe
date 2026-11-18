@@ -5,7 +5,9 @@
 //! these cases assert the batch framing only: which scope reached the provider,
 //! what the queue did with the verdict, and what the terminal event reports.
 
+use crate::contracts::Project;
 use std::sync::Arc;
+use tauqe_tui::projection::ReviewProjection;
 
 use super::{
     init_repo_with_file, make_tasks, save_grouped_session, subplan_item, test_config, test_item,
@@ -21,14 +23,14 @@ use crate::state::AppState;
 use crate::transport::OutChannel;
 
 use tauqe_core::config::AppConfig;
+use tauqe_core::models::{ModelEntry, ModelRef};
+use tauqe_core::plan::PlanItemStatus;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::providers::LlmProvider;
+use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::model::TurnWorkContext;
-use tauqe_protocol::{
-    events, IssueStatus, ModelEntry, ModelRef, ModelStartedEvent, PlanItemStatus,
-    ReviewUpdatedEvent,
-};
+use tauqe_protocol::{events, ModelStartedEvent, ReviewUpdatedEvent};
 
 use tokio::sync::mpsc;
 
@@ -399,7 +401,7 @@ async fn batch_publishes_the_lifecycle_of_a_single_finding_run() {
         .session
         .find_item(1)
         .expect("the finding is stored");
-    assert_eq!(observed.status, IssueStatus::InProgress);
+    assert_eq!(observed.status, IssueStatus::InProgress.project());
 
     // The turn declares the work it executes instead of leaving the client to
     // reconstruct it from the stored session.
@@ -441,7 +443,7 @@ async fn batch_publishes_the_lifecycle_of_a_single_finding_run() {
         .next()
         .expect("review/updated must follow model/finished");
     let verdict = settled.session.find_item(1).expect("the finding is stored");
-    assert_eq!(verdict.status, IssueStatus::Fixed);
+    assert_eq!(verdict.status, IssueStatus::Fixed.project());
     assert!(
         verdict
             .resolution_notes
@@ -535,13 +537,13 @@ async fn batch_publishes_the_lifecycle_of_a_group_member_run() {
         .expect("the group is stored");
     assert_eq!(
         running_group.implementation.items[0].status,
-        PlanItemStatus::InProgress
+        PlanItemStatus::InProgress.project()
     );
     let pending_finding = in_progress
         .session
         .find_item(1)
         .expect("the finding is stored");
-    assert_eq!(pending_finding.status, IssueStatus::Todo);
+    assert_eq!(pending_finding.status, IssueStatus::Todo.project());
 
     // The turn declares the group horizon it executes instead of leaving the
     // client to reconstruct it from the stored session.
@@ -591,10 +593,10 @@ async fn batch_publishes_the_lifecycle_of_a_group_member_run() {
         .expect("the group is stored");
     assert_eq!(
         settled_group.implementation.items[0].status,
-        PlanItemStatus::Done
+        PlanItemStatus::Done.project()
     );
     let verdict = settled.session.find_item(1).expect("the finding is stored");
-    assert_eq!(verdict.status, IssueStatus::Fixed);
+    assert_eq!(verdict.status, IssueStatus::Fixed.project());
     assert!(
         verdict
             .resolution_notes
@@ -684,7 +686,7 @@ async fn batch_publishes_the_skipped_verdict_of_an_exhausted_run() {
         .next_back()
         .expect("review/updated must be published");
     let skipped = settled.session.find_item(1).expect("the finding is stored");
-    assert_eq!(skipped.status, IssueStatus::Skipped);
+    assert_eq!(skipped.status, IssueStatus::Skipped.project());
     let note = skipped.resolution_notes.as_deref().unwrap_or_default();
     let diagnostic = note
         .strip_prefix("The implementation run could not address this finding: ")

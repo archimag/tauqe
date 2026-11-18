@@ -6,13 +6,15 @@
 //! terminal state — `Done` with the commit that produced it, `Blocked` with
 //! the reported reason, or a reset to `Todo` after the ladder is exhausted.
 
+use crate::context::ContextAccess;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauqe_protocol::{
-    ContextAccess, EditProtocolKind, LlmCapability, LlmCommand, ModelEntry, ModelRole,
-    ModelSelection, Plan, PlanImplementation, PlanItem, PlanItemStatus, ReasoningEffort,
-};
+use crate::llm::LlmCapability;
+use crate::llm::LlmCommand;
+use crate::models::{ModelEntry, ModelRole, ModelSelection, ReasoningEffort};
+use crate::plan::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
+use crate::workflow::EditProtocolKind;
 
 use crate::config::ModelsConfig;
 use crate::control::context::LoopContext;
@@ -106,7 +108,7 @@ pub struct PlanStepArtifact {
 /// durable state through [`PlanDocumentPersistence`]; every other outcome leaves
 /// the step at `Todo` so no completed turn is claimed by accident.
 #[cfg(test)]
-pub(crate) async fn run_plan_step_loop(
+async fn run_plan_step_loop(
     ctx: &mut LoopContext<'_>,
     plan_id: &str,
     step_id: &str,
@@ -678,7 +680,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use tauqe_protocol::{CapabilityTree, ConceptItem, ModelRef, Plan, PlanItem, PlanItemStatus};
+    use crate::llm::CapabilityTree;
+    use crate::models::ModelRef;
+    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink, LoopContext};

@@ -1,8 +1,7 @@
+use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
+use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanRejection};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{
-    DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus, PlanRejection,
-};
 
 use super::{PlanApplicationOutcome, PlanBatchSnapshot, PlanMutationMode, PlanStorage};
 
@@ -171,7 +170,7 @@ struct PlanMutationTag {
     id: String,
     title: Option<String>,
     description: Option<String>,
-    concept: Vec<tauqe_protocol::ConceptItem>,
+    concept: Vec<crate::plan::ConceptItem>,
     items: Vec<PlanMutationItem>,
 }
 
@@ -323,8 +322,8 @@ impl PlanStorage {
                         }
 
                         fn update_concept_single(
-                            concepts: &mut [tauqe_protocol::ConceptItem],
-                            update: &tauqe_protocol::ConceptItem,
+                            concepts: &mut [crate::plan::ConceptItem],
+                            update: &crate::plan::ConceptItem,
                         ) -> bool {
                             for item in concepts.iter_mut() {
                                 if item.id.eq_ignore_ascii_case(&update.id) {
@@ -651,7 +650,7 @@ impl PlanStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::PlanRejectionKind;
+    use crate::plan::PlanRejectionKind;
     use tempfile::tempdir;
 
     fn probe_leaf(id: &str, file: &str) -> PlanItem {
@@ -670,7 +669,7 @@ mod tests {
             id: Some(id.to_string()),
             title: Some(format!("Plan {id}")),
             description: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
@@ -698,7 +697,7 @@ mod tests {
             id: Some("structured-auth".to_string()),
             title: Some("Structured Auth".to_string()),
             description: Some("Implement auth via structured output".to_string()),
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Structured auth requirement".to_string(),
                 details: None,
@@ -796,7 +795,7 @@ mod tests {
             id: Some("test-plan".to_string()),
             title: Some("Test".to_string()),
             description: Some("Updated Desc without items".to_string()),
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Architecture concept".to_string(),
                 details: None,
@@ -827,7 +826,7 @@ mod tests {
             id: Some("structured-upsert".to_string()),
             title: Some("Structured Upsert".to_string()),
             description: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
@@ -1057,7 +1056,7 @@ mod tests {
             id: Some("outer-docs-plan".to_string()),
             title: Some("Outer Docs Plan".to_string()),
             description: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+            concept: vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,

@@ -1,7 +1,7 @@
 //! Virtual staging and the deterministic algorithms that resolve a change set.
 //!
-//! Nothing here touches the cognitive layers: the substrate works from the wire
-//! contract (`EditOperation`, `ProjectConfig`, `ContextState`) and the pure path
+//! Nothing here touches the cognitive layers: the substrate works from edit
+//! operations, resolved project commands, explicit context paths, and the pure path
 //! predicates of [`crate::paths`]. A change set is applied to memory before any
 //! byte reaches disk, a refused member restores exactly the paths it touched,
 //! and the files an attempt staged leave through the declared project filter.
@@ -18,14 +18,13 @@ pub mod error;
 mod format;
 pub mod fuzzy;
 mod line_endings;
+pub mod operation;
 mod protection;
 pub mod staging;
 
 pub use change_set::{
-    stage_and_validate_edits, stage_and_validate_edits_with, FailedFileEdit, StageEditsResult,
-    StagedConfigValidator, StagedEditsState,
+    stage_and_validate_edits_with, FailedFileEdit, StageEditsResult, StagedConfigValidator,
+    StagedEditsState,
 };
 pub use error::EditError;
-pub use format::{
-    prepare_staged_edits_with_config, prepare_staged_edits_with_config_and_validator,
-};
+pub use format::prepare_staged_edits_with_config_and_validator;

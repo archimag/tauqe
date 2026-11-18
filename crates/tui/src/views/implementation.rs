@@ -8,6 +8,7 @@
 
 use ratatui::style::{Style, Stylize};
 use tauqe_protocol::{PlanImplementation, PlanItemStatus};
+use tauqe_tui::projection::*;
 
 use crate::theme::engine::current_engine;
 
@@ -32,8 +33,8 @@ pub(crate) fn status_style(status: PlanItemStatus) -> Style {
 
 /// Executable leaf progress of a horizon as `(total, done)`.
 ///
-/// Delegates to `PlanImplementation::count_stats`, the single authoritative
-/// metric: only leaves carry an explicit status, cancelled leaves are excluded
+/// Uses the client `PlanImplementationProjection::count_stats` projection,
+/// checked against core: only leaves carry an explicit status, cancelled leaves are excluded
 /// from the total, and `done` counts the finished leaves. The Plans view and
 /// the Review view therefore report one number for one horizon (c-5).
 pub(crate) fn leaf_progress(implementation: &PlanImplementation) -> (usize, usize) {

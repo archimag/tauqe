@@ -1,7 +1,8 @@
 use crate::edits::stream::json::decode::first_json_object_str;
+use crate::llm::discussion::normalize_repo_map_path;
+use crate::llm::discussion::RepoSearchRequest;
+use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::discussion::normalize_repo_map_path;
-use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus, RepoSearchRequest};
 
 /// Host-environment impossibility declared by an Architect synthesis round.
 ///
@@ -95,7 +96,7 @@ pub(crate) fn parse_plan_refinement_output(raw_json: &str) -> anyhow::Result<Pla
 }
 
 /// Maximum supported hierarchy nesting depth for structured plan refinement output.
-pub(crate) const MAX_PLAN_REFINEMENT_DEPTH: usize = 5;
+const MAX_PLAN_REFINEMENT_DEPTH: usize = 5;
 
 /// Target size range (in changed lines) for one cohesive leaf implementation step.
 const LEAF_STEP_TARGET_LINES: (usize, usize) = (150, 400);

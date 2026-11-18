@@ -1,12 +1,16 @@
+mod projection;
+pub(crate) use projection::{
+    context_access_domain, context_layer_domain, context_state_dto, publish_context,
+};
 use std::sync::Arc;
 
 use tauqe_protocol::{
-    errors, events, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
-    ContextClearParams, ContextLayer, ContextRemoveParams, ContextSetAccessParams, Event, Request,
-    RequestId, Response,
+    errors, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult, ContextClearParams,
+    ContextRemoveParams, ContextSetAccessParams, Request, RequestId, Response,
 };
 
-use crate::state::{AppState, OperationGuard};
+use crate::state::AppState;
+use tauqe_core::api::{ContextError, ContextOperation};
 
 /// Claims the operation slot for a context mutation.
 ///
@@ -19,22 +23,27 @@ use crate::state::{AppState, OperationGuard};
 fn claim_context_mutation(
     req_id: &RequestId,
     state: &Arc<AppState>,
-) -> Result<OperationGuard, Box<Response>> {
-    super::begin_exclusive_operation(
-        req_id,
-        state,
-        "Context cannot be modified while a turn or batch is running",
-    )
+) -> Result<ContextOperation, Box<Response>> {
+    state.application.begin_context_change().map_err(|_| {
+        tracing::warn!(
+            code = errors::OPERATION_IN_PROGRESS,
+            "Refused to register a new operation: a slot is already active"
+        );
+        Box::new(Response::err(
+            req_id.clone(),
+            errors::OPERATION_IN_PROGRESS,
+            "Context cannot be modified while a turn or batch is running",
+        ))
+    })
 }
 
 pub async fn handle_context_get(req: Request, state: &Arc<AppState>) -> Response {
-    let ctx = state.context.read().await;
-    let ctx_state = ctx.get_state();
-    Response::ok_typed(req.id, &ctx_state)
+    let ctx_state = state.context_state().await;
+    Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response {
-    let _operation = match claim_context_mutation(&req.id, state) {
+    let operation = match claim_context_mutation(&req.id, state) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
     };
@@ -50,52 +59,32 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    // Honor the requested layer instead of always defaulting to the User layer.
-    // The Pinned layer stays configuration-only and the OuterDocs layer is
-    // owned by the external documentation registry, so both are refused here.
-    let layer = params.layer.unwrap_or(ContextLayer::User);
-    if layer == ContextLayer::Pinned {
-        return Response::err(
-            req.id,
-            errors::PINNED_PROTECTED,
-            "Pinned files are managed by project configuration and cannot be added manually",
-        );
-    }
-    if layer == ContextLayer::OuterDocs {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "The OuterDocs layer is registry-managed and cannot be added manually",
-        );
-    }
-
-    // Metadata reads and path verification touch the disk, so the mutation runs
-    // on the blocking pool while the exclusive context guard is held for the
-    // whole read-modify-write sequence.
-    let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.add_file_to_layer(&params.path, params.access, layer)
-            .map(|_| ctx.get_state())
-            .map_err(|err| err.to_string())
-    })
-    .await;
-
-    let ctx_state = match outcome {
-        Ok(Ok(state)) => state,
-        Ok(Err(err)) | Err(err) => {
-            return Response::err(req.id, errors::ADD_FAILED, err);
+    let ctx_state = match operation
+        .add_file(
+            params.path,
+            context_access_domain(params.access),
+            params.layer.map(context_layer_domain),
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let code = match error {
+                ContextError::PinnedAddition => errors::PINNED_PROTECTED,
+                ContextError::RegistryManaged => errors::INVALID_PARAMS,
+                _ => errors::ADD_FAILED,
+            };
+            return Response::err(req.id, code, error.to_string());
         }
     };
 
-    state.out.send_event(&Event {
-        method: events::CONTEXT_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "state": ctx_state })),
-    });
+    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
-    Response::ok_typed(req.id, &ctx_state)
+    Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> Response {
-    let _operation = match claim_context_mutation(&req.id, state) {
+    let operation = match claim_context_mutation(&req.id, state) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
     };
@@ -112,67 +101,29 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             }
         };
 
-    // Read the aggregate token budget before taking the context write lock so the
-    // two locks are never held at the same time.
-    let token_budget = {
-        let guard = state.config.lock().await;
-        guard.config.context.token_budget
+    let addition = match operation
+        .add_pattern(params.pattern, context_access_domain(params.access))
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Response::err(req.id, errors::ADD_PATTERN_FAILED, error.to_string()),
     };
+    let ctx_state = addition.state;
 
-    let repo_root = state.repo_root().await;
-    let available_files =
-        super::offload(move || tauqe_core::git::list_repository_files(Some(repo_root.as_path())))
-            .await
-            .map(|result| result.unwrap_or_default())
-            .unwrap_or_default();
-
-    // Matching the pattern against the repository listing and pricing every
-    // admitted file from its metadata touches the disk, so the whole
-    // application runs inside the blocking closure.
-    let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.add_files_by_pattern(
-            &params.pattern,
-            params.access,
-            &available_files,
-            token_budget,
-        )
-        .map(|outcome| {
-            let state = ctx.get_state();
-            (
-                outcome.added_items.len(),
-                outcome.added_tokens,
-                outcome.truncated,
-                state,
-            )
-        })
-        .map_err(|err| err.to_string())
-    })
-    .await;
-
-    let (added_count, added_tokens, truncated, ctx_state) = match outcome {
-        Ok(Ok(value)) => value,
-        Ok(Err(err)) | Err(err) => {
-            return Response::err(req.id, errors::ADD_PATTERN_FAILED, err);
-        }
-    };
-
-    state.out.send_event(&Event {
-        method: events::CONTEXT_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "state": ctx_state })),
-    });
+    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
     let result = ContextAddPatternResult {
-        added_count,
-        added_tokens,
-        truncated,
-        state: ctx_state,
+        added_count: addition.added_count,
+        added_tokens: addition.added_tokens,
+        truncated: addition.truncated,
+        state: context_state_dto(&ctx_state),
     };
 
     Response::ok_typed(req.id, &result)
 }
 
 pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Response {
-    let _operation = match claim_context_mutation(&req.id, state) {
+    let operation = match claim_context_mutation(&req.id, state) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
     };
@@ -185,30 +136,18 @@ pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Respo
         }
     };
 
-    let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.remove_file(&params.path)
-            .map(|_| ctx.get_state())
-            .map_err(|err| err.to_string())
-    })
-    .await;
-
-    let ctx_state = match outcome {
-        Ok(Ok(state)) => state,
-        Ok(Err(err)) | Err(err) => {
-            return Response::err(req.id, errors::REMOVE_FAILED, err);
-        }
+    let ctx_state = match operation.remove_file(params.path).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::err(req.id, errors::REMOVE_FAILED, error.to_string()),
     };
 
-    state.out.send_event(&Event {
-        method: events::CONTEXT_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "state": ctx_state })),
-    });
+    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
-    Response::ok_typed(req.id, &ctx_state)
+    Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> Response {
-    let _operation = match claim_context_mutation(&req.id, state) {
+    let operation = match claim_context_mutation(&req.id, state) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
     };
@@ -225,30 +164,21 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
             }
         };
 
-    let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.set_access(&params.path, params.access)
-            .map(|_| ctx.get_state())
-            .map_err(|err| err.to_string())
-    })
-    .await;
-
-    let ctx_state = match outcome {
-        Ok(Ok(state)) => state,
-        Ok(Err(err)) | Err(err) => {
-            return Response::err(req.id, errors::SET_ACCESS_FAILED, err);
-        }
+    let ctx_state = match operation
+        .set_access(params.path, context_access_domain(params.access))
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::err(req.id, errors::SET_ACCESS_FAILED, error.to_string()),
     };
 
-    state.out.send_event(&Event {
-        method: events::CONTEXT_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "state": ctx_state })),
-    });
+    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
-    Response::ok_typed(req.id, &ctx_state)
+    Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Response {
-    let _operation = match claim_context_mutation(&req.id, state) {
+    let operation = match claim_context_mutation(&req.id, state) {
         Ok(guard) => guard,
         Err(resp) => return *resp,
     };
@@ -271,48 +201,23 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
         None => ContextClearParams::default(),
     };
 
-    if params.layer == Some(ContextLayer::Pinned) {
-        return Response::err(
-            req.id,
-            errors::PINNED_PROTECTED,
-            "Pinned files are protected and cannot be cleared",
-        );
-    }
-
-    // Clearing recomputes hierarchical pinned files, which stats the disk, so it
-    // runs on the blocking pool like every other context mutation. Clearing the
-    // Auto layer, the OuterDocs layer, or the whole context really shrinks the
-    // stable prompt prefix, so those paths go through the shared `AppState`
-    // facade, which rotates the dialogue session exactly when files were
-    // removed. A user-layer clear leaves the Auto layer intact, so it keeps the
-    // warm session and stays a plain context mutation.
-    let cleared = match params.layer {
-        Some(ContextLayer::Auto) => state.clear_auto_context().await,
-        Some(ContextLayer::User) => {
-            super::with_context_mutation(state, |ctx| {
-                ctx.clear_user();
-                ctx.get_state()
-            })
-            .await
+    let ctx_state = match operation
+        .clear(params.layer.map(context_layer_domain))
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let code = match error {
+                ContextError::PinnedClear => errors::PINNED_PROTECTED,
+                _ => errors::INTERNAL_ERROR,
+            };
+            return Response::err(req.id, code, error.to_string());
         }
-        // External documents form a persistent layer of their own, so clearing
-        // it drops exactly that layer and leaves the other three intact.
-        Some(ContextLayer::OuterDocs) => state.clear_outer_docs_context().await,
-        // The Pinned layer is refused above, so nothing else remains to clear.
-        _ => state.clear_all_context().await,
     };
 
-    let ctx_state = match cleared {
-        Ok(state) => state,
-        Err(err) => return Response::err(req.id, errors::INTERNAL_ERROR, err),
-    };
+    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
-    state.out.send_event(&Event {
-        method: events::CONTEXT_CHANGED.to_string(),
-        params: Some(serde_json::json!({ "state": ctx_state })),
-    });
-
-    Response::ok_typed(req.id, &ctx_state)
+    Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 #[cfg(test)]
@@ -320,7 +225,7 @@ mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
-    use tauqe_protocol::{methods, ContextAccess, ContextLayer, Request, RequestId};
+    use tauqe_protocol::{events, methods, ContextAccess, ContextLayer, Request, RequestId};
 
     /// Scratch repository root of one context handler test, removed on drop.
     struct TestDir(std::path::PathBuf);
@@ -358,10 +263,11 @@ mod tests {
         let file_path = dir.path().join("lib.rs");
         std::fs::write(&file_path, "pub fn hello() {}\n").unwrap();
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_file("lib.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_file("lib.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
 
         let req = Request {
@@ -496,10 +402,11 @@ mod tests {
         std::fs::write(&file_path, "fn test() {}\n").unwrap();
 
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_file("test.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_file("test.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
 
         let make_set_req = |id: u64, params: Option<serde_json::Value>| Request {
@@ -583,18 +490,20 @@ mod tests {
 
         // Populate user and auto
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_file("user.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_file("user.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_auto_file("auto.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
-        assert_eq!(state.context.read().await.get_state().items.len(), 2);
+        assert_eq!(state.context_state().await.items.len(), 2);
 
         let warm_session = state.session_uuid().await;
 
@@ -617,10 +526,11 @@ mod tests {
 
         // Repopulate auto
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_auto_file("auto.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
 
         // Clear User only
@@ -669,10 +579,9 @@ mod tests {
         std::fs::write(&pinned_file, "fn pinned() {}\n").unwrap();
 
         state
-            .context
-            .write()
+            .mutate_context(|context| context.load_pinned(&["pinned.rs".to_string()]))
             .await
-            .load_pinned(&["pinned.rs".to_string()]);
+            .expect("fixture context mutation runs");
 
         let req = Request {
             id: RequestId::Number(1),
@@ -758,7 +667,7 @@ mod tests {
             "the running operation must keep owning the slot"
         );
         assert!(
-            state.context.read().await.get_state().items.is_empty(),
+            state.context_state().await.items.is_empty(),
             "a refused context mutation must not reach the manager"
         );
 
@@ -799,7 +708,7 @@ mod tests {
 
         assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
         assert!(
-            !state.context.read().await.contains("ref.md").unwrap(),
+            !state.context_snapshot().await.contains("ref.md").unwrap(),
             "the registry owns the OuterDocs layer"
         );
     }
@@ -817,22 +726,22 @@ mod tests {
         std::fs::write(&snapshot, "# External snapshot\n").unwrap();
         std::fs::write(dir.path().join("user.rs"), "fn user() {}\n").unwrap();
         state
-            .context
-            .write()
+            .mutate_context(move |context| context.add_outer_docs_file(&cached))
             .await
-            .add_outer_docs_file(&cached)
+            .expect("fixture context mutation runs")
             .unwrap();
         state
-            .context
-            .write()
+            .mutate_context(|context| {
+                context.add_file("user.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            })
             .await
-            .add_file("user.rs", ContextAccess::ReadOnly)
+            .expect("fixture context mutation runs")
             .unwrap();
-        let resident = state.context.read().await.get_state();
+        let resident = state.context_state().await;
         let document = resident
             .items
             .iter()
-            .find(|item| item.layer == ContextLayer::OuterDocs)
+            .find(|item| item.layer == tauqe_core::context::ContextLayer::OuterDocs)
             .expect("the document is resident");
         assert_eq!(
             document.path, "ref.md",
@@ -891,10 +800,9 @@ mod tests {
         std::fs::write(&snapshot, "# Summary\n").unwrap();
 
         state
-            .context
-            .write()
+            .mutate_context(move |context| context.add_outer_docs_file(&cached))
             .await
-            .add_outer_docs_file(&cached)
+            .expect("fixture context mutation runs")
             .expect("the snapshot enters the context");
 
         let req = Request {

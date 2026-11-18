@@ -1,7 +1,7 @@
-use tauqe_protocol::Plan;
+use crate::plan::Plan;
 
 /// Computes the Levenshtein edit distance between two strings.
-pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
+fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
     let m = a_chars.len();

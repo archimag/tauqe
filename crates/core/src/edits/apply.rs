@@ -6,9 +6,10 @@
 //! through [`apply_edit_proposal`], while a bounded turn applies the
 //! configuration it froze through [`apply_edit_proposal_with_config`].
 
+use crate::config::project::ProjectConfig;
 use std::path::Path;
 
-use tauqe_protocol::{EditProposal, ProjectConfig};
+use crate::edits::EditProposal;
 
 use super::atomic::commit_staged_edits;
 use super::stage::prepare_staged_edits_with_config;
@@ -85,12 +86,12 @@ pub async fn apply_edit_proposal_with_config(
         for path in result.staged_state.staged_files.keys() {
             if context_manager.contains(path).unwrap_or(false) {
                 let _ = context_manager.update_file_metadata(path);
-                let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
+                let _ = context_manager.set_access(path, crate::context::ContextAccess::Editable);
             } else {
                 // A path absent from context is a file the turn created (or a
                 // move destination), so it widens the transient auto layer only.
                 let _ =
-                    context_manager.add_auto_file(path, tauqe_protocol::ContextAccess::Editable);
+                    context_manager.add_auto_file(path, crate::context::ContextAccess::Editable);
             }
         }
     });

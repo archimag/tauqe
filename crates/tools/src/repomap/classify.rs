@@ -24,9 +24,9 @@ pub enum SymlinkStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymlinkTarget {
     /// Link target exactly as stored on disk, empty when it cannot be read.
-    pub target: String,
+    pub(crate) target: String,
     /// Whether the link stays inside the repository or is broken.
-    pub status: SymlinkStatus,
+    pub(crate) status: SymlinkStatus,
 }
 
 /// Classification of a tracked repository path without following symbolic links.
@@ -44,7 +44,7 @@ pub enum RepoPathKind {
 ///
 /// The entry is inspected as it exists on disk, so a symbolic link is never
 /// implicitly dereferenced into the regular file it points to.
-pub fn classify_repo_path(repo_root: &Path, relative_path: &str) -> RepoPathKind {
+pub(crate) fn classify_repo_path(repo_root: &Path, relative_path: &str) -> RepoPathKind {
     let full_path = repo_root.join(relative_path);
     let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
         return RepoPathKind::Other;

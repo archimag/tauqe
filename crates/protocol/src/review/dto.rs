@@ -168,9 +168,6 @@ pub struct ReviewPreviewResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ReviewListParams {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReviewListResult {
     pub reviews: Vec<ReviewSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

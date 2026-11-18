@@ -1,10 +1,9 @@
+use crate::models::ArchitectTier;
+use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation, PlanValidationError};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{
-    ArchitectTier, Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation, PlanValidationError,
-};
 
 use super::PlanStorage;
 
@@ -349,7 +348,7 @@ fn drop_done_collisions(items: Vec<PlanItem>, done_ids: &HashSet<String>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::ModelRef;
+    use crate::models::ModelRef;
     use tempfile::tempdir;
 
     /// Architect provenance recorded by the synthesis primitive under test.
@@ -987,7 +986,7 @@ mod tests {
             None,
             0,
             10,
-            vec![tauqe_protocol::ConceptItem {
+            vec![crate::plan::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,

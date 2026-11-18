@@ -1,6 +1,6 @@
+use crate::history::{HistoryFileChange, TurnRoundRecord};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{HistoryFileChange, TurnRoundRecord};
 
 /// A semantic record in the interaction history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +197,27 @@ pub(crate) fn record_bytes(entry: &HistoryEntry) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::EditFileOp;
+    use crate::history::HistoryFileOperation;
+
+    #[test]
+    fn typed_history_files_keep_legacy_operation_decoding_and_canonical_bytes() {
+        let stored = r#"{"type":"response","message":"Moved directory","files":[{"path":"src/old","op":" MOVE_DIR ","to":"src/new"},{"path":"README.md"}]}"#;
+        let entry = HistoryEntry::from_jsonl_line(stored).unwrap();
+        match &entry {
+            HistoryEntry::Response { files, .. } => assert_eq!(
+                files,
+                &vec![
+                    HistoryFileChange::moved_dir("src/old", "src/new"),
+                    HistoryFileChange::plain("README.md"),
+                ]
+            ),
+            _ => panic!("expected response"),
+        }
+        assert_eq!(
+            entry.to_jsonl_line().unwrap(),
+            r#"{"type":"response","message":"Moved directory","files":[{"path":"src/old","op":"move_dir","to":"src/new"},{"path":"README.md"}]}"#
+        );
+    }
 
     #[test]
     fn test_summary_serialization() {
@@ -265,7 +285,7 @@ mod tests {
             commit: Some("a1b2c3d".to_string()),
             summary: Some("Initial refactor".to_string()),
             files: vec![
-                HistoryFileChange::operated(EditFileOp::Create, "src/new.rs"),
+                HistoryFileChange::operated(HistoryFileOperation::Create, "src/new.rs"),
                 HistoryFileChange::plain("src/history.rs"),
             ],
         };
@@ -287,7 +307,7 @@ mod tests {
             commit: None,
             summary: None,
             files: vec![
-                HistoryFileChange::operated(EditFileOp::Create, "src/new.rs"),
+                HistoryFileChange::operated(HistoryFileOperation::Create, "src/new.rs"),
                 HistoryFileChange::moved("src/a.rs", "src/b.rs"),
                 HistoryFileChange::plain("src/lib.rs"),
             ],
@@ -312,10 +332,10 @@ mod tests {
                 assert_eq!(
                     files,
                     vec![
-                        HistoryFileChange::operated(EditFileOp::Replace, "src/lib.rs"),
-                        HistoryFileChange::operated(EditFileOp::Create, "src/util.rs"),
-                        HistoryFileChange::operated(EditFileOp::Delete, "src/old.rs"),
-                        HistoryFileChange::operated(EditFileOp::Overwrite, "src/gen.rs"),
+                        HistoryFileChange::operated(HistoryFileOperation::Replace, "src/lib.rs"),
+                        HistoryFileChange::operated(HistoryFileOperation::Create, "src/util.rs"),
+                        HistoryFileChange::operated(HistoryFileOperation::Delete, "src/old.rs"),
+                        HistoryFileChange::operated(HistoryFileOperation::Overwrite, "src/gen.rs"),
                         HistoryFileChange::moved("src/a.rs", "src/b.rs"),
                         HistoryFileChange::plain("src/plain.rs"),
                     ]

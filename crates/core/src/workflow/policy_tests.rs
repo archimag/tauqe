@@ -5,12 +5,14 @@
 //! finalization, where a verified change set becomes durable, and rollback,
 //! where the working tree returns to its pre-edit state.
 
+use crate::config::project::ProjectConfig;
+use crate::context::{ContextAccess, ContextLayer};
 use std::path::Path;
 
-use tauqe_protocol::{
-    ContextAccess, ContextLayer, EditCreate, EditOperation, EditProposal, EditReplace,
-    ProjectConfig,
-};
+use crate::edits::EditCreate;
+use crate::edits::EditOperation;
+use crate::edits::EditProposal;
+use crate::edits::EditReplace;
 
 use crate::context::ContextManager;
 use crate::git::cmd::run_git;

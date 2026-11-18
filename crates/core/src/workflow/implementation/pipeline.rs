@@ -41,10 +41,10 @@
 
 use std::path::Path;
 
-use tauqe_protocol::{
-    ArchitectTier, EditProtocolKind, IssueStatus, ModelSelection, PlanItem, PlanItemStatus,
-    PlanScopeEvaluation,
-};
+use crate::models::{ArchitectTier, ModelSelection};
+use crate::plan::{PlanItem, PlanItemStatus, PlanScopeEvaluation};
+use crate::review::IssueStatus;
+use crate::workflow::EditProtocolKind;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::AppConfig;
@@ -99,7 +99,7 @@ pub enum PlanImplementationStop {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanImplementationReport {
     /// The scope whose horizon the run executed.
-    pub scope: ExecutionScope,
+    scope: ExecutionScope,
     /// Terminal reason the run stopped.
     pub stop: PlanImplementationStop,
     /// Leaves scheduled for execution across every round of the run.
@@ -109,21 +109,14 @@ pub struct PlanImplementationReport {
     /// Executed leaves that satisfied their success contract.
     pub succeeded: usize,
     /// Executed leaves that filtered themselves out of the run.
-    pub skipped: usize,
+    skipped: usize,
     /// Executed leaves that failed, blocked, or were cancelled.
-    pub failed: usize,
+    failed: usize,
     /// Architect waves the run spent reprojecting its horizon.
     ///
     /// The initial just-in-time projection of a horizon the scope did not own yet
     /// is not a replan, so it is not counted here.
     pub replans: usize,
-}
-
-impl PlanImplementationReport {
-    /// Whether the run executed every remaining leaf of its horizon.
-    pub fn is_success(&self) -> bool {
-        matches!(self.stop, PlanImplementationStop::Completed)
-    }
 }
 
 /// Batch driver of one implementation horizon.
@@ -694,8 +687,6 @@ impl<'a> PlanImplementationPipeline<'a> {
             }),
             reasoning_effort: tier.effort,
             instructions: self.options.instructions.clone(),
-            marker: self.options.marker.clone(),
-            cancel_rx: cancel_rx.clone(),
         };
 
         let result = self.host.run_refinement(request).await;
@@ -898,12 +889,11 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    use crate::models::{ArchitectTier, ModelEntry, ModelRef, ModelSelection, ReasoningEffort};
+    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
+    use crate::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
+    use crate::review::{ReviewGroup, ReviewItem, ReviewSession};
     use async_trait::async_trait;
-    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
-    use tauqe_protocol::{
-        ArchitectTier, ConceptItem, ModelEntry, ModelRef, ModelSelection, Plan, PlanItem,
-        PlanItemStatus, ReasoningEffort, ReviewGroup, ReviewItem, ReviewSession,
-    };
     use tempfile::tempdir;
 
     use super::*;

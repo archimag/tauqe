@@ -6,15 +6,17 @@
 //! Every capability is a registered handler, so a turn loop dispatches through
 //! the trait instead of branching on the command it decoded.
 
+use crate::context::ContextAccess;
 pub mod journal;
 pub mod search;
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use tauqe_protocol::{
-    ContextAccess, DirListRequest, DocTopic, LlmCapability, LlmCommand, RepoSearchRequest,
-};
+use crate::llm::discussion::DirListRequest;
+use crate::llm::discussion::RepoSearchRequest;
+use crate::llm::DocTopic;
+use crate::llm::LlmCommand;
 
 use crate::blocking::{run_blocking, run_blocking_async};
 use crate::config::ContextConfig;
@@ -24,11 +26,7 @@ use crate::mockups;
 use crate::outer_docs;
 use crate::outer_docs::MaterializeError;
 
-pub use search::{
-    execute_repo_search, execute_repo_searches, format_search_feedback,
-    format_single_search_feedback, normalize_search_path, FileSearchMatch, RepoSearchResult,
-    MAX_SEARCHABLE_FILE_SIZE, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
-};
+pub(crate) use search::{execute_repo_searches, format_search_feedback, RepoSearchResult};
 
 /// Operational caps applied to one Research round.
 ///
@@ -39,13 +37,13 @@ pub use search::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResearchLimits {
     /// Repository search queries honored in one round.
-    pub max_search_requests_per_round: usize,
+    max_search_requests_per_round: usize,
     /// Matching files reported for a single search query.
-    pub max_matched_files_per_search: usize,
+    max_matched_files_per_search: usize,
     /// Entries rendered by a single directory listing.
-    pub max_dir_list_entries: usize,
+    max_dir_list_entries: usize,
     /// Distinct targeted map requests honored in one round.
-    pub max_repo_map_requests_per_round: usize,
+    max_repo_map_requests_per_round: usize,
 }
 
 impl Default for ResearchLimits {
@@ -56,7 +54,7 @@ impl Default for ResearchLimits {
 
 impl ResearchLimits {
     /// Reads the Research caps declared by the project configuration.
-    pub fn from_context_config(config: &ContextConfig) -> Self {
+    pub(crate) fn from_context_config(config: &ContextConfig) -> Self {
         Self {
             max_search_requests_per_round: config.max_search_requests_per_round,
             max_matched_files_per_search: config.max_matched_files_per_search,
@@ -66,7 +64,7 @@ impl ResearchLimits {
     }
 }
 
-pub(crate) fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) -> bool {
+fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) -> bool {
     match current {
         Some(ContextAccess::Editable) => true,
         Some(ContextAccess::ReadOnly) => requested == ContextAccess::ReadOnly,
@@ -101,12 +99,11 @@ pub struct OuterDocsRejection {
 /// exact cause and the `[[workspace]]` block that would authorize the source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuterDocsTrustRefusal {
-    /// Repository-relative cache path the model asked for.
-    pub path: String,
+    path: String,
     /// Exact cause reported by the developer's trust declaration.
-    pub reason: String,
+    reason: String,
     /// Ready-to-paste declaration that would authorize the source, when one exists.
-    pub remedy: Option<String>,
+    remedy: Option<String>,
 }
 /// Content of one file a research round delivered to the context.
 ///
@@ -115,20 +112,19 @@ pub struct OuterDocsTrustRefusal {
 /// element it emits carries the same anchors and the same `access` attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedFileContent {
-    /// Repository-relative path, or the logical path of an external document.
-    pub path: String,
+    path: String,
     /// Effective access the file resolved to after the round.
-    pub access: ContextAccess,
+    access: ContextAccess,
     /// Bytes of the file as the context renders them.
-    pub content: String,
+    content: String,
 }
 
 /// Outcome of applying context requests to ContextManager.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextApplicationOutcome {
     pub added: Vec<String>,
-    pub missing: Vec<String>,
-    pub already_satisfied: Vec<String>,
+    missing: Vec<String>,
+    already_satisfied: Vec<String>,
     pub limit_exceeded: Option<ContextLimitExceeded>,
     pub outer_docs_rejected: Vec<OuterDocsRejection>,
 }
@@ -156,7 +152,7 @@ pub struct ContextApplicationOutcome {
 /// `[context].token_budget` ceiling. Requesting an already loaded snapshot
 /// changes nothing: the snapshot is immutable for the whole task and the layer
 /// keeps no eviction order.
-pub fn reconcile_research_context(
+fn reconcile_research_context(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
@@ -372,7 +368,8 @@ pub fn apply_context_requests_detailed(
 
 /// Registers model-requested repository files in the Auto layer.
 /// Returns the paths that actually widened the effective context.
-pub fn apply_context_requests(
+#[cfg(test)]
+fn apply_context_requests(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
@@ -386,20 +383,20 @@ pub fn apply_context_requests(
 /// The dispatcher resolves repository facts once per round and hands them to
 /// every handler, so a handler never performs its own file listing and never
 /// re-derives the same budget.
-pub struct ResearchRoundContext<'a> {
+struct ResearchRoundContext<'a> {
     /// Repository root used for path validation and file scans.
-    pub repo_root: &'a Path,
+    repo_root: &'a Path,
     /// Repository-relative files known to exist in the working tree.
-    pub available_files: &'a [String],
+    available_files: &'a [String],
     /// Single token budget of the context: repository files and external
     /// documents are priced the same way under it.
-    pub token_budget: usize,
+    token_budget: usize,
     /// Token budget for a targeted repository map rendered this round.
-    pub repomap_token_budget: usize,
+    repomap_token_budget: usize,
     /// Operational caps resolved from the project configuration.
-    pub limits: ResearchLimits,
+    limits: ResearchLimits,
     /// Whether a request already satisfied by the context counts as progress.
-    pub allow_already_satisfied_feedback: bool,
+    allow_already_satisfied_feedback: bool,
 }
 
 /// Accumulated effect of one Research round.
@@ -410,39 +407,38 @@ pub struct ResearchRoundContext<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResearchRoundOutcome {
     /// Set when context additions would breach the files token budget.
-    pub limit_exceeded: Option<ContextLimitExceeded>,
+    pub(crate) limit_exceeded: Option<ContextLimitExceeded>,
     /// Files that widened the effective context this round.
-    /// Files that widened the effective context this round.
-    pub added_files: Vec<String>,
+    pub(crate) added_files: Vec<String>,
     /// Contents of the files that widened the context this round.
     ///
     /// The journal renders them as `<file>` elements, so the feedback of the
     /// round that requested them carries the bytes it delivered instead of a
     /// path the model would have to request again.
-    pub added_file_contents: Vec<AddedFileContent>,
+    added_file_contents: Vec<AddedFileContent>,
     /// Requested files that do not exist in the repository.
-    pub missing_files: Vec<String>,
+    pub(crate) missing_files: Vec<String>,
     /// Requested files whose current access already satisfied the request.
-    pub already_satisfied_files: Vec<String>,
+    pub(crate) already_satisfied_files: Vec<String>,
     /// External documents the OuterDocs layer refused, with the reported reason.
-    pub outer_docs_rejected: Vec<OuterDocsRejection>,
+    outer_docs_rejected: Vec<OuterDocsRejection>,
     /// External documents the developer's trust declaration refused.
     ///
     /// Kept apart from [`Self::outer_docs_rejected`] because a trust refusal is
     /// answered by the developer, never by the model that requested the document.
-    pub outer_docs_trust_refused: Vec<OuterDocsTrustRefusal>,
+    outer_docs_trust_refused: Vec<OuterDocsTrustRefusal>,
     /// Repository searches executed this round, with their matches.
-    pub searches_executed: Vec<RepoSearchResult>,
+    searches_executed: Vec<RepoSearchResult>,
     /// Documentation topics loaded this round.
-    pub doc_topics_loaded: Vec<DocTopic>,
+    doc_topics_loaded: Vec<DocTopic>,
     /// Repository directory trees rendered this round.
-    pub dir_trees_loaded: usize,
+    dir_trees_loaded: usize,
     /// Directory listings rendered this round.
-    pub dir_lists_loaded: usize,
+    dir_lists_loaded: usize,
     /// Targeted repository maps rendered this round.
-    pub repo_maps_loaded: usize,
+    repo_maps_loaded: usize,
     /// Feedback blocks to inject into the next proposal round.
-    pub feedback_blocks: Vec<String>,
+    pub(crate) feedback_blocks: Vec<String>,
 }
 
 impl ResearchRoundOutcome {
@@ -453,7 +449,7 @@ impl ResearchRoundOutcome {
     /// files as progress. The architect loop needs that: the model still
     /// deserves the explanation that those files are already visible, so such a
     /// round must not be mistaken for a dead end.
-    pub fn has_progress(&self, allow_already_satisfied: bool) -> bool {
+    pub(crate) fn has_progress(&self, allow_already_satisfied: bool) -> bool {
         !self.added_files.is_empty()
             || !self.missing_files.is_empty()
             || !self.searches_executed.is_empty()
@@ -475,7 +471,7 @@ impl ResearchRoundOutcome {
     /// is told to report the missing document instead of routing around the
     /// prohibition. A delivery failure addresses the model, which works with
     /// the material it already holds and retries when the source is reachable.
-    pub fn record_outer_docs_failure(&mut self, path: &str, error: &MaterializeError) {
+    pub(crate) fn record_outer_docs_failure(&mut self, path: &str, error: &MaterializeError) {
         let Some(refusal) = error.trust() else {
             self.record_delivery_failure(path, error.reason());
             return;
@@ -521,7 +517,8 @@ impl ResearchRoundOutcome {
     }
 
     /// Joins the round's feedback blocks into one prompt fragment.
-    pub fn combined_feedback(&self) -> String {
+    #[cfg(test)]
+    fn combined_feedback(&self) -> String {
         self.feedback_blocks
             .iter()
             .map(|block| block.trim())
@@ -531,7 +528,7 @@ impl ResearchRoundOutcome {
     }
 
     /// Detailed round summary for the architect research banner.
-    pub fn architect_banner_summary(&self) -> String {
+    pub(crate) fn architect_banner_summary(&self) -> String {
         let mut notes = Vec::new();
         if !self.added_files.is_empty() {
             notes.push(format!(
@@ -585,10 +582,7 @@ impl ResearchRoundOutcome {
 /// A handler owns the validation, disk work, and feedback text of its own
 /// capability, so turn loops dispatch Research commands polymorphically instead
 /// of branching on command types.
-pub trait ResearchCapabilityHandler: Send + Sync {
-    /// Capability realized by this handler.
-    fn capability(&self) -> LlmCapability;
-
+trait ResearchCapabilityHandler: Send + Sync {
     /// Reports whether the handler executes the given command.
     fn handles(&self, command: &LlmCommand) -> bool;
 
@@ -606,10 +600,6 @@ pub trait ResearchCapabilityHandler: Send + Sync {
 struct ContextRequestHandler;
 
 impl ResearchCapabilityHandler for ContextRequestHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::ContextRequest
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::ContextRequest(_))
     }
@@ -684,10 +674,6 @@ impl ResearchCapabilityHandler for ContextRequestHandler {
 struct RepoSearchHandler;
 
 impl ResearchCapabilityHandler for RepoSearchHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::RepoSearch
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::RepoSearch(_))
     }
@@ -732,10 +718,6 @@ impl ResearchCapabilityHandler for RepoSearchHandler {
 struct RepoDirsHandler;
 
 impl ResearchCapabilityHandler for RepoDirsHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::RepoDirs
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::RepoDirs(_))
     }
@@ -779,10 +761,6 @@ impl ResearchCapabilityHandler for RepoDirsHandler {
 struct RepoMapRequestHandler;
 
 impl ResearchCapabilityHandler for RepoMapRequestHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::RepoMap
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::RepoMap(_))
     }
@@ -860,10 +838,6 @@ impl ResearchCapabilityHandler for RepoMapRequestHandler {
 struct DirListHandler;
 
 impl ResearchCapabilityHandler for DirListHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::DirList
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::DirList(_))
     }
@@ -976,10 +950,6 @@ fn render_dir_listing(available_files: &[String], target: &str, recursive: bool)
 struct DocRequestHandler;
 
 impl ResearchCapabilityHandler for DocRequestHandler {
-    fn capability(&self) -> LlmCapability {
-        LlmCapability::DocRequest
-    }
-
     fn handles(&self, command: &LlmCommand) -> bool {
         matches!(command, LlmCommand::DocRequest(_))
     }
@@ -1028,7 +998,7 @@ static RESEARCH_HANDLERS: &[&dyn ResearchCapabilityHandler] = &[
 ];
 
 /// Returns the registered Research capability handlers in dispatch order.
-pub fn research_handlers() -> &'static [&'static dyn ResearchCapabilityHandler] {
+fn research_handlers() -> &'static [&'static dyn ResearchCapabilityHandler] {
     RESEARCH_HANDLERS
 }
 
@@ -1040,7 +1010,7 @@ pub fn research_handlers() -> &'static [&'static dyn ResearchCapabilityHandler] 
 /// blocks an async worker thread. The `limits` caps travel with the call, so a
 /// round applies exactly the bounds the project declared.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_research_commands_sync(
+fn execute_research_commands_sync(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     available_files: &[String],
@@ -1094,7 +1064,7 @@ pub fn execute_research_commands_sync(
 /// cancelled offloaded task alike — is recorded before the caller degrades,
 /// so an uninspectable repository stays distinguishable from an empty one.
 /// Returns `None` when the list could not be resolved.
-pub async fn resolve_repository_files(repo_root: &Path) -> Option<Vec<String>> {
+pub(crate) async fn resolve_repository_files(repo_root: &Path) -> Option<Vec<String>> {
     let root = repo_root.to_path_buf();
     match run_blocking_async(move || crate::git::list_repository_files(Some(&root))).await {
         Ok(Ok(files)) => Some(files),
@@ -1148,7 +1118,7 @@ fn cancel_requested(cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> b
 /// abandoned resolves immediately, before the repository file list is read and
 /// before a single handler runs.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_research_commands(
+pub(crate) async fn execute_research_commands(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     commands: &[LlmCommand],
@@ -1203,6 +1173,7 @@ pub async fn execute_research_commands(
 
 #[cfg(test)]
 mod tests {
+    use super::search::FileSearchMatch;
     use super::*;
 
     /// Research caps applied by tests that do not exercise a specific limit.
@@ -1432,19 +1403,19 @@ mod tests {
         let available = vec!["a.rs".to_string(), "b.rs".to_string()];
 
         let commands = vec![
-            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
+            LlmCommand::ContextRequest(crate::llm::ContextRequestCommand {
                 path: "a.rs".to_string(),
                 access: ContextAccess::ReadOnly,
             }),
-            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
+            LlmCommand::ContextRequest(crate::llm::ContextRequestCommand {
                 path: "missing.rs".to_string(),
                 access: ContextAccess::ReadOnly,
             }),
-            LlmCommand::RepoSearch(tauqe_protocol::RepoSearchCommand {
+            LlmCommand::RepoSearch(crate::llm::RepoSearchCommand {
                 path: String::new(),
                 regex: "pub fn".to_string(),
             }),
-            LlmCommand::DocRequest(tauqe_protocol::DocRequestCommand {
+            LlmCommand::DocRequest(crate::llm::DocRequestCommand {
                 topic: DocTopic::Workflow,
             }),
         ];
@@ -1486,11 +1457,11 @@ mod tests {
         let available = vec!["big.rs".to_string()];
 
         let commands = vec![
-            LlmCommand::ContextRequest(tauqe_protocol::ContextRequestCommand {
+            LlmCommand::ContextRequest(crate::llm::ContextRequestCommand {
                 path: "big.rs".to_string(),
                 access: ContextAccess::ReadOnly,
             }),
-            LlmCommand::DocRequest(tauqe_protocol::DocRequestCommand {
+            LlmCommand::DocRequest(crate::llm::DocRequestCommand {
                 topic: DocTopic::Workflow,
             }),
         ];
@@ -1525,7 +1496,7 @@ mod tests {
         cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
         let available = vec!["a.rs".to_string()];
         let commands = vec![LlmCommand::ContextRequest(
-            tauqe_protocol::ContextRequestCommand {
+            crate::llm::ContextRequestCommand {
                 path: "a.rs".to_string(),
                 access: ContextAccess::ReadOnly,
             },
@@ -1571,7 +1542,7 @@ mod tests {
             "src/nested/module.rs".to_string(),
         ];
 
-        let commands = vec![LlmCommand::RepoDirs(tauqe_protocol::RepoDirsCommand {})];
+        let commands = vec![LlmCommand::RepoDirs(crate::llm::RepoDirsCommand {})];
         let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
@@ -1602,7 +1573,7 @@ mod tests {
         ];
 
         // A shallow listing reports the direct children of the directory.
-        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
+        let commands = vec![LlmCommand::DirList(crate::llm::DirListCommand {
             path: "src".to_string(),
             recursive: false,
         })];
@@ -1625,7 +1596,7 @@ mod tests {
         assert!(!feedback.contains("README.md"));
 
         // A recursive listing reports every tracked file underneath.
-        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
+        let commands = vec![LlmCommand::DirList(crate::llm::DirListCommand {
             path: "src".to_string(),
             recursive: true,
         })];
@@ -1658,7 +1629,7 @@ mod tests {
             max_dir_list_entries: 2,
             ..default_limits()
         };
-        let commands = vec![LlmCommand::DirList(tauqe_protocol::DirListCommand {
+        let commands = vec![LlmCommand::DirList(crate::llm::DirListCommand {
             path: "src".to_string(),
             recursive: true,
         })];
@@ -1686,7 +1657,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
 
-        let commands = vec![LlmCommand::Text(tauqe_protocol::TextCommand {
+        let commands = vec![LlmCommand::Text(crate::llm::TextCommand {
             content: "no research work".to_string(),
         })];
         let outcome = execute_research_commands_sync(
@@ -1721,10 +1692,10 @@ mod tests {
 
         // The same target requested twice renders exactly one block.
         let commands = vec![
-            LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
+            LlmCommand::RepoMap(crate::llm::RepoMapCommand {
                 path: "src".to_string(),
             }),
-            LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
+            LlmCommand::RepoMap(crate::llm::RepoMapCommand {
                 path: "src".to_string(),
             }),
         ];
@@ -1761,7 +1732,7 @@ mod tests {
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let available = vec!["src/alpha.rs".to_string()];
 
-        let commands = vec![LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
+        let commands = vec![LlmCommand::RepoMap(crate::llm::RepoMapCommand {
             path: "docs".to_string(),
         })];
         let outcome = execute_research_commands_sync(
@@ -1800,7 +1771,7 @@ mod tests {
 
         let commands: Vec<LlmCommand> = (0..5)
             .map(|index| {
-                LlmCommand::RepoMap(tauqe_protocol::RepoMapCommand {
+                LlmCommand::RepoMap(crate::llm::RepoMapCommand {
                     path: format!("module{index}"),
                 })
             })
@@ -1842,7 +1813,7 @@ mod tests {
         let missing_root = dir.path().join("no-such-repository");
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let commands = vec![LlmCommand::ContextRequest(
-            tauqe_protocol::ContextRequestCommand {
+            crate::llm::ContextRequestCommand {
                 path: "a.rs".to_string(),
                 access: ContextAccess::ReadOnly,
             },

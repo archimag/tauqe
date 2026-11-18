@@ -10,8 +10,8 @@ pub use openrouter::OpenRouterProvider;
 pub use retry::{RetryConfig, RetryingProvider};
 pub use types::*;
 
+use crate::models::ProviderKind;
 use async_trait::async_trait;
-use tauqe_protocol::ProviderKind;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::AppConfig;

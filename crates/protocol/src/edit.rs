@@ -9,7 +9,7 @@ pub use operation::{
     normalize_repo_path, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
     EditOperation, EditOverwrite, EditReplace,
 };
-pub use proposal::{ChangeConversionError, EditProposal, StructuredChangeProposal};
+pub use proposal::StructuredChangeProposal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
@@ -90,7 +90,7 @@ impl std::convert::TryFrom<String> for EditFileStatus {
 }
 
 impl EditFileStatus {
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Error => "error",

@@ -8,7 +8,7 @@
 //! reads and keeps rendering exactly the field names the schema enforces.
 
 use crate::escape::single_line;
-use tauqe_protocol::review::{ReviewGroup, ReviewIssue, ReviewSession, DEFAULT_REVIEW_GROUP_ID};
+use crate::review::{ReviewGroup, ReviewIssue, ReviewSession, DEFAULT_REVIEW_GROUP_ID};
 
 /// Builds the system prompt for the cross-group review post-analysis.
 ///
@@ -227,8 +227,8 @@ fn render_paths(paths: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus, ReviewSeverity};
-    use tauqe_protocol::ModelRef;
+    use crate::models::ModelRef;
+    use crate::review::{IssueType, ReviewItem, ReviewItemStatus, ReviewSeverity};
 
     /// Identity of the finding the core engine group produced.
     const CORE_UUID: &str = "018f9c1e-6b3a-7c1e-8b3a-000000000001";

@@ -11,7 +11,7 @@
 //! at all, and the turn reports that the change set stayed unverified instead of
 //! inventing a toolchain from a build manifest.
 
-use tauqe_protocol::ProjectConfig;
+use crate::toolchain::config::ProjectConfig;
 
 use super::exec::CommandLine;
 use super::DEFAULT_PROJECT_TIMEOUT_SECS;

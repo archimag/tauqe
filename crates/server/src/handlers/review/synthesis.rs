@@ -1,41 +1,31 @@
 //! Primary audit synthesis and cancellation handlers.
 //!
-//! Starting a review streams the reviewer model's Structured Output through a
-//! `JsonFieldStreamFilter`, so only the cleaned `summary` reaches the client
-//! while raw JSON syntax stays server-side. Cancellation supports both a soft
+//! Core filters and materializes the reviewer model's Structured Output, so
+//! this adapter publishes only the decoded `summary` while raw JSON stays
+//! inside the engine. Cancellation supports both a soft
 //! stop (drain the current turn) and an immediate hard stop.
 
+use crate::contracts::Project;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
-use tauqe_core::providers::{
-    create_provider, format_session_id, ChatMessage, LlmProvider, StreamEvent,
-    SESSION_PREFIX_REVIEW,
+use tauqe_core::api::{
+    ResolvedReviewSynthesis, ReviewObserver, ReviewSynthesisExecutionConfig,
+    ReviewSynthesisObserver, ReviewSynthesisPreparationError, UsageTotalsSnapshot,
 };
-use tauqe_core::review::parser::ReviewFindingsOutput;
-use tauqe_core::review::{
-    build_review_system_prompt, build_review_user_prompt, parse_review_findings,
-    parse_review_output, review_findings_response_format, uuid::generate_uuid_v7, ReviewStorage,
-};
-use tauqe_core::workflow::batch::BatchStop;
-use tauqe_protocol::review::{PostAnalysisMode, ReviewLaunchConfig};
+use tauqe_core::providers::LlmProvider;
+use tauqe_core::review::stream::ReviewStreamUpdate;
+use tauqe_core::review::ReviewSession;
 use tauqe_protocol::{
-    errors, events, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewIssue, ReviewItem,
-    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
-    ReviewStartedEvent, ReviewUpdatedEvent,
+    errors, events, ModelUsageEvent, ModelUsageInfo, Request, Response, ReviewCancelParams,
+    ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewListChangedEvent,
+    ReviewReasoningDeltaEvent, ReviewStartParams, ReviewStartedEvent, ReviewUpdatedEvent,
 };
-use tokio::sync::mpsc;
 
 use crate::handlers::common::withdraw_streamed_attempt;
-use crate::reap::abort_and_reap;
+use crate::reap::task_exit_deadline;
 use crate::state::{next_operation_id, AppState};
 
-use super::analysis::run_review_post_analysis;
-use super::common::{emit, emit_error, offload_review};
-use super::groups::run_group_audits;
-use super::window::{expand_window, WindowBudgets, WindowContext};
+use super::common::{emit, emit_error};
 pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewStartParams = match req.params.take() {
         Some(p) => match serde_json::from_value(p) {
@@ -61,152 +51,39 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         return start_preset_review(req, state, &params, preset_name.to_string()).await;
     }
 
-    let (provider, model, reasoning_effort, budgets) = {
-        let cfg = state.config.lock().await.config.clone();
-        // The request carries the whole reviewer selection — the model together
-        // with the reasoning depth of the configured entry the developer picked
-        // — so the depth is read straight from the DTO instead of being
-        // re-derived by matching the model against the configured entries,
-        // which could never distinguish two rungs of the same model. An absent
-        // selection runs the base rung of the reviewer role.
-        let selection = params
-            .model
-            .clone()
-            .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
-        let model = cfg.resolve_model(&selection);
-        let reasoning_effort = cfg
-            .models
-            .resolve_selection_effort(ModelRole::Reviewer, &selection);
-        // Deterministic unit tests inject a scripted provider through the
-        // state's test seam; production builds construct a real network
-        // provider from configuration.
-        #[cfg(test)]
-        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
-            Some(provider) => provider,
-            None => match create_provider(model.provider, &cfg) {
-                Ok(p) => Arc::from(p),
-                Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
-            },
-        };
-
-        #[cfg(not(test))]
-        let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
-            Ok(p) => Arc::from(p),
-            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
-        };
-
-        // The pattern expansion is bounded by the same context budgets
-        // that govern research, so one wide glob cannot drag an unbounded
-        // file set into the audit window.
-        (
-            provider,
-            model,
-            reasoning_effort,
-            WindowBudgets {
-                files_tokens: cfg.context.token_budget,
-            },
-        )
-    };
-
-    let (repo_root, ctx_snapshot, mut estimated_tokens) = {
-        let ctx = state.context.read().await;
-        (
-            ctx.repo_root().to_path_buf(),
-            ctx.clone(),
-            ctx.get_state().total_estimated_tokens as usize,
-        )
-    };
-
-    let mut files = match crate::handlers::offload(move || ctx_snapshot.read_context_files()).await
-    {
-        Ok(files) => files,
-        Err(err) => {
-            tracing::warn!(error = %err, "Failed to read context files in offload");
-            Vec::new()
-        }
-    };
-
-    // The audit window is the union of the active context and every declared
-    // line: a repository file is selected as soon as one pattern matches it, so
-    // several paths widen the audit instead of competing for it. Blank lines
-    // narrow nothing and are dropped before compilation (c-1, c-6).
-    let patterns: Vec<String> = params
-        .path_patterns
-        .iter()
-        .map(|pattern| pattern.trim())
-        .filter(|pattern| !pattern.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    // Pattern-matched files the configured budgets kept out of the audit.
-    // Reported on the started event so a truncated expansion is never silent.
-    let mut omitted_files = 0usize;
-
-    if !patterns.is_empty() {
-        // The expansion is the single deterministic projection of the audit
-        // window: the preset launch and the read-only preview read the same
-        // function, so the window the developer previewed is the window this
-        // launch reads (#c-1, #c-4).
-        let expanded = expand_window(
-            &repo_root,
-            WindowContext {
-                files: &files,
-                tokens: estimated_tokens,
-            },
-            &patterns,
-            budgets,
+    let resolved = state
+        .application
+        .resolve_review_synthesis(
+            params
+                .model
+                .as_ref()
+                .map(|value| value.clone().project())
+                .as_ref(),
         )
         .await;
-
-        match expanded {
-            Ok(expanded) => {
-                // A pattern that selects nothing is a mistyped or unsupported
-                // path, never a narrower audit: launching anyway would review a
-                // different file set while the developer believes the pattern
-                // chose it. A partial selection stays a lawful run reported
-                // through `omitted_files`, so only a zero match is refused.
-                if expanded.selected_nothing() {
-                    return Response::err(
-                        req.id,
-                        errors::INVALID_PARAMS,
-                        format!(
-                            "Review path patterns matched no repository files: {}",
-                            patterns.join(", ")
-                        ),
-                    );
-                }
-                estimated_tokens = expanded.estimated_tokens;
-                omitted_files = expanded.window.omitted_files;
-                if omitted_files > 0 {
-                    tracing::warn!(
-                        omitted = omitted_files,
-                        selected = expanded.window.selected_files,
-                        matched = expanded.window.matched_files,
-                        "path pattern expansion exhausted the configured file token budget; remaining matched files were not loaded"
-                    );
-                }
-                files.extend(expanded.files);
-            }
-            Err(err) => {
-                // The listing failed at the infrastructure level, which says
-                // nothing about the pattern itself: the audit proceeds with the
-                // context files already loaded instead of rejecting a pattern the
-                // harness never evaluated.
-                tracing::warn!(
-                    error = %err,
-                    "Failed to list repository files for the review path pattern"
-                );
-            }
+    let provider = match resolve_synthesis_provider(state, &resolved).await {
+        Ok(provider) => provider,
+        Err(error) => return Response::err(req.id, errors::NO_API_KEY, error),
+    };
+    let model = resolved.model.clone();
+    let window = match state
+        .application
+        .prepare_review_synthesis_window(&resolved, &params.path_patterns)
+        .await
+    {
+        Ok(window) => window,
+        Err(error) => {
+            let code = match &error {
+                ReviewSynthesisPreparationError::NoPatternMatches(_) => errors::INVALID_PARAMS,
+                ReviewSynthesisPreparationError::EmptyContext => errors::EMPTY_CONTEXT,
+            };
+            return Response::err(req.id, code, error.to_string());
         }
-    }
-
-    if files.is_empty() {
-        return Response::err(
-            req.id,
-            errors::EMPTY_CONTEXT,
-            "Context is empty: add files to review first",
-        );
-    }
+    };
+    let repo_root = window.root;
+    let files = window.files;
+    let estimated_tokens = window.estimated_tokens;
+    let omitted_files = window.omitted_by_budget;
 
     let operation = match state.try_begin_operation() {
         Ok(guard) => Arc::new(guard),
@@ -220,23 +97,24 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
     };
 
     let op_id = format!("op-{}", next_operation_id());
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // A review audit is one long-lived logical context: the synthesis, the
-    // refinement of its findings, and every finding and sub-plan turn share one
-    // identifier, so the backend keeps a single warm prompt-prefix cache. The
-    // identifier is minted before the streamed call because the request needs it.
-    let review_id = generate_uuid_v7();
-    let session_id = format_session_id(SESSION_PREFIX_REVIEW, &review_id);
+    let prepared = match state.application.prepare_review_synthesis_request(
+        &operation,
+        &resolved,
+        &files,
+        params.user_prompt.clone(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Response::err(req.id, errors::OPERATION_IN_PROGRESS, error.to_string())
+        }
+    };
 
     emit(
         &state.out,
         events::REVIEW_STARTED,
         serde_json::to_value(ReviewStartedEvent {
             operation_id: op_id.clone(),
-            model: model.clone(),
+            model: model.clone().project(),
             files_count: files.len(),
             estimated_tokens,
             omitted_files,
@@ -244,328 +122,57 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         .ok(),
     );
 
-    let target_files: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-    let messages = vec![
-        ChatMessage::system(build_review_system_prompt()),
-        ChatMessage::user(build_review_user_prompt(
-            &files,
-            params.user_prompt.as_deref(),
-        )),
-    ];
-    // Review synthesis is a non-code operation: the enforced JSON schema turns
-    // the model output into machine-readable findings instead of parsed markdown.
-    let response_format = review_findings_response_format();
-
     let state_for_spawn = Arc::clone(state);
     let op_id_for_spawn = op_id.clone();
 
     tokio::spawn(async move {
         let state = state_for_spawn;
         let op_id = op_id_for_spawn;
-        let mut cancel_rx = operation.cancel_receiver();
-        // Open the shared usage ledger before the provider call: this audit
-        // reports both the usage the provider returns and the duration the
-        // harness measures, so every operation kind feeds one snapshot.
-        let usage_guard = state.begin_usage(&op_id).await;
-
-        let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
-        let err_tx = tx.clone();
-        let model_name = model.name.clone();
-        let stream_cancel = cancel_rx.clone();
-        let stream_task = tokio::spawn(async move {
-            if let Err(err) = provider
-                .stream_chat_with_session(
-                    &model_name,
-                    messages,
-                    Some(response_format),
-                    reasoning_effort,
-                    Some(session_id.as_str()),
-                    tx,
-                    stream_cancel,
-                )
-                .await
-            {
-                let _ = err_tx.send(StreamEvent::Error(err.to_string())).await;
-            }
+        let observer = Arc::new(ReviewSynthesisRpcObserver {
+            state: Arc::clone(&state),
+            operation_id: op_id.clone(),
+            repo_root: repo_root.clone(),
         });
-        operation.set_abort_handle(stream_task.abort_handle());
-
-        // The provider streams raw Structured Output JSON; this filter decodes
-        // only the `summary` string so JSON syntax never reaches the client.
-        let mut filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-        let mut failure: Option<String> = None;
-        let mut stream_cancelled = false;
-
-        // The relay applies the transport-owned pacing policy instead of
-        // restating an exemption set of its own: a terminal notice publishes
-        // immediately, and every other variant waits for the writer to catch up,
-        // so a client that keeps its pipe open but stopped reading pauses the
-        // relay here instead of growing the outbound queue for the rest of the
-        // review.
-        while let Some(event) = rx.recv().await {
-            state.out.pace_event(&event, &mut cancel_rx).await;
-            match event {
-                StreamEvent::ReasoningDelta(delta) => emit(
-                    &state.out,
-                    events::REVIEW_REASONING_DELTA,
-                    serde_json::to_value(ReviewReasoningDeltaEvent {
-                        operation_id: op_id.clone(),
-                        delta,
-                    })
-                    .ok(),
-                ),
-                StreamEvent::TextDelta(chunk) => {
-                    // Forward only cleaned summary text; raw JSON deltas are
-                    // consumed by the filter and never leave the server.
-                    if let Some(delta) = filter.push_chunk(&chunk) {
-                        emit(
-                            &state.out,
-                            events::REVIEW_CONTENT_DELTA,
-                            serde_json::to_value(ReviewContentDeltaEvent {
-                                operation_id: op_id.clone(),
-                                delta,
-                            })
-                            .ok(),
-                        );
-                    }
-                }
-                // Fold every report the provider makes into the accounting window
-                // as it arrives: an audit that reported usage on an intermediate
-                // chunk, or whose retry resumed after an aborted attempt had
-                // already reported its tokens, must not lose the earlier reports.
-                StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
-                StreamEvent::Done => break,
-                // The provider may report cancellation as an explicit stream
-                // event even when the turn's cancel signal has not been observed
-                // yet, so the event is recorded instead of inferred from
-                // `cancel_rx` alone.
-                StreamEvent::Cancelled => {
-                    stream_cancelled = true;
-                    break;
-                }
-                StreamEvent::Error(err) => {
-                    failure = Some(err);
-                    break;
-                }
-                // The retry decorator withdrew the previous attempt because it
-                // broke after partial output: the filter holds a prefix of a
-                // document the retry regenerates from its beginning, so it is
-                // restarted instead of accumulating both payloads into one
-                // unparsable body, and the client drops the partial summary it
-                // already rendered.
-                StreamEvent::ResetStream => {
-                    withdraw_streamed_attempt(&state.out, &op_id, || {
-                        filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // The streamed provider call has resolved, so the slot must stop
-        // pointing at it: a later hard-cancel would otherwise abort an already
-        // finished task while the operation is still finalizing and persisting.
-        operation.clear_abort_handle();
-
-        // Account for the tokens, cost, and duration the audit consumed through
-        // the shared ledger before any early return, so a failed or cancelled
-        // audit is still charged and leaves no in-flight window behind for the
-        // next operation.
-        // Every report was already folded into the window as it arrived, so the
-        // flush below charges the whole audit instead of its last report alone.
-        usage_guard.flush().await;
-        let usage_snapshot = state.usage_snapshot().await;
-
-        // The consumed tokens are published before any early return, exactly as
-        // a review group publishes its own usage: an interrupted or failed audit
-        // is charged to the session, so the client observes that charge instead
-        // of watching the session cost grow with no event behind it. Both totals
-        // come from the authoritative ledger — the operation scope the flush just
-        // closed and the session scope it was folded into — rather than from a
-        // second, independently accumulated counter.
-        let operation_usage: ModelUsageInfo = usage_snapshot.prev.to_usage_info();
-        let session_total_cost = usage_snapshot.session.cost;
-        let cost = usage_snapshot.prev.cost;
-        emit(
-            &state.out,
-            events::MODEL_USAGE,
-            serde_json::to_value(ModelUsageEvent {
-                operation_id: op_id.clone(),
-                usage: operation_usage.clone(),
-                session_total_cost,
-                current_cost: Some(cost),
-            })
-            .ok(),
-        );
-
-        let cancelled = *cancel_rx.borrow() || stream_cancelled;
-
-        if cancelled {
-            let _ = abort_and_reap(&op_id, "review-synthesis-stream", stream_task).await;
-            emit(
-                &state.out,
-                events::REVIEW_CANCELLED,
-                Some(serde_json::json!({ "operation_id": op_id })),
-            );
-            return;
-        }
-        if let Some(message) = failure {
-            let _ = abort_and_reap(&op_id, "review-synthesis-stream", stream_task).await;
-            emit_error(&state.out, &op_id, message);
-            return;
-        }
-        // Capture the raw payload before finalizing: `finish` consumes the
-        // filter, while the full response is still needed for the tolerant
-        // fallback parser and the persisted `raw_markdown`.
-        let raw_buffer = filter.buffer().to_string();
-        if raw_buffer.trim().is_empty() {
-            emit_error(
-                &state.out,
-                &op_id,
-                "Model returned an empty review".to_string(),
-            );
-            return;
-        }
-
-        // A clean deserialization yields the typed payload; a malformed tail
-        // degrades gracefully to the tolerant text parser instead of dropping
-        // an otherwise usable review.
-        let (parsed_title, summary, issues) = match filter.finish() {
-            Ok(output) => {
-                let trimmed = output.summary.trim();
-                let summary = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-                let title = output.title.trim();
-                let title = if title.is_empty() {
-                    None
-                } else {
-                    Some(title.to_string())
-                };
-                (title, summary, parse_review_findings(&raw_buffer))
-            }
-            Err(_) => parse_review_output(&raw_buffer),
-        };
-
-        // The reviewer role synthesizes a concise session title; when it omits
-        // one, fall back to the first line of the user's prompt and finally to
-        // a time-derived placeholder.
-        let title = parsed_title
-            .or_else(|| {
-                params
-                    .user_prompt
-                    .as_deref()
-                    .and_then(|p| p.lines().next())
-                    .map(|l| l.trim())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| l.chars().take(60).collect::<String>())
-            })
-            .unwrap_or_else(|| format!("Review {}", created_at));
-
-        let session = ReviewSession {
-            // The UUIDv7 minted before the streamed call carries a millisecond
-            // timestamp plus random bits, so two reviews started within the same
-            // second never share a session file, and the same string keys the
-            // provider session.
-            id: review_id,
-            title,
-            created_at,
-            model: model.clone(),
-            description: summary.or_else(|| params.user_prompt.clone()),
-            user_prompt: params.user_prompt.clone(),
-            target_files,
-            // Every synthesized finding gets its UUIDv7 identity before the
-            // session is persisted, so later layers can reference it.
-            items: with_finding_identities(issues),
-            raw_markdown: raw_buffer,
-            // A launch performs exactly one implicit `Default` audit and asks for
-            // no post-analysis, so the stored session keeps the degenerate
-            // single-audit shape the protocol layer resolves on its own (#c-4).
-            groups: Vec::new(),
-            post_analysis: None,
-            launch_config: None,
-        };
-        // A cancel delivered after the stream resolved — during parsing, or
-        // across a storage round-trip — must not persist an artifact the
-        // developer already abandoned, so the signal is re-checked right before
-        // the session touches disk.
-        if *cancel_rx.borrow() {
-            emit(
-                &state.out,
-                events::REVIEW_CANCELLED,
-                Some(serde_json::json!({ "operation_id": op_id })),
-            );
-            return;
-        }
-
-        let save_root = repo_root.clone();
-        let session_clone = session.clone();
-        if let Err(err) =
-            offload_review(move || ReviewStorage::save_session(&save_root, &session_clone)).await
-        {
-            emit_error(&state.out, &op_id, err);
-            return;
-        }
-
-        emit(
-            &state.out,
-            events::REVIEW_UPDATED,
-            serde_json::to_value(ReviewUpdatedEvent {
-                session: session.clone(),
-            })
-            .ok(),
-        );
-
-        let list_root = repo_root.clone();
-        if let Ok(reviews) = offload_review(move || ReviewStorage::load_all(&list_root)).await {
-            let active_root = repo_root.clone();
-            let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
-                .await
-                .unwrap_or(None);
-            emit(
-                &state.out,
-                events::REVIEW_LIST_CHANGED,
-                serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
-            );
-        }
-
-        // Recording the review appends to `history.jsonl` behind an `fsync`
-        // barrier, so it runs on the blocking pool under the exclusive history
-        // guard instead of stalling an async worker thread.
-        let history_model = model.to_string();
-        let history_prompt = params.user_prompt.clone();
-        let history_description = session.description.clone();
-        let history_files = session.target_files.clone();
-        let history_items = session.items.len();
-        // The blocking mutation closure takes ownership of its own handle, so
-        // the shared state stays usable afterwards for cost aggregation and
-        // the terminal events.
-        let history_state = Arc::clone(&state);
-        let recorded = crate::handlers::with_history_mutation(&history_state, move |history| {
-            history.record_review(
-                history_model,
-                history_prompt,
-                history_description,
-                history_files,
-                history_items,
+        let result = state
+            .application
+            .execute_review_synthesis(
+                &operation,
+                &repo_root,
+                prepared,
+                provider,
+                observer,
+                ReviewSynthesisExecutionConfig {
+                    operation_id: op_id.clone(),
+                    exit_deadline: task_exit_deadline(),
+                },
             )
-        })
-        .await;
-        if let Err(err) = recorded {
-            tracing::warn!(
-                error = %err,
-                "Failed to record the review in interaction history"
-            );
-        }
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if error.is_cancelled() {
+                    emit(
+                        &state.out,
+                        events::REVIEW_CANCELLED,
+                        Some(serde_json::json!({ "operation_id": op_id })),
+                    );
+                } else {
+                    emit_error(&state.out, &op_id, error.to_string());
+                }
+                return;
+            }
+        };
+        let session = result.session;
+        let operation_usage = crate::usage::wire_usage(&result.usage.prev.to_usage_info());
+        let session_total_cost = result.usage.session.cost;
+        let cost = result.usage.prev.cost;
 
         emit(
             &state.out,
             events::REVIEW_FINISHED,
             serde_json::to_value(ReviewFinishedEvent {
                 operation_id: op_id,
-                session,
+                session: session.project(),
                 usage: Some(operation_usage),
                 session_total_cost: Some(session_total_cost),
                 current_cost: Some(cost),
@@ -576,6 +183,125 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
 
     Response::ok(req.id, serde_json::json!({ "operation_id": op_id }))
 }
+struct ReviewSynthesisRpcObserver {
+    state: Arc<AppState>,
+    operation_id: String,
+    repo_root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl ReviewObserver for ReviewSynthesisRpcObserver {
+    async fn pace(
+        &self,
+        event: &tauqe_core::providers::StreamEvent,
+        cancel: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.state.out.pace_event(event, cancel).await;
+    }
+    fn publish(&self, update: ReviewStreamUpdate) {
+        match update {
+            ReviewStreamUpdate::Reasoning(delta) => emit(
+                &self.state.out,
+                events::REVIEW_REASONING_DELTA,
+                serde_json::to_value(ReviewReasoningDeltaEvent {
+                    operation_id: self.operation_id.clone(),
+                    delta,
+                })
+                .ok(),
+            ),
+            ReviewStreamUpdate::Content(delta) => emit(
+                &self.state.out,
+                events::REVIEW_CONTENT_DELTA,
+                serde_json::to_value(ReviewContentDeltaEvent {
+                    operation_id: self.operation_id.clone(),
+                    delta,
+                })
+                .ok(),
+            ),
+            ReviewStreamUpdate::Reset => {
+                withdraw_streamed_attempt(&self.state.out, &self.operation_id, || {})
+            }
+            _ => {}
+        }
+    }
+    fn publish_usage_totals(&self, operation_id: &str, snapshot: &UsageTotalsSnapshot) {
+        crate::usage::publish_snapshot(&self.state.out, operation_id, snapshot);
+    }
+    fn publish_usage(&self, snapshot: &UsageTotalsSnapshot) {
+        let operation_usage: ModelUsageInfo =
+            crate::usage::wire_usage(&snapshot.prev.to_usage_info());
+        let session_total_cost = snapshot.session.cost;
+        let cost = snapshot.prev.cost;
+        emit(
+            &self.state.out,
+            events::MODEL_USAGE,
+            serde_json::to_value(ModelUsageEvent {
+                operation_id: self.operation_id.clone(),
+                usage: operation_usage.clone(),
+                session_total_cost,
+                current_cost: Some(cost),
+            })
+            .ok(),
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl ReviewSynthesisObserver for ReviewSynthesisRpcObserver {
+    async fn publish_saved(&self, session: &ReviewSession) {
+        emit(
+            &self.state.out,
+            events::REVIEW_UPDATED,
+            serde_json::to_value(ReviewUpdatedEvent {
+                session: session.clone().project(),
+            })
+            .ok(),
+        );
+
+        let list_root = self.repo_root.clone();
+        if let Ok(reviews) = self
+            .state
+            .application
+            .documents_at(&list_root)
+            .reviews()
+            .await
+        {
+            let active_root = self.repo_root.clone();
+            let active_id = self
+                .state
+                .application
+                .documents_at(&active_root)
+                .active_review_id()
+                .await
+                .unwrap_or(None);
+            emit(
+                &self.state.out,
+                events::REVIEW_LIST_CHANGED,
+                serde_json::to_value(ReviewListChangedEvent {
+                    reviews: reviews
+                        .into_iter()
+                        .map(crate::contracts::Project::project)
+                        .collect(),
+                    active_id,
+                })
+                .ok(),
+            );
+        }
+    }
+}
+
+/// Preserve the scripted-provider seam; production setup belongs to core.
+async fn resolve_synthesis_provider(
+    _state: &Arc<AppState>,
+    resolved: &ResolvedReviewSynthesis,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    #[cfg(test)]
+    if let Some(provider) = _state.provider_override.lock().await.clone() {
+        return Ok(provider);
+    }
+    resolved.provider().map_err(|error| error.to_string())
+}
+
 /// Launches a grouped audit from a named review preset.
 ///
 /// The preset is the single source of the session shape: its groups are
@@ -589,48 +315,30 @@ async fn start_preset_review(
     params: &ReviewStartParams,
     preset_name: String,
 ) -> Response {
-    let (preset, model) = {
-        let cfg = state.config.lock().await.config.clone();
-        let preset = cfg
-            .review
-            .presets
-            .iter()
-            .find(|preset| preset.name.trim() == preset_name.as_str())
-            .cloned();
-        let preset = match preset {
-            Some(preset) => preset,
-            None => {
-                return Response::err(
-                    req.id,
-                    errors::NOT_FOUND,
-                    format!("Review preset '{preset_name}' not found"),
-                )
-            }
-        };
-        // An absent selection runs the base rung of the reviewer role; the
-        // supervisor resolves its own transport from the session model.
-        let selection = params
-            .model
-            .clone()
-            .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
-        (preset, cfg.resolve_model(&selection))
+    let resolved = match state
+        .application
+        .resolve_review_preset(
+            &preset_name,
+            params
+                .model
+                .as_ref()
+                .map(|value| value.clone().project())
+                .as_ref(),
+        )
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let code = match &error {
+                tauqe_core::api::PresetReviewPreparationError::NotFound(_) => errors::NOT_FOUND,
+                _ => errors::INVALID_PARAMS,
+            };
+            return Response::err(req.id, code, error.to_string());
+        }
     };
-
-    let groups = preset.to_launch_groups();
-    if groups.is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            format!("Review preset '{preset_name}' declares no groups"),
-        );
-    }
-    let group_count = groups.len();
-    let post_analysis_mode = preset.post_analysis;
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let user_prompt = params.user_prompt.clone();
-
+    let root = state.repo_root().await;
     let operation = match state.try_begin_operation() {
-        Ok(guard) => Arc::new(guard),
+        Ok(op) => Arc::new(op),
         Err(()) => {
             return Response::err(
                 req.id,
@@ -639,255 +347,64 @@ async fn start_preset_review(
             )
         }
     };
-    // The grouped events the supervisor emits name the registered
-    // operation, so the launch keeps that identifier instead of minting a
-    // second one the client cannot correlate.
-    let op_id = format!("op-{}", operation.id());
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let review_id = generate_uuid_v7();
-
-    // The declared audit paths are the launch snapshot's targets: literal
-    // paths and patterns both, exactly as configured.
-    let mut target_files: Vec<String> = groups
-        .iter()
-        .flat_map(|group| group.paths.iter())
-        .cloned()
-        .collect();
-    target_files.sort();
-    target_files.dedup();
-    // The launch is named by configuration: the preset's title is the
-    // session title, never a streamed summary.
-    let title = preset
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| preset.name.trim().to_string());
-
-    let session = ReviewSession {
-        // The UUIDv7 minted before the batch carries a millisecond
-        // timestamp plus random bits, so two preset launches never share
-        // a session file, and the same string keys the provider session.
-        id: review_id.clone(),
-        title,
-        created_at,
-        model: model.clone(),
-        description: user_prompt.clone(),
-        user_prompt: user_prompt.clone(),
-        target_files,
-        // Findings are appended by the group supervisor, so the snapshot
-        // stores the empty list the batch starts from.
-        items: Vec::new(),
-        raw_markdown: String::new(),
-        groups: groups.clone(),
-        post_analysis: None,
-        // Immutable launch snapshot: a later edit of the project
-        // configuration never rewrites a stored session.
-        launch_config: Some(ReviewLaunchConfig {
-            preset: Some(preset_name.clone()),
-            mode: post_analysis_mode,
-            groups,
-        }),
+    let session = match state.application.prepare_preset_review(
+        &operation,
+        &resolved,
+        params.user_prompt.clone(),
+    ) {
+        Ok(session) => session,
+        Err(error) => return Response::err(req.id, errors::INVALID_PARAMS, error.to_string()),
     };
-
+    let op_id = format!("op-{}", operation.id());
     emit(
         &state.out,
         events::REVIEW_STARTED,
         serde_json::to_value(ReviewStartedEvent {
             operation_id: op_id.clone(),
-            model: model.clone(),
-            // The audit window is per group: the launch event announces
-            // the session, and every group's own started event carries its
-            // real file count and token estimate.
+            model: session.model.clone().project(),
             files_count: 0,
             estimated_tokens: 0,
             omitted_files: 0,
         })
         .ok(),
     );
-
-    let state_for_spawn = Arc::clone(state);
-    let op_id_for_spawn = op_id.clone();
-
+    let state = Arc::clone(state);
+    let id = op_id.clone();
     tokio::spawn(async move {
-        let state = state_for_spawn;
-        let op_id = op_id_for_spawn;
-
-        // A cancel delivered while the launch was being acknowledged must
-        // not persist an empty session the developer already abandoned, so
-        // the signal is re-checked right before the snapshot touches disk.
-        if *operation.cancel_receiver().borrow() {
-            emit(
+        let observer = super::groups::observer(&state, &root, &id);
+        match state
+            .application
+            .execute_preset_review(
+                Arc::clone(&operation),
+                &root,
+                session,
+                observer,
+                task_exit_deadline(),
+            )
+            .await
+        {
+            Ok(result) => emit(
+                &state.out,
+                events::REVIEW_FINISHED,
+                serde_json::to_value(ReviewFinishedEvent {
+                    operation_id: id,
+                    session: result.session.project(),
+                    usage: Some(crate::usage::wire_usage(&result.usage)),
+                    session_total_cost: Some(result.session_total_cost),
+                    current_cost: Some(result.current_cost),
+                })
+                .ok(),
+            ),
+            Err(tauqe_core::api::PresetReviewExecutionError::Cancelled) => emit(
                 &state.out,
                 events::REVIEW_CANCELLED,
-                Some(serde_json::json!({ "operation_id": op_id })),
-            );
-            return;
+                Some(serde_json::json!({"operation_id":id})),
+            ),
+            Err(error) => emit_error(&state.out, &id, error.to_string()),
         }
-        // The supervisor appends every group's findings to the stored
-        // session, so the launch snapshot is persisted before the batch
-        // starts and a group that fails withholds only its own findings.
-        let save_root = repo_root.clone();
-        let session_save = session.clone();
-        let saved =
-            offload_review(move || ReviewStorage::save_session(&save_root, &session_save)).await;
-        if let Err(err) = saved {
-            emit_error(&state.out, &op_id, err);
-            return;
-        }
-        tracing::info!(
-            review_id = review_id.as_str(),
-            preset = preset_name.as_str(),
-            groups = group_count,
-            "preset review session persisted"
-        );
-
-        let batch_op = Arc::clone(&operation);
-        let batch = run_group_audits(&state, &repo_root, &session, batch_op).await;
-        let report = match batch {
-            Ok(report) => report,
-            Err(err) => {
-                // The supervisor could not construct the reviewer transport,
-                // so no group ran and the launch surfaces the failure.
-                emit_error(&state.out, &op_id, err);
-                return;
-            }
-        };
-
-        match &report.stop {
-            // A hard cancellation mirrors the plain launch's terminal event;
-            // the supervisor already reported each interrupted group.
-            BatchStop::Cancelled => {
-                emit(
-                    &state.out,
-                    events::REVIEW_CANCELLED,
-                    Some(serde_json::json!({ "operation_id": op_id })),
-                );
-                return;
-            }
-            // An infrastructure failure stopped the queue: the failing
-            // group's terminal event carries the diagnostic, so the launch
-            // reports the stop without inventing a second reason.
-            BatchStop::Failed { step_id } => {
-                emit_error(
-                    &state.out,
-                    &op_id,
-                    format!("Review group batch stopped on failed group '{step_id}'"),
-                );
-                return;
-            }
-            BatchStop::Blocked { step_id, reason } => {
-                emit_error(
-                    &state.out,
-                    &op_id,
-                    format!("Review group batch stopped on blocked group '{step_id}': {reason}"),
-                );
-                return;
-            }
-            // A completed or softly stopped queue leaves a durable record of
-            // every group that ran, so the launch finishes normally.
-            BatchStop::Completed | BatchStop::Stopped => {}
-        }
-
-        // The supervisor appended its findings to the stored session, so the
-        // durable record — not the empty launch snapshot — is what the finish
-        // event and an automatic classification read.
-        let load_root = repo_root.clone();
-        let load_id = review_id.clone();
-        let stored = offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await;
-        let mut final_session = match stored {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                emit_error(
-                    &state.out,
-                    &op_id,
-                    format!("Review session '{review_id}' disappeared after the group batch"),
-                );
-                return;
-            }
-            Err(err) => {
-                emit_error(&state.out, &op_id, err);
-                return;
-            }
-        };
-
-        // The automatic classification is a layer over a fully completed
-        // queue: a cancelled, failed, or softly stopped run keeps the
-        // findings as the durable record instead of spending another model
-        // call the developer already interrupted.
-        if post_analysis_mode == PostAnalysisMode::Automatic && report.is_success() {
-            let root = repo_root.as_path();
-            let guard = operation.as_ref();
-            // No developer is present in this contour, so the automatic
-            // classification runs the base rung of the architect ladder.
-            match run_review_post_analysis(&state, root, &final_session, None, guard, true).await {
-                Ok(analyzed) => final_session = analyzed,
-                Err(err) => {
-                    // The findings stay durable and published by the
-                    // supervisor; only the classification layer failed.
-                    emit_error(&state.out, &op_id, err.message);
-                    return;
-                }
-            }
-        }
-
-        // Recording the review appends to `history.jsonl` behind an `fsync`
-        // barrier, so it runs on the blocking pool under the exclusive
-        // history guard instead of stalling an async worker thread.
-        let history_model = model.to_string();
-        let history_description = final_session.description.clone();
-        let history_files = final_session.target_files.clone();
-        let history_items = final_session.items.len();
-        let history_state = Arc::clone(&state);
-        let recorded = crate::handlers::with_history_mutation(&history_state, move |history| {
-            history.record_review(
-                history_model,
-                user_prompt,
-                history_description,
-                history_files,
-                history_items,
-            )
-        })
-        .await;
-        if let Err(err) = recorded {
-            tracing::warn!(
-                error = %err,
-                "Failed to record the review in interaction history"
-            );
-        }
-
-        // The finished event carries the batch's aggregate usage: each group
-        // already reported its own, and the session total comes from the
-        // shared ledger rather than a second accumulated counter.
-        let aggregate = ModelUsageInfo {
-            prompt_tokens: report.usage.prompt_tokens,
-            completion_tokens: report.usage.completion_tokens,
-            total_tokens: report.usage.total_tokens,
-            reasoning_tokens: None,
-            cached_tokens: None,
-            cost: report.usage.cost,
-        };
-        let current_cost = report.usage.cost.unwrap_or(0.0);
-        let session_total_cost = state.usage_snapshot().await.session.cost;
-        emit(
-            &state.out,
-            events::REVIEW_FINISHED,
-            serde_json::to_value(ReviewFinishedEvent {
-                operation_id: op_id,
-                session: final_session,
-                usage: Some(aggregate),
-                session_total_cost: Some(session_total_cost),
-                current_cost: Some(current_cost),
-            })
-            .ok(),
-        );
+        drop(operation);
     });
-
-    Response::ok(req.id, serde_json::json!({ "operation_id": op_id }))
+    Response::ok(req.id, serde_json::json!({"operation_id":op_id}))
 }
 pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Response {
     // A present-but-malformed payload is refused instead of defaulted: silently
@@ -922,81 +439,4 @@ pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Respon
     // watchdog force-aborts a stalled task after the grace period.
     state.hard_cancel_active_operation();
     Response::ok(req.id, serde_json::json!({ "cancelled": true }))
-}
-
-/// Projects synthesized findings into review items carrying a UUIDv7 identity.
-///
-/// The reviewer emits findings without identifiers, while the post-analysis
-/// layer and the Architect decomposition reference a finding by its UUIDv7.
-/// Minting the identity before the session is persisted guarantees that every
-/// stored finding of a single audit is addressable, exactly as the grouped
-/// audit guarantees it through `ReviewStorage::append_group_findings`. An
-/// identity a finding already carries is preserved, so a projection never
-/// mints a second one for the same finding.
-fn with_finding_identities(issues: Vec<ReviewIssue>) -> Vec<ReviewItem> {
-    let mut items = Vec::with_capacity(issues.len());
-    for issue in issues {
-        let mut item = ReviewItem::from(issue);
-        if item.uuid.is_none() {
-            item.uuid = Some(generate_uuid_v7());
-        }
-        items.push(item);
-    }
-    items
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tauqe_core::review::uuid::is_valid_uuid_v7;
-    use tauqe_protocol::{IssueStatus, IssueType};
-
-    /// Builds a finding exactly as the reviewer parser emits it: a complete
-    /// issue without an identity.
-    fn synthesized_issue(id: u32, title: &str) -> ReviewIssue {
-        ReviewIssue {
-            id,
-            title: title.to_string(),
-            uuid: None,
-            commit: None,
-            group: None,
-            model: None,
-            issue_type: IssueType::Quality,
-            status: IssueStatus::Discussion,
-            description: "Description".to_string(),
-            recommendations: Vec::new(),
-            files: Vec::new(),
-            readonly_files: Vec::new(),
-            note: None,
-        }
-    }
-
-    #[test]
-    fn every_synthesized_finding_receives_a_valid_uuid_v7() {
-        let first = synthesized_issue(1, "First finding");
-        let second = synthesized_issue(2, "Second finding");
-        let items = with_finding_identities(vec![first, second]);
-        assert_eq!(items.len(), 2);
-
-        let mut identities = Vec::new();
-        for item in &items {
-            let identity = item.uuid.clone().expect("finding identity");
-            assert!(is_valid_uuid_v7(&identity), "not a UUIDv7: {identity}");
-            identities.push(identity);
-        }
-        assert_ne!(identities[0], identities[1], "identities are unique");
-        assert_eq!(items[0].title, "First finding");
-        assert_eq!(items[1].id, 2);
-        assert_eq!(items[0].status, IssueStatus::Discussion);
-    }
-
-    #[test]
-    fn an_identity_a_finding_already_carries_is_preserved() {
-        let existing = generate_uuid_v7();
-        let mut issue = synthesized_issue(1, "Carried identity");
-        issue.uuid = Some(existing.clone());
-
-        let items = with_finding_identities(vec![issue]);
-        assert_eq!(items[0].uuid.as_deref(), Some(existing.as_str()));
-    }
 }

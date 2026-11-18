@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
+use crate::review::{IssueStatus, IssueType, ReviewIssue};
 use serde::Deserialize;
-use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue};
 
 use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -14,7 +14,7 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 /// findings. Each finding carries an actionable category, a technical
 /// description of the defect, an explicit remediation strategy, the files to
 /// modify, and the immutable files the fix must rely on but never change.
-pub fn review_findings_response_schema() -> serde_json::Value {
+fn review_findings_response_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -103,29 +103,28 @@ pub struct ReviewFindingsOutput {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
-    pub findings: Vec<ReviewFindingOutput>,
+    findings: Vec<ReviewFindingOutput>,
 }
 
-/// A single model-emitted finding before server-side normalization.
+/// A single model-emitted finding before session normalization.
 #[derive(Debug, Deserialize)]
 pub struct ReviewFindingOutput {
-    #[serde(default)]
-    pub title: String,
+    title: String,
     #[serde(rename = "type", alias = "severity", alias = "issue_type", default)]
-    pub issue_type: IssueType,
+    issue_type: IssueType,
     /// Technical description of the defect. The legacy `body` key is still
     /// accepted so pre-existing payloads stay readable.
     #[serde(default, alias = "body")]
-    pub description: String,
+    description: String,
     #[serde(default)]
-    pub recommendations: Vec<String>,
+    recommendations: Vec<String>,
     #[serde(default)]
-    pub files: Vec<String>,
+    files: Vec<String>,
     #[serde(default)]
-    pub readonly_files: Vec<String>,
+    readonly_files: Vec<String>,
     /// Legacy single-file location folded into `files` during normalization.
     #[serde(default)]
-    pub file_path: Option<String>,
+    file_path: Option<String>,
 }
 
 /// Parses the model's review synthesis output into a session title, a

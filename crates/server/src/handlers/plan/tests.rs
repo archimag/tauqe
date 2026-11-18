@@ -3,16 +3,15 @@ use super::batch::{
     run_plan_batch, BatchOutcome, PlanBatchOptions,
 };
 use crate::handlers::common::test_support::scratch_root;
-use crate::handlers::common::turn_applied_edits;
 use crate::state::AppState;
 use crate::transport::OutChannel;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tauqe_core::context::ContextAccess;
 use tauqe_core::plan::storage::PlanStorage;
+use tauqe_core::plan::{Plan, PlanItemStatus};
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-use tauqe_protocol::{
-    errors, events, ContextAccess, Plan, PlanItemStatus, PlanRefineResult, Request,
-};
+use tauqe_protocol::{errors, events, PlanRefineResult, Request};
 
 struct TestDir(std::path::PathBuf);
 impl TestDir {
@@ -29,8 +28,8 @@ impl Drop for TestDir {
     }
 }
 
-fn test_item(id: &str, status: PlanItemStatus) -> tauqe_protocol::PlanItem {
-    tauqe_protocol::PlanItem {
+fn test_item(id: &str, status: PlanItemStatus) -> tauqe_core::plan::PlanItem {
+    tauqe_core::plan::PlanItem {
         id: id.to_string(),
         title: format!("Step {}", id),
         status,
@@ -41,9 +40,9 @@ fn test_item(id: &str, status: PlanItemStatus) -> tauqe_protocol::PlanItem {
 
 /// Declares one rung of a model role ladder that receives `attempts` content
 /// attempts before the ladder escalates to the next rung.
-fn tier_with_attempts(model: &str, attempts: u32) -> tauqe_protocol::ModelEntry {
+fn tier_with_attempts(model: &str, attempts: u32) -> tauqe_core::models::ModelEntry {
     let mut entry =
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(model), None);
+        tauqe_core::models::ModelEntry::new(tauqe_core::models::ModelRef::openrouter(model), None);
     entry.attempts = Some(attempts);
     entry
 }
@@ -464,11 +463,11 @@ async fn test_handle_plan_refine_defaults_to_architect_role() {
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.models.architect = Some(vec![tauqe_protocol::ModelRef::openrouter(
+    config.models.architect = Some(vec![tauqe_core::models::ModelRef::openrouter(
         "test/architect-model",
     )
     .into()]);
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("test/repl-model").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("test/repl-model").into()];
 
     let refine_output = serde_json::json!({
         "status": "success",
@@ -578,12 +577,11 @@ async fn test_handle_plan_refine_clears_auto_context() {
     let state = test_state_with_provider(&dir, config, mock_provider).await;
 
     state
-        .context
-        .write()
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
-        .add_auto_file("file.rs", ContextAccess::ReadOnly)
+        .expect("fixture context mutation runs")
         .unwrap();
-    assert_eq!(state.context.read().await.auto_files().len(), 1);
+    assert_eq!(state.context_snapshot().await.auto_files().len(), 1);
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -594,7 +592,7 @@ async fn test_handle_plan_refine_clears_auto_context() {
     assert!(res.error.is_none(), "plan_refine failed: {:?}", res.error);
 
     assert!(
-        state.context.read().await.auto_files().is_empty(),
+        state.context_snapshot().await.auto_files().is_empty(),
         "auto context should be cleared after plan refinement"
     );
 }
@@ -735,72 +733,6 @@ async fn test_plan_execute_preflight_is_torn_down_by_a_hard_cancel() {
         .all(|i| i.status == PlanItemStatus::Todo));
 }
 
-#[test]
-fn test_turn_applied_edits_requires_applied_change() {
-    use crate::handlers::model::ModelTurnResult;
-
-    let applied = ModelTurnResult {
-        operation_id: "op-1".to_string(),
-        result: Some(tauqe_protocol::ModelResult::Edit {
-            summary: "fix".to_string(),
-            edits: vec![],
-            proposal: None,
-            outcome: tauqe_protocol::EditOutcome {
-                applied: true,
-                error: None,
-                changed_files: vec!["src/lib.rs".to_string()],
-                commit_hash: Some("abc".to_string()),
-                verification: None,
-            },
-        }),
-        is_cancelled: false,
-        error: None,
-        has_terminal_success: false,
-        blocked: None,
-        abort: None,
-    };
-    assert!(applied.is_success());
-    assert!(turn_applied_edits(&applied));
-
-    // Explanatory text with a terminal success tag satisfies an interactive
-    // turn but must not complete a code-modifying plan step.
-    let answer = ModelTurnResult {
-        operation_id: "op-2".to_string(),
-        result: Some(tauqe_protocol::ModelResult::Answer {
-            text: "Nothing to change.".to_string(),
-        }),
-        is_cancelled: false,
-        error: None,
-        has_terminal_success: true,
-        blocked: None,
-        abort: None,
-    };
-    assert!(answer.is_success());
-    assert!(!turn_applied_edits(&answer));
-
-    let failed = ModelTurnResult {
-        operation_id: "op-3".to_string(),
-        result: Some(tauqe_protocol::ModelResult::Edit {
-            summary: "fix".to_string(),
-            edits: vec![],
-            proposal: None,
-            outcome: tauqe_protocol::EditOutcome {
-                applied: false,
-                error: Some("compiler error".to_string()),
-                changed_files: vec![],
-                commit_hash: None,
-                verification: None,
-            },
-        }),
-        is_cancelled: false,
-        error: Some("compiler error".to_string()),
-        has_terminal_success: false,
-        blocked: None,
-        abort: None,
-    };
-    assert!(!turn_applied_edits(&failed));
-}
-
 #[tokio::test]
 async fn test_handle_plan_replan_validation() {
     let dir = TestDir::new();
@@ -826,7 +758,7 @@ async fn test_handle_plan_replan_validation() {
     .await;
     assert_eq!(res.error.unwrap().code, "NOT_FOUND");
 
-    let parent = tauqe_protocol::PlanItem {
+    let parent = tauqe_core::plan::PlanItem {
         id: "3".to_string(),
         title: "Parent".to_string(),
         status: PlanItemStatus::Todo,
@@ -1271,7 +1203,7 @@ async fn test_plan_step_binds_the_plan_session() {
     let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
@@ -1305,7 +1237,7 @@ fn test_collect_plan_context_files_dedups_and_recurses() {
     nested.files = vec!["src/shared.rs".to_string(), "./src/nested.rs".to_string()];
     nested.readonly_files = vec!["src/shared.rs".to_string()];
 
-    let parent = tauqe_protocol::PlanItem {
+    let parent = tauqe_core::plan::PlanItem {
         id: "2".to_string(),
         title: "Parent".to_string(),
         status: PlanItemStatus::Todo,
@@ -1476,7 +1408,12 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
 
     // Strict history transactionality invariant: no assistant response was recorded
     // into session history because persistence failed.
-    let entries = state.history.lock().await.get_entries().unwrap();
+    let entries = state
+        .application
+        .test_mutate_history(|history| history.get_entries())
+        .await
+        .unwrap()
+        .unwrap();
     let responses = entries
         .iter()
         .filter(|e| matches!(e, tauqe_core::history::HistoryEntry::Response { .. }))
@@ -1565,7 +1502,7 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
 
@@ -1677,13 +1614,19 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/one"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/two"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("planner/one"),
+            None,
+        ),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("planner/two"),
+            None,
+        ),
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
@@ -1792,7 +1735,7 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.repl.max_replans = 1;
     config.models.auto_level_up = false;
 
@@ -1887,13 +1830,13 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     // protocol is always structured
     config.repl.max_replans = 2;
     config.models.auto_level_up = false;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
-    config.models.architect = Some(vec![tauqe_protocol::ModelEntry::new(
-        tauqe_protocol::ModelRef::openrouter("planner/one"),
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/model").into()];
+    config.models.architect = Some(vec![tauqe_core::models::ModelEntry::new(
+        tauqe_core::models::ModelRef::openrouter("planner/one"),
         None,
     )]);
 
@@ -2038,8 +1981,8 @@ struct StreamCancellingProvider;
 
 #[async_trait::async_trait]
 impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
-    fn kind(&self) -> tauqe_protocol::ProviderKind {
-        tauqe_protocol::ProviderKind::OpenRouter
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
     }
 
     async fn stream_chat(
@@ -2101,7 +2044,7 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
         None,
         1,
         1,
-        vec![tauqe_protocol::ConceptItem {
+        vec![tauqe_core::plan::ConceptItem {
             id: "c-1".to_string(),
             title: "Invariant".to_string(),
             details: None,
@@ -2152,7 +2095,7 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     // protocol is always structured
     config.models.auto_level_up = false;
 
@@ -2750,7 +2693,7 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
             .architect
             .as_ref()
             .map(|tier| tier.model.clone()),
-        Some(tauqe_protocol::ModelRef::openrouter("planner/two"))
+        Some(tauqe_core::models::ModelRef::openrouter("planner/two"))
     );
 }
 
@@ -2984,7 +2927,7 @@ async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.repl.max_replans = 0;
     config.models.auto_level_up = false;
 
@@ -3083,7 +3026,7 @@ async fn test_plan_step_structured_protocol_execution() {
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
@@ -3180,9 +3123,9 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = true;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
         tier_with_attempts("coder/one", 1),
         tier_with_attempts("coder/mid", 1),
@@ -3197,8 +3140,8 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
             .expect("register batch operation"),
     );
     let options = PlanBatchOptions {
-        model: Some(tauqe_protocol::ModelSelection::Specific(
-            tauqe_protocol::ModelRef::openrouter("coder/mid"),
+        model: Some(tauqe_core::models::ModelSelection::Specific(
+            tauqe_core::models::ModelRef::openrouter("coder/mid"),
         )),
         step_id: None,
     };
@@ -3277,13 +3220,22 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = true;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/mid"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/one"),
+            None,
+        ),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/mid"),
+            None,
+        ),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/strong"),
+            None,
+        ),
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
@@ -3294,8 +3246,8 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
             .expect("register batch operation"),
     );
     let options = PlanBatchOptions {
-        model: Some(tauqe_protocol::ModelSelection::Specific(
-            tauqe_protocol::ModelRef::openrouter("coder/mid"),
+        model: Some(tauqe_core::models::ModelSelection::Specific(
+            tauqe_core::models::ModelRef::openrouter("coder/mid"),
         )),
         step_id: None,
     };
@@ -3360,16 +3312,22 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         MockResponse::text("The step looks complete."),
     ]));
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = true;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
-    let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
-    let mut manual_entry = tauqe_protocol::ModelEntry::new(manual_model.clone(), None);
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
+    let manual_model = tauqe_core::models::ModelRef::openrouter("coder/manual");
+    let mut manual_entry = tauqe_core::models::ModelEntry::new(manual_model.clone(), None);
     manual_entry.level_up = Some(false);
     config.models.coder = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/one"),
+            None,
+        ),
         manual_entry,
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/strong"),
+            None,
+        ),
     ]);
 
     let (out, mut rx) = OutChannel::new();
@@ -3384,7 +3342,7 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
             .expect("register batch operation"),
     );
     let options = PlanBatchOptions {
-        model: Some(tauqe_protocol::ModelSelection::Specific(manual_model)),
+        model: Some(tauqe_core::models::ModelSelection::Specific(manual_model)),
         step_id: None,
     };
     let outcome = run_plan_batch(
@@ -3496,13 +3454,19 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     // protocol is always structured
     config.models.auto_level_up = true;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/one"),
+            None,
+        ),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/strong"),
+            None,
+        ),
     ]);
 
     let (out, mut rx) = OutChannel::new();
@@ -3588,12 +3552,18 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.models.auto_level_up = true;
-    config.models.repl = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/one"),
+            None,
+        ),
+        tauqe_core::models::ModelEntry::new(
+            tauqe_core::models::ModelRef::openrouter("coder/strong"),
+            None,
+        ),
     ]);
 
     let (out, mut rx) = OutChannel::new();
@@ -3676,8 +3646,8 @@ struct ParkingProvider {
 
 #[async_trait::async_trait]
 impl tauqe_core::providers::LlmProvider for ParkingProvider {
-    fn kind(&self) -> tauqe_protocol::ProviderKind {
-        tauqe_protocol::ProviderKind::OpenRouter
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
     }
 
     async fn stream_chat(
@@ -3730,7 +3700,7 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
     });
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     // A hard cancel is classified in the turn-classification branch, before the
     // tier budget is consulted: the raised cancel signal ends the step as
     // cancelled instead of spending an attempt on the aborted turn.
@@ -3888,7 +3858,12 @@ async fn test_handle_plan_refine_surfaces_the_architect_abort() {
     }
 
     // The verdict is durable in the session history under its own label.
-    let entries = state.history.lock().await.get_entries().unwrap();
+    let entries = state
+        .application
+        .test_mutate_history(|history| history.get_entries())
+        .await
+        .unwrap()
+        .unwrap();
     let recorded = entries
         .iter()
         .find_map(|entry| match entry {
@@ -4034,8 +4009,8 @@ struct CancellingFinalRoundProvider {
 
 #[async_trait::async_trait]
 impl tauqe_core::providers::LlmProvider for CancellingFinalRoundProvider {
-    fn kind(&self) -> tauqe_protocol::ProviderKind {
-        tauqe_protocol::ProviderKind::OpenRouter
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
     }
 
     async fn stream_chat(
@@ -4188,7 +4163,12 @@ async fn test_plan_refine_answers_cancelled_before_the_destructive_horizon_write
 
     // Strict history transactionality: the aborted write records neither the
     // turn nor its response.
-    let entries = state.history.lock().await.get_entries().unwrap();
+    let entries = state
+        .application
+        .test_mutate_history(|history| history.get_entries())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         entries.is_empty(),
         "an aborted horizon write must record no session history"

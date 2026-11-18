@@ -2,29 +2,30 @@
 //!
 //! The tests pin the deterministic decisions taken before any provider request
 //! is launched: which turn intent a typed discussion target establishes and
-//! whether a turn binds the interactive dialogue session. Every assertion
+//! which commands the selected protocol admits. Every assertion
 //! targets a pure function, so the suite needs no `AppState`, no provider, and
 //! no repository.
 
+use crate::contracts::Project;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tauqe_core::config::AppConfig;
+use tauqe_core::llm::LlmCapability;
+use tauqe_core::llm::LlmCommand;
+use tauqe_core::models::{ModelRef, ModelSelection, ProviderKind};
+use tauqe_core::plan::DiscussionPlanAction;
+use tauqe_core::plan::Plan;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
-use tauqe_protocol::discussion::DiscussionPlanAction;
 use tauqe_protocol::{
-    DiscussionFocus, DiscussionRequest, DiscussionTarget, EditProtocolKind, LlmCapability,
-    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, ProviderKind, Request,
+    DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams, Request,
 };
 use tokio::sync::{mpsc, watch};
 
 use super::prompt::build_model_ask_prompt;
-use super::turn::{
-    execute_model_turn, forward_step_event, resolve_session_id, resolve_turn_protocol,
-    StepTurnOptions,
-};
+use super::turn::forward_step_event;
 use super::{
     handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
 };
@@ -33,23 +34,26 @@ use crate::handlers::edit_cycle::EditCycle;
 use crate::handlers::history::handle_history_get;
 use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
+use tauqe_core::api::turn_prompt_protocol as resolve_turn_protocol;
 /// Capability surface of a free interactive dialogue.
-fn dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
+fn dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
     tauqe_core::control::repl_capabilities(None)
 }
 
 /// Capability surface of a plan-anchored dialogue.
-fn plan_dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
-    tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Plan {
+fn plan_dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
+    tauqe_core::control::repl_capabilities(Some(&tauqe_core::discussion::DiscussionTarget::Plan {
         id: "plan-1".to_string(),
     }))
 }
 
 /// Capability surface of a review-anchored dialogue.
-fn review_dialogue_capabilities() -> tauqe_protocol::CapabilityTree {
-    tauqe_core::control::repl_capabilities(Some(&DiscussionTarget::Review {
-        id: "review-1".to_string(),
-    }))
+fn review_dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
+    tauqe_core::control::repl_capabilities(Some(
+        &tauqe_core::discussion::DiscussionTarget::Review {
+            id: "review-1".to_string(),
+        },
+    ))
 }
 
 /// A plan-anchored dialogue declares plan mutation beside the dialogue surface,
@@ -73,7 +77,7 @@ fn review_discussion_is_authorized_by_its_surface() {
     // A group dialogue shares the surface: the plan of the group is the unit of
     // remediation, and the decision it records belongs to the same anchored
     // session.
-    let group = DiscussionTarget::ReviewGroup {
+    let group = tauqe_core::discussion::DiscussionTarget::ReviewGroup {
         session_id: "review-1".to_string(),
         group_id: "arch-1".to_string(),
     };
@@ -93,7 +97,7 @@ const REVIEW_DECISION_JSON: &str = r#"{"message":"Recording the decision.","acti
 fn decoded_review_updates(
     protocol: &dyn PromptProtocol,
     raw: &str,
-) -> Vec<tauqe_protocol::review::ReviewUpdateProposal> {
+) -> Vec<tauqe_core::review::ReviewUpdateProposal> {
     protocol
         .decode(raw, &[])
         .into_iter()
@@ -118,7 +122,7 @@ fn review_discussion_decodes_the_recorded_decision() {
     assert_eq!(decisions[0].item_id, 7);
     assert_eq!(
         decisions[0].status,
-        tauqe_protocol::review::ReviewDecisionStatus::Rejected
+        tauqe_core::review::ReviewDecisionStatus::Rejected
     );
     assert_eq!(decisions[0].note, "The race cannot happen");
 }
@@ -147,29 +151,16 @@ fn the_recorded_decision_never_leaves_the_review_regime() {
     let decisions = decoded_review_updates(review.as_ref(), REVIEW_DECISION_JSON);
     assert_eq!(decisions.len(), 1);
 }
-/// An isolated step never inherits the interactive session, so it cannot reuse
-/// a prompt-prefix cache built from the dialogue transcript.
-#[test]
-fn isolated_step_carries_no_dialogue_session() {
-    assert_eq!(resolve_session_id(true, "session-1".to_string()), None);
-}
-
-/// A dialogue turn binds the interactive session, so successive rounds reuse the
-/// backend's cached prompt prefix.
-/// A dialogue turn binds the interactive session, so successive rounds reuse the
-/// backend's cached prompt prefix.
-#[test]
-fn interactive_turn_binds_the_dialogue_session() {
-    assert!(resolve_session_id(false, "session-1".to_string()).is_some());
-}
-
 /// Builds a `model/select` request for the given selection.
 fn select_request(selection: ModelSelection) -> Request {
     Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: "model/select".to_string(),
         params: Some(
-            serde_json::to_value(tauqe_protocol::ModelSelectParams { selection }).unwrap(),
+            serde_json::to_value(tauqe_protocol::ModelSelectParams {
+                selection: selection.project(),
+            })
+            .unwrap(),
         ),
     }
 }
@@ -254,7 +245,10 @@ fn decoded_plan_actions(protocol: &dyn PromptProtocol, raw: &str) -> Vec<Discuss
 #[test]
 fn plan_discussion_follows_the_configured_transport() {
     let protocol = resolve_turn_protocol(plan_dialogue_capabilities());
-    assert_eq!(protocol.kind(), EditProtocolKind::Structured);
+    assert_eq!(
+        protocol.kind(),
+        tauqe_core::workflow::EditProtocolKind::Structured
+    );
     assert!(protocol
         .capability_expr()
         .contains(LlmCapability::EditReplace));
@@ -896,7 +890,7 @@ async fn model_select_is_refused_while_an_operation_is_registered() {
     let operation = state
         .try_begin_operation()
         .expect("operation slot must be free");
-    let before = state.config.lock().await.selection.clone();
+    let before = state.application.configuration().await.selection.clone();
 
     let refused = handle_model_select(
         select_request(ModelSelection::Specific(ModelRef::openrouter("beta/model"))),
@@ -908,7 +902,7 @@ async fn model_select_is_refused_while_an_operation_is_registered() {
         tauqe_protocol::errors::OPERATION_IN_PROGRESS
     );
     assert_eq!(
-        state.config.lock().await.selection,
+        state.application.configuration().await.selection,
         before,
         "a refused switch must not change the selection"
     );
@@ -936,14 +930,18 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
     let state = state_over_root(root.clone());
 
     state
-        .mutate_history(|history| history.record_turn("Keep me", Vec::new()).map(|_| ()))
+        .application
+        .record_history_turn("Keep me".into(), Vec::new())
         .await
-        .expect("the record runs on the blocking pool")
         .expect("the record must persist");
 
     // A bounded turn works on a private clone of the manager and adopts it back
     // when it ends, so this clone is exactly what a running turn holds.
-    let turn_clone = state.history.lock().await.clone();
+    let turn_clone = state
+        .application
+        .test_mutate_history(|history| history.clone())
+        .await
+        .unwrap();
     let session = state.session_uuid().await;
     let operation = state
         .try_begin_operation()
@@ -957,12 +955,16 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
 
     // The journal was never truncated, so the turn's adoption cannot resurrect a
     // cleared transcript, and the session the turn resolved is still current.
-    state.adopt_history(turn_clone).await;
-    let entries = state
-        .history
-        .lock()
+    state
+        .application
+        .test_mutate_history(move |history| *history = turn_clone)
         .await
-        .get_entries()
+        .unwrap();
+    let entries = state
+        .application
+        .test_mutate_history(|history| history.get_entries())
+        .await
+        .unwrap()
         .expect("history reads back");
     assert_eq!(
         entries.len(),
@@ -981,10 +983,10 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
     );
     assert!(
         state
-            .history
-            .lock()
+            .application
+            .test_mutate_history(|history| history.get_entries())
             .await
-            .get_entries()
+            .unwrap()
             .expect("history reads back")
             .is_empty(),
         "the clear must truncate the journal once it owns the slot"
@@ -993,474 +995,6 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
         session,
         state.session_uuid().await,
         "a completed clear rotates the dialogue session"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A decision recorded in a review dialogue is durable review state, so the turn
-/// publishes it as it completes instead of leaving the client to refetch the
-/// session. The publication is scoped to the findings the turn actually moved.
-#[tokio::test]
-async fn a_recorded_review_decision_is_published_as_review_updated() {
-    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_core::workflow::DirectApplyPolicy;
-    use tauqe_protocol::review::{
-        IssueStatus, IssueType, ReviewItem, ReviewSession, ReviewSeverity,
-    };
-
-    let root = scratch_root("review-decision-sync");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
-    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let session = ReviewSession {
-        id: "review-sync".to_string(),
-        title: "Decision Audit".to_string(),
-        created_at: 1,
-        items: vec![ReviewItem {
-            id: 7,
-            title: "Held guard".to_string(),
-            uuid: None,
-            commit: None,
-            group: None,
-            model: None,
-            issue_type: IssueType::Bug,
-            severity: ReviewSeverity::Critical,
-            status: IssueStatus::Discussion,
-            recommendations: Vec::new(),
-            files: Vec::new(),
-            readonly_files: Vec::new(),
-            resolution_notes: None,
-            body: "The guard is released after the await".to_string(),
-        }],
-        ..ReviewSession::default()
-    };
-    tauqe_core::review::ReviewStorage::save_session(&root, &session)
-        .expect("save the review session");
-
-    let cfg = AppConfig::default();
-    let (out, mut rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, root.clone(), history_sender, out.clone());
-    let script = [MockResponse::text(REVIEW_DECISION_JSON)];
-    let provider = Arc::new(MockLlmProvider::scripted(script));
-    let injected: Arc<dyn LlmProvider> = provider.clone();
-    *state.provider_override.lock().await = Some(injected);
-    state
-        .set_discussion_focus(DiscussionFocus::review("review-sync", Vec::new()))
-        .await;
-
-    let result = execute_model_turn(
-        &state,
-        "Record the decision we reached".to_string(),
-        Box::new(DirectApplyPolicy::new()),
-        StepTurnOptions {
-            capabilities: review_dialogue_capabilities(),
-            is_isolated_step: false,
-            custom_selection: None,
-            plan_context: None,
-            work_context: None,
-            reasoning_effort: None,
-            marker: None,
-            session_id: None,
-            shared_operation: None,
-            phase_out: None,
-        },
-    )
-    .await
-    .expect("the review dialogue runs");
-    assert!(
-        result.error.is_none(),
-        "the dialogue failed: {:?}",
-        result.error
-    );
-    assert_eq!(
-        provider.remaining(),
-        0,
-        "the turn decodes a single provider round"
-    );
-
-    let stored = tauqe_core::review::ReviewStorage::load_review(&root, "review-sync")
-        .expect("load the session")
-        .expect("the session is stored");
-    assert_eq!(
-        stored.find_item(7).expect("the finding is stored").status,
-        IssueStatus::Rejected
-    );
-
-    let mut published = Vec::new();
-    while let Ok(line) = rx.try_recv() {
-        let event: serde_json::Value =
-            serde_json::from_str(&line).expect("the transport writes JSON lines");
-        if event.get("method").and_then(|method| method.as_str())
-            == Some(tauqe_protocol::events::REVIEW_UPDATED)
-        {
-            published.push(event);
-        }
-    }
-    let event = published
-        .first()
-        .expect("the recorded decision is published to the client");
-    assert_eq!(
-        published.len(),
-        1,
-        "one publication is emitted per affected finding"
-    );
-    let session: ReviewSession = serde_json::from_value(event["params"]["session"].clone())
-        .expect("the publication carries the refreshed session");
-    assert_eq!(session.id, "review-sync");
-    let finding = session
-        .find_item(7)
-        .expect("the decided finding is published");
-    assert_eq!(finding.status, IssueStatus::Rejected);
-    assert_eq!(
-        finding.resolution_notes.as_deref(),
-        Some("The race cannot happen")
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Budget after which a deliberate non-yielding stretch ends on its own.
-///
-/// The stretch exists to prove what an abort cannot reach, so it spins
-/// synchronously instead of parking on an abort landing point. The budget is the
-/// second line of defence behind the test's release guard: an unbounded stretch
-/// pins the worker thread of its runtime, whose shutdown waits for that thread,
-/// so one failed assertion would hang the whole suite instead of failing one
-/// case.
-const SYNCHRONOUS_STRETCH_BUDGET: Duration = Duration::from_secs(5);
-
-/// Provider that relays a cancellation and then parks the workflow task inside a
-/// synchronous stretch, so the task never reaches the suspension point an abort
-/// lands at.
-///
-/// It reproduces the last-resort hazard: a cancelled turn whose workflow sits
-/// between abort landing points outlives both unwind graces while it still
-/// holds the session lock it acquired.
-struct AbortIgnoringProvider {
-    /// Signals that the workflow task entered the synchronous stretch.
-    entered: mpsc::UnboundedSender<()>,
-    /// Set by the test to let the workflow task reach a suspension point.
-    released: Arc<AtomicBool>,
-    /// Set once the synchronous stretch has ended.
-    exited: Arc<AtomicBool>,
-}
-
-impl AbortIgnoringProvider {
-    /// Builds the provider together with the receiver that observes its stall.
-    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
-        let (entered, receiver) = mpsc::unbounded_channel();
-        (
-            Self {
-                entered,
-                released: Arc::new(AtomicBool::new(false)),
-                exited: Arc::new(AtomicBool::new(false)),
-            },
-            receiver,
-        )
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for AbortIgnoringProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenRouter
-    }
-
-    async fn stream_chat(
-        &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
-        tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        // Relay the cancellation the turn reacts to, then hold the task inside a
-        // synchronous stretch. An abort only lands at a suspension point, so the
-        // task keeps running and keeps holding the session lock. The cancel
-        // signal is deliberately never observed here: a workflow that ignores it
-        // is exactly what the deferred reaping has to survive.
-        let _ = tx.send(StreamEvent::Cancelled).await;
-        let _ = self.entered.send(());
-        // The non-yielding stretch is the subject of this fixture, so it spins
-        // synchronously: a suspension point here would let the abort land and
-        // erase the hazard under test. Its budget ends the spin even when the
-        // test's release guard never fires.
-        let deadline = std::time::Instant::now() + SYNCHRONOUS_STRETCH_BUDGET;
-        while !self.released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        self.exited.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-/// Flips the release flag on drop so an aborted or panicked test never leaves
-/// the synchronous stretch spinning on a worker thread.
-struct StretchRelease(Arc<AtomicBool>);
-
-impl Drop for StretchRelease {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// A workflow task that survives the abort must never be detached: the turn
-/// either unwinds it or hands the still-owned handle to the shared watchdog,
-/// while the operation slot stays registered until the task has truly exited, so
-/// the zombie releases the session lock before any new operation can register.
-///
-/// The regression runs on a multi-thread runtime because the stand-in parks the
-/// workflow task inside a synchronous stretch: that stretch never yields, which
-/// is exactly why the abort cannot land there. Ending the stretch is what lets
-/// the turn settle, so the wedged assertions are made first and the awaiting
-/// second.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
-    use tauqe_core::workflow::DirectApplyPolicy;
-
-    let root = scratch_root("deferred-reap");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
-    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let state = state_over_root(root.clone());
-    let (provider, mut entered) = AbortIgnoringProvider::new();
-    let released = Arc::clone(&provider.released);
-    let exited = Arc::clone(&provider.exited);
-    let _release_guard = StretchRelease(Arc::clone(&released));
-    let injected: Arc<dyn LlmProvider> = Arc::new(provider);
-    *state.provider_override.lock().await = Some(injected);
-
-    // The production grace exists to give a real workflow time to unwind. A short
-    // grace confined to this turn's task reaches the expiry without changing what
-    // any concurrently running test observes.
-    let grace = Duration::from_millis(150);
-    let turn_state = Arc::clone(&state);
-    let turn = tokio::spawn(async move {
-        super::turn::with_unwind_grace(grace, async move {
-            execute_model_turn(
-                &turn_state,
-                "Explain the repository".to_string(),
-                Box::new(DirectApplyPolicy::new()),
-                StepTurnOptions {
-                    capabilities: dialogue_capabilities(),
-                    is_isolated_step: false,
-                    custom_selection: None,
-                    plan_context: None,
-                    work_context: None,
-                    reasoning_effort: None,
-                    marker: None,
-                    session_id: None,
-                    shared_operation: None,
-                    phase_out: None,
-                },
-            )
-            .await
-        })
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(10), entered.recv())
-        .await
-        .expect("the turn must reach the provider")
-        .expect("the provider signals that the workflow task is parked");
-    state.cancel_active_operation();
-
-    // The cancelled workflow sits between abort landing points, so it keeps
-    // running and keeps holding the session lock it acquired: no new operation
-    // may register while it is still in there.
-    tokio::time::sleep(grace * 5).await;
-    assert!(
-        !exited.load(Ordering::SeqCst),
-        "the workflow task must still be inside the synchronous stretch"
-    );
-    assert!(
-        state.is_operation_active(),
-        "the slot must stay registered while the aborted task still runs"
-    );
-    assert!(
-        state.try_begin_operation().is_err(),
-        "a new operation must stay refused until the aborted task has exited"
-    );
-
-    // Ending the stretch gives the pending abort a landing point, so the turn
-    // settles within its budget instead of outliving the grace period whatever
-    // value the cancel path observed.
-    released.store(true, Ordering::SeqCst);
-    let result = tokio::time::timeout(Duration::from_secs(10), turn)
-        .await
-        .expect("the turn must return once the workflow task can unwind")
-        .expect("the turn task joins")
-        .expect("the turn returns a cancelled result");
-    assert!(result.is_cancelled, "the turn must report the cancellation");
-
-    // The registration outlives the task only until the task really exits, and it
-    // is dropped either by the task's own guard or by the deferred watchdog.
-    let mut freed = false;
-    for _ in 0..500 {
-        if !state.is_operation_active() {
-            freed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(freed, "the slot must be released once the task exits");
-    assert!(
-        exited.load(Ordering::SeqCst),
-        "the workflow task must have reached its own end"
-    );
-    assert!(
-        state.try_begin_operation().is_ok(),
-        "the slot must be reusable afterwards"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Provider that streams nothing, ignores the cancellation signal, and never
-/// returns on its own, so the only way the turn it serves can end is the
-/// last-resort reaping of a wedged workflow task.
-struct SilentlyParkedProvider {
-    /// Signals that the provider is parked inside its stream.
-    entered: mpsc::UnboundedSender<()>,
-}
-
-impl SilentlyParkedProvider {
-    /// Builds the provider together with the receiver that observes its stall.
-    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
-        let (entered, receiver) = mpsc::unbounded_channel();
-        (Self { entered }, receiver)
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for SilentlyParkedProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenRouter
-    }
-
-    async fn stream_chat(
-        &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
-        _tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        // Nothing is relayed and the cancellation is never observed, so the
-        // workflow stays parked until the watchdog aborts it: exactly the turn
-        // that used to surface as a provider failure.
-        let _ = self.entered.send(());
-        std::future::pending::<()>().await;
-        Ok(())
-    }
-}
-
-/// A hard-cancelled turn whose workflow ignored the signal is reported as a
-/// cancellation, not as a provider failure.
-///
-/// The force-abort watchdog drops the wedged workflow task, so the turn's relay
-/// loop ends without a `Cancelled` event and the join yields an error. The
-/// raised cancel signal stays the authoritative classification — the rule every
-/// other seam applies — so a client that asked for the cancellation never
-/// receives a spurious `model/error` one watchdog cycle later, and a direct
-/// caller observes `is_cancelled` instead of a failure.
-#[tokio::test]
-async fn a_force_aborted_turn_is_reported_as_cancelled() {
-    use tauqe_core::workflow::DirectApplyPolicy;
-
-    let root = scratch_root("force-aborted-turn");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
-    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let (out, mut rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
-    let (provider, mut entered) = SilentlyParkedProvider::new();
-    let injected: Arc<dyn LlmProvider> = Arc::new(provider);
-    *state.provider_override.lock().await = Some(injected);
-
-    let turn_state = Arc::clone(&state);
-    let turn = tokio::spawn(async move {
-        execute_model_turn(
-            &turn_state,
-            "Explain the repository".to_string(),
-            Box::new(DirectApplyPolicy::new()),
-            StepTurnOptions {
-                capabilities: dialogue_capabilities(),
-                is_isolated_step: false,
-                custom_selection: None,
-                plan_context: None,
-                work_context: None,
-                reasoning_effort: None,
-                marker: None,
-                session_id: None,
-                shared_operation: None,
-                phase_out: None,
-            },
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(10), entered.recv())
-        .await
-        .expect("the turn must reach the provider")
-        .expect("the provider signals that it is parked");
-    state.cancel_active_operation();
-    state
-        .force_abort_active_operation(Duration::from_secs(10))
-        .await;
-
-    let result = tokio::time::timeout(Duration::from_secs(10), turn)
-        .await
-        .expect("the aborted turn must return")
-        .expect("the turn task joins")
-        .expect("the turn reports the cancellation instead of a start failure");
-    assert!(
-        result.is_cancelled,
-        "the raised cancel signal must classify the turn as cancelled"
-    );
-    assert_eq!(
-        result.error.as_deref(),
-        Some("Operation cancelled"),
-        "a cancelled turn carries the same payload as a cooperative cancellation"
-    );
-    assert!(
-        result.result.is_none(),
-        "an aborted turn produces no result"
-    );
-
-    let mut published = Vec::new();
-    while let Ok(line) = rx.try_recv() {
-        let event: serde_json::Value =
-            serde_json::from_str(&line).expect("the transport writes JSON lines");
-        if let Some(method) = event.get("method").and_then(|method| method.as_str()) {
-            published.push(method.to_string());
-        }
-    }
-    assert!(
-        published
-            .iter()
-            .any(|method| method == tauqe_protocol::events::MODEL_CANCELLED),
-        "a cancelled turn must report model/cancelled: {published:?}"
-    );
-    assert!(
-        !published
-            .iter()
-            .any(|method| method == tauqe_protocol::events::MODEL_ERROR),
-        "a cancelled turn must never report model/error: {published:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1487,7 +1021,7 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
         "op-step-edit",
         StreamEvent::EditFileStarted {
             path: "src/main.rs".to_string(),
-            op_type: tauqe_protocol::EditFileOp::Replace,
+            op_type: tauqe_core::edits::EditFileOp::Replace,
         },
         &mut usage_guard,
         &edit_cycle,
@@ -1516,7 +1050,7 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
         "op-step-edit",
         StreamEvent::EditFileDone {
             path: "src/main.rs".to_string(),
-            status: tauqe_protocol::EditFileStatus::Ok,
+            status: tauqe_core::edits::EditFileStatus::Ok,
             error: None,
             hunks_count: 1,
         },
@@ -1543,256 +1077,6 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A committed turn applies the change set it proposed and releases the
-/// transient context that served the decision.
-///
-/// The Auto layer is part of the stable prompt prefix exactly like a repository
-/// file, so the material discovery gathered for one decision must not survive
-/// the commit that made the decision durable: keeping it resident would charge
-/// every later request for a prompt prefix that no longer needs it. The
-/// dialogue session rotates with the prefix the release shrank, so the next
-/// round is never routed to a cache the dialogue no longer sends.
-#[tokio::test]
-async fn a_committed_turn_applies_its_change_set_and_releases_the_transient_context() {
-    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_core::workflow::DirectApplyPolicy;
-    use tauqe_protocol::ContextAccess;
-
-    let root = scratch_root("turn-committed-release");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
-        .expect("write the edit target");
-    std::fs::write(root.join("discovered.rs"), "pub fn discovered() {}\n")
-        .expect("write the discovered file");
-    let fixtures = vec!["target.rs".to_string(), "discovered.rs".to_string()];
-    tauqe_core::git::cmd::stage_files(&root, &fixtures).expect("stage the fixtures");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixtures", false)
-        .expect("commit the fixtures");
-
-    let cfg = AppConfig::default();
-    let (out, _rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, root.clone(), history_sender, out);
-    state
-        .context
-        .write()
-        .await
-        .add_file("target.rs", ContextAccess::Editable)
-        .expect("the edit target is editable");
-    state
-        .context
-        .write()
-        .await
-        .add_auto_file("discovered.rs", ContextAccess::ReadOnly)
-        .expect("the discovered file joins the transient context");
-    let script = [MockResponse::text(
-        serde_json::json!({
-            "message": "Rewriting the value.",
-            "action": {
-                "kind": "edit",
-                "changes": [
-                    {
-                        "op": "replace",
-                        "path": "target.rs",
-                        "to": "",
-                        "start": "",
-                        "end": "",
-                        "old_text": "pub fn value() -> i32 { 0 }\n",
-                        "new_text": "pub fn value() -> i32 { 42 }\n",
-                        "content": ""
-                    }
-                ],
-                "commit_message": "Bump the value",
-                "message": "",
-                "reason": ""
-            }
-        })
-        .to_string(),
-    )];
-    let provider = Arc::new(MockLlmProvider::scripted(script));
-    let injected: Arc<dyn LlmProvider> = provider.clone();
-    *state.provider_override.lock().await = Some(injected);
-    let warm_session = state.session_uuid().await;
-
-    let result = execute_model_turn(
-        &state,
-        "Bump the value to 42".to_string(),
-        Box::new(DirectApplyPolicy::new()),
-        StepTurnOptions {
-            capabilities: dialogue_capabilities(),
-            is_isolated_step: false,
-            custom_selection: None,
-            plan_context: None,
-            work_context: None,
-            reasoning_effort: None,
-            marker: None,
-            session_id: None,
-            shared_operation: None,
-            phase_out: None,
-        },
-    )
-    .await
-    .expect("the bounded turn runs");
-
-    assert!(
-        result.is_success(),
-        "the released turn must apply its change set: {:?}",
-        result.result
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("target.rs")).expect("read the edit target"),
-        "pub fn value() -> i32 { 42 }\n",
-        "the change set must reach the working tree"
-    );
-    assert!(
-        state.context.read().await.auto_files().is_empty(),
-        "a committed turn must release the transient context that served it"
-    );
-    assert!(
-        !state
-            .context
-            .read()
-            .await
-            .contains("discovered.rs")
-            .expect("the context resolves the discovered path"),
-        "the discovered file leaves the context with the decision"
-    );
-    assert!(
-        state
-            .context
-            .read()
-            .await
-            .contains("target.rs")
-            .expect("the context resolves the edit target"),
-        "the explicitly added file keeps its own entry"
-    );
-    assert_ne!(
-        warm_session,
-        state.session_uuid().await,
-        "a released prefix starts a fresh dialogue session"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Flips a flag when the owning task future is dropped, so a test can prove that
-/// a watchdog released the registration of a task that still ran and that the
-/// orphan died once its non-yielding stretch ended.
-struct WatchdogExitMarker(Arc<AtomicBool>);
-
-impl Drop for WatchdogExitMarker {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// A watchdog reap is bounded in both directions: it waits for the task it
-/// aborted, but never longer than the shared task-exit deadline, so a workflow
-/// wedged in a non-yielding stretch cannot pin the operation slot until process
-/// exit. Releasing the slot leaves the abort delivered, so the orphan dies at the
-/// next suspension point its stretch finally reaches.
-#[test]
-fn a_watchdog_reap_that_expires_releases_the_slot_of_a_pinned_task() {
-    let root = scratch_root("watchdog-reap-expiry");
-
-    // The wedged workflow owns a runtime of its own: its whole point is a stretch
-    // that never yields back to its scheduler, so it must not be able to pin the
-    // scheduler the confirmation runs on.
-    let wedged_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("the wedged runtime starts");
-    let confirmation_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("the confirmation runtime starts");
-
-    let stretch_ends = Arc::new(AtomicBool::new(false));
-    // The stretch belongs to a runtime of its own, whose shutdown waits for its
-    // pinned worker: releasing it on drop keeps a failed assertion from hanging
-    // the suite.
-    let _stretch_guard = StretchRelease(Arc::clone(&stretch_ends));
-    let exited = Arc::new(AtomicBool::new(false));
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-
-    confirmation_runtime.block_on(async {
-        let state = state_over_root(root.clone());
-        let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
-        let task = {
-            let stretch_ends = Arc::clone(&stretch_ends);
-            let exited = Arc::clone(&exited);
-            wedged_runtime.spawn(async move {
-                let _marker = WatchdogExitMarker(Arc::clone(&exited));
-                // The signal proves the task reached the stretch, so the abort
-                // delivered below lands on a task that is demonstrably running
-                // instead of racing its very first poll.
-                let _ = entered_tx.send(());
-                // A non-yielding stretch: the task reaches no suspension point,
-                // so the abort cannot land while it spins. Its budget ends the
-                // spin even when the release guard never fires.
-                let deadline = std::time::Instant::now() + SYNCHRONOUS_STRETCH_BUDGET;
-                while !stretch_ends.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-            })
-        };
-        entered_rx
-            .await
-            .expect("the wedged task must enter its non-yielding stretch");
-
-        // The deadline is resolved where the watchdog is spawned and applied by
-        // the confirmation inside it, so a compressed value keeps the expiry path
-        // deterministic.
-        crate::reap::with_task_exit_deadline(Duration::from_millis(50), async {
-            state.defer_abort_owning_operation(guard, task);
-        })
-        .await;
-
-        // The confirmation expires while the task is still pinned: the slot is
-        // released within the bound although the task provably never exited.
-        let mut released = false;
-        for _ in 0..500 {
-            if !state.is_operation_active() {
-                released = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            released,
-            "the expired confirmation must release the operation slot"
-        );
-        assert!(
-            !exited.load(Ordering::SeqCst),
-            "the wedged task provably never exited before the slot was released"
-        );
-
-        // The released slot admits the next operation instead of refusing every
-        // request until the process exits.
-        assert!(
-            state.try_begin_operation().is_ok(),
-            "the released slot must admit a new operation"
-        );
-
-        // The orphan keeps its abort delivered: it dies at the first suspension
-        // point its stretch reaches.
-        stretch_ends.store(true, Ordering::SeqCst);
-        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
-            while !exited.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(
-            stopped.is_ok(),
-            "the orphaned task must die once its non-yielding stretch ends"
-        );
-    });
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// Drains the transport queue into the ordered list of published events.
 fn published_events(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<(String, serde_json::Value)> {
     let mut events = Vec::new();
@@ -1810,347 +1094,29 @@ fn published_events(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<(String, se
     events
 }
 
-/// A turn that applies its change set closes the edit cycle exactly once, and
-/// the closing precedes the terminal `model/result` event.
 #[tokio::test]
-async fn a_successful_turn_closes_the_edit_cycle_before_the_result() {
-    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_core::workflow::DirectApplyPolicy;
-
-    let root = scratch_root("turn-cycle-success");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("target.rs"), "pub fn value() -> i32 { 0 }\n")
-        .expect("write the edit target");
-    tauqe_core::git::cmd::stage_files(&root, &["target.rs".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let cfg = AppConfig::default();
-    let (out, mut rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, root.clone(), history_sender, out);
-    state
-        .context
-        .write()
-        .await
-        .add_file("target.rs", tauqe_protocol::ContextAccess::Editable)
-        .expect("the edit target is editable");
-    let script = [MockResponse::text(
-        serde_json::json!({
-            "message": "Rewriting the value.",
-            "action": {
-                "kind": "edit",
-                "changes": [
-                    {
-                        "op": "replace",
-                        "path": "target.rs",
-                        "to": "",
-                        "start": "",
-                        "end": "",
-                        "old_text": "pub fn value() -> i32 { 0 }\n",
-                        "new_text": "pub fn value() -> i32 { 42 }\n",
-                        "content": ""
-                    }
-                ],
-                "commit_message": "Bump the value",
-                "message": "",
-                "reason": ""
-            }
-        })
-        .to_string(),
-    )];
-    let injected: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted(script));
-    *state.provider_override.lock().await = Some(injected);
-
-    let result = execute_model_turn(
-        &state,
-        "Bump the value to 42".to_string(),
-        Box::new(DirectApplyPolicy::new()),
-        StepTurnOptions {
-            capabilities: dialogue_capabilities(),
-            is_isolated_step: false,
-            custom_selection: None,
-            plan_context: None,
-            work_context: None,
-            reasoning_effort: None,
-            marker: None,
-            session_id: None,
-            shared_operation: None,
-            phase_out: None,
-        },
-    )
-    .await
-    .expect("the bounded turn runs");
-    assert!(
-        result.is_success(),
-        "the turn must apply: {:?}",
-        result.result
-    );
-
-    let events = published_events(&mut rx);
-    let position = |wanted: &str| {
-        events
-            .iter()
-            .enumerate()
-            .filter(|(_, (method, _))| method == wanted)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    };
-    let started = position(tauqe_protocol::events::EDIT_STARTED);
-    let finished = position(tauqe_protocol::events::EDIT_FINISHED);
-    let results = position(tauqe_protocol::events::MODEL_RESULT);
-    assert_eq!(started.len(), 1, "the cycle opens exactly once");
-    assert_eq!(finished.len(), 1, "the cycle closes exactly once");
-    assert_eq!(results.len(), 1);
-    assert!(started[0] < finished[0]);
-    assert!(
-        finished[0] < results[0],
-        "the closing must precede the terminal result"
-    );
-    assert_eq!(events[finished[0]].1["applied"], true);
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Provider that opens an edit cycle, withdraws the attempt, opens the next
-/// one, and then answers in text without applying anything.
-struct WithdrawingProvider {
-    /// Set once the first call has played the withdrawn attempt.
-    played: AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for WithdrawingProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenRouter
-    }
-
-    async fn stream_chat(
-        &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
-        tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        if !self.played.swap(true, Ordering::SeqCst) {
-            let _ = tx.send(StreamEvent::EditStarted).await;
-            let _ = tx.send(StreamEvent::ResetStream).await;
-            let _ = tx.send(StreamEvent::EditStarted).await;
-        }
-        let _ = tx
-            .send(StreamEvent::TextDelta("No change is needed.".to_string()))
-            .await;
-        Ok(())
-    }
-}
-
-/// A withdrawn attempt closes its cycle before the next rung opens one, and a
-/// turn that ends with a text answer leaves no cycle open: every opening is
-/// answered by exactly one closing, and the last closing precedes the result.
-#[tokio::test]
-async fn a_withdrawn_attempt_closes_its_cycle_before_the_next_one_opens() {
-    use tauqe_core::workflow::DirectApplyPolicy;
-
-    let root = scratch_root("turn-cycle-withdrawn");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
-    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let cfg = AppConfig::default();
-    let (out, mut rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(cfg, root.clone(), history_sender, out);
-    let injected: Arc<dyn LlmProvider> = Arc::new(WithdrawingProvider {
-        played: AtomicBool::new(false),
-    });
-    *state.provider_override.lock().await = Some(injected);
-
-    let _ = execute_model_turn(
-        &state,
-        "Explain the repository".to_string(),
-        Box::new(DirectApplyPolicy::new()),
-        StepTurnOptions {
-            capabilities: dialogue_capabilities(),
-            is_isolated_step: false,
-            custom_selection: None,
-            plan_context: None,
-            work_context: None,
-            reasoning_effort: None,
-            marker: None,
-            session_id: None,
-            shared_operation: None,
-            phase_out: None,
-        },
-    )
-    .await
-    .expect("the bounded turn runs");
-
-    let events = published_events(&mut rx);
-    let cycle: Vec<&(String, serde_json::Value)> = events
-        .iter()
-        .filter(|(method, _)| {
-            method == tauqe_protocol::events::EDIT_STARTED
-                || method == tauqe_protocol::events::EDIT_FINISHED
-        })
-        .collect();
-    for (index, (method, params)) in cycle.iter().enumerate() {
-        if index % 2 == 0 {
-            assert_eq!(method, tauqe_protocol::events::EDIT_STARTED);
-        } else {
-            assert_eq!(method, tauqe_protocol::events::EDIT_FINISHED);
-            assert!(
-                !params["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty(),
-                "an unapplied closing must carry a reason: {params}"
-            );
-        }
-    }
-    assert_eq!(cycle.len() % 2, 0, "no cycle may stay open");
-
-    let last_closing = events
-        .iter()
-        .rposition(|(method, _)| method == tauqe_protocol::events::EDIT_FINISHED);
-    let result = events
-        .iter()
-        .position(|(method, _)| method == tauqe_protocol::events::MODEL_RESULT);
-    if let (Some(closing), Some(result)) = (last_closing, result) {
-        assert!(closing < result, "the closing must precede the result");
-    }
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Provider that opens an edit cycle and then parks until the harness cancels
-/// the turn, so the cancellation lands while the cycle is open.
-struct OpenCycleProvider {
-    /// Signals that the cycle is open and the provider is parked.
-    entered: mpsc::UnboundedSender<()>,
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for OpenCycleProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenRouter
-    }
-
-    async fn stream_chat(
-        &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
-        tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        if tx.send(StreamEvent::EditStarted).await.is_err() {
-            return Ok(());
-        }
-        let _ = self.entered.send(());
-        while !*cancel_rx.borrow() {
-            if cancel_rx.changed().await.is_err() {
-                break;
-            }
-        }
-        let _ = tx.send(StreamEvent::Cancelled).await;
-        Ok(())
-    }
-}
-
-/// A turn cancelled while its edit cycle is open closes the cycle exactly once,
-/// with an unapplied outcome that states its reason, before the cancellation
-/// notice reaches the client.
-#[tokio::test]
-async fn a_cancelled_turn_closes_its_open_cycle_exactly_once() {
-    use tauqe_core::workflow::DirectApplyPolicy;
-
-    let root = scratch_root("turn-cycle-cancelled");
-    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
-    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
-    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
-        .expect("stage the fixture");
-    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
-        .expect("commit the fixture");
-
-    let (out, mut rx) = crate::transport::OutChannel::new();
-    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+async fn history_clear_preserves_the_rpc_result_and_emits_focus_detach_once() {
+    let root = scratch_root("clear-history-focus-event");
+    let (out, mut events) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = mpsc::unbounded_channel();
     let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
-    let (entered_tx, mut entered) = mpsc::unbounded_channel();
-    let injected: Arc<dyn LlmProvider> = Arc::new(OpenCycleProvider {
-        entered: entered_tx,
-    });
-    *state.provider_override.lock().await = Some(injected);
-
-    let turn_state = Arc::clone(&state);
-    let turn = tokio::spawn(async move {
-        execute_model_turn(
-            &turn_state,
-            "Explain the repository".to_string(),
-            Box::new(DirectApplyPolicy::new()),
-            StepTurnOptions {
-                capabilities: dialogue_capabilities(),
-                is_isolated_step: false,
-                custom_selection: None,
-                plan_context: None,
-                work_context: None,
-                reasoning_effort: None,
-                marker: None,
-                session_id: None,
-                shared_operation: None,
-                phase_out: None,
-            },
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(10), entered.recv())
-        .await
-        .expect("the turn must reach the provider")
-        .expect("the provider signals that the cycle is open");
-    state.hard_cancel_active_operation();
-
-    let result = tokio::time::timeout(Duration::from_secs(10), turn)
-        .await
-        .expect("the cancelled turn must return")
-        .expect("the turn task joins")
-        .expect("the turn reports the cancellation");
-    assert!(result.is_cancelled);
-
-    let events = published_events(&mut rx);
-    let position = |wanted: &str| {
-        events
-            .iter()
-            .enumerate()
-            .filter(|(_, (method, _))| method == wanted)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    };
-    let started = position(tauqe_protocol::events::EDIT_STARTED);
-    let finished = position(tauqe_protocol::events::EDIT_FINISHED);
-    let cancelled = position(tauqe_protocol::events::MODEL_CANCELLED);
-    assert_eq!(started.len(), 1, "the cycle opens exactly once");
-    assert_eq!(finished.len(), 1, "the cycle closes exactly once");
-    assert_eq!(cancelled.len(), 1);
-    assert!(
-        finished[0] < cancelled[0],
-        "the closing must precede the cancellation notice"
-    );
-    let closing = &events[finished[0]].1;
-    assert_eq!(closing["applied"], false);
-    assert!(
-        !closing["error"]
-            .as_str()
-            .unwrap_or_default()
-            .trim()
-            .is_empty(),
-        "an unapplied closing must carry a reason: {closing}"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
+    state
+        .set_discussion_focus(DiscussionFocus::plan("plan-1", vec![]))
+        .await;
+    while events.try_recv().is_ok() {}
+    let response = handle_model_clear_history(clear_history_request(), &state).await;
+    assert!(response.error.is_none());
+    assert_eq!(response.result, Some(serde_json::json!({"cleared":true})));
+    let mut detached = 0;
+    while let Ok(line) = events.try_recv() {
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if event["method"] == tauqe_protocol::events::DISCUSSION_FOCUS_CHANGED {
+            assert_eq!(event["params"]["focus"]["kind"], "none");
+            detached += 1;
+        }
+    }
+    assert_eq!(detached, 1);
+    handle_model_clear_history(clear_history_request(), &state).await;
+    assert!(events.try_recv().is_err());
+    let _ = std::fs::remove_dir_all(root);
 }

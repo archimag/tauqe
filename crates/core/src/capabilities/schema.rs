@@ -18,15 +18,20 @@
 //! because strict Structured Output mode is not guaranteed to resolve a JSON
 //! Pointer of a shared definition, least of all inside a discriminated union.
 
-use serde_json::{json, Map, Value};
 #[cfg(test)]
-use tauqe_protocol::DocTopic;
-use tauqe_protocol::{
-    AbortCommand, BlockedCommand, CapabilityTree, CommitMessageCommand, ContextRequestCommand,
-    CustomToolCommand, DirListCommand, DocRequestCommand, LlmCapability, OuterDocRequestCommand,
-    PatchStrategy, RepoDirsCommand, RepoMapCommand, RepoSearchCommand, ScratchpadCommand,
-    StructuredChangeProposal, TextCommand, TurnErrorCommand, TurnSkipCommand,
+use crate::config::project::ProjectConfig;
+use crate::edits::StructuredChangeProposal;
+use crate::llm::CapabilityTree;
+#[cfg(test)]
+use crate::llm::DocTopic;
+use crate::llm::LlmCapability;
+use crate::llm::{
+    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
+    DirListCommand, DocRequestCommand, OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand,
+    RepoSearchCommand, ScratchpadCommand, TextCommand, TurnErrorCommand, TurnSkipCommand,
 };
+use crate::workflow::PatchStrategy;
+use serde_json::{json, Map, Value};
 
 use crate::capabilities::PromptRenderContext;
 use crate::edits::strategy::StrategyProfile;
@@ -379,19 +384,19 @@ fn capability_schema(
         LlmCapability::PlanCreation => {
             map.insert(
                 "plan_create".to_string(),
-                tauqe_protocol::discussion::schema::plan_create_schema().clone(),
+                crate::llm::discussion::schema::plan_create_schema().clone(),
             );
         }
         LlmCapability::PlanUpdate => {
             map.insert(
                 "plan_update".to_string(),
-                tauqe_protocol::discussion::schema::plan_update_schema().clone(),
+                crate::llm::discussion::schema::plan_update_schema().clone(),
             );
         }
         LlmCapability::ReviewUpdate => {
             map.insert(
                 "review_update".to_string(),
-                tauqe_protocol::discussion::schema::review_update_schema().clone(),
+                crate::llm::discussion::schema::review_update_schema().clone(),
             );
         }
         LlmCapability::Scratchpad => {
@@ -517,7 +522,7 @@ fn collect_expr_schema(
         CapabilityTree::Leaf(cap) => {
             if matches!(cap, LlmCapability::PlanCreation | LlmCapability::PlanUpdate) {
                 if let Some(entries) =
-                    tauqe_protocol::discussion::schema::plan_schema_definitions().as_object()
+                    crate::llm::discussion::schema::plan_schema_definitions().as_object()
                 {
                     for (name, schema) in entries {
                         defs.entry(name.clone()).or_insert_with(|| schema.clone());
@@ -674,7 +679,7 @@ pub(crate) fn capability_expr_schema(
 mod tests {
     use super::*;
     use crate::capabilities::PromptRenderContext;
-    use tauqe_protocol::{LlmCapability, ProjectConfig};
+    use crate::llm::LlmCapability;
 
     fn project_with_command() -> ProjectConfig {
         serde_json::from_str(r#"{"commands": {"check": {"command": "just", "args": ["check"]}}}"#)
@@ -783,7 +788,7 @@ mod tests {
 
     #[test]
     fn the_plan_payloads_are_split_and_forwarded_authoritatively() {
-        use tauqe_protocol::discussion::schema::{
+        use crate::llm::discussion::schema::{
             plan_create_schema, plan_update_schema, PLAN_TREE_DEPTH,
         };
 
@@ -992,7 +997,7 @@ mod tests {
 
     #[test]
     fn the_review_schema_forwards_the_authoritative_protocol_schema() {
-        use tauqe_protocol::review::ReviewDecisionStatus;
+        use crate::review::ReviewDecisionStatus;
 
         let ctx = PromptRenderContext::new(&[], None);
         let fragment = Value::Object(capability_schema(LlmCapability::ReviewUpdate, &ctx).unwrap());
@@ -1000,7 +1005,7 @@ mod tests {
 
         assert_eq!(
             review_update,
-            tauqe_protocol::discussion::schema::review_update_schema()
+            crate::llm::discussion::schema::review_update_schema()
         );
 
         // The nullable shape is the canonical strict form: one object schema
@@ -1192,7 +1197,7 @@ mod tests {
 
         // CustomTools is active only when the project declares commands.
         assert!(capability_schema(LlmCapability::CustomTools, &search_ctx).is_none());
-        let project: tauqe_protocol::ProjectConfig = serde_json::from_str(
+        let project: crate::config::project::ProjectConfig = serde_json::from_str(
             r#"{"commands": {"check": {"command": "just", "args": ["check"]}}}"#,
         )
         .expect("project parses");
@@ -1275,7 +1280,7 @@ mod tests {
 
     #[test]
     fn a_plan_focused_surface_wraps_the_plan_payloads_in_one_union() {
-        use tauqe_protocol::DiscussionTarget;
+        use crate::discussion::DiscussionTarget;
 
         let ctx = PromptRenderContext::new(&[], None);
         let focused = crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {

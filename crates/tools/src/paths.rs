@@ -259,7 +259,7 @@ pub fn verify_path_within_repo_for_write(repo_root: &Path, relative_path: &str) 
 /// and ends the walk, exactly as the boundary check degrades.
 ///
 /// The answer is the repository-relative spelling of the blocking component.
-pub fn blocking_ancestor(repo_root: &Path, relative_path: &str) -> Option<String> {
+pub(crate) fn blocking_ancestor(repo_root: &Path, relative_path: &str) -> Option<String> {
     let components: Vec<_> = Path::new(relative_path).components().collect();
     let (_, ancestors) = components.split_last()?;
     let mut current = PathBuf::from(repo_root);

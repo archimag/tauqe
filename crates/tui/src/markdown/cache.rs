@@ -28,12 +28,6 @@
 //! owned by the state of the view that renders the tree, which is also the only
 //! writer of the bodies it stores.
 
-// The Plans, Review, and History trees all render through this component, so a
-// body is parsed once per rendering variant instead of once per frame. A few
-// accessors are still exercised only by the test build; the allowance keeps the
-// zero-warning gate green while the module surface settles.
-#![allow(dead_code)]
-
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

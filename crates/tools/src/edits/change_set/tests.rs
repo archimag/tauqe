@@ -8,9 +8,8 @@
 
 use std::path::Path;
 
-use tauqe_protocol::{
-    ContextAccess, ContextItem, ContextLayer, EditCreate, EditDelete, EditMove, EditMoveDir,
-    EditOverwrite, EditReplace,
+use crate::edits::operation::{
+    EditCreate, EditDelete, EditMove, EditMoveDir, EditOverwrite, EditReplace,
 };
 
 use super::*;
@@ -75,23 +74,8 @@ fn track_all(repo_root: &Path) {
 }
 
 /// Builds the context snapshot that holds `paths` as editable files.
-fn context_state(paths: &[&str]) -> ContextState {
-    ContextState {
-        revision: 1,
-        items: paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| ContextItem {
-                path: (*path).to_string(),
-                access: ContextAccess::Editable,
-                size_bytes: 0,
-                estimated_tokens: 1,
-                layer: ContextLayer::User,
-                insertion_seq: index as u64 + 1,
-            })
-            .collect(),
-        total_estimated_tokens: paths.len() as u64,
-    }
+fn context_state(paths: &[&str]) -> Vec<String> {
+    paths.iter().map(|path| (*path).to_string()).collect()
 }
 
 /// Returns the exact staged bytes of `path`.

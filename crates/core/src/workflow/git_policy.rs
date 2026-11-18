@@ -1,11 +1,14 @@
 //! Git-backed transactional apply policy for edit workflows.
 
+use crate::config::project::ProjectConfig;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::edits::EditOperation;
+use crate::edits::EditProposal;
 use async_trait::async_trait;
-use tauqe_protocol::{EditOperation, EditProposal, ProjectConfig};
 use tokio::sync::watch;
 
 use super::policy::ApplyPolicy;
@@ -55,18 +58,12 @@ impl GitTransactionPolicy {
         Self::default()
     }
 
-    /// Creates a policy that reports an open transaction through `guard`.
-    pub fn with_guard(guard: Arc<AtomicBool>) -> Self {
-        Self {
-            checkpoint: None,
-            guard: Some(guard),
-            cancel: None,
-        }
-    }
-
     /// Creates a policy that reports an open transaction through `guard` and
     /// observes the turn's cancellation signal while capturing and committing.
-    pub fn with_guard_and_cancel(guard: Arc<AtomicBool>, cancel: watch::Receiver<bool>) -> Self {
+    pub(crate) fn with_guard_and_cancel(
+        guard: Arc<AtomicBool>,
+        cancel: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             checkpoint: None,
             guard: Some(guard),
@@ -222,12 +219,16 @@ impl ApplyPolicy for GitTransactionPolicy {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::project::ProjectConfig;
+    use crate::context::ContextAccess;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     use super::{ApplyPolicy, GitTransactionPolicy};
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, EditReplace, ProjectConfig};
+    use crate::edits::EditOperation;
+    use crate::edits::EditProposal;
+    use crate::edits::EditReplace;
     use tokio::sync::watch;
 
     /// Project configuration the policy tests stage under: no formatter, no hook.
@@ -264,7 +265,10 @@ mod tests {
         let mut cm = editable_context(root);
 
         let edits = replace_edit();
-        let mut policy = GitTransactionPolicy::new();
+        let application = crate::api::Application::default();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = application.git_transaction_policy(cancel_rx);
+        assert!(!application.transaction_is_active());
         let staged = policy
             .staging(root, &project(), &cm, &edits, None, None)
             .await;
@@ -278,6 +282,7 @@ mod tests {
             .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
+        assert!(application.transaction_is_active());
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
@@ -286,6 +291,7 @@ mod tests {
             .await
             .unwrap();
         assert!(commit.is_some());
+        assert!(!application.transaction_is_active());
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
     }
 
@@ -297,7 +303,10 @@ mod tests {
         let mut cm = editable_context(root);
 
         let edits = replace_edit();
-        let mut policy = GitTransactionPolicy::new();
+        let application = crate::api::Application::default();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = application.git_transaction_policy(cancel_rx);
+        assert!(!application.transaction_is_active());
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
@@ -306,10 +315,12 @@ mod tests {
             .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
+        assert!(application.transaction_is_active());
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
         assert!(policy.rollback(root).await.unwrap());
+        assert!(!application.transaction_is_active());
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
     }
 

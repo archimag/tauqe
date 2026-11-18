@@ -12,61 +12,16 @@
 //! `tauqe_core::workflow::implementation`, so the plan path cannot drift from the
 //! review runners that execute the very same pipeline.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use super::super::common::{offload_plan, publish_plan};
-use crate::handlers::common::{cleanup_transient_context, emit, spawn_escalation_relay};
+use super::super::common::publish_plan;
+use crate::handlers::common::{emit, spawn_escalation_relay};
 use crate::handlers::host::ServerImplementationHost;
 use crate::state::{AppState, OperationGuard};
-use tauqe_core::plan::storage::PlanStorage;
-use tauqe_core::workflow::implementation::{
-    ExecutionScope, PlanImplementationOptions, PlanImplementationPipeline,
-    PlanImplementationReport, PlanImplementationStop,
-};
-use tauqe_protocol::{
-    events, BatchFinishStatus, BatchFinishSummary, ModelSelection, PlanBatchFinishedEvent,
-};
+use tauqe_core::workflow::implementation::{PlanImplementationReport, PlanImplementationStop};
+use tauqe_protocol::{events, BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent};
 
-/// Outcome of a server-driven batch of plan steps.
-///
-/// The type is re-exported by the `batch` facade for the plan handler entry
-/// points and the supervisor test suite, so its visibility stops exactly at the
-/// plan subsystem.
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::handlers::plan) enum BatchOutcome {
-    Completed {
-        steps: usize,
-    },
-    Failed {
-        completed: usize,
-        step_id: String,
-        reason: String,
-    },
-    Blocked {
-        completed: usize,
-        step_id: String,
-        reason: String,
-    },
-    Cancelled {
-        completed: usize,
-    },
-    Stopped {
-        completed: usize,
-    },
-}
-
-/// Execution options a plan batch forwards to every step it runs.
-///
-/// The coder selection names the ladder rung a step starts from. It travels from
-/// the RPC parameters, so a batch never invents a starting model of its own.
-#[derive(Debug, Clone, Default)]
-pub(in crate::handlers::plan) struct PlanBatchOptions {
-    /// Coder selection the batch starts from, resolved against the coder ladder.
-    pub(crate) model: Option<ModelSelection>,
-    /// Targeted step or subtree to execute, if not the entire plan.
-    pub(crate) step_id: Option<String>,
-}
+pub use tauqe_core::api::{BatchOutcome, PlanBatchOptions};
 
 /// Emits the single terminal `plan/batch_finished` event for a batch run.
 ///
@@ -141,78 +96,50 @@ pub(super) async fn run_plan_batch_with(
     options: &PlanBatchOptions,
 ) -> BatchOutcome {
     let started_at = std::time::Instant::now();
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-
-    // Activating the executed plan keeps the interface anchored on the run.
-    {
-        let active_root = repo_root.clone();
-        let active_plan_id = plan_id.to_string();
-        let _ = offload_plan(move || {
-            PlanStorage::save_active_id(&active_root, Some(active_plan_id.as_str()))
-        })
-        .await;
-    }
-    // A batch starts from a released transient context: nothing a previous turn
-    // discovered or mounted survives into the horizon it is about to run.
-    cleanup_transient_context(state).await;
-
+    tracing::info!(plan_id, validated = step_ids.len(), "plan batch started");
     let operation_id = format!("op-{}", operation.id());
-    tracing::info!(
-        plan_id = plan_id,
-        validated = step_ids.len(),
-        "plan batch started"
-    );
-
-    let cfg_snapshot = state.config.lock().await.config.clone();
-    let host = Arc::new(ServerImplementationHost::new(
-        Arc::clone(state),
-        Arc::clone(operation),
-        cfg_snapshot.clone(),
-        repo_root.clone(),
-    ));
-
-    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
-    let relay = spawn_escalation_relay(state.out.clone(), operation_id.clone(), stream_rx);
-
-    let marker = None;
-    let pipeline_options = PlanImplementationOptions {
-        selection: options.model.clone(),
-        instructions: None,
-        marker,
-    };
-    let scope = ExecutionScope::Plan {
-        plan_id: plan_id.to_string(),
-        step_id: options.step_id.clone(),
-    };
-    let pipeline = PlanImplementationPipeline::new(
-        &repo_root,
-        scope,
-        host.as_ref(),
-        cfg_snapshot,
-        pipeline_options,
-    );
-
-    let cancel_rx = operation.cancel_receiver();
-    let soft_stop_rx = operation.soft_stop_receiver();
-    let report = pipeline.run(&stream_tx, &cancel_rx, &soft_stop_rx).await;
-    drop(stream_tx);
-    let _ = relay.await;
-
-    cleanup_transient_context(state).await;
-    publish_plan_state(state, &repo_root, plan_id).await;
+    let observer = Arc::new(Observer {
+        state: state.clone(),
+        operation: operation.clone(),
+        operation_id: operation_id.clone(),
+    });
+    let report = state
+        .application
+        .execute_plan_batch(plan_id, operation, options, observer)
+        .await;
     finish_batch(state, &operation_id, plan_id, started_at, &report)
 }
 
-/// Publishes the durable state of the executed plan once the run settles.
-async fn publish_plan_state(state: &Arc<AppState>, repo_root: &Path, plan_id: &str) {
-    let load_root = repo_root.to_path_buf();
-    let load_plan_id = plan_id.to_string();
-    match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
-        Ok(Some(plan)) => publish_plan(state, repo_root, plan, plan_id).await,
-        Ok(None) => tracing::warn!(plan_id = plan_id, "the executed plan was not found"),
-        Err(err) => {
-            tracing::warn!(plan_id = plan_id, error = %err, "failed to reload the executed plan")
-        }
+pub(super) struct Observer {
+    pub(super) state: Arc<AppState>,
+    pub(super) operation: Arc<OperationGuard>,
+    pub(super) operation_id: String,
+}
+#[async_trait::async_trait]
+impl tauqe_core::api::PlanBatchObserver for Observer {
+    fn context_changed(&self, state: tauqe_core::context::ContextState) {
+        crate::handlers::context::publish_context(&self.state.out, &state);
+    }
+    fn host(
+        &self,
+        config: tauqe_core::config::AppConfig,
+        root: std::path::PathBuf,
+    ) -> Arc<dyn tauqe_core::workflow::implementation::ImplementationHost> {
+        Arc::new(ServerImplementationHost::new(
+            self.state.clone(),
+            self.operation.clone(),
+            config,
+            root,
+        ))
+    }
+    async fn relay(&self, events: tokio::sync::mpsc::Receiver<tauqe_core::providers::StreamEvent>) {
+        let _ =
+            spawn_escalation_relay(self.state.out.clone(), self.operation_id.clone(), events).await;
+    }
+    async fn publish(&self, plan: tauqe_core::plan::Plan) {
+        let root = self.state.repo_root().await;
+        let id = plan.id.clone();
+        publish_plan(&self.state, &root, plan, &id).await;
     }
 }
 
@@ -282,4 +209,22 @@ fn finish_batch(
     );
 
     outcome
+}
+
+#[async_trait::async_trait]
+impl tauqe_core::api::PlanQueueObserver for Observer {
+    fn batch_finished(
+        &self,
+        id: &str,
+        elapsed: std::time::Duration,
+        report: &PlanImplementationReport,
+    ) {
+        finish_batch(
+            &self.state,
+            &self.operation_id,
+            id,
+            std::time::Instant::now() - elapsed,
+            report,
+        );
+    }
 }

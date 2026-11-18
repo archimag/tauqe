@@ -294,7 +294,7 @@ pub const STAGING_TEMP_MARKER: &str = ".tauqe-tmp";
 
 /// Marker appended to a file name to name the sibling that keeps the original
 /// content while a change set is committed.
-pub const STAGING_BACKUP_MARKER: &str = ".tauqe-bak";
+pub(crate) const STAGING_BACKUP_MARKER: &str = ".tauqe-bak";
 
 /// A staging sibling of another file, parsed from its name.
 ///
@@ -307,13 +307,13 @@ pub const STAGING_BACKUP_MARKER: &str = ".tauqe-bak";
 #[derive(Debug, PartialEq, Eq)]
 pub struct StagingSibling<'a> {
     /// The file name the sibling stages or backs up.
-    pub original: &'a str,
+    pub(crate) original: &'a str,
     /// The process id of the writer that created the sibling.
     ///
     /// A sibling this policy writes always embeds its writer's process id;
     /// `None` names a sibling of the earlier fixed-name policy, which
     /// attributes its writer to nobody.
-    pub owner_pid: Option<u32>,
+    pub(crate) owner_pid: Option<u32>,
 }
 
 /// Parses `name` as a staging temp sibling, yielding the file it stages and
@@ -321,7 +321,7 @@ pub struct StagingSibling<'a> {
 ///
 /// Returns `None` for every name that is not a sibling carrying
 /// [`STAGING_TEMP_MARKER`].
-pub fn staging_temp_sibling(name: &str) -> Option<StagingSibling<'_>> {
+pub(crate) fn staging_temp_sibling(name: &str) -> Option<StagingSibling<'_>> {
     staging_sibling(name, STAGING_TEMP_MARKER)
 }
 
@@ -330,7 +330,7 @@ pub fn staging_temp_sibling(name: &str) -> Option<StagingSibling<'_>> {
 ///
 /// Returns `None` for every name that is not a sibling carrying
 /// [`STAGING_BACKUP_MARKER`].
-pub fn staging_backup_sibling(name: &str) -> Option<StagingSibling<'_>> {
+pub(crate) fn staging_backup_sibling(name: &str) -> Option<StagingSibling<'_>> {
     staging_sibling(name, STAGING_BACKUP_MARKER)
 }
 
@@ -403,7 +403,7 @@ fn is_ascii_digits(part: &str) -> bool {
 /// writer that created a given sibling; a reused id is reported alive, which
 /// errs on the side of leaving artifacts in place.
 #[cfg(unix)]
-pub fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     let Some(target) = signalable_pid(pid) else {
         return true;
     };

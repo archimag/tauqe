@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tauqe_tui::projection::*;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -578,7 +579,7 @@ pub(crate) async fn delete_plan(
 /// Reports whether deleting the plan would discard unfinished implementation
 /// work.
 ///
-/// The count comes from the authoritative leaf metric (`Plan::count_stats`), so
+/// The count comes from the client leaf metric (`PlanImplementationProjection::count_stats`), so
 /// completed and cancelled leaves never escalate the confirmation while pending,
 /// in-progress, blocked, and discussion leaves do. A plan the client no longer
 /// holds exposes no progress and is deleted through the first tier, exactly as

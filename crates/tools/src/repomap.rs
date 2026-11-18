@@ -46,12 +46,13 @@ pub struct Symbol {
     pub kind: SymbolKind,
     pub signature: Option<String>,
     pub is_public: bool,
-    pub line: usize,
+    line: usize,
     pub children: Vec<Symbol>,
 }
 
 impl Symbol {
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         name: impl Into<String>,
         kind: SymbolKind,
         signature: Option<String>,
@@ -71,25 +72,10 @@ impl Symbol {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFileSymbols {
-    pub path: String,
+    path: String,
     pub symbols: Vec<Symbol>,
     #[serde(default)]
-    pub line_count: usize,
-}
-
-impl RepoFileSymbols {
-    pub fn new(path: impl Into<String>, symbols: Vec<Symbol>) -> Self {
-        Self {
-            path: path.into(),
-            symbols,
-            line_count: 0,
-        }
-    }
-
-    pub fn with_line_count(mut self, line_count: usize) -> Self {
-        self.line_count = line_count;
-        self
-    }
+    line_count: usize,
 }
 
 /// Reflexive projection so owned payloads and shared `Arc` payloads satisfy the
@@ -110,7 +96,7 @@ pub enum DetailLevel {
 }
 
 /// Generates a semantic repository map outline formatted within `token_budget` using the default Tree-sitter extractor.
-pub fn generate_repo_map(
+fn generate_repo_map(
     repo_root: &Path,
     available_files: &[String],
     context_files: &[String],
@@ -270,7 +256,8 @@ fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
 }
 
 /// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
-pub fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
+#[cfg(test)]
+fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
     files: &[S],
     token_budget: usize,
 ) -> String {
@@ -287,7 +274,7 @@ pub fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
 ///
 /// Accepts both owned payloads and shared `Arc` payloads, so map generation
 /// formats cached symbols without cloning them.
-pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
+fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
     symbols: &[S],
     all_git_files: &[String],
     token_budget: usize,

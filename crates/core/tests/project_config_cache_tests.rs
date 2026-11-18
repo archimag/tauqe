@@ -9,18 +9,21 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use tauqe_core::context::ContextAccess;
 
 use tauqe_core::context::ContextManager;
 use tauqe_core::control::cache::TurnInputCache;
 use tauqe_core::control::context::{CancellationToken, EventSink, LoopContext};
 use tauqe_core::control::prompt::PromptBuilder;
 use tauqe_core::control::turn::{run_turn_loop, TurnLoopConfig};
+use tauqe_core::llm::CapabilityTree;
+use tauqe_core::llm::LlmCapability;
+use tauqe_core::models::ModelRef;
 use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::workflow::git_policy::GitTransactionPolicy;
 use tauqe_core::workflow::policy::DirectApplyPolicy;
 use tauqe_core::workflow::research::journal::TurnResearchJournal;
-use tauqe_protocol::{CapabilityTree, ContextAccess, LlmCapability, ModelRef};
 
 /// Writes an instrumented `just` stub into `bin_dir` and returns its counter.
 ///

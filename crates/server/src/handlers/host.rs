@@ -4,57 +4,33 @@
 //! (`tauqe_core::workflow::implementation`) owns *what* a horizon does: which
 //! leaf runs, on which coder rung, with which prompt, and when a failure
 //! justifies an Architect wave. This module owns *how* one of those turns is
-//! executed inside the daemon: context preloading, the provider turn with its
-//! streamed telemetry and usage window, and the classification of the turn
-//! result into the engine's failure taxonomy.
+//! executed inside the daemon: preparation notifications, the provider turn with its
+//! streamed telemetry and usage window, and forwarding the core's classification
+//! of the turn result.
 //!
 //! One implementation serves every workflow that owns a step graph, so a plan
 //! batch and a review run cannot drift apart in how they reach a provider, how
-//! they publish telemetry, or how they interpret a blocked, aborted, cancelled,
+//! they publish telemetry, or how they forward a blocked, aborted, cancelled,
 //! or unverified turn.
-#![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use crate::contracts::Project;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tauqe_core::config::AppConfig;
-use tauqe_core::control::outcome::{LoopResult, ResponseEnvelope};
-use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
-use tauqe_core::control::turn::TurnArtifact;
-use tauqe_core::outer_docs::OuterDocsRegistry;
-use tauqe_core::plan::prompt::{
-    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, PlanHorizonDiagnostics,
-};
-use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT, SESSION_PREFIX_REVIEW};
+use tauqe_core::models::ModelRole;
 use tauqe_core::workflow::implementation::{
-    ExecutionScope, ImplementationFrame, ImplementationHost, RefinementRequest, RefinementResult,
-    StepFailure, StepTurnRequest, StepTurnResult,
+    classify_refinement, classify_step_turn, ExecutionScope, ImplementationHost, RefinementRequest,
+    RefinementResult, StepFailure, StepTurnRequest, StepTurnResult,
 };
-use tauqe_core::workflow::WorkflowOptions;
-use tauqe_protocol::model::{TurnWorkContext, TurnWorkQueue};
-use tauqe_protocol::{
-    events, ArchitectTier, LlmCapability, LlmCommand, ModelFinishedEvent, ModelRole,
-    ModelSelection, ModelStartedEvent, ModelTurnPlanContext, ReasoningEffort, VerificationVerdict,
-};
-use tokio::sync::watch;
+use tauqe_protocol::{events, ModelFinishedEvent, ModelStartedEvent};
 
 use crate::handlers::architect::run_contour_synthesis;
-use crate::handlers::common::{
-    append_developer_directives, append_outer_docs_diagnostics, blocked_reason,
-    cleanup_transient_context, emit, preload_declared_files, preload_declared_outer_docs,
-    OuterDocsRefusal,
-};
-use crate::handlers::model::turn::{
-    compact_session_journal, run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport,
-};
-use crate::handlers::offload;
+use crate::handlers::common::{emit, prepare_implementation_step};
+use crate::handlers::model::turn::{run_step_loop, StepLoopBody, StepLoopOptions, StepLoopReport};
 use crate::handlers::review::publish_review;
 use crate::state::{AppState, OperationGuard};
-
-/// Budget diagnostic an Architect wave reports when it outgrows its context.
-const HORIZON_BUDGET_HINT: &str =
-    "The plan is too broad and should be manually decomposed or scoped down.";
 
 /// Turn seam between the engine's implementation machinery and the daemon.
 ///
@@ -84,220 +60,36 @@ impl ServerImplementationHost {
             repo_root,
         }
     }
-
-    /// Declares the plan turn coordinates of a plan step.
-    ///
-    /// A review scope carries no plan coordinates: its turns are addressed by
-    /// the review entities the runner executes.
-    fn plan_context(scope: &ExecutionScope, queue: &TurnWorkQueue) -> Option<ModelTurnPlanContext> {
-        let plan_id = match scope {
-            ExecutionScope::Plan { plan_id, .. } => plan_id,
-            ExecutionScope::ReviewGroup { .. } | ExecutionScope::ReviewFinding { .. } => {
-                return None
-            }
-        };
-        let step_id = queue
-            .items
-            .get(queue.active_index)
-            .map(|item| item.id.clone())
-            .unwrap_or_default();
-        Some(ModelTurnPlanContext {
-            plan_id: plan_id.clone(),
-            step_id,
-            batch_step_ids: queue.items.iter().map(|item| item.id.clone()).collect(),
-        })
-    }
-
-    /// Declares the work the running step executes from typed fields.
-    ///
-    /// Every scope names its own work kind, so the interface never infers the task
-    /// from a title: a plan step carries the plan coordinates, and both review
-    /// scopes carry the review address with the queue the run advances through — a
-    /// review group through its unified horizon, a single finding as a degenerate
-    /// run.
-    ///
-    /// The typed request carries only the title of the horizon a scope owns, which
-    /// is the plan title, the group title, or the finding title; the title of the
-    /// review session itself is not part of it. Both review variants therefore
-    /// address the review by the identifier the client can resolve, instead of
-    /// inventing a session title nobody declared.
-    fn work_context(
-        scope: &ExecutionScope,
-        title: &str,
-        queue: TurnWorkQueue,
-    ) -> Option<TurnWorkContext> {
-        match scope {
-            ExecutionScope::Plan { plan_id, .. } => Some(TurnWorkContext::PlanStep {
-                plan_id: plan_id.clone(),
-                plan_title: title.to_string(),
-                queue,
-            }),
-            ExecutionScope::ReviewGroup {
-                review_id,
-                group_id,
-            } => Some(TurnWorkContext::ReviewGroupStep {
-                review_id: review_id.clone(),
-                review_title: review_id.clone(),
-                group_id: group_id.clone(),
-                group_title: title.to_string(),
-                queue,
-            }),
-            ExecutionScope::ReviewFinding { review_id, .. } => Some(TurnWorkContext::ReviewStep {
-                review_id: review_id.clone(),
-                review_title: review_id.clone(),
-                queue,
-            }),
-        }
-    }
-
-    /// Resolves the Architect rung a wave runs on from the request.
-    ///
-    /// The pipeline already resolved the ladder and applied the lazy level-up
-    /// invariant, so the request names the exact rung to execute; the host never
-    /// re-derives the escalation policy locally.
-    ///
-    /// The rung travels as the pair of its model and the reasoning depth the
-    /// request states, and it is resolved against the configured Architect
-    /// entries: the attempt budget and the escalation marker declared for that
-    /// pair reach the synthesis contour, so the wave runs within the rounds it is
-    /// granted and a rung the developer reserved for manual runs stays saturated.
-    /// A pair the configuration does not declare keeps the requested depth and
-    /// resolves no runtime parameters, exactly as a plain tier carries them.
-    fn architect_tier(
-        &self,
-        selection: Option<&ModelSelection>,
-        effort: Option<ReasoningEffort>,
-    ) -> ArchitectTier {
-        let model = match selection {
-            Some(selection) => self.config.resolve_model(selection),
-            None => self.config.models.architect_tier(0).model,
-        };
-        let rung = ModelSelection::Tier { model, effort };
-        self.config.models.resolve_selection_architect_tier(&rung)
-    }
-
-    /// Resolves the frame a scope executes without occupying an async worker.
-    ///
-    /// Resolving a frame reads the plan or the review session from disk and
-    /// takes the process-wide storage mutex the storage engines hold, which is
-    /// the blocking work every other storage touch point of the daemon offloads.
-    /// A resolution the blocking pool could not complete is reported as an
-    /// infrastructure failure instead of stalling an executor thread.
-    async fn resolve_frame(
-        scope: &ExecutionScope,
-        repo_root: &Path,
-    ) -> Result<ImplementationFrame, StepFailure> {
-        let scope = scope.clone();
-        let root = repo_root.to_path_buf();
-        match offload(move || scope.resolve(&root)).await {
-            Ok(resolved) => resolved,
-            Err(reason) => Err(StepFailure::infrastructure(format!(
-                "The implementation frame could not be resolved: {reason}"
-            ))),
-        }
-    }
-
-    /// Resolves the external documents the active step of the run declares.
-    ///
-    /// The step identity comes from the queue the request carries, so the
-    /// documents belong to the leaf the turn actually executes rather than to the
-    /// horizon as a whole. The horizon is re-resolved from the storage that owns
-    /// it, exactly as the pipeline resolves it before launching the step, so the
-    /// host never carries a second copy of the step graph. A scope that cannot be
-    /// read declares nothing: the pipeline reports that failure through the
-    /// diagnostic it owns.
-    async fn declared_outer_docs(
-        scope: &ExecutionScope,
-        queue: &TurnWorkQueue,
-        repo_root: &Path,
-    ) -> Vec<String> {
-        let Ok(frame) = Self::resolve_frame(scope, repo_root).await else {
-            return Vec::new();
-        };
-        let Some(step_id) = queue.active().map(|item| item.id.as_str()) else {
-            return Vec::new();
-        };
-        frame
-            .plan
-            .implementation
-            .find_item(step_id)
-            .map(|step| step.outer_docs.clone())
-            .unwrap_or_default()
-    }
-
-    /// Materializes and mounts the external documents the active step declares.
-    ///
-    /// A mounted document reaches the model through the read-only OuterDocs
-    /// context layer, while a document the harness could not deliver becomes a
-    /// diagnostic of the step prompt instead of failing the step.
-    async fn preload_step_outer_docs(
-        &self,
-        scope: &ExecutionScope,
-        queue: &TurnWorkQueue,
-        cancel_rx: &watch::Receiver<bool>,
-    ) -> Result<Vec<String>, OuterDocsRefusal> {
-        let declared = Self::declared_outer_docs(scope, queue, &self.repo_root).await;
-        if declared.is_empty() {
-            return Ok(Vec::new());
-        }
-        let registry = OuterDocsRegistry::new(&self.config.outer_docs);
-        preload_declared_outer_docs(
-            &self.state,
-            &self.repo_root,
-            &registry,
-            &declared,
-            self.config.context.token_budget,
-            cancel_rx,
-        )
-        .await
-    }
 }
 
 #[async_trait]
 impl ImplementationHost for ServerImplementationHost {
     async fn run_step(&self, request: StepTurnRequest) -> StepTurnResult {
+        let prompt = match prepare_implementation_step(
+            &self.state,
+            &self.operation,
+            &self.repo_root,
+            &self.config,
+            &request,
+        )
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => return error.into_step_result(),
+        };
         let StepTurnRequest {
             scope,
             title,
             queue,
-            prompt,
-            files,
-            readonly_files,
             selection,
             reasoning_effort,
-            instructions,
             marker,
             session_id,
             cancel_rx,
+            ..
         } = request;
-        // A batch executes many steps against one journal, so the run keeps it
-        // within the configured budget before the step assembles its context.
-        // The two-sided cards the executed steps recorded stay authoritative.
-        compact_session_journal(&self.state, &self.config, cancel_rx.clone()).await;
-        // Every attempt starts from a clean transient context: the files a
-        // previous step discovered and the documents it mounted describe work
-        // that is already finished.
-        cleanup_transient_context(&self.state).await;
-        preload_declared_files(&self.state, &self.repo_root, &files, &readonly_files).await;
-        // A step declares the external specifications it obeys, so the harness
-        // mounts them before the turn starts instead of leaving the Coder to
-        // discover them through research rounds. A trust refusal ends the step
-        // before any model work is spent: only the developer can authorize the
-        // source, and a replanning wave cannot widen a declaration that lives
-        // outside the repository.
-        let outer_docs = match self
-            .preload_step_outer_docs(&scope, &queue, &cancel_rx)
-            .await
-        {
-            Ok(diagnostics) => diagnostics,
-            Err(refusal) => return StepTurnResult::Abort(refusal.to_message()),
-        };
-
-        let plan_context = Self::plan_context(&scope, &queue);
-        let work_context = Self::work_context(&scope, &title, queue);
-        let mut prompt = prompt;
-        append_developer_directives(&mut prompt, instructions.as_deref());
-        append_outer_docs_diagnostics(&mut prompt, &outer_docs);
+        let plan_context = scope.plan_context(&queue);
+        let work_context = Some(scope.work_context(&title, queue));
 
         // The step executor already persisted the lifecycle of the reviewed entity
         // before it asked for this turn, so a review scope is published here: the
@@ -344,41 +136,38 @@ impl ImplementationHost for ServerImplementationHost {
     }
 
     async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult {
-        let tier = self.architect_tier(request.selection.as_ref(), request.reasoning_effort);
-        let frame = match Self::resolve_frame(&request.scope, &self.repo_root).await {
-            Ok(frame) => frame,
-            Err(failure) => {
+        let prepared = match self
+            .state
+            .application
+            .prepare_implementation_refinement(&self.repo_root, &self.config, &request)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return RefinementResult::Blocked {
-                    reason: failure.into_reason(),
-                    tier,
+                    reason: error.reason,
+                    tier: error.tier,
                 }
             }
         };
-
+        let tauqe_core::api::PreparedImplementationRefinement {
+            tier,
+            options,
+            task,
+            intro_header,
+            budget_hint,
+        } = prepared;
         let op_id = format!("op-{}", self.operation.id());
-        let mut options = WorkflowOptions::from_app_config(&self.config);
-        // A wave is an isolated design dialogue of the entity that owns the
-        // horizon: the session is keyed by the plan or the review audit, never by
-        // the interactive REPL, so a step turn can never poison the dialogue cache.
-        options.session_id = Some(match &frame.scope {
-            ExecutionScope::Plan { plan_id, .. } => {
-                format_session_id(SESSION_PREFIX_ARCHITECT, plan_id)
-            }
-            ExecutionScope::ReviewGroup { review_id, .. }
-            | ExecutionScope::ReviewFinding { review_id, .. } => {
-                format_session_id(SESSION_PREFIX_REVIEW, review_id)
-            }
-        });
 
         emit(
             &self.state.out,
             events::MODEL_STARTED,
             serde_json::to_value(ModelStartedEvent {
                 operation_id: op_id.clone(),
-                model: tier.model.clone(),
-                role: Some(ModelRole::Architect),
+                model: tier.model.clone().project(),
+                role: Some(ModelRole::Architect.project()),
                 alias: None,
-                effort: tier.effort,
+                effort: tier.effort.map(crate::contracts::Project::project),
                 plan_context: None,
                 work_context: None,
                 is_batch: true,
@@ -386,30 +175,7 @@ impl ImplementationHost for ServerImplementationHost {
             .ok(),
         );
 
-        // The wave reprojects the remaining horizon around the approach that
-        // failed, so the diagnostic of that failure travels into the task: without
-        // it the Architect would regenerate the very horizon that already failed.
-        let diagnostics = request
-            .failed_step
-            .as_deref()
-            .map(|step| PlanHorizonDiagnostics {
-                blocked_step_id: step,
-                blocked_reason: request.failure.as_deref(),
-                toolchain_status: None,
-            });
-        let mut task = build_plan_horizon_system_prompt();
-        task.push_str("\n\n---\n\n");
-        task.push_str(&build_plan_horizon_user_prompt(
-            &frame.plan,
-            diagnostics,
-            request.instructions.as_deref(),
-        ));
-        let intro_header = format!(
-            "# Automated Plan Replanning: [{}] {}\n*Reprojecting the remaining horizon of this implementation...*\n\n---\n\n",
-            frame.plan.id, frame.plan.title
-        );
-
-        let context_snapshot = self.state.context.read().await.clone();
+        let context_snapshot = self.state.context_snapshot().await;
         let (contour, summary) = run_contour_synthesis(
             &self.state,
             &self.operation,
@@ -420,7 +186,7 @@ impl ImplementationHost for ServerImplementationHost {
             self.config.models.clone(),
             tier.clone(),
             intro_header,
-            HORIZON_BUDGET_HINT.to_string(),
+            budget_hint,
         )
         .await;
 
@@ -446,437 +212,6 @@ impl ImplementationHost for ServerImplementationHost {
             }
         };
 
-        let StructuredRefineOutcome {
-            output,
-            tier: synthesized_tier,
-            status,
-        } = outcome;
-        match status {
-            StructuredRefineStatus::Synthesized => match output {
-                Some(output) if !output.items.is_empty() => RefinementResult::Synthesized {
-                    items: output.items,
-                    tier: synthesized_tier,
-                },
-                _ => RefinementResult::Blocked {
-                    reason: "The Architect reported a synthesized horizon without any step"
-                        .to_string(),
-                    tier: synthesized_tier,
-                },
-            },
-            StructuredRefineStatus::Blocked { reason } => RefinementResult::Blocked {
-                reason,
-                tier: synthesized_tier,
-            },
-            StructuredRefineStatus::BudgetExceeded { diagnostic } => RefinementResult::Blocked {
-                reason: diagnostic,
-                tier: synthesized_tier,
-            },
-            // An abort is a diagnosis of the same weight as a blocker: the plan
-            // or the group records why the horizon could not be reprojected, and
-            // the message carries the host action the developer must perform
-            // before the wave can run again.
-            StructuredRefineStatus::Aborted(report) => RefinementResult::Blocked {
-                reason: report.to_message(),
-                tier: synthesized_tier,
-            },
-            StructuredRefineStatus::Cancelled => RefinementResult::Blocked {
-                reason: "The Architect wave was cancelled".to_string(),
-                tier: synthesized_tier,
-            },
-        }
-    }
-}
-
-/// Classifies the terminal result of a control-loop step turn.
-///
-/// The category decides the pipeline behavior: a blocked or exhausted turn is a
-/// domain verdict the step loop may retry on a stronger coder tier, while a
-/// broken transport or a change set the harness could not commit is fatal to the
-/// whole run.
-fn classify_step_turn(result: LoopResult<TurnArtifact>) -> StepTurnResult {
-    match result {
-        LoopResult::Success(success) => {
-            if let Some(err) = success.value.commit_error.clone() {
-                return StepTurnResult::Failed(StepFailure::infrastructure(format!(
-                    "Failed to commit the change set of the step: {err}"
-                )));
-            }
-            if let Some(reason) = blocked_reason(&success.response) {
-                return StepTurnResult::Blocked(reason);
-            }
-            if success.response.has(LlmCapability::Abort) {
-                return StepTurnResult::Abort(abort_message(&success.response));
-            }
-            let summary = envelope_text(&success.response)
-                .unwrap_or_else(|| success.value.modified_paths.join(", "));
-            let verdict = success.value.verification;
-            // A repository that declares no verification command did not fail its
-            // verification: the harness simply had nothing to run, and the Git
-            // transaction accepts the commit exactly as it does for a passed run.
-            let verified = match &verdict {
-                Some(VerificationVerdict::Passed) | Some(VerificationVerdict::NotConfigured) => {
-                    true
-                }
-                Some(_) => false,
-                None => declares_success(&success.response),
-            };
-            if verified {
-                StepTurnResult::Success {
-                    summary,
-                    commit: success.value.commit_hash,
-                }
-            } else if verdict.is_some() {
-                StepTurnResult::Failed(StepFailure::domain(
-                    "The change set of the step did not pass toolchain verification",
-                ))
-            } else {
-                tracing::warn!(
-                    remaining = ?success.response.remaining_capabilities(),
-                    commands = ?success.response.commands(),
-                    "step turn produced neither a verified change set nor a declared outcome"
-                );
-                StepTurnResult::Failed(StepFailure::domain(
-                    "The step turn produced neither a verified change set nor a declared outcome",
-                ))
-            }
-        }
-        LoopResult::Diverged(envelope) => {
-            if let Some(reason) = blocked_reason(&envelope) {
-                return StepTurnResult::Blocked(reason);
-            }
-            if envelope.has(LlmCapability::Abort) {
-                return StepTurnResult::Abort(abort_message(&envelope));
-            }
-            StepTurnResult::Failed(StepFailure::domain(
-                "The step turn diverged without a completed change set",
-            ))
-        }
-        LoopResult::Exhausted(report) => StepTurnResult::Failed(StepFailure::domain(report.reason)),
-    }
-}
-
-/// Renders the conversational text a turn produced, if any.
-fn envelope_text(envelope: &ResponseEnvelope) -> Option<String> {
-    let mut envelope = envelope.clone();
-    let mut combined = String::new();
-    for command in envelope.take(LlmCapability::TextMessage) {
-        if let LlmCommand::Text(command) = command {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(&command.content);
-        }
-    }
-    if combined.trim().is_empty() {
-        None
-    } else {
-        Some(combined)
-    }
-}
-
-/// Renders the unconditional abort a turn declared, together with the host action
-/// it requires.
-///
-/// An abort is a host-environment verdict rather than a content failure, so the
-/// supervisor reports the exact instruction the developer must perform instead of
-/// a summary of the turn.
-fn abort_message(envelope: &ResponseEnvelope) -> String {
-    let mut envelope = envelope.clone();
-    envelope
-        .take(LlmCapability::Abort)
-        .into_iter()
-        .find_map(|command| match command {
-            LlmCommand::Abort(command) => Some(
-                tauqe_core::control::outcome::AbortReport {
-                    reason: command.reason,
-                    recommendation: command.recommendation,
-                }
-                .to_message(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_else(|| "The step declared an unconditional abort.".to_string())
-}
-
-/// Whether a turn declared a terminal success outcome.
-fn declares_success(envelope: &ResponseEnvelope) -> bool {
-    let mut envelope = envelope.clone();
-    envelope
-        .take_any(&[
-            LlmCapability::CommitMessage,
-            LlmCapability::TurnError,
-            LlmCapability::TurnSkip,
-        ])
-        .into_iter()
-        .any(|command| {
-            matches!(
-                command,
-                LlmCommand::CommitMessage(_) | LlmCommand::TurnSkip(_)
-            )
-        })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::handlers::common::test_support::scratch_root;
-    use crate::transport::OutChannel;
-    use tauqe_core::config::ModelsConfig;
-    use tauqe_core::plan::storage::PlanStorage;
-    use tauqe_protocol::model::TurnWorkItem;
-    use tauqe_protocol::{ModelEntry, ModelRef, Plan, PlanItem};
-
-    /// Ordered queue every work-context assertion advances through.
-    fn queue() -> TurnWorkQueue {
-        TurnWorkQueue {
-            items: vec![
-                TurnWorkItem {
-                    id: "1".to_string(),
-                    title: "Declare the contract".to_string(),
-                },
-                TurnWorkItem {
-                    id: "2".to_string(),
-                    title: "Wire the client".to_string(),
-                },
-            ],
-            active_index: 1,
-        }
-    }
-
-    #[test]
-    fn a_plan_scope_declares_a_plan_step_context() {
-        let context = ServerImplementationHost::work_context(
-            &ExecutionScope::Plan {
-                plan_id: "plan-1".to_string(),
-                step_id: None,
-            },
-            "Plan One",
-            queue(),
-        )
-        .expect("a plan scope declares its work");
-
-        match context {
-            TurnWorkContext::PlanStep {
-                plan_id,
-                plan_title,
-                queue,
-            } => {
-                assert_eq!(plan_id, "plan-1");
-                assert_eq!(plan_title, "Plan One");
-                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
-            }
-            other => panic!("unexpected context: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_review_finding_scope_declares_a_review_step_context() {
-        let context = ServerImplementationHost::work_context(
-            &ExecutionScope::ReviewFinding {
-                review_id: "rev-42".to_string(),
-                item_id: 7,
-            },
-            "Guard the parser",
-            queue(),
-        )
-        .expect("a review finding declares its work");
-
-        match context {
-            TurnWorkContext::ReviewStep {
-                review_id,
-                review_title,
-                queue,
-            } => {
-                assert_eq!(review_id, "rev-42");
-                // The typed request carries the horizon title, not the session
-                // title, so the review is addressed by its identifier.
-                assert_eq!(review_title, "rev-42");
-                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
-            }
-            other => panic!("unexpected context: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_review_group_scope_declares_a_review_group_step_context() {
-        let context = ServerImplementationHost::work_context(
-            &ExecutionScope::ReviewGroup {
-                review_id: "rev-42".to_string(),
-                group_id: "arch-1".to_string(),
-            },
-            "Unified error handling",
-            queue(),
-        )
-        .expect("a review group declares its work");
-
-        match context {
-            TurnWorkContext::ReviewGroupStep {
-                review_id,
-                review_title,
-                group_id,
-                group_title,
-                queue,
-            } => {
-                assert_eq!(review_id, "rev-42");
-                assert_eq!(review_title, "rev-42");
-                assert_eq!(group_id, "arch-1");
-                // The frame the executor resolves carries the group title as the
-                // horizon title, so the step names the group it executes.
-                assert_eq!(group_title, "Unified error handling");
-                assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
-            }
-            other => panic!("unexpected context: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_active_step_declares_the_external_documents_it_preloads() {
-        let root = scratch_root("host-outer-docs");
-        let plan = Plan::from_parts(
-            "outer-docs-plan".to_string(),
-            "Outer Docs Plan".to_string(),
-            None,
-            0,
-            0,
-            Vec::new(),
-            vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Read the published contract".to_string(),
-                    // A leaf always declares what it targets, so the horizon
-                    // validator accepts it and the step preloads real files.
-                    files: vec!["src/client.rs".to_string()],
-                    outer_docs: vec!["vendor/api.md".to_string()],
-                    ..PlanItem::default()
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Wire the client".to_string(),
-                    files: vec!["src/client.rs".to_string()],
-                    ..PlanItem::default()
-                },
-            ],
-        );
-        PlanStorage::save_plan(&root, &plan).expect("store the plan");
-        let scope = ExecutionScope::Plan {
-            plan_id: "outer-docs-plan".to_string(),
-            step_id: None,
-        };
-        let queue = |id: &str, title: &str| TurnWorkQueue {
-            items: vec![TurnWorkItem {
-                id: id.to_string(),
-                title: title.to_string(),
-            }],
-            active_index: 0,
-        };
-
-        assert_eq!(
-            ServerImplementationHost::declared_outer_docs(
-                &scope,
-                &queue("1", "Read the published contract"),
-                &root
-            )
-            .await,
-            vec!["vendor/api.md".to_string()]
-        );
-        // The declaration belongs to the running leaf, so a step that declares
-        // none mounts nothing even though the horizon declares documentation.
-        assert!(ServerImplementationHost::declared_outer_docs(
-            &scope,
-            &queue("2", "Wire the client"),
-            &root
-        )
-        .await
-        .is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn a_scope_that_cannot_be_resolved_declares_no_external_documents() {
-        let queue = TurnWorkQueue {
-            items: vec![TurnWorkItem {
-                id: "1".to_string(),
-                title: "Step".to_string(),
-            }],
-            active_index: 0,
-        };
-        let scope = ExecutionScope::Plan {
-            plan_id: "absent".to_string(),
-            step_id: None,
-        };
-        let root = scratch_root("host-absent-scope");
-
-        let declared = ServerImplementationHost::declared_outer_docs(&scope, &queue, &root);
-        assert!(declared.await.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-    /// Builds a host bound to its own scratch repository root and configuration.
-    fn test_host(config: AppConfig, label: &str) -> (ServerImplementationHost, PathBuf) {
-        let root = scratch_root(label);
-        let (out, _events) = OutChannel::new();
-        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(config.clone(), root.clone(), history_sender, out);
-        let operation = state
-            .try_begin_operation()
-            .expect("the operation slot is free");
-        (
-            ServerImplementationHost::new(state, Arc::new(operation), config, root.clone()),
-            root,
-        )
-    }
-
-    /// A wave requests the whole rung by its `(model, effort)` pair, so the
-    /// runtime parameters declared for that exact Architect entry reach the
-    /// synthesis contour instead of being reset by a reconstructed tier.
-    #[tokio::test]
-    async fn the_wave_tier_keeps_the_configured_parameters_of_its_rung() {
-        let shared = ModelRef::openrouter("architect/shared");
-        let mut manual = ModelEntry::new(shared.clone(), Some(ReasoningEffort::High));
-        manual.attempts = Some(4);
-        manual.level_up = Some(false);
-        let config = AppConfig {
-            models: ModelsConfig {
-                repl: vec![ModelEntry::from(ModelRef::openrouter("base/primary"))],
-                architect: Some(vec![
-                    ModelEntry::new(shared.clone(), Some(ReasoningEffort::Low)),
-                    manual,
-                ]),
-                ..ModelsConfig::default()
-            },
-            ..AppConfig::default()
-        };
-        let (host, root) = test_host(config, "host-architect-tier");
-
-        let selection = ModelSelection::Tier {
-            model: shared.clone(),
-            effort: Some(ReasoningEffort::High),
-        };
-        let tier = host.architect_tier(Some(&selection), Some(ReasoningEffort::High));
-        assert_eq!(tier.model, shared);
-        assert_eq!(tier.effort, Some(ReasoningEffort::High));
-        assert_eq!(tier.attempts, Some(4));
-        assert_eq!(tier.attempts(), 4);
-        assert_eq!(tier.level_up, Some(false));
-
-        // A pair the configuration does not declare keeps the requested depth
-        // and resolves no runtime parameters, exactly as a plain tier carried
-        // them before the rung identity was introduced.
-        let outside = ModelSelection::Tier {
-            model: ModelRef::openrouter("architect/outside"),
-            effort: Some(ReasoningEffort::Max),
-        };
-        let tier = host.architect_tier(Some(&outside), Some(ReasoningEffort::Max));
-        assert_eq!(tier.model, ModelRef::openrouter("architect/outside"));
-        assert_eq!(tier.effort, Some(ReasoningEffort::Max));
-        assert_eq!(tier.attempts, None);
-        assert_eq!(tier.level_up, None);
-
-        // An absent selection still resolves the base rung of the ladder.
-        let tier = host.architect_tier(None, Some(ReasoningEffort::Low));
-        assert_eq!(tier.model, ModelRef::openrouter("architect/shared"));
-        assert_eq!(tier.effort, Some(ReasoningEffort::Low));
-
-        let _ = std::fs::remove_dir_all(&root);
+        classify_refinement(outcome)
     }
 }

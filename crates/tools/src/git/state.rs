@@ -1,7 +1,14 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::RepositoryState;
+/// Technical snapshot returned by Git inspection, independent of RPC.
+#[derive(Debug, Clone)]
+pub struct RepositoryState {
+    pub root: String,
+    pub branch: String,
+    pub head: String,
+    pub dirty: bool,
+}
 
 use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore};
 use crate::git::GitHooks;

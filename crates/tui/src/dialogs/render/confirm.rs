@@ -13,6 +13,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use tauqe_tui::projection::*;
 
 use crate::app::capture::{CaptureSite, QuitGuardReason};
 use crate::app::{AppState, ConfirmDialogButton};
@@ -515,7 +516,7 @@ pub fn render_confirm_execute_pipeline_popup(frame: &mut ratatui::Frame, state: 
 
 /// Number of implementation leaves of a plan that are not `Done`.
 ///
-/// The metric is the authoritative leaf accounting of `Plan::count_stats`, which
+/// The metric is the client leaf accounting of `PlanImplementationProjection::count_stats`, which
 /// already excludes cancelled leaves from the total, so a plan whose leaves are
 /// all completed or cancelled needs no escalation (c-1).
 pub(crate) fn plan_unfinished_steps(plan: &tauqe_protocol::Plan) -> usize {

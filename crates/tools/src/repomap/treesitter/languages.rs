@@ -16,7 +16,7 @@ pub(super) type SymbolExtraction =
 
 /// Tree-sitter language support entry covering a set of file extensions.
 pub(super) struct LanguageSupport {
-    pub(super) extensions: &'static [&'static str],
+    extensions: &'static [&'static str],
     pub(super) language: fn() -> tree_sitter::Language,
     pub(super) extract: SymbolExtraction,
 }

@@ -1,9 +1,11 @@
+pub(crate) mod lexical_path;
+mod model;
 use crate::prompt::estimate_tokens_from_bytes;
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
+pub use model::{ContextAccess, ContextItem, ContextLayer, ContextState};
 use std::path::{Path, PathBuf};
-pub use tauqe_protocol::matches_glob_pattern;
-use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, ContextState, GlobPattern};
+use tauqe_tools::path_patterns::GlobPattern;
 
 pub mod path;
 pub mod pinned;
@@ -129,10 +131,11 @@ fn refresh_metadata(item: &mut ContextItem, full_path: &Path) -> bool {
     true
 }
 
-impl ContextManager {
-    pub fn new(repo_root: PathBuf) -> Self {
-        let mut cm = Self {
-            repo_root,
+impl Default for ContextManager {
+    /// An empty in-memory context. Repository binding loads pinned entries.
+    fn default() -> Self {
+        Self {
+            repo_root: PathBuf::new(),
             revision: 1,
             insertion_counter: 0,
             pinned_patterns: Vec::new(),
@@ -140,6 +143,15 @@ impl ContextManager {
             user: IndexMap::new(),
             auto: IndexMap::new(),
             outer_docs: IndexMap::new(),
+        }
+    }
+}
+
+impl ContextManager {
+    pub fn new(repo_root: PathBuf) -> Self {
+        let mut cm = Self {
+            repo_root,
+            ..Self::default()
         };
         cm.load_pinned_from_repo();
         cm

@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
+use tauqe_tui::projection::*;
 
 use crate::app::AppState;
 use crate::i18n::active_t;

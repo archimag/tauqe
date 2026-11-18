@@ -1,8 +1,8 @@
 use super::ReviewStorage;
+use crate::review::{IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
-use tauqe_protocol::{IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
 
 /// Placement of one finding in the layer a post-analysis produces.
 ///

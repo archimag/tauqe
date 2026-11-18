@@ -1,8 +1,9 @@
 use crate::escape::{escape_xml_text, single_line};
-use tauqe_protocol::review::ReviewSession;
-use tauqe_protocol::EditProtocolKind;
+use crate::review::ReviewSession;
+use crate::workflow::EditProtocolKind;
 
-pub const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
+#[cfg(test)]
+const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
 
 /// Renders repository paths as escaped, backticked breadcrumbs.
 fn render_paths(paths: &[String]) -> String {
@@ -22,7 +23,8 @@ fn render_paths(paths: &[String]) -> String {
 /// turn: the structured contour asks for a change set and a successful
 /// `outcome`, while the tagged contour asks for an edit block and the success
 /// tag bound to `marker`.
-pub fn format_review_step_retry_prompt(
+#[cfg(test)]
+pub(crate) fn format_review_step_retry_prompt(
     assistant_text: &str,
     error: Option<&str>,
     _protocol: EditProtocolKind,
@@ -62,7 +64,8 @@ pub fn format_review_step_retry_prompt(
     out
 }
 
-pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
+#[cfg(test)]
+const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
 
 /// Formats a targeted prompt for resolving an isolated review finding.
 ///
@@ -79,7 +82,8 @@ pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:"
 /// `blocked`, `context_requests`, `verify`), while the tagged contour names its
 /// control tags bound to `marker`. A structured turn emits no command tag, so
 /// the marker it carries is never used.
-pub fn format_review_step_execution_prompt(
+#[cfg(test)]
+pub(crate) fn format_review_step_execution_prompt(
     session: &ReviewSession,
     item_id: u32,
     _protocol: EditProtocolKind,
@@ -184,7 +188,8 @@ const REVIEW_STEP_FAILURE_NOTE_PREFIX: &str = "Skipped after execution failure";
 
 /// Builds the `resolution_notes` diagnostic recorded when a finding is skipped
 /// because a domain failure prevented it from being resolved in code.
-pub fn format_review_step_failure_note(reason: &str) -> String {
+#[cfg(test)]
+pub(crate) fn format_review_step_failure_note(reason: &str) -> String {
     let trimmed = reason.trim();
     if trimmed.is_empty() {
         format!("{} without diagnostics", REVIEW_STEP_FAILURE_NOTE_PREFIX)
@@ -196,7 +201,7 @@ pub fn format_review_step_failure_note(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewIssue, ReviewItem};
+    use crate::review::{IssueStatus, IssueType, ReviewIssue, ReviewItem};
 
     /// Builds a session holding one finding with a protected contract file.
     fn session() -> ReviewSession {

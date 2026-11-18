@@ -18,8 +18,9 @@ impl ContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAccess;
     use std::path::PathBuf;
-    use tauqe_protocol::ContextAccess;
+
     use tempfile::tempdir;
 
     #[test]

@@ -101,7 +101,8 @@ impl GitDeadline {
 
     /// Builds a deadline that follows the turn's cancellation signal under the
     /// default wall-clock budget.
-    pub fn from_cancel(cancel: watch::Receiver<bool>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_cancel(cancel: watch::Receiver<bool>) -> Self {
         Self {
             timeout_secs: DEFAULT_GIT_TIMEOUT_SECS,
             cancel: Some(cancel),
