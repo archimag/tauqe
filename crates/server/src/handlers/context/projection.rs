@@ -1,6 +1,6 @@
 //! Context RPC adaptation. Core snapshots have no transport serialization.
 use crate::contracts::Project;
-use tauqe_core::context::{ContextAccess, ContextLayer, ContextState};
+use tauqe_flow::api::types::{ContextAccess, ContextLayer, ContextState};
 
 pub(crate) fn context_access_domain(access: tauqe_protocol::ContextAccess) -> ContextAccess {
     access.project()

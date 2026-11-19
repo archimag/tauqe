@@ -55,7 +55,8 @@ impl ModelEntry {
 
     /// Renders the entry as the canonical model specification, with the
     /// configured reasoning depth appended when one is set.
-    pub fn display_label(&self) -> String {
+    #[cfg(test)]
+    fn display_label(&self) -> String {
         match self.effort {
             Some(effort) => format!("{} [{}]", self.model.to_spec(), effort),
             None => self.model.to_spec(),
@@ -358,7 +359,8 @@ impl ArchitectTier {
     /// An absent marker means the tier participates in ladder escalation:
     /// `level_up = false` excludes the entry from automatic escalation;
     /// `level_up = true` explicitly allows it.
-    pub fn level_up(&self) -> Option<bool> {
+    #[cfg(test)]
+    fn level_up(&self) -> Option<bool> {
         self.level_up
     }
 }

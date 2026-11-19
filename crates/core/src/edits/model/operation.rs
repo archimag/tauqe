@@ -174,7 +174,7 @@ impl From<EditLineAnchor> for EditOperation {
 #[cfg(test)]
 use crate::context::lexical_path::decode_repo_path;
 /// Validates an edit path through the shared core lexical grammar.
-pub use crate::context::lexical_path::normalize_repo_path;
+pub(crate) use crate::context::lexical_path::normalize_repo_path;
 
 fn encode_path_separators(path: &str) -> Cow<'_, str> {
     if path.contains('\\') {
@@ -224,7 +224,7 @@ mod repo_path {
 /// "absent" and must not be dropped silently. This is a first line of defence
 /// only: `core` still canonicalizes and confines every path against the
 /// repository root.
-pub fn deserialize_repo_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub(crate) fn deserialize_repo_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

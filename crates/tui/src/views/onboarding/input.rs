@@ -32,7 +32,7 @@ fn dismiss_step(st: &mut AppState) -> Option<InputResult> {
     if st.onboarding.step == OnboardingStep::Modifier {
         st.onboarding.step = OnboardingStep::Workstation;
         st.onboarding.selected_index = 0;
-    } else if st.onboarding.has_api_key {
+    } else if !st.onboarding.needs_api_key() {
         st.view_mode = ViewMode::Repl;
     } else {
         st.onboarding.step = OnboardingStep::Gatekeeper;
@@ -395,7 +395,7 @@ pub async fn handle_onboarding_key(
                             .await?;
                         }
                         _ => {
-                            if st.onboarding.has_api_key {
+                            if !st.onboarding.needs_api_key() {
                                 st.onboarding.step = st.onboarding.next_step();
                             } else {
                                 st.onboarding.step = OnboardingStep::Gatekeeper;

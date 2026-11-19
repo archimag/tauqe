@@ -193,6 +193,27 @@ impl std::fmt::Debug for CredentialsSaveParams {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChatGptSignInPrompt {
+    pub id: String,
+    pub model: String,
+    pub authorization_url: String,
+}
+
+impl std::fmt::Debug for ChatGptSignInPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGptSignInPrompt")
+            .field("id", &self.id)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGptSignInId {
+    pub id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStatusResult {
     pub has_git: bool,

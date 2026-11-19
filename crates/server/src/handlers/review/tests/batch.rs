@@ -60,18 +60,7 @@ fn json_edit_response(content: &str) -> String {
         "message": "Applied architecture fix",
         "action": {
             "kind": "edit",
-            "changes": [
-                {
-                    "op": "replace",
-                    "path": "src/target.rs",
-                    "to": "",
-                    "start": "",
-                    "end": "",
-                    "old_text": "pub fn target() {}\n",
-                    "new_text": format!("{content}\n"),
-                    "content": ""
-                }
-            ],
+            "patch": format!("*** Begin Patch\n*** Update File: src/target.rs\n@@\n-pub fn target() {{}}\n+{content}\n*** End Patch"),
             "commit_message": "Fix architecture issue",
             "message": "",
             "reason": ""
@@ -307,7 +296,7 @@ async fn event_state(
     let (out, rx) = OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), history_sender, out);
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     (state, rx)
 }
 

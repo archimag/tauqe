@@ -6,13 +6,14 @@ use tauqe_tools::edits::operation as tools;
 
 #[derive(Debug)]
 pub struct StageEditsResult {
-    pub staged_state: StagedEditsState,
-    pub successful_paths: Vec<String>,
-    pub successful_edits: Vec<engine::EditOperation>,
-    pub failed_files: Vec<FailedFileEdit>,
+    pub(crate) staged_state: StagedEditsState,
+    pub(crate) successful_paths: Vec<String>,
+    pub(crate) successful_edits: Vec<engine::EditOperation>,
+    pub(crate) failed_files: Vec<FailedFileEdit>,
 }
 impl StageEditsResult {
-    pub fn is_success(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_success(&self) -> bool {
         self.failed_files.is_empty()
     }
 }

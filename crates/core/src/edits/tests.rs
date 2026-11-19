@@ -1155,6 +1155,24 @@ fn anchored_range(path: &str, start: u16, end: u16, content: &str) -> EditOperat
     })
 }
 
+#[tokio::test]
+async fn anchored_retry_batches_resolve_against_the_preceding_round() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a.rs"), "first\nlast\n").unwrap();
+    let mut cm = ContextManager::new(root.to_owned());
+    cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+    let first = [anchored_range("a.rs", 0, 0, "one\ntwo")];
+    let next = [anchored_range("a.rs", 2, 2, "three")];
+    apply_edit_proposal_with_config(root, &Default::default(), &mut cm, &[&first, &next])
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+}
+
 #[test]
 fn anchored_ranges_stage_bottom_to_top_without_touching_disk() {
     let dir = tempdir().unwrap();

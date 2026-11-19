@@ -13,6 +13,7 @@
 
 mod admission;
 pub mod anchor;
+pub mod apply_patch;
 mod change_set;
 pub mod error;
 mod format;
@@ -27,4 +28,4 @@ pub use change_set::{
     StagedEditsState,
 };
 pub use error::EditError;
-pub use format::prepare_staged_edits_with_config_and_validator;
+pub use format::prepare_edit_batches;

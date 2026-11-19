@@ -163,18 +163,26 @@ async fn review_delete_releases_the_focus_anchored_on_the_deleted_session() {
         "a focus anchored on a deleted session must be dropped"
     );
 
-    // The release is broadcast as a typed payload every client reconstructs its
-    // anchor from.
-    let mut release = None;
-    while let Ok(raw) = rx.try_recv() {
-        if raw.contains(events::DISCUSSION_FOCUS_CHANGED) {
-            release = Some(raw);
-        }
-    }
-    let release = release.expect("the focus release must be broadcast");
-    assert!(
-        release.contains("\"kind\":\"none\""),
-        "the release must carry an explicit detached focus: {release}"
+    assert_eq!(response.result, Some(serde_json::json!({"success": true})));
+    assert!(ReviewStorage::load_review(&root, "review-del")
+        .unwrap()
+        .is_none());
+    let published: Vec<tauqe_protocol::Event> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .collect();
+    assert_eq!(
+        published
+            .iter()
+            .map(|event| event.method.as_str())
+            .collect::<Vec<_>>(),
+        [
+            events::DISCUSSION_FOCUS_CHANGED,
+            events::REVIEW_LIST_CHANGED
+        ]
+    );
+    assert_eq!(
+        published[0].params.as_ref().unwrap()["focus"]["kind"],
+        "none"
     );
 
     // A focus anchored on a surviving session is untouched by another deletion.

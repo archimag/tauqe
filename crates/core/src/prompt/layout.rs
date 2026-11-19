@@ -8,15 +8,13 @@
 //! ## Chronological invalidation points
 //!
 //! The transcript keeps the provider's cached prefix warm only while it stays
-//! append-only. Five structural mutations legitimately move an earlier byte, and
+//! append-only. Four structural mutations legitimately move an earlier byte, and
 //! each is a documented — never silent — boundary:
 //!
-//! - **Repository outline change.** The frozen symbol map (or the compact
-//!   directory outline) closes the head. It is frozen for the whole turn, but a
-//!   later turn generates it again and excludes the files that entered the
-//!   context, so the head itself changes and invalidates the whole tail. That is
-//!   the deliberate price of keeping the large outline in the stable head
-//!   instead of paying a full reprocessing pass on every round.
+//! - **Repository outline change.** The symbol map (or the compact directory
+//!   outline) closes the head and stays frozen for the whole turn. A later turn
+//!   can reflect repository changes, invalidating the tail if the rendered
+//!   outline changes. Adding files to context does not change the symbol map.
 //! - **Access promotion.** Promoting a file from `read_only` to `editable`
 //!   rewrites the `access` attribute of that file's own element in place. The
 //!   element keeps its position and its neighbors keep their bytes.
@@ -29,14 +27,10 @@
 //!   rotated together with it, because the provider must not be asked to reuse a
 //!   node cache whose prefix the dialogue no longer sends.
 //!
-//! - **Context churn relocation.** A change set that converged or was refused
-//!   in virtual staging re-issues the arrival watermark of the paths it
-//!   named, so the relocated group renders after the last recorded turn with
-//!   the anchors of the bytes the next round must address. The converged
-//!   members are named before the refused ones, and every element the churn
-//!   did not name keeps its exact bytes and its exact position.
+//! During a bounded turn content edits retain the original file's arrival
+//! slot. Updated bytes are attached to the outgoing request.
 //!
-//! A context file that arrives while a turn runs is not a sixth boundary. Its
+//! A newly discovered file keeps its arrival position. Its
 //! slot is derived from the watermark the file carries, so the turn that
 //! discovered it emits it right after its own prompt record and every later turn
 //! emits it at the very same point: the response of that turn and the prompt of
@@ -355,9 +349,11 @@ mod tests {
         records: Vec<HistoryEntry>,
         task: &str,
     ) -> Vec<ChatMessage> {
-        assembly(files, records).assemble_chat_messages(task, &JsonPromptProtocol::default())
+        assembly(files, records).assemble_chat_messages(
+            task,
+            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+        )
     }
-
     #[test]
     fn transcript_places_files_by_their_arrival_watermark() {
         let messages = transcript(
@@ -488,9 +484,11 @@ mod tests {
         );
         assembly.repo_map = Some("crate\n  pub fn main".to_string());
 
-        let messages = assembly.assemble_chat_messages("Go", &JsonPromptProtocol::default());
+        let messages = assembly.assemble_chat_messages(
+            "Go",
+            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+        );
         let head = &messages[0].content;
-
         assert!(head.contains("## Repository Map"));
         assert!(head.contains("crate\n  pub fn main"));
         assert!(!head.contains("## Language Directive"));

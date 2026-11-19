@@ -160,6 +160,13 @@ fn apply_response(
             st.onboarding.step = st.onboarding.next_step();
             st.onboarding.selected_index = 0;
         }
+        Some(methods::CHATGPT_SIGN_OUT) => {
+            if value.as_bool() == Some(true) {
+                st.notify_success(active_t("dialog.chatgpt.signed_out"));
+            } else {
+                st.notify_warning(active_t("dialog.chatgpt.revocation_unconfirmed"));
+            }
+        }
         Some(methods::CREDENTIALS_SAVE) => {
             st.onboarding.has_api_key = true;
             st.onboarding
@@ -283,7 +290,7 @@ fn apply_response(
                             .replacen("{}", &done.to_string(), 1)
                             .replacen("{}", &total.to_string(), 1),
                     };
-                    upsert_plan(st, plan);
+                    upsert_plan(st, *plan);
                     st.notify_success(message);
                 }
                 Ok(PlanRefineResult::Blocked { reason }) => st.notify_error(reason),
@@ -587,7 +594,7 @@ fn apply_system_status(st: &mut AppState, status: SystemStatusResult, reloaded: 
         st.mark_model_choice_changed();
     }
     if reloaded {
-        if status.has_api_key {
+        if !st.onboarding.needs_api_key() {
             st.onboarding
                 .set_status(active_t("onboarding.status.config_reloaded"));
         } else {

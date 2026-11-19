@@ -112,9 +112,11 @@ has not reached the client yet the picker stays closed and says why, because an 
 While a turn runs, the REPL renders it as a live document rather than a growing
 paragraph:
 
-- **Lifecycle badges** report the turn status (awaiting, thinking, responding, editing,
-  verifying, research, staging, healing, done, cancelled, error) and the current phase,
-  with a round counter where the phase repeats.
+- **Lifecycle badges** report the current work, such as collecting context,
+  staging, running verification, or waiting for a model response. The round badge
+  counts admitted provider calls independently and stays visible as that work changes.
+  A corrective call can show its reason beside the round number until the next
+  operation replaces it. The footer never displays a fixed phase ladder.
 - **The reasoning transcript** streams as a bounded sliding tail: the most recent lines
   with a running line count, rendered with lightweight per-line styling. The full
   Markdown parse and syntax highlighting run once, when reasoning finalizes. The raw

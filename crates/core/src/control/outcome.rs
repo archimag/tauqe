@@ -10,7 +10,10 @@ pub enum SystemError {
     #[error("operation cancelled")]
     Cancelled,
     #[error("turn round budget exhausted")]
-    RoundBudgetExhausted,
+    RoundBudgetExhausted {
+        spent: usize,
+        last_answer: Option<String>,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("provider error: {0}")]
@@ -49,7 +52,7 @@ impl ResponseEnvelope {
     }
 
     /// Drains and returns all commands matching the specified capability.
-    pub fn take(&mut self, capability: LlmCapability) -> Vec<LlmCommand> {
+    pub(crate) fn take(&mut self, capability: LlmCapability) -> Vec<LlmCommand> {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
@@ -64,7 +67,7 @@ impl ResponseEnvelope {
     }
 
     /// Drains and returns all commands matching any of the specified capabilities.
-    pub fn take_any(&mut self, capabilities: &[LlmCapability]) -> Vec<LlmCommand> {
+    pub(crate) fn take_any(&mut self, capabilities: &[LlmCapability]) -> Vec<LlmCommand> {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
@@ -86,7 +89,7 @@ impl ResponseEnvelope {
     }
 
     /// Returns the unique set of capabilities remaining in the envelope.
-    pub fn remaining_capabilities(&self) -> Vec<LlmCapability> {
+    pub(crate) fn remaining_capabilities(&self) -> Vec<LlmCapability> {
         let mut caps: Vec<_> = self
             .items
             .iter()
@@ -110,7 +113,7 @@ impl ResponseEnvelope {
     }
 
     /// Returns a slice of the commands currently remaining in the envelope.
-    pub fn commands(&self) -> &[LlmCommand] {
+    pub(crate) fn commands(&self) -> &[LlmCommand] {
         &self.items
     }
 }
@@ -126,7 +129,7 @@ pub struct LoopSuccess<T> {
 
 impl<T> LoopSuccess<T> {
     /// Wraps an artifact with its originating model response envelope.
-    pub(crate) fn new(value: T, response: ResponseEnvelope) -> Self {
+    pub fn new(value: T, response: ResponseEnvelope) -> Self {
         Self { value, response }
     }
 }
@@ -144,11 +147,7 @@ pub struct FailureReport {
 
 impl FailureReport {
     /// Creates a new failure report.
-    pub(crate) fn new(
-        reason: impl Into<String>,
-        attempts: usize,
-        diagnostics: Vec<String>,
-    ) -> Self {
+    pub fn new(reason: impl Into<String>, attempts: usize, diagnostics: Vec<String>) -> Self {
         Self {
             reason: reason.into(),
             attempts,
@@ -163,7 +162,7 @@ pub struct AbortReport {
     /// What blocked the work in the host environment.
     pub reason: String,
     /// The exact command or instruction the developer must run.
-    pub recommendation: String,
+    pub(crate) recommendation: String,
 }
 
 impl AbortReport {

@@ -15,7 +15,7 @@ use tauqe_core::context::ContextManager;
 use tauqe_core::control::cache::TurnInputCache;
 use tauqe_core::control::context::{CancellationToken, EventSink, LoopContext};
 use tauqe_core::control::prompt::PromptBuilder;
-use tauqe_core::control::turn::{run_turn_loop, TurnLoopConfig};
+use tauqe_core::control::turn::{run_turn_loop, TurnCompletion, TurnLoopConfig};
 use tauqe_core::llm::CapabilityTree;
 use tauqe_core::llm::LlmCapability;
 use tauqe_core::models::ModelRef;
@@ -76,18 +76,7 @@ fn edit_payload(summary: &str, path: &str, search: &str, replace: &str) -> Strin
         "message": summary,
         "action": {
             "kind": "edit",
-            "changes": [
-                {
-                    "op": "replace",
-                    "path": path,
-                    "old_text": search,
-                    "new_text": replace,
-                    "to": "",
-                    "start": "",
-                    "end": "",
-                    "content": ""
-                }
-            ],
+            "patch": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-{search}\n+{replace}\n*** End Patch"),
             "commit_message": summary,
             "message": "",
             "reason": ""
@@ -173,14 +162,13 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
         MockResponse::text(repair_beta),
     ]);
     let model = ModelRef::openrouter("mock/model");
-    let protocol = JsonPromptProtocol::edits();
-
+    let caps = tauqe_core::control::turn::turn_capability_expr();
+    let protocol = JsonPromptProtocol::new(caps.clone());
     let cancel = CancellationToken::new();
     let events = EventSink::noop();
     let mut cache = TurnInputCache::default();
     let mut journal = TurnResearchJournal::default();
     let mut policy = GitTransactionPolicy::new();
-    let caps = tauqe_core::control::turn::turn_capability_expr();
     let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
     let mut ctx = LoopContext::new(
         &cancel,
@@ -193,9 +181,14 @@ async fn a_bounded_turn_dumps_the_task_runner_once_across_retries_and_healing() 
         prompt_builder,
     );
 
-    let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-        .await
-        .expect("the bounded turn executes");
+    let outcome = run_turn_loop(
+        &mut ctx,
+        None,
+        &TurnLoopConfig::default(),
+        TurnCompletion::AnswerAllowed,
+    )
+    .await
+    .expect("the bounded turn executes");
 
     assert!(outcome.is_success());
     let success = outcome.into_success().expect("success");
@@ -266,18 +259,17 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
     let answer = "Nothing to change here.";
     let provider = MockLlmProvider::scripted([MockResponse::text(answer)]);
     let model = ModelRef::openrouter("mock/model");
-    let protocol = JsonPromptProtocol::edits();
-
-    let cancel = CancellationToken::new();
-    let events = EventSink::noop();
-    let mut cache = TurnInputCache::default();
-    let mut journal = TurnResearchJournal::default();
-    let mut policy = DirectApplyPolicy::new();
     let caps = CapabilityTree::set([
         CapabilityTree::leaf(LlmCapability::TextMessage),
         CapabilityTree::leaf(LlmCapability::EditReplace),
         CapabilityTree::leaf(LlmCapability::ContextRequest),
     ]);
+    let protocol = JsonPromptProtocol::new(caps.clone());
+    let cancel = CancellationToken::new();
+    let events = EventSink::noop();
+    let mut cache = TurnInputCache::default();
+    let mut journal = TurnResearchJournal::default();
+    let mut policy = DirectApplyPolicy::new();
     let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
     let mut ctx = LoopContext::new(
         &cancel,
@@ -290,9 +282,14 @@ async fn an_answer_only_verification_round_reuses_the_frozen_configuration() {
         prompt_builder,
     );
 
-    let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-        .await
-        .expect("the bounded turn executes");
+    let outcome = run_turn_loop(
+        &mut ctx,
+        None,
+        &TurnLoopConfig::default(),
+        TurnCompletion::AnswerAllowed,
+    )
+    .await
+    .expect("the bounded turn executes");
 
     assert!(outcome.is_success());
     let success = outcome.into_success().expect("success");

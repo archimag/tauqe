@@ -1,32 +1,20 @@
 //! Assemble and execute a turn-local interactive control context.
 
 use super::{ReplArtifact, ReplLoopConfig};
-use crate::config::AppConfig;
 use crate::context::ContextManager;
-use crate::control::context::{CancellationToken, EventSink, LoopContext};
+use crate::control::context::{CancellationToken, EventSink};
+use crate::control::execution::{TurnExecutionConfig, TurnInputs, TurnPrompt};
 use crate::control::outcome::{LoopResult, SystemError};
-use crate::control::prompt::PromptBuilder;
 use crate::discussion::DiscussionTarget;
 use crate::history::HistorySnapshot;
-use crate::models::{ModelRef, ReasoningEffort};
-use crate::prompt::protocol::PromptProtocol;
-use crate::providers::LlmProvider;
 use crate::workflow::policy::ApplyPolicy;
-use crate::workflow::research::journal::TurnResearchJournal;
-use std::path::Path;
 
 /// Resolved dependencies and frozen prompt inputs of one interactive execution.
 pub struct ReplExecutionConfig<'a> {
-    pub repo_root: &'a Path,
-    pub provider: &'a dyn LlmProvider,
-    pub model: &'a ModelRef,
-    pub protocol: &'a dyn PromptProtocol,
-    pub config: &'a AppConfig,
+    pub turn: TurnExecutionConfig<'a>,
     pub prompt: String,
     pub history: Option<&'a HistorySnapshot>,
     pub focus: Option<&'a DiscussionTarget>,
-    pub session_id: Option<String>,
-    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 pub async fn run_repl_execution(
@@ -36,42 +24,25 @@ pub async fn run_repl_execution(
     sink: &EventSink,
     execution: ReplExecutionConfig<'_>,
 ) -> Result<LoopResult<ReplArtifact>, SystemError> {
-    let mut journal = TurnResearchJournal::default();
-    let mut input_cache = crate::control::cache::TurnInputCache::default();
-    let capabilities = super::repl_capability_expr(execution.focus);
-    let prompt_builder = PromptBuilder::new(
-        execution.provider,
-        execution.model,
-        execution.protocol,
-        &mut input_cache,
-    )
-    .with_session_id(execution.session_id)
-    .with_prompt(Some(execution.prompt))
-    .with_history(execution.history)
-    .with_repo_map_config(
-        execution.config.context.include_repo_map,
-        execution.config.context.repomap_token_budget,
-    )
-    .with_patch_strategy(execution.config.repl.patch_strategy)
-    .with_workflow(execution.config.repl.workflow.to_string())
-    .with_outer_docs(execution.config.outer_docs.clone())
-    .with_reasoning_effort(execution.reasoning_effort);
-    let mut ctx = LoopContext::new(
+    debug_assert_eq!(
+        execution.turn.protocol.capability_expr(),
+        super::repl_capability_expr(execution.focus)
+    );
+    let config = ReplLoopConfig::from_app_config(execution.turn.config);
+    let mut inputs = TurnInputs::default();
+    let mut ctx = inputs.prepare(
+        execution.turn,
+        TurnPrompt {
+            prompt: Some(execution.prompt),
+            history: execution.history,
+            brief: None,
+        },
+        context_manager,
+        policy,
         cancel,
         sink,
-        execution.repo_root,
-        context_manager,
-        &mut journal,
-        policy,
-        capabilities,
-        prompt_builder,
     );
-    super::run_repl_loop(
-        &mut ctx,
-        &ReplLoopConfig::from_app_config(execution.config),
-        execution.focus,
-    )
-    .await
+    super::run_repl_loop(&mut ctx, &config, execution.focus).await
 }
 
 #[cfg(test)]
@@ -81,6 +52,10 @@ mod tests {
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::policy::DirectApplyPolicy;
+    use crate::{
+        config::AppConfig,
+        models::{ModelRef, ReasoningEffort},
+    };
 
     struct Fixture {
         root: tempfile::TempDir,
@@ -108,8 +83,7 @@ mod tests {
         ) -> Result<LoopResult<ReplArtifact>, SystemError> {
             let mut config = AppConfig::default();
             config.context.include_repo_map = false;
-            let protocol = JsonPromptProtocol::edits()
-                .with_capability_expr(crate::control::repl_capabilities(focus));
+            let protocol = JsonPromptProtocol::new(crate::control::repl_capabilities(focus));
             let model = ModelRef::openrouter("mock/model");
             let mut policy = DirectApplyPolicy::new();
             run_repl_execution(
@@ -118,16 +92,18 @@ mod tests {
                 &self.cancel,
                 &EventSink::noop(),
                 ReplExecutionConfig {
-                    repo_root: self.root.path(),
-                    provider: &self.provider,
-                    model: &model,
-                    protocol: protocol.as_ref(),
-                    config: &config,
+                    turn: crate::control::execution::TurnExecutionConfig {
+                        repo_root: self.root.path(),
+                        provider: &self.provider,
+                        model: &model,
+                        protocol: &protocol,
+                        config: &config,
+                        session_id: Some("interactive-session".into()),
+                        reasoning_effort: Some(ReasoningEffort::High),
+                    },
                     prompt: "Current developer request".into(),
                     history,
                     focus,
-                    session_id: Some("interactive-session".into()),
-                    reasoning_effort: Some(ReasoningEffort::High),
                 },
             )
             .await

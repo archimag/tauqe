@@ -11,7 +11,7 @@ use super::{
 use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
+use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{events, Request};
 use tokio::sync::{mpsc, watch};
@@ -68,7 +68,7 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     state
         .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
@@ -229,14 +229,12 @@ impl LlmProvider for StreamCancellingProvider {
         tauqe_core::models::ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         _cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         let _ = tx.send(StreamEvent::Cancelled).await;
         Ok(())
     }
@@ -256,7 +254,10 @@ async fn test_review_start_surfaces_stream_cancelled_event() {
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(Arc::new(StreamCancellingProvider));
+    state
+        .application
+        .test_set_provider(Arc::new(StreamCancellingProvider))
+        .await;
 
     state
         .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
@@ -324,7 +325,7 @@ async fn test_review_start_withdraws_the_aborted_attempt_before_the_retry() {
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     state
         .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
@@ -433,7 +434,7 @@ async fn test_review_start_withholds_the_summary_until_the_outbound_queue_drains
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     state
         .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await
@@ -519,7 +520,7 @@ async fn test_review_start_cancellation_releases_the_stalled_relay() {
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     state
         .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
         .await

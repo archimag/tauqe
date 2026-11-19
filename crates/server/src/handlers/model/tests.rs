@@ -16,25 +16,18 @@ use tauqe_core::llm::LlmCapability;
 use tauqe_core::llm::LlmCommand;
 use tauqe_core::models::{ModelRef, ModelSelection, ProviderKind};
 use tauqe_core::plan::DiscussionPlanAction;
-use tauqe_core::plan::Plan;
 use tauqe_core::prompt::protocol::PromptProtocol;
-use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
-use tauqe_protocol::{
-    DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams, Request,
-};
+use tauqe_core::providers::{LlmProvider, StreamEvent};
+use tauqe_protocol::{DiscussionFocus, Request};
 use tokio::sync::{mpsc, watch};
 
-use super::prompt::build_model_ask_prompt;
-use super::turn::forward_step_event;
-use super::{
-    handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
-};
+use super::{handle_model_cancel, handle_model_clear_history, handle_model_select};
 use crate::handlers::common::test_support::scratch_root;
-use crate::handlers::edit_cycle::EditCycle;
 use crate::handlers::history::handle_history_get;
 use crate::handlers::PreflightVerdict;
+use crate::publication::publish_stream;
 use crate::state::AppState;
-use tauqe_core::api::turn_prompt_protocol as resolve_turn_protocol;
+use tauqe_flow::api::turn_prompt_protocol as resolve_turn_protocol;
 /// Capability surface of a free interactive dialogue.
 fn dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
     tauqe_core::control::repl_capabilities(None)
@@ -320,190 +313,56 @@ fn state_over_root(root: std::path::PathBuf) -> std::sync::Arc<AppState> {
     AppState::new(AppConfig::default(), root, history_sender, out)
 }
 
-/// While a plan focus is active, a plain prompt continues the anchored
-/// discussion: the turn is enriched with the focused plan and its intent
-/// follows the anchor rather than the free-form text.
+// RPC decoding precedes admission, which precedes discussion preparation.
 #[tokio::test]
-async fn plain_prompt_with_active_focus_continues_the_discussion() {
-    let root = scratch_root("focus-active");
-    let plan = Plan {
-        id: "plan-1".to_string(),
-        title: "Focus Plan".to_string(),
-        ..Default::default()
-    };
-    tauqe_core::plan::storage::PlanStorage::save_plan(&root, &plan).unwrap();
-
-    let state = state_over_root(root.clone());
+async fn model_ask_decodes_before_admission_and_does_not_prepare_while_busy() {
+    let root = scratch_root("ask-busy");
+    let (out, mut events) = crate::transport::OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        root.clone(),
+        history,
+        out,
+    );
     state
-        .set_discussion_focus(DiscussionFocus::plan("plan-1", vec!["1".to_string()]))
-        .await;
-
-    let turn = build_model_ask_prompt(
-        &state,
-        ModelAskParams::Prompt {
-            text: "keep refining".to_string(),
-        },
-    )
-    .await
-    .expect("the focused plan must load");
-
-    assert!(
-        matches!(turn.focus, Some(DiscussionTarget::Plan { .. })),
-        "a plain prompt under plan focus must follow the anchored branch"
-    );
-    assert!(
-        turn.prompt.contains("keep refining"),
-        "the plain prompt must reach the discussion prompt"
-    );
-    assert!(
-        state.discussion_focus().await.is_active(),
-        "a successful enriched turn must keep the anchor"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// An explicit discussion target that loads replaces the focus anchor with
-/// the addressed entity and its focused items, turning one-shot comments into
-/// a continuous dialogue.
-#[tokio::test]
-async fn discussion_target_replaces_the_focus_anchor() {
-    let root = scratch_root("focus-replace");
-    let plan = Plan {
-        id: "plan-1".to_string(),
-        title: "Focus Plan".to_string(),
-        ..Default::default()
-    };
-    tauqe_core::plan::storage::PlanStorage::save_plan(&root, &plan).unwrap();
-
-    let state = state_over_root(root.clone());
-    state
-        .set_discussion_focus(DiscussionFocus::plan("other-plan", Vec::new()))
-        .await;
-
-    let turn = build_model_ask_prompt(
-        &state,
-        ModelAskParams::Discussion(DiscussionRequest {
-            target: DiscussionTarget::Plan {
-                id: "plan-1".to_string(),
-            },
-            focused_items: vec!["1".to_string()],
-            comment: "refine the authentication flow".to_string(),
-        }),
-    )
-    .await
-    .expect("the stored plan must load");
-
-    assert!(matches!(turn.focus, Some(DiscussionTarget::Plan { .. })));
-    assert!(
-        turn.prompt.contains("refine the authentication flow"),
-        "the developer comment must reach the discussion prompt"
-    );
-
-    let focus = state.discussion_focus().await;
-    assert_eq!(
-        focus.target().cloned(),
-        Some(DiscussionTarget::Plan {
-            id: "plan-1".to_string()
-        })
-    );
-    assert_eq!(focus.focused_items(), ["1".to_string()].as_slice());
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A plain prompt whose focus anchor references a plan that is gone falls
-/// back to the raw prompt and clears the stale anchor, so the dialogue is
-/// never routed at an entity that no longer exists.
-#[tokio::test]
-async fn plain_prompt_with_stale_focus_clears_the_anchor() {
-    let root = scratch_root("focus-stale");
-    let state = state_over_root(root.clone());
-
-    state
-        .set_discussion_focus(DiscussionFocus::plan("gone-plan", Vec::new()))
-        .await;
-
-    let turn = build_model_ask_prompt(
-        &state,
-        ModelAskParams::Prompt {
-            text: "just answer here".to_string(),
-        },
-    )
-    .await
-    .expect("a stale focus must not fail the plain prompt");
-
-    assert_eq!(turn.prompt, "just answer here");
-    assert!(turn.focus.is_none());
-    assert!(
-        state.discussion_focus().await.is_none(),
-        "the stale anchor must be cleared instead of kept"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// An explicit discussion target that cannot be loaded fails the turn and
-/// leaves the previous focus anchor untouched, because the anchor is replaced
-/// only after the referenced entity loads successfully.
-#[tokio::test]
-async fn missing_discussion_target_keeps_the_previous_focus() {
-    let root = scratch_root("focus-missing");
-    let state = state_over_root(root.clone());
-
-    let anchor = DiscussionFocus::plan("kept-plan", vec!["1".to_string()]);
-    state.set_discussion_focus(anchor.clone()).await;
-
-    let err = build_model_ask_prompt(
-        &state,
-        ModelAskParams::Discussion(DiscussionRequest {
-            target: DiscussionTarget::Plan {
-                id: "missing-plan".to_string(),
+        .application
+        .set_discussion_focus(tauqe_flow::api::DiscussionFocus::Focused {
+            target: tauqe_flow::api::DiscussionTarget::Plan {
+                id: "missing-plan".into(),
             },
             focused_items: Vec::new(),
-            comment: "where did the plan go?".to_string(),
-        }),
-    )
-    .await
-    .expect_err("a target that cannot be loaded must fail the turn");
-
-    assert_eq!(err.code, tauqe_protocol::errors::NOT_FOUND.to_string());
-    assert_eq!(
-        state.discussion_focus().await,
-        anchor,
-        "the failed discussion must not replace the previous anchor"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A blank free-form prompt is rejected before any focus handling, so the
-/// invalid request never mutates the focus anchor.
-#[tokio::test]
-async fn blank_prompt_is_rejected_without_touching_the_focus() {
-    let root = scratch_root("focus-blank");
-    let state = state_over_root(root.clone());
-
-    let anchor = DiscussionFocus::plan("plan-1", Vec::new());
-    state.set_discussion_focus(anchor.clone()).await;
-
-    let err = build_model_ask_prompt(
+        })
+        .await;
+    let focus = state.application.discussion_focus().await;
+    let operation = state.try_begin_operation().unwrap();
+    let request = |params| tauqe_protocol::Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::MODEL_ASK.into(),
+        params: Some(params),
+    };
+    let malformed = super::handle_model_ask(
+        request(serde_json::json!({"kind":"prompt","text":42})),
         &state,
-        ModelAskParams::Prompt {
-            text: "   ".to_string(),
-        },
     )
-    .await
-    .expect_err("a blank prompt must be rejected");
-
-    assert_eq!(err.code, tauqe_protocol::errors::INVALID_PARAMS.to_string());
+    .await;
     assert_eq!(
-        state.discussion_focus().await,
-        anchor,
-        "a rejected prompt must leave the focus anchor untouched"
+        malformed.error.unwrap().code,
+        tauqe_protocol::errors::INVALID_PARAMS
     );
-
-    let _ = std::fs::remove_dir_all(&root);
+    let busy = super::handle_model_ask(
+        request(serde_json::json!({"kind":"prompt","text":"Continue"})),
+        &state,
+    )
+    .await;
+    assert_eq!(
+        busy.error.unwrap().code,
+        tauqe_protocol::errors::OPERATION_IN_PROGRESS
+    );
+    assert_eq!(state.application.discussion_focus().await, focus);
+    assert!(events.try_recv().is_err());
+    drop(operation);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Runs the deterministic pre-flight gate over a scratch repository that
@@ -621,14 +480,12 @@ impl LlmProvider for StallingProvider {
         ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         // Stream a fragment first, so the turn is genuinely mid-stream when the
         // test dispatches its requests.
         if tx
@@ -796,17 +653,20 @@ async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
     let (provider, mut entered) = StallingProvider::new();
     let provider = Arc::new(provider);
     let injected: Arc<dyn LlmProvider> = provider.clone();
-    *state.provider_override.lock().await = Some(injected);
+    state.application.test_set_provider(injected).await;
 
-    start_model_turn(
-        &state,
-        "Explain the repository".to_string(),
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("the turn starts");
+    state
+        .application
+        .ask(
+            tauqe_flow::api::ModelAskInput::Prompt {
+                text: "Explain the repository".into(),
+            },
+            Arc::new(crate::publication::Publisher {
+                out: state.out.clone(),
+            }),
+        )
+        .await
+        .expect("the turn starts");
 
     tokio::time::timeout(Duration::from_secs(10), entered.recv())
         .await
@@ -1000,34 +860,20 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[tokio::test]
-async fn step_event_forwarding_streams_edit_lifecycle_events() {
+#[test]
+fn step_event_forwarding_streams_edit_lifecycle_events() {
     let (out, mut rx) = crate::transport::OutChannel::new();
-    let edit_cycle = EditCycle::new(out.clone(), "op-step-edit");
-    let root = scratch_root("step-forward-edits");
-    let state = state_over_root(root.clone());
-    let mut usage_guard = state.begin_usage("op-step-edit").await;
-
-    forward_step_event(
-        &out,
-        "op-step-edit",
-        StreamEvent::EditStarted,
-        &mut usage_guard,
-        &edit_cycle,
-    )
-    .await;
-    forward_step_event(
+    let edit_cycle = crate::handlers::edit_cycle::edit_cycle(out.clone(), "op-step-edit");
+    edit_cycle.open();
+    publish_stream(
         &out,
         "op-step-edit",
         StreamEvent::EditFileStarted {
             path: "src/main.rs".to_string(),
             op_type: tauqe_core::edits::EditFileOp::Replace,
         },
-        &mut usage_guard,
-        &edit_cycle,
-    )
-    .await;
-    forward_step_event(
+    );
+    publish_stream(
         &out,
         "op-step-edit",
         StreamEvent::EditHunk {
@@ -1041,11 +887,8 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
             old_text: "fn main() {}".to_string(),
             new_text: "fn main() {\n    println!();\n}".to_string(),
         },
-        &mut usage_guard,
-        &edit_cycle,
-    )
-    .await;
-    forward_step_event(
+    );
+    publish_stream(
         &out,
         "op-step-edit",
         StreamEvent::EditFileDone {
@@ -1054,10 +897,7 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
             error: None,
             hunks_count: 1,
         },
-        &mut usage_guard,
-        &edit_cycle,
-    )
-    .await;
+    );
 
     let events = published_events(&mut rx);
     let methods: Vec<&str> = events.iter().map(|(m, _)| m.as_str()).collect();
@@ -1073,8 +913,6 @@ async fn step_event_forwarding_streams_edit_lifecycle_events() {
     assert_eq!(events[1].1["path"], "src/main.rs");
     assert_eq!(events[2].1["hunk_index"], 0);
     assert_eq!(events[3].1["hunks_count"], 1);
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Drains the transport queue into the ordered list of published events.

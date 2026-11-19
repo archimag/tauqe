@@ -1,11 +1,13 @@
 //! Explicit projection of engine turn results onto the TUI wire contract.
 use crate::contracts::Project;
-pub(super) fn result_dto(result: tauqe_core::llm::ModelResult) -> tauqe_protocol::ModelResult {
+pub(crate) fn result_dto(
+    result: tauqe_flow::api::types::ModelResult,
+) -> tauqe_protocol::ModelResult {
     match result {
-        tauqe_core::llm::ModelResult::Answer { text } => {
+        tauqe_flow::api::types::ModelResult::Answer { text } => {
             tauqe_protocol::ModelResult::Answer { text }
         }
-        tauqe_core::llm::ModelResult::Edit {
+        tauqe_flow::api::types::ModelResult::Edit {
             summary,
             edits,
             proposal,

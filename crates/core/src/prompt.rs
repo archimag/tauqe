@@ -14,7 +14,6 @@ use crate::context::ContextFileContent;
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::history::HistorySnapshot;
-use crate::llm::CapabilityTree;
 use crate::plan::Plan;
 use crate::prompt::layout::assemble_chronological_messages;
 use crate::prompt::protocol::PromptProtocol;
@@ -45,7 +44,7 @@ pub enum ContourKind {
 /// regime follow the same typed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnBrief {
-    pub(crate) contour: ContourKind,
+    contour: ContourKind,
     /// Opening text the turn renders ahead of the Core System Contract.
     intro: String,
 }
@@ -59,7 +58,7 @@ impl TurnBrief {
     }
 
     /// Builds the brief of one isolated step.
-    pub fn step() -> Self {
+    pub(crate) fn step() -> Self {
         Self {
             contour: ContourKind::Step,
             intro: STEP_INTRO.to_string(),
@@ -272,7 +271,7 @@ pub use tauqe_tools::tokens::{estimate_tokens, estimate_tokens_from_bytes};
 /// of grouping files under separate read-only and editable sections, so
 /// promoting a file to editable rewrites only its own attribute and never moves
 /// it past its neighbors.
-fn access_attribute(access: ContextAccess) -> &'static str {
+pub(crate) fn access_attribute(access: ContextAccess) -> &'static str {
     match access {
         ContextAccess::ReadOnly => "read_only",
         ContextAccess::Editable => "editable",
@@ -318,13 +317,13 @@ pub fn context_element_overhead_tokens(path: &str, access: ContextAccess) -> usi
 /// to exactly one file and cannot be reused across files. Both access layers
 /// are rendered the same way: a read-only file is as addressable as an editable
 /// one, it merely cannot be edited yet.
-fn render_context_element(
+pub(crate) fn render_context_element(
     file: &ContextFileContent,
     access: ContextAccess,
     patch_strategy: PatchStrategy,
 ) -> String {
     let content = match patch_strategy {
-        PatchStrategy::SearchReplace => file.content.clone(),
+        PatchStrategy::SearchReplace | PatchStrategy::ApplyPatch => file.content.clone(),
         // A file outside the sixteen-bit domain of the codec cannot be
         // addressed by anchors at all, so it stays raw rather than carrying
         // prefixes that would name other lines.
@@ -402,7 +401,7 @@ impl ContextBlockCache {
     /// The research journal renders the files a round delivered through this
     /// very method, so a delivered file carries the anchors, the `access`
     /// attribute, and the bytes the context block of the turn renders.
-    pub(crate) fn element(
+    fn element(
         &mut self,
         file: &ContextFileContent,
         access: ContextAccess,
@@ -501,10 +500,8 @@ impl PromptAssembly {
     }
 
     fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
-        let capabilities = self.effective_capability_expr(protocol);
-        let effective_protocol = protocol
-            .with_capability_expr(capabilities.clone())
-            .with_project(self.project.clone());
+        let capabilities = protocol.capability_expr();
+        let effective_protocol = protocol.with_project(self.project.clone());
         let mut prompt = String::new();
         let turn_brief = self.turn_brief.clone().unwrap_or_default();
         prompt.push_str(&turn_brief.intro);
@@ -538,10 +535,6 @@ impl PromptAssembly {
         }
 
         prompt
-    }
-
-    fn effective_capability_expr(&self, protocol: &dyn PromptProtocol) -> CapabilityTree {
-        protocol.capability_expr()
     }
 
     fn context_file_access(&self, file: &ContextFileContent) -> ContextAccess {
@@ -691,18 +684,20 @@ impl PromptAssembly {
 mod tests {
     use super::*;
     use crate::history::HistoryEntry;
+    use crate::llm::CapabilityTree;
     use crate::prompt::json::JsonPromptProtocol;
-
     /// Structured protocol carrying the shared dialogue surface.
     fn dialogue_protocol() -> Box<dyn PromptProtocol> {
-        JsonPromptProtocol::edits()
-            .with_capability_expr(crate::control::repl::repl_capability_expr(None))
+        Box::new(JsonPromptProtocol::new(
+            crate::control::repl::repl_capability_expr(None),
+        ))
     }
 
     /// Structured protocol carrying the capability surface of one isolated step.
     fn step_protocol() -> Box<dyn PromptProtocol> {
-        JsonPromptProtocol::edits()
-            .with_capability_expr(crate::control::turn::turn_capability_expr())
+        Box::new(JsonPromptProtocol::new(
+            crate::control::turn::turn_capability_expr(),
+        ))
     }
     /// Lifts the operational branch envelope of a composed schema into one surface.
     ///
@@ -800,7 +795,8 @@ mod tests {
             None,
             None,
         );
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Привет", &proto);
         assert!(!messages[0].content.contains("## Language Directive"));
         assert!(messages[0].content.contains("Response Language"));
@@ -831,9 +827,9 @@ mod tests {
             history,
             repo_map,
         );
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
-
         // The head keeps the contract, the instructions, and the outline; the
         // interaction record and the file body travel through the transcript.
         assert_eq!(messages[0].role, "system");
@@ -886,13 +882,12 @@ mod tests {
             None,
             None,
         );
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(true, false));
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
-
         // A plan discussion is a dialogue like any other: the rule that
         // restricted it to prose is gone, and direct edits are authorized by
-        // the very same Action Authorization rule the REPL states.
         assert!(!sys.contains("Discussion Mode Scope"));
         assert!(!sys.contains("architectural discussion"));
         assert!(sys.contains("Action Authorization"));
@@ -986,10 +981,12 @@ mod tests {
                 "## Mode: Stub Wire\nAnswer in the stub wire format.\n".to_string()
             }
 
-            fn with_capability_expr(&self, _expr: CapabilityTree) -> Box<dyn PromptProtocol> {
+            fn with_project(
+                &self,
+                _project: Option<crate::config::project::ProjectConfig>,
+            ) -> Box<dyn PromptProtocol> {
                 Box::new(StubWireProtocol)
             }
-
             fn create_stream_filter(
                 &self,
                 editable_paths: Vec<String>,
@@ -1039,11 +1036,12 @@ mod tests {
         // transport derives the edit mode and composes the registry schema, where
         // the plan payload is already declared. The conversation-specific mode
         // section is therefore never rendered for it.
-        let protocol = crate::prompt::json::JsonPromptProtocol::discussion();
+        let protocol = crate::prompt::json::JsonPromptProtocol::new(
+            crate::control::repl::dialogue_capability_expr(true, false),
+        );
         let prompt = assembly.build_system_prompt(&protocol);
-
         assert_eq!(prompt.matches("Code Modification Protocol").count(), 1);
-        assert!(prompt.contains("`changes`"));
+        assert!(prompt.contains("`patch`"));
         assert!(prompt.contains("`plan_update`"));
         assert!(!prompt.contains("## Mode: Structured Discussion"));
         assert!(!prompt.contains("conforming to the discussion schema"));
@@ -1306,9 +1304,9 @@ mod tests {
             }],
         ));
 
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Do work", &proto);
-
         let head = &messages[0].content;
         assert_eq!(messages[0].role, "system");
         assert!(head.contains("## Repository Map"));
@@ -1368,16 +1366,15 @@ mod tests {
         let mut with_map = base().with_repo_dirs(Some("crate\n  src".to_string()));
         with_map.repo_map = Some("crate\n  pub fn main".to_string());
         assert!(with_map.format_repo_dirs_block().is_some());
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = with_map.assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(sys.contains("## Repository Map"));
         assert!(!sys.contains("## Repository Directories"));
         assert!(!sys.contains(DIRS_BLOCK));
-
         // Without a map the compact outline answers where subsystems live.
         let with_dirs = base().with_repo_dirs(Some("crate\n  src".to_string()));
-        let proto = JsonPromptProtocol::default();
         let messages = with_dirs.assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(!sys.contains("## Repository Map"));
@@ -1388,8 +1385,6 @@ mod tests {
         let blank = base().with_repo_dirs(Some("   ".to_string()));
         assert!(blank.format_repo_dirs_block().is_none());
 
-        // With neither input the prefix carries no repository outline.
-        let proto = JsonPromptProtocol::default();
         let messages = base().assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(!sys.contains("## Repository Map"));
@@ -1433,10 +1428,10 @@ mod tests {
         );
         assert!(assembly.has_eager_repo_map());
 
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
-
         // The static symbol contours already answer where symbols live, so no
         // rendered instruction may advertise an on-demand map request.
         assert!(system.contains("## Repository Map"));
@@ -1464,10 +1459,10 @@ mod tests {
         );
         assert!(!assembly.has_eager_repo_map());
 
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
-
         assert!(!system.contains("## Repository Map"));
         assert!(system.contains("repo_maps"));
     }
@@ -1533,8 +1528,12 @@ mod tests {
     /// loop declared, and a turn without one opens with the dialogue introduction.
     #[test]
     fn the_turn_brief_renders_the_introduction_of_its_contour() {
-        let proto = JsonPromptProtocol::default();
         let render = |turn_brief: Option<TurnBrief>| {
+            let proto =
+                JsonPromptProtocol::new(match turn_brief.as_ref().map(|brief| brief.contour) {
+                    Some(ContourKind::Step) => crate::control::turn::turn_capability_expr(),
+                    _ => crate::control::repl::dialogue_capability_expr(false, false),
+                });
             let mut assembly = PromptAssembly::new(
                 None,
                 1,
@@ -1573,7 +1572,8 @@ mod tests {
 
     #[test]
     fn test_interactive_repl_routes_harness_questions_to_the_documentation() {
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1583,7 +1583,6 @@ mod tests {
             None,
             None,
         );
-
         // The self-knowledge rule routes a question about the harness to the
         // authoritative documentation, so the intent delta carries no second
         // lecture about the environment beside it.
@@ -1626,8 +1625,8 @@ mod tests {
 
     #[test]
     fn test_planning_prompt_instructions() {
-        let proto = JsonPromptProtocol::default();
-
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         // Develop mode
         let dev_assembly = PromptAssembly::new(
             None,
@@ -1648,8 +1647,7 @@ mod tests {
         assert!(dev_prompt.contains("Plan Creation Invariant"));
         assert!(dev_prompt.contains("only create a plan when explicitly instructed"));
 
-        // Discussion mode
-        // Discussion mode
+        // Plan-focused dialogue
         let disc_assembly = PromptAssembly::new(
             None,
             1,
@@ -1662,7 +1660,9 @@ mod tests {
         // The plan-action semantics follow the surface the round actually
         // advertises, so the plan-anchored surface of the discussion protocol
         // is what authorizes in-place plan mutation.
-        let disc_prompt = disc_assembly.build_system_prompt(&JsonPromptProtocol::discussion());
+        let disc_prompt = disc_assembly.build_system_prompt(&JsonPromptProtocol::new(
+            crate::control::repl::dialogue_capability_expr(true, false),
+        ));
         assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
         assert!(disc_prompt.contains("Leaf-Only Files Invariant"));
         assert!(disc_prompt.contains("Plan Action Semantics"));
@@ -1671,8 +1671,8 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_research_instructions() {
-        let proto = JsonPromptProtocol::default();
-
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1693,6 +1693,8 @@ mod tests {
     fn test_system_prompt_anchors_project_configuration() {
         use crate::llm::LlmCapability;
 
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1702,18 +1704,15 @@ mod tests {
             None,
             None,
         );
-        let proto = JsonPromptProtocol::default();
         let full = assembly.build_system_prompt(&proto);
-
         // The configuration anchor belongs to the static introduction, and the
         // self-knowledge rule routes configuration questions to that topic.
         assert!(full.contains("tauqe.toml"));
         assert!(full.contains("Self-Knowledge"));
 
         // With documentation requests disabled the anchor survives as prose.
-        let text_only = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
-            LlmCapability::TextMessage,
-        ]));
+        let text_only =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         let narrowed = assembly.build_system_prompt(&text_only);
         assert!(narrowed.contains("tauqe.toml"));
         assert!(!narrowed.contains("Self-Knowledge"));
@@ -1728,14 +1727,16 @@ mod tests {
             None,
             None,
         );
-        let proto = JsonPromptProtocol::discussion();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(true, false));
         let prompt = discussion.build_system_prompt(&proto);
         assert!(prompt.contains("tauqe.toml"));
     }
 
     #[test]
     fn test_prompt_assembly_with_turn_scratchpad() {
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let mut assembly = PromptAssembly::new(
             None,
             1,
@@ -1746,7 +1747,6 @@ mod tests {
             None,
         );
         assert!(assembly.format_scratchpad_block().is_none());
-
         assembly.turn_scratchpad = Some("   ".to_string());
         assert!(assembly.format_scratchpad_block().is_none());
 
@@ -1802,7 +1802,8 @@ mod tests {
             None,
         );
 
-        let json = JsonPromptProtocol::default();
+        let json =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let json_prompt = assembly.build_system_prompt(&json);
         assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 
@@ -1819,7 +1820,8 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_states_the_proactive_engineering_stance() {
-        let proto = JsonPromptProtocol::default();
+        let proto =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
 
         // Interactive REPL turn: a direct request is executed immediately,
         // while an open or architectural question is answered in prose.
@@ -1868,7 +1870,9 @@ mod tests {
             None,
             None,
         );
-        let discussion_prompt = discussion.build_system_prompt(&proto);
+        let discussion_prompt = discussion.build_system_prompt(&JsonPromptProtocol::new(
+            crate::control::repl::dialogue_capability_expr(true, false),
+        ));
         assert!(discussion_prompt.contains("Action Authorization"));
         assert!(!discussion_prompt.contains("Discussion Mode Scope"));
     }
@@ -2111,7 +2115,10 @@ mod tests {
         // A turn that can request an external document publishes the catalog in
         // the byte-stable head, and the head carries no repository metadata: the
         // working-tree state reaches the model through the context block alone.
-        let messages = built.assemble_chat_messages("Go", &JsonPromptProtocol::default());
+        let messages = built.assemble_chat_messages(
+            "Go",
+            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+        );
         let system = &messages[0].content;
         assert!(!system.contains("## Project Metadata"));
         let catalog = system
@@ -2136,7 +2143,7 @@ mod tests {
         );
 
         // A narrowed surface that cannot request a document advertises none.
-        let narrowed = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
+        let narrowed = JsonPromptProtocol::new(CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::EditReplace,
         ]));

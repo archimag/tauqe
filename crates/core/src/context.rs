@@ -432,68 +432,12 @@ impl ContextManager {
     /// arrived. Allocating a fresh one on every add would move the file to the
     /// tail of the chronological timeline, and it would make an otherwise
     /// identical re-add look like a change that bumps the revision on its own.
-    /// [`Self::move_files_to_tail`] is the one sanctioned re-issuer of a watermark:
-    /// a change set that rewrote the file is a position event, not a repeated arrival.
     fn resolve_insertion_seq(&mut self, clean_path: &str) -> u64 {
         if let Some(seq) = self.existing_insertion_seq(clean_path) {
             return seq;
         }
         self.insertion_counter += 1;
         self.insertion_counter
-    }
-    /// Relocates the named context paths to the tail of their context layers.
-    ///
-    /// A change set that converged or was refused in virtual staging changes
-    /// what the model must read next, so the working set it touched travels to
-    /// the tail of the transcript: every named path a context layer holds is
-    /// re-issued a fresh arrival watermark — in the order the caller named
-    /// the groups, the converged members before the refused ones — and its
-    /// entry moves to the tail of the layer that holds it. The chronological
-    /// layout is a pure function of the watermark, so the next assembly
-    /// renders the relocated group behind the last recorded turn instead of
-    /// where the files first arrived, and the repair or healing round
-    /// addresses the bytes it is about to change.
-    ///
-    /// The relocation is the sanctioned exception to the stable arrival slot
-    /// (§9.6 of `crates/core/Conventions.md`): an arrival keeps its position
-    /// while nothing changes it, and a rewrite is a position event. A path no
-    /// layer holds — a file the change set creates outside the context — is
-    /// skipped without consuming a watermark, and a call that names no path
-    /// the layers know leaves the revision untouched.
-    ///
-    /// Returns `true` only when at least one named path was found and moved.
-    pub(crate) fn move_files_to_tail(&mut self, paths: &[String]) -> bool {
-        let mut moved = false;
-        for raw in paths {
-            let Ok(clean) = self.normalize_path(raw) else {
-                continue;
-            };
-            let present = self.pinned.contains_key(&clean)
-                || self.outer_docs.contains_key(&clean)
-                || self.user.contains_key(&clean)
-                || self.auto.contains_key(&clean);
-            if !present {
-                continue;
-            }
-            self.insertion_counter += 1;
-            let fresh = self.insertion_counter;
-            for layer in [
-                &mut self.pinned,
-                &mut self.outer_docs,
-                &mut self.user,
-                &mut self.auto,
-            ] {
-                if let Some(mut item) = layer.shift_remove(&clean) {
-                    item.insertion_seq = fresh;
-                    layer.insert(clean.clone(), item);
-                }
-            }
-            moved = true;
-        }
-        if moved {
-            self.revision += 1;
-        }
-        moved
     }
     pub fn add_file(&mut self, relative_path: &str, access: ContextAccess) -> Result<ContextItem> {
         self.add_file_to_layer(relative_path, access, ContextLayer::User)
@@ -2052,53 +1996,5 @@ mod tests {
             vec!["a.md".to_string(), "b.md".to_string()]
         );
         assert!(outer_docs_tokens(&primary) > 0);
-    }
-
-    #[test]
-    fn test_move_files_to_tail_relocates_named_paths_in_the_given_order() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        for name in ["a.rs", "b.rs", "c.rs"] {
-            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
-        }
-
-        let mut cm = ContextManager::new(root);
-        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
-        cm.add_file("b.rs", ContextAccess::ReadOnly).unwrap();
-        cm.add_file("c.rs", ContextAccess::ReadOnly).unwrap();
-        let opening_a = watermark_of(&cm, "a.rs");
-        let rev_before = cm.get_state().revision;
-
-        // The converged member is named first, the refused member second, so
-        // the relocation keeps exactly that order while the untouched neighbor
-        // keeps its position.
-        assert!(cm.move_files_to_tail(&["c.rs".to_string(), "a.rs".to_string()]));
-
-        let state = cm.get_state();
-        let paths: Vec<&str> = state.items.iter().map(|i| i.path.as_str()).collect();
-        assert_eq!(paths, vec!["b.rs", "c.rs", "a.rs"]);
-        assert!(cm.get_state().revision > rev_before);
-        // A re-issued watermark exceeds every watermark the session recorded
-        // before it, so the chronological layout moves the file to the tail.
-        let seq_c = watermark_of(&cm, "c.rs");
-        let seq_a = watermark_of(&cm, "a.rs");
-        assert!(seq_c > opening_a);
-        assert!(seq_a > seq_c);
-    }
-
-    #[test]
-    fn test_move_files_to_tail_skips_unknown_paths_without_a_revision_bump() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("a.rs"), "fn f() {}\n").unwrap();
-
-        let mut cm = ContextManager::new(root);
-        cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
-        let rev_before = cm.get_state().revision;
-
-        assert!(!cm.move_files_to_tail(&["missing.rs".to_string()]));
-        assert_eq!(cm.get_state().revision, rev_before);
-        assert!(!cm.move_files_to_tail(&[]));
-        assert_eq!(cm.get_state().revision, rev_before);
     }
 }

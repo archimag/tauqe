@@ -1,9 +1,8 @@
 //! Review document RPC adaptation.
-use super::common::{publish_review, publish_review_list};
 use crate::contracts::Project;
+use crate::publication::Publisher;
 use crate::state::AppState;
 use std::sync::Arc;
-#[cfg(test)]
 #[cfg(test)]
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
@@ -11,19 +10,14 @@ use tauqe_protocol::{
     ReviewGetResult, ReviewListResult, ReviewUpdateItemParams, ReviewUpdateItemResult,
 };
 pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response {
-    let root = state.repo_root().await;
-    let documents = state.application.documents_at(&root);
-    match documents.reviews().await {
-        Ok(reviews) => {
-            let active_id = documents.active_review_id().await.unwrap_or(None);
-            Response::ok_typed(
-                req.id,
-                &ReviewListResult {
-                    reviews: reviews.into_iter().map(Project::project).collect(),
-                    active_id,
-                },
-            )
-        }
+    match state.application.list_reviews().await {
+        Ok((reviews, active_id)) => Response::ok_typed(
+            req.id,
+            &ReviewListResult {
+                reviews: reviews.into_iter().map(Project::project).collect(),
+                active_id,
+            },
+        ),
         Err(error) => Response::err(req.id, errors::REVIEW_LIST_FAILED, error),
     }
 }
@@ -35,7 +29,7 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
     let target_id = match req.params {
         None => None,
         Some(payload) => match serde_json::from_value::<ReviewGetParams>(payload) {
-            Ok(params) => params.id.filter(|id| !id.trim().is_empty()),
+            Ok(params) => params.id,
             Err(err) => {
                 return Response::err(
                     req.id,
@@ -46,13 +40,7 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
         },
     };
 
-    let root = state.repo_root().await;
-    match state
-        .application
-        .documents_at(&root)
-        .resolve_review(target_id)
-        .await
-    {
+    match state.application.get_review(target_id).await {
         Ok(session) => Response::ok_typed(
             req.id,
             &ReviewGetResult {
@@ -63,14 +51,6 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
     }
 }
 pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot delete a review while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: ReviewDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
@@ -82,29 +62,13 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
         }
     };
 
-    let root = state.repo_root().await;
-    match state
-        .application
-        .documents_at(&root)
-        .delete_review(&params.id)
-        .await
-    {
-        Ok(outcome) => {
-            if let Some(update) = outcome.focus_update {
-                state.publish_focus_update(update);
-            }
-            if outcome.deleted {
-                publish_review_list(state, &root).await;
-            }
-            Response::ok_typed(
-                req.id,
-                &ReviewDeleteResult {
-                    success: outcome.deleted,
-                },
-            )
-        }
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
+    match state.application.delete_review(&params.id, &observer).await {
+        Ok(deleted) => Response::ok_typed(req.id, &ReviewDeleteResult { success: deleted }),
         Err(error) => {
-            let code = if matches!(&error, tauqe_core::api::DocumentError::Busy) {
+            let code = if matches!(&error, tauqe_flow::api::DocumentError::Busy) {
                 errors::OPERATION_IN_PROGRESS
             } else {
                 errors::REVIEW_DELETE_FAILED
@@ -114,14 +78,6 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
     }
 }
 pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot update a review item while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: ReviewUpdateItemParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -134,36 +90,35 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
             }
         };
 
-    let root = state.repo_root().await;
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
     match state
         .application
-        .documents_at(&root)
         .update_review_item(
             params.review_id,
             params.item_id,
             params.status.map(Project::project),
             params.note,
+            &observer,
         )
         .await
     {
-        Ok((review_id, Some(item))) => {
-            publish_review(state, &root, &review_id).await;
-            Response::ok_typed(
-                req.id,
-                &ReviewUpdateItemResult {
-                    item: item.project(),
-                },
-            )
-        }
-        Ok((_, None)) => Response::err(
+        Ok(Some(item)) => Response::ok_typed(
+            req.id,
+            &ReviewUpdateItemResult {
+                item: item.project(),
+            },
+        ),
+        Ok(None) => Response::err(
             req.id,
             errors::NOT_FOUND,
             format!("Review item #{} not found", params.item_id),
         ),
         Err(error) => {
             let code = match &error {
-                tauqe_core::api::DocumentError::MissingReviewId => errors::INVALID_PARAMS,
-                tauqe_core::api::DocumentError::Busy => errors::OPERATION_IN_PROGRESS,
+                tauqe_flow::api::DocumentError::MissingReviewId => errors::INVALID_PARAMS,
+                tauqe_flow::api::DocumentError::Busy => errors::OPERATION_IN_PROGRESS,
                 _ => errors::REVIEW_UPDATE_FAILED,
             };
             Response::err(req.id, code, error.to_string())

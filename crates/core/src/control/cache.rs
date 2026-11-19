@@ -1,7 +1,7 @@
 //! Per-turn memoization of deterministic proposal inputs.
 //!
 //! The repository map is the heaviest deterministic input of a proposal round:
-//! a full Tree-sitter pass over every tracked file outside the active context.
+//! a Tree-sitter pass over tracked files, independent of the active context.
 //! It is generated once, on the first proposal round of a bounded turn, and
 //! frozen for the rest of that turn. Patch retries, verification healing, and
 //! research rounds that widened the context all receive the identical map
@@ -129,16 +129,12 @@ impl MemoizedContextFile {
 impl TurnInputCache {
     /// Returns the repository map frozen at the start of the turn.
     ///
-    /// The first call generates the map from the tracked files, the paths
-    /// already present in context, and the token budget, then freezes the
-    /// result. Every later call returns that exact string, even when a research
-    /// round added files to the context and thereby narrowed the set of paths the
-    /// map describes: dropping those nodes mid-turn would shorten the map block
-    /// and invalidate the prompt prefix the provider has already cached.
+    /// The first call generates the map from tracked files within the token budget,
+    /// independently of the active context. Later calls reuse the exact result,
+    /// even if files change on disk during the turn.
     pub(crate) async fn repo_map(
         &mut self,
         repo_root: &Path,
-        targetable_paths: &[String],
         token_budget: usize,
     ) -> Option<String> {
         if let Some(frozen) = &self.repo_map {
@@ -146,7 +142,6 @@ impl TurnInputCache {
         }
 
         let root = repo_root.to_path_buf();
-        let targetable = targetable_paths.to_vec();
         // The tracked-file listing and the Tree-sitter pass are blocking file
         // and subprocess work, so they run off the async executor thread. The
         // pass runs through the process-wide shared extractor, so files whose
@@ -158,7 +153,7 @@ impl TurnInputCache {
                 crate::repomap::generate_repo_map_with_extractor(
                     &root,
                     &files,
-                    &targetable,
+                    &[],
                     token_budget,
                     crate::repomap::treesitter::shared_extractor(),
                 )
@@ -447,7 +442,8 @@ mod tests {
             insertion_seq: 0,
         };
 
-        let protocol = JsonPromptProtocol::default();
+        let protocol =
+            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
         let mut cache = TurnInputCache::default();
         let mut assembly = PromptAssembly::new(
             None,
@@ -504,65 +500,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn repo_map_stays_identical_when_research_widens_the_context() {
+    async fn repository_changes_only_reach_the_next_turns_map() {
         let (_dir, root) = repo_with_two_files();
-        let mut cache = TurnInputCache::default();
-
-        let opening_round: Vec<String> = Vec::new();
-        let first = cache
-            .repo_map(&root, &opening_round, 1000)
+        let mut first_turn = TurnInputCache::default();
+        let before = first_turn
+            .repo_map(&root, 1000)
             .await
-            .expect("the opening round generates the map");
-        assert!(first.contains("b.rs"));
-        assert!(first.contains("pub fn beta"));
+            .expect("first turn map");
+        assert!(before.contains("pub fn beta"));
+        assert_eq!(
+            TurnInputCache::default()
+                .repo_map(&root, 1000)
+                .await
+                .as_deref(),
+            Some(before.as_str())
+        );
 
-        // A research round pulls `b.rs` into the context, which would exclude
-        // it from a regenerated map. The frozen map keeps the node and stays
-        // byte-identical, so the prompt prefix of the previous round survives.
-        let later_round = vec!["b.rs".to_string()];
-        let second = cache
-            .repo_map(&root, &later_round, 1000)
+        std::fs::write(root.join("b.rs"), "pub fn rewritten_beta() {}\n").unwrap();
+        assert_eq!(
+            first_turn.repo_map(&root, 1000).await.as_deref(),
+            Some(before.as_str())
+        );
+
+        let after = TurnInputCache::default()
+            .repo_map(&root, 1000)
             .await
-            .expect("the frozen map is reused");
-        assert_eq!(second, first);
+            .expect("next turn map");
+        assert!(after.contains("pub fn rewritten_beta"));
+        assert!(after.contains("a.rs"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_repo_map_is_frozen_instead_of_being_regenerated() {
         let (_dir, root) = repo_with_two_files();
         let mut cache = TurnInputCache::default();
-
-        let everything = crate::git::list_repository_files(Some(&root)).unwrap();
-        assert!(cache.repo_map(&root, &everything, 1000).await.is_none());
-
-        // A later round that would produce a non-empty map still observes the
-        // frozen empty result.
-        let narrowed = vec!["a.rs".to_string()];
-        assert!(cache.repo_map(&root, &narrowed, 1000).await.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_new_turn_generates_its_own_map() {
-        let (_dir, root) = repo_with_two_files();
-
-        let mut first_turn = TurnInputCache::default();
-        let opening_round: Vec<String> = Vec::new();
-        let before = first_turn
-            .repo_map(&root, &opening_round, 1000)
-            .await
-            .expect("first turn map");
-        assert!(before.contains("b.rs"));
-
-        // A new turn starts with `b.rs` already in context and therefore gets a
-        // map without that node: the freeze is scoped to a single turn.
-        let mut second_turn = TurnInputCache::default();
-        let with_b = vec!["b.rs".to_string()];
-        let after = second_turn
-            .repo_map(&root, &with_b, 1000)
-            .await
-            .expect("second turn map");
-        assert!(!after.contains("b.rs"));
-        assert!(after.contains("a.rs"));
+        assert!(cache.repo_map(&root, 0).await.is_none());
+        assert!(cache.repo_map(&root, 1000).await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -637,7 +610,7 @@ mod tests {
         let mut cache = TurnInputCache::default();
 
         let (buffer, _guard) = crate::blocking::log_capture::install();
-        assert!(cache.repo_map(&missing_root, &[], 1000).await.is_none());
+        assert!(cache.repo_map(&missing_root, 1000).await.is_none());
 
         let logs = crate::blocking::log_capture::contents(&buffer);
         assert!(
@@ -651,7 +624,7 @@ mod tests {
 
         // The degraded map is frozen: a later round reuses it without
         // re-running the listing or emitting a second record.
-        assert!(cache.repo_map(&missing_root, &[], 1000).await.is_none());
+        assert!(cache.repo_map(&missing_root, 1000).await.is_none());
         assert_eq!(
             crate::blocking::log_capture::contents(&buffer),
             logs,

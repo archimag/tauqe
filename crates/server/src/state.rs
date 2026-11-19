@@ -1,31 +1,32 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauqe_core::context::ContextState;
+#[cfg(test)]
+use tauqe_flow::api::types::ContextState;
 #[cfg(test)]
 use tauqe_protocol::DiscussionTarget;
 
-use tauqe_core::api::UsageTotalsSnapshot;
-use tauqe_core::config::AppConfig;
-use tauqe_core::context::ContextManager;
-use tauqe_core::history::HistoryMutation;
-use tauqe_protocol::{events, DiscussionFocus, DiscussionFocusChangedEvent, Event};
 #[cfg(test)]
-use tokio::sync::Mutex;
+use tauqe_core::context::ContextManager;
+use tauqe_flow::api::types::AppConfig;
+use tauqe_flow::api::types::HistoryMutation;
+#[cfg(test)]
+use tauqe_flow::api::UsageTotalsSnapshot;
+#[cfg(test)]
+use tauqe_protocol::DiscussionFocus;
 
+#[cfg(test)]
 use crate::reap::task_exit_deadline;
 use crate::transport::OutChannel;
 
-pub use tauqe_core::api::{next_operation_id, OperationGuard};
+#[cfg(test)]
+pub use tauqe_flow::api::OperationGuard;
 
 pub struct AppState {
     /// Application facade owning the migrated session scenarios.
     /// Discussion focus state and transition rules are private to core.
-    pub application: tauqe_core::api::Application,
+    pub application: tauqe_flow::api::Application,
     pub out: OutChannel,
-    /// Test-only seam letting deterministic unit tests inject a scripted
-    /// provider instead of building a real network provider from config.
-    #[cfg(test)]
-    pub provider_override: Mutex<Option<Arc<dyn tauqe_core::providers::LlmProvider>>>,
+    pub login: Arc<crate::handlers::login::SignIn>,
 }
 
 impl AppState {
@@ -36,19 +37,21 @@ impl AppState {
         out: OutChannel,
     ) -> Arc<Self> {
         let application =
-            tauqe_core::api::Application::for_repository(config, repo_path, history_sender);
+            tauqe_flow::api::Application::for_repository(config, repo_path, history_sender);
 
+        let login = Arc::new(crate::handlers::login::SignIn::new(out.clone()));
+        let application = application.with_chatgpt_sign_in(login.clone());
         Arc::new(Self {
             application,
             out,
-            #[cfg(test)]
-            provider_override: Mutex::new(None),
+            login,
         })
     }
 
     /// Registers an exclusive operation in the application runtime.
+    #[cfg(test)]
     pub fn try_begin_operation(self: &Arc<Self>) -> Result<OperationGuard, ()> {
-        self.application.try_begin_operation().map_err(|_| {
+        self.application.test_begin_operation().map_err(|_| {
             tracing::warn!(
                 code = tauqe_protocol::errors::OPERATION_IN_PROGRESS,
                 "Refused to register a new operation: a slot is already active"
@@ -61,9 +64,10 @@ impl AppState {
     }
 
     /// Resolve caller-scoped budgets and delegate cancellation policy to core.
+    #[cfg(test)]
     pub fn hard_cancel_active_operation(self: &Arc<Self>) {
-        self.application.hard_cancel_active_operation(
-            crate::handlers::model::unwind_grace(),
+        self.application.cancel(
+            tauqe_flow::api::CancellationMode::Hard,
             task_exit_deadline(),
         );
     }
@@ -109,8 +113,12 @@ impl AppState {
     /// and only then does the queue stop before launching the next member.
     /// Unlike [`AppState::cancel_active_operation`], the request is advisory and
     /// never interrupts work that is already running.
+    #[cfg(test)]
     pub fn soft_stop_active_operation(&self) {
-        self.application.soft_stop_active_operation();
+        self.application.cancel(
+            tauqe_flow::api::CancellationMode::Soft,
+            task_exit_deadline(),
+        );
     }
 
     /// Returns the authoritative repository root shared by every handler.
@@ -118,6 +126,7 @@ impl AppState {
     /// Git, context, plan, and review handlers must all resolve the repository
     /// from this single source instead of re-deriving it from the process CWD,
     /// which can drift from the initialized repository.
+    #[cfg(test)]
     pub async fn repo_root(&self) -> PathBuf {
         self.application.repository_root().await
     }
@@ -128,6 +137,7 @@ impl AppState {
     /// of the window that owns its in-flight scope, so every reader goes through
     /// this accessor instead of reaching for the bare snapshot and silently
     /// dropping the identity that guards it.
+    #[cfg(test)]
     pub async fn usage_snapshot(&self) -> UsageTotalsSnapshot {
         self.application.usage_snapshot().await
     }
@@ -158,58 +168,35 @@ impl AppState {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn history_token_estimate(&self) -> u64 {
-        self.application.history_token_estimate().await
-    }
     /// Adapts the application focus scenario for existing RPC callers.
+    #[cfg(test)]
     pub async fn discussion_focus(&self) -> DiscussionFocus {
         crate::discussion::focus_dto(self.application.discussion_focus().await)
     }
 
+    #[cfg(test)]
     pub async fn set_discussion_focus(&self, focus: DiscussionFocus) -> DiscussionFocus {
-        let update = self
-            .application
-            .set_discussion_focus(crate::discussion::focus_from_dto(focus))
-            .await;
-        self.publish_focus_update(update)
-    }
-
-    pub async fn clear_discussion_focus(&self) -> DiscussionFocus {
-        let update = self.application.clear_discussion_focus().await;
-        self.publish_focus_update(update)
+        let observer = crate::publication::Publisher {
+            out: self.out.clone(),
+        };
+        crate::discussion::focus_dto(
+            self.application
+                .set_focus(crate::discussion::focus_from_dto(focus), &observer)
+                .await,
+        )
     }
 
     #[cfg(test)]
     pub async fn release_discussion_focus_anchored_on(&self, anchor: &DiscussionTarget) -> bool {
-        let update = self
-            .application
-            .release_discussion_focus(&crate::discussion::target_from_dto(anchor.clone()))
-            .await;
-        let changed = update.changed;
-        self.publish_focus_update(update);
-        changed
-    }
-
-    pub(crate) fn publish_focus_update(
-        &self,
-        update: tauqe_core::api::FocusUpdate,
-    ) -> DiscussionFocus {
-        let focus = crate::discussion::focus_dto(update.focus);
-        if update.changed {
-            self.broadcast_focus_change(&focus);
-        }
-        focus
-    }
-
-    /// Publishes the resulting focus anchor so every client adopts or drops it.
-    fn broadcast_focus_change(&self, focus: &DiscussionFocus) {
-        let event = DiscussionFocusChangedEvent {
-            focus: focus.clone(),
+        let observer = crate::publication::Publisher {
+            out: self.out.clone(),
         };
-        self.out.send_event(&Event {
-            method: events::DISCUSSION_FOCUS_CHANGED.to_string(),
-            params: serde_json::to_value(event).ok(),
-        });
+        self.application
+            .release_document_focus(
+                &crate::discussion::target_from_dto(anchor.clone()),
+                &observer,
+            )
+            .await
     }
 
     #[cfg(test)]
@@ -221,26 +208,26 @@ impl AppState {
     /// session when files were actually removed.
     #[cfg(test)]
     pub async fn clear_auto_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(tauqe_core::api::ContextClearScope::Auto)
+        self.clear_context(tauqe_flow::api::ContextClearScope::Auto)
             .await
     }
 
     #[cfg(test)]
     pub async fn clear_transient_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(tauqe_core::api::ContextClearScope::Transient)
+        self.clear_context(tauqe_flow::api::ContextClearScope::Transient)
             .await
     }
 
     #[cfg(test)]
     pub async fn clear_all_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(tauqe_core::api::ContextClearScope::All)
+        self.clear_context(tauqe_flow::api::ContextClearScope::All)
             .await
     }
 
     #[cfg(test)]
     pub(crate) async fn clear_context(
         &self,
-        scope: tauqe_core::api::ContextClearScope,
+        scope: tauqe_flow::api::ContextClearScope,
     ) -> Result<ContextState, String> {
         self.application
             .clear_context(scope)
@@ -248,11 +235,13 @@ impl AppState {
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) async fn context_state(&self) -> ContextState {
         self.application.context_state().await
     }
 
     /// Returns a detached copy for a turn-local workflow.
+    #[cfg(test)]
     pub(crate) async fn context_snapshot(&self) -> ContextManager {
         self.application.context_for_turn().await
     }

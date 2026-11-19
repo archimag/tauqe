@@ -63,8 +63,8 @@ pub async fn handle_review_preview(mut req: Request, state: &Arc<AppState>) -> R
         ),
         Err(error) => {
             let code = match error {
-                tauqe_core::api::ReviewPreviewError::PresetNotFound(_) => errors::NOT_FOUND,
-                tauqe_core::api::ReviewPreviewError::Read(_) => errors::REVIEW_PREVIEW_FAILED,
+                tauqe_flow::api::ReviewPreviewError::PresetNotFound(_) => errors::NOT_FOUND,
+                tauqe_flow::api::ReviewPreviewError::Read(_) => errors::REVIEW_PREVIEW_FAILED,
             };
             Response::err(req.id, code, error.to_string())
         }

@@ -65,6 +65,13 @@ impl Default for WorkflowOptions {
 }
 
 impl WorkflowOptions {
+    pub fn max_turn_rounds(&self) -> usize {
+        self.max_turn_rounds
+    }
+    pub fn token_budget(&self) -> usize {
+        self.token_budget
+    }
+
     /// Constructs workflow options from the unified application configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
         Self {

@@ -258,7 +258,7 @@ pub struct ResponseError {
     pub code: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
+    data: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for ResponseError {

@@ -15,18 +15,6 @@ use crate::plan::PlanImplementation;
 /// Stable identifier of the implicit group a single-audit session audits.
 pub const DEFAULT_REVIEW_GROUP_ID: &str = "default";
 
-/// Stable identifier of the group collecting the findings that share no root
-/// cause with another finding.
-///
-/// The post-analysis layer always materializes this group, even when it turns
-/// out empty, so a classified session keeps one uniform shape: every finding
-/// belongs to exactly one group, and the findings that need no architectural
-/// remediation are collected here instead of floating outside the group list.
-pub const LOCAL_REVIEW_GROUP_ID: &str = "local";
-
-/// Title of the group collecting the findings that share no root cause.
-pub const LOCAL_REVIEW_GROUP_TITLE: &str = "Local Issues";
-
 /// Class of a review group, the typed dichotomy that governs its execution.
 ///
 /// A simple group collects independent defects, so each of its findings is

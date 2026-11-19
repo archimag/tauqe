@@ -13,7 +13,7 @@ use crate::llm::LlmCommand;
 
 use super::context::LoopContext;
 use super::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
-use super::turn::{run_turn_loop, TurnLoopConfig};
+use super::turn::{completed_without_change_set, run_turn_loop, TurnCompletion, TurnLoopConfig};
 use crate::prompt::TurnBrief;
 use crate::providers::StreamEvent;
 
@@ -26,7 +26,7 @@ pub struct ReplLoopConfig {
 
 impl ReplLoopConfig {
     /// Creates REPL loop configuration from authoritative project configuration.
-    pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
+    pub(crate) fn from_app_config(config: &crate::config::AppConfig) -> Self {
         Self {
             turn: TurnLoopConfig::from_app_config(config),
         }
@@ -191,7 +191,7 @@ pub struct ReplArtifact {
 }
 
 /// Runs the interactive REPL turn lifecycle.
-pub async fn run_repl_loop(
+pub(crate) async fn run_repl_loop(
     ctx: &mut LoopContext<'_>,
     config: &ReplLoopConfig,
     focus: Option<&crate::discussion::DiscussionTarget>,
@@ -201,7 +201,30 @@ pub async fn run_repl_loop(
     let repl_caps = repl_capabilities(focus);
     let mut ctx = ctx.reborrow_with_capabilities(repl_caps);
     ctx.set_turn_brief(Some(TurnBrief::dialogue()));
-    let turn_result = run_turn_loop(&mut ctx, None, &config.turn).await?;
+    let turn_result = match run_turn_loop(
+        &mut ctx,
+        None,
+        &config.turn,
+        TurnCompletion::AnswerAllowed,
+    )
+    .await
+    {
+        Err(SystemError::RoundBudgetExhausted { spent, last_answer }) => {
+            let answer = last_answer.unwrap_or_else(|| {
+                "The turn reached its round budget before producing an answer.".to_owned()
+            });
+            let text = format!(
+                "{answer}\n\n---\n**[Round Budget Reached]** The turn spent its whole budget of {spent} provider call(s). \
+                 The answer above is the last one the model produced; ask again to continue from the material the turn already gathered."
+            );
+            let envelope =
+                ResponseEnvelope::from_commands(&[LlmCommand::Text(crate::llm::TextCommand {
+                    content: text,
+                })]);
+            completed_without_change_set(spent, envelope)
+        }
+        result => result?,
+    };
 
     let (mut envelope, turn_artifact) = match turn_result {
         LoopResult::Success(success) => (success.response, success.value),
@@ -355,7 +378,7 @@ async fn apply_plan_commands(
         let repair = plan_correction_prompt(&defects, corrections);
         match ctx.request_repair(&repair, None).await {
             Ok(env) => *envelope = env,
-            Err(SystemError::RoundBudgetExhausted) => {
+            Err(SystemError::RoundBudgetExhausted { .. }) => {
                 tracing::warn!(
                     repo_root = %ctx.repo_root.display(),
                     corrections,
@@ -401,17 +424,12 @@ async fn apply_review_commands(
         return Vec::new();
     }
 
-    let review_id = match focus {
-        Some(crate::discussion::DiscussionTarget::Review { id }) => id.clone(),
-        Some(crate::discussion::DiscussionTarget::ReviewGroup { session_id, .. }) => {
-            session_id.clone()
-        }
-        _ => {
-            tracing::warn!(
-                "Review update commands were emitted without an active review focus; ignoring"
-            );
-            return Vec::new();
-        }
+    let Some(review_id) = focus.and_then(crate::discussion::DiscussionTarget::review_session_id)
+    else {
+        tracing::warn!(
+            "Review update commands were emitted without an active review focus; ignoring"
+        );
+        return Vec::new();
     };
 
     let repo_root = ctx.repo_root.to_path_buf();
@@ -421,7 +439,7 @@ async fn apply_review_commands(
         if let LlmCommand::ReviewUpdate { update } = cmd {
             let item_id = update.item_id;
             let root_clone = repo_root.clone();
-            let rev_id_clone = review_id.clone();
+            let rev_id_clone = review_id.to_owned();
             let apply_res = crate::blocking::run_blocking_async(move || {
                 crate::review::storage::ReviewStorage::apply_decision(
                     &root_clone,
@@ -532,7 +550,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(crate::control::repl_capabilities(None)),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -554,7 +572,8 @@ mod tests {
                 &self.model,
                 &self.protocol,
                 &mut self.cache,
-            );
+            )
+            .with_patch_strategy(crate::workflow::PatchStrategy::LineAnchor);
             LoopContext::new(
                 &self.cancel,
                 &self.events,
@@ -580,6 +599,68 @@ mod tests {
         let success = outcome.into_success().expect("success");
         assert_eq!(success.value.message.as_deref(), Some("Hello"));
         assert!(success.value.modified_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_decision_streams_the_message_and_updates_only_the_focused_session() {
+        use crate::discussion::DiscussionTarget;
+        use crate::review::{IssueStatus, ReviewSession, ReviewStorage};
+
+        let response = serde_json::json!({
+            "message": "Decision recorded.",
+            "action": {
+                "kind": "review",
+                "review_update": {"item_id": 7, "group_id": null, "status": "rejected",
+                    "note": "  Already verified  ", "recommendations": ["Add coverage", "Add coverage"]},
+                "commit_message": "", "reason": ""
+            }
+        });
+        let mut fixture = Fixture::new(&[], vec![MockResponse::text(response.to_string())]);
+        for id in ["focused", "other"] {
+            let session = ReviewSession {
+                id: id.into(),
+                title: id.into(),
+                items: vec![
+                    serde_json::from_value(serde_json::json!({"id": 7, "title": "Race"})).unwrap(),
+                ],
+                ..Default::default()
+            };
+            ReviewStorage::save_session(fixture.dir.path(), &session).unwrap();
+        }
+        let focus = DiscussionTarget::Review {
+            id: "focused".into(),
+        };
+        fixture.protocol = JsonPromptProtocol::new(repl_capabilities(Some(&focus)));
+        let (events, mut rx) = EventSink::channel();
+        fixture.events = events;
+        let result = run_repl_loop(&mut fixture.context(), &Default::default(), Some(&focus))
+            .await
+            .unwrap()
+            .into_success()
+            .unwrap();
+        assert_eq!(result.value.review_decisions_applied, [7]);
+        assert_eq!(result.value.message.as_deref(), Some("Decision recorded."));
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::TextDelta(text) = event {
+                streamed.push_str(&text);
+            }
+        }
+        assert_eq!(streamed, "Decision recorded.");
+        let load = |id| {
+            ReviewStorage::load_review(fixture.dir.path(), id)
+                .unwrap()
+                .unwrap()
+        };
+        let stored = load("focused");
+        let item = stored.find_item(7).unwrap();
+        assert_eq!(item.status, IssueStatus::Rejected);
+        assert_eq!(item.resolution_notes.as_deref(), Some("Already verified"));
+        assert_eq!(item.recommendations, ["Add coverage"]);
+        assert_eq!(
+            load("other").find_item(7).unwrap().status,
+            IssueStatus::Discussion
+        );
     }
 
     #[tokio::test]

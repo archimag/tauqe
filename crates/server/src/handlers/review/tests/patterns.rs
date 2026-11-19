@@ -128,7 +128,7 @@ async fn state_with_events(
     let (out, events) = OutChannel::new();
     let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), history_sender, out);
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     (state, events)
 }
 

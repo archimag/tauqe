@@ -21,7 +21,7 @@ pub enum ReviewStreamError {
     Provider(String),
 }
 
-pub(crate) struct ReviewStream<T> {
+pub struct ReviewStream<T> {
     filter: JsonFieldStreamFilter<T>,
     failure: Option<String>,
     cancelled: bool,
@@ -39,7 +39,7 @@ impl<T: DeserializeOwned> Default for ReviewStream<T> {
 
 impl<T: DeserializeOwned> ReviewStream<T> {
     /// The caller paces the raw event before any state transition or publication.
-    pub(crate) fn observe(&mut self, event: StreamEvent) -> ReviewStreamUpdate {
+    pub fn observe(&mut self, event: StreamEvent) -> ReviewStreamUpdate {
         match event {
             StreamEvent::ReasoningDelta(delta) => ReviewStreamUpdate::Reasoning(delta),
             StreamEvent::TextDelta(chunk) => self
@@ -66,10 +66,7 @@ impl<T: DeserializeOwned> ReviewStream<T> {
     }
 
     /// After accounting, cancellation wins over provider errors and decoding.
-    pub(crate) fn finish(
-        self,
-        cancelled: bool,
-    ) -> Result<JsonFieldStreamFilter<T>, ReviewStreamError> {
+    pub fn finish(self, cancelled: bool) -> Result<JsonFieldStreamFilter<T>, ReviewStreamError> {
         if cancelled || self.cancelled {
             return Err(ReviewStreamError::Cancelled);
         }

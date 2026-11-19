@@ -4,15 +4,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use super::operation::{
+use super::operation::{
     normalize_repo_path, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
     EditOperation, EditOverwrite, EditReplace,
 };
 use crate::edits::EditFileOp;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditProposal {
-    pub summary: String,
-    pub edits: Vec<EditOperation>,
+    pub(crate) summary: String,
+    pub(crate) edits: Vec<EditOperation>,
 }
 
 /// One entry of a change set: its operation, its target, and its payload.
@@ -40,10 +40,10 @@ pub struct StructuredChangeProposal {
     /// Replacement text (for 'replace' under search/replace, empty string otherwise).
     #[serde(default, deserialize_with = "super::deserialize_null_as_default")]
     pub new_text: String,
-    /// Opaque anchor of the first replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).
+    /// Opaque anchor of the first replaced line, copied verbatim from the current file version (required for 'replace' under line-anchor, empty string otherwise).
     #[serde(default, deserialize_with = "super::deserialize_null_as_default")]
     pub start: String,
-    /// Opaque anchor of the last replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).
+    /// Opaque anchor of the last replaced line, copied verbatim from the current file version (required for 'replace' under line-anchor, empty string otherwise).
     #[serde(default, deserialize_with = "super::deserialize_null_as_default")]
     pub end: String,
     /// Replacement range text for 'replace' (line-anchor) or complete file content for 'create' and 'overwrite' (empty string otherwise).
@@ -81,11 +81,11 @@ impl schemars::JsonSchema for StructuredChangeProposal {
             ),
             (
                 "start",
-                "Opaque anchor of the first replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).",
+                "Opaque anchor of the first replaced line, copied verbatim from the current file version (required for 'replace' under line-anchor, empty string otherwise).",
             ),
             (
                 "end",
-                "Opaque anchor of the last replaced line, copied verbatim from <context> (required for 'replace' under line-anchor, empty string otherwise).",
+                "Opaque anchor of the last replaced line, copied verbatim from the current file version (required for 'replace' under line-anchor, empty string otherwise).",
             ),
             (
                 "content",
@@ -162,7 +162,7 @@ impl StructuredChangeProposal {
     /// An empty or whitespace-only `op` defaults to [`EditFileOp::Replace`],
     /// while an unrecognized spelling is rejected with the parser's own
     /// diagnostic naming the declared spelling.
-    pub fn parsed_op(&self) -> Result<EditFileOp, String> {
+    pub(crate) fn parsed_op(&self) -> Result<EditFileOp, String> {
         match self.op.trim() {
             "" => Ok(EditFileOp::Replace),
             declared => declared.parse::<EditFileOp>(),
@@ -184,7 +184,7 @@ impl StructuredChangeProposal {
     /// The rejection is rendered as text here. A caller that must explain it in
     /// the vocabulary of the active patch strategy calls
     /// [`Self::to_edit_operation_typed`] instead.
-    pub fn to_edit_operation(&self) -> Result<EditOperation, String> {
+    pub(crate) fn to_edit_operation(&self) -> Result<EditOperation, String> {
         self.to_edit_operation_typed()
             .map_err(|error| error.to_string())
     }
@@ -208,7 +208,7 @@ impl StructuredChangeProposal {
     /// An entry that declared an operation the shared parser rejected is
     /// rejected first, with that parser's own diagnostic naming the declared
     /// spelling.
-    pub fn to_edit_operation_typed(&self) -> Result<EditOperation, ChangeConversionError> {
+    pub(crate) fn to_edit_operation_typed(&self) -> Result<EditOperation, ChangeConversionError> {
         let op = self.parsed_op().map_err(ChangeConversionError::Other)?;
         let path = normalize_repo_path(&self.path).map_err(ChangeConversionError::Other)?;
         let start = self.start.trim();

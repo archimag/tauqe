@@ -60,7 +60,7 @@ impl ReviewStorage {
     }
 
     /// Updates status of a review item within the explicitly named review session.
-    pub(crate) fn update_session_item_status(
+    pub fn update_session_item_status(
         repo_root: &Path,
         review_id: &str,
         item_id: u32,
@@ -86,22 +86,7 @@ impl ReviewStorage {
         decision: &ReviewUpdateProposal,
     ) -> Result<Option<ReviewIssue>> {
         Self::update_session_item(repo_root, review_id, decision.item_id, |issue| {
-            issue.status = decision.status.into();
-            let note = decision.note.trim();
-            if !note.is_empty() {
-                issue.note = Some(note.to_string());
-            }
-            for recommendation in &decision.recommendations {
-                let trimmed = recommendation.trim();
-                if !trimmed.is_empty()
-                    && !issue
-                        .recommendations
-                        .iter()
-                        .any(|existing| existing == trimmed)
-                {
-                    issue.recommendations.push(trimmed.to_string());
-                }
-            }
+            issue.apply_decision(decision);
         })
     }
 }

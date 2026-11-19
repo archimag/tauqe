@@ -365,3 +365,11 @@ root, separator, and wildcard semantics pinned by the matcher tests. Its pure
 inputs/results must remain independent of engine, transport, and filesystem I/O.
 TUI may depend on tools for utilities while durable operations remain driven by
 core application scenarios.
+
+## Codex Patch Strategy
+
+`apply_patch` is the default edit strategy. A patch starts with `*** Begin Patch`
+and ends with `*** End Patch`. It supports Add File, Update File with context
+hunks and optional Move to, and Delete File. The substrate stages the entire
+document in memory under the same repository admission checks as other edits.
+It returns an updated virtual state only when every section succeeds.

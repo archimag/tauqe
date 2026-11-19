@@ -1,22 +1,21 @@
 //! Plan document RPC adaptation; selection and mutation rules belong to core.
-use super::common::{emit, publish_plan_list};
 use crate::contracts::Project;
+use crate::publication::Publisher;
 use crate::state::AppState;
 use std::sync::Arc;
 #[cfg(test)]
-#[cfg(test)]
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    errors, events, PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams,
-    PlanGetParams, PlanGetResult, PlanListResult, PlanSaveParams, PlanSetActiveParams,
-    PlanUpdateItemParams, PlanUpdatedEvent, Request, Response,
+    errors, PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams, PlanGetParams,
+    PlanGetResult, PlanListResult, PlanSaveParams, PlanSetActiveParams, PlanUpdateItemParams,
+    Request, Response,
 };
 fn document_error(
     id: tauqe_protocol::RequestId,
     fallback: &str,
-    error: tauqe_core::api::DocumentError,
+    error: tauqe_flow::api::DocumentError,
 ) -> Response {
-    use tauqe_core::api::DocumentError;
+    use tauqe_flow::api::DocumentError;
     let code = match &error {
         DocumentError::InvalidPlanId => errors::INVALID_PLAN_ID,
         DocumentError::InvalidPlanTree(_) => errors::INVALID_PLAN_TREE,
@@ -27,8 +26,7 @@ fn document_error(
     Response::err(id, code, error.to_string())
 }
 pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
-    let root = state.repo_root().await;
-    match state.application.documents_at(&root).plan_list().await {
+    match state.application.list_plans().await {
         Ok((plans, active_id)) => Response::ok_typed(
             req.id,
             &PlanListResult {
@@ -48,8 +46,7 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
     let target_id = match req.params {
         None => None,
         Some(payload) => match serde_json::from_value::<PlanGetParams>(payload) {
-            Ok(params) if !params.id.trim().is_empty() => Some(params.id),
-            Ok(_) => None,
+            Ok(params) => Some(params.id),
             Err(err) => {
                 return Response::err(
                     req.id,
@@ -60,13 +57,7 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
         },
     };
 
-    let root = state.repo_root().await;
-    match state
-        .application
-        .documents_at(&root)
-        .resolve_plan(target_id)
-        .await
-    {
+    match state.application.get_plan(target_id).await {
         Ok(plan) => Response::ok_typed(
             req.id,
             &PlanGetResult {
@@ -77,14 +68,6 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
     }
 }
 pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot save a plan while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: PlanSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
@@ -96,37 +79,19 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    let root = state.repo_root().await;
-    let plan = match state
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
+    if let Err(error) = state
         .application
-        .documents_at(&root)
-        .save_plan(params.plan.project())
+        .save_plan(params.plan.project(), &observer)
         .await
     {
-        Ok(plan) => plan,
-        Err(error) => return document_error(req.id, errors::PLAN_SAVE_FAILED, error),
-    };
-    emit(
-        &state.out,
-        events::PLAN_UPDATED,
-        serde_json::to_value(PlanUpdatedEvent {
-            plan: plan.project(),
-            is_save: true,
-        })
-        .ok(),
-    );
-    publish_plan_list(state, &root).await;
+        return document_error(req.id, errors::PLAN_SAVE_FAILED, error);
+    }
     Response::ok(req.id, serde_json::json!({"saved":true}))
 }
 pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot update a plan item while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: PlanUpdateItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
     {
         Some(p) => p,
@@ -139,30 +104,20 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
         }
     };
 
-    let root = state.repo_root().await;
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
     match state
         .application
-        .documents_at(&root)
         .update_plan_item(
             &params.plan_id,
             &params.item_id,
             params.status.map(Project::project),
+            &observer,
         )
         .await
     {
-        Ok(Some(plan)) => {
-            emit(
-                &state.out,
-                events::PLAN_UPDATED,
-                serde_json::to_value(PlanUpdatedEvent {
-                    plan: plan.clone().project(),
-                    is_save: false,
-                })
-                .ok(),
-            );
-            publish_plan_list(state, &root).await;
-            Response::ok(req.id, serde_json::json!({"plan":plan.project()}))
-        }
+        Ok(Some(plan)) => Response::ok(req.id, serde_json::json!({"plan":plan.project()})),
         Ok(None) => Response::err(
             req.id,
             errors::NOT_FOUND,
@@ -175,14 +130,6 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
     }
 }
 pub async fn handle_plan_clear_horizon(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot clear a plan horizon while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: PlanClearHorizonParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -195,31 +142,20 @@ pub async fn handle_plan_clear_horizon(req: Request, state: &Arc<AppState>) -> R
             }
         };
 
-    let root = state.repo_root().await;
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
     match state
         .application
-        .documents_at(&root)
-        .clear_plan_horizon(&params.plan_id)
+        .clear_plan_horizon(&params.plan_id, &observer)
         .await
     {
-        Ok(Some(plan)) => {
-            emit(
-                &state.out,
-                events::PLAN_UPDATED,
-                serde_json::to_value(PlanUpdatedEvent {
-                    plan: plan.clone().project(),
-                    is_save: false,
-                })
-                .ok(),
-            );
-            publish_plan_list(state, &root).await;
-            Response::ok_typed(
-                req.id,
-                &PlanClearHorizonResult {
-                    plan: plan.project(),
-                },
-            )
-        }
+        Ok(Some(plan)) => Response::ok_typed(
+            req.id,
+            &PlanClearHorizonResult {
+                plan: plan.project(),
+            },
+        ),
         Ok(None) => Response::err(
             req.id,
             errors::NOT_FOUND,
@@ -229,47 +165,20 @@ pub async fn handle_plan_clear_horizon(req: Request, state: &Arc<AppState>) -> R
     }
 }
 pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot delete a plan while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     let params: PlanDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID"),
     };
 
-    let root = state.repo_root().await;
-    match state
-        .application
-        .documents_at(&root)
-        .delete_plan(&params.id)
-        .await
-    {
-        Ok(outcome) => {
-            if let Some(update) = outcome.focus_update {
-                state.publish_focus_update(update);
-            }
-            if outcome.deleted {
-                publish_plan_list(state, &root).await;
-            }
-            Response::ok(req.id, serde_json::json!({"deleted":outcome.deleted}))
-        }
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
+    match state.application.delete_plan(&params.id, &observer).await {
+        Ok(deleted) => Response::ok(req.id, serde_json::json!({"deleted": deleted})),
         Err(error) => document_error(req.id, errors::PLAN_DELETE_FAILED, error),
     }
 }
 pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot change the active plan while a model operation is in progress",
-    ) {
-        return resp;
-    }
-
     // A present payload must parse cleanly: a silent fallback to the default would
     // clear the active plan when the payload is malformed.
     let params: PlanSetActiveParams = match req.params {
@@ -286,26 +195,15 @@ pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Resp
         None => PlanSetActiveParams::default(),
     };
 
-    let root = state.repo_root().await;
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
     if let Err(error) = state
         .application
-        .documents_at(&root)
-        .set_active_plan(params.id.clone())
+        .set_active_plan(params.id.clone(), &observer)
         .await
     {
         return document_error(req.id, errors::PLAN_SET_ACTIVE_FAILED, error);
-    }
-    // Publish the explicitly requested marker, retaining its wire spelling.
-    if let Ok(plans) = state.application.documents_at(&root).plans().await {
-        emit(
-            &state.out,
-            events::PLAN_LIST_CHANGED,
-            serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
-                plans: plans.into_iter().map(Project::project).collect(),
-                active_id: params.id.clone(),
-            })
-            .ok(),
-        );
     }
     Response::ok(req.id, serde_json::json!({"active_id":params.id}))
 }

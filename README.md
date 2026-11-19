@@ -83,6 +83,20 @@ just dev
 
 On first launch, an interactive onboarding wizard automatically checks your Git repository, configures toolchains in `tauqe.toml`, and saves credentials securely.
 
+### Model providers
+
+Configure OpenRouter models in `[providers.openrouter]` or use a ChatGPT plan with `[providers.openai]`. On the first action that needs an OpenAI model, choose **Continue with ChatGPT** and complete authorization in your browser. TAUQE resumes the waiting request and saves the session in the user-level `credentials.toml` or the file selected by `--credentials`. To sign out, open usage statistics (Alt+U) and press Shift+L.
+
+Replace `MODEL_ID` with a model available on your ChatGPT plan.
+
+```toml
+[providers.openai]
+models = [{ model = "MODEL_ID", alias = "chatgpt" }]
+
+[models]
+repl = ["chatgpt"]
+```
+
 ### Workspace Navigation
 
 | Shortcut | View | Description |
@@ -113,7 +127,6 @@ The simplest way, however, is to **ask TAUQE directly** in the interactive envir
 
 ## Current Limitations
 
-- **Provider Support:** Currently, only [OpenRouter](https://openrouter.ai/) is supported as the LLM provider.
 - **Tested Models:** Models that have been actively tested and verified in real workflows are documented directly in the project configuration file (`tauqe.toml`).
 - **Terminal Compatibility:** The interactive client has been tested and verified specifically with [kitty](https://sw.kovidgoyal.net/kitty/).
 

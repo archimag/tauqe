@@ -98,7 +98,7 @@ impl ReviewStorage {
     ///
     /// Returns `None` when the named session does not exist or declares no group
     /// with that identifier.
-    pub(crate) fn update_group_subplan(
+    pub fn update_group_subplan(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,

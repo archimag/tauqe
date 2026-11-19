@@ -21,7 +21,8 @@ use crate::control::context::LoopContext;
 use crate::control::outcome::{
     FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError,
 };
-use crate::control::turn::{run_turn_loop, turn_capability_expr, TurnLoopConfig};
+use crate::control::step::run_step_turn;
+use crate::control::turn::{turn_capability_expr, TurnLoopConfig};
 use crate::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 #[cfg(test)]
 use crate::plan::storage::PlanStorage;
@@ -93,7 +94,7 @@ pub struct PlanStepLoopConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanStepArtifact {
     /// Identifier of the step that succeeded.
-    pub(crate) step_id: String,
+    pub step_id: String,
     /// Commit hash produced by the step, when its turn made one.
     pub commit: Option<String>,
     /// Repository-relative paths the step modified.
@@ -123,9 +124,9 @@ async fn run_plan_step_loop(
 /// The bounded turn, the coder ladder, and the lifecycle rules are identical for
 /// every horizon of steps, so the persistence adapter owns loading and writing
 /// while this loop stays the one implementation of the lifecycle.
-pub(crate) async fn run_plan_step_loop_with<P: StepPersistence>(
+pub(crate) async fn run_plan_step_loop_with(
     ctx: &mut LoopContext<'_>,
-    persistence: &P,
+    persistence: &dyn StepPersistence,
     step_id: &str,
     config: &PlanStepLoopConfig,
 ) -> Result<LoopResult<PlanStepArtifact>, SystemError> {
@@ -229,7 +230,7 @@ pub(crate) async fn run_plan_step_loop_with<P: StepPersistence>(
         let turn_result = {
             let turn_caps = turn_capability_expr();
             let mut turn_ctx = ctx.reborrow_with_capabilities(turn_caps);
-            run_turn_loop(&mut turn_ctx, None, &config.turn).await?
+            run_step_turn(&mut turn_ctx, &config.turn).await?
         };
 
         let escalation_trigger: Option<String> = match turn_result {
@@ -514,9 +515,9 @@ fn prepare_context(ctx: &mut LoopContext<'_>, leaf: &PlanItem) -> Result<(), Sys
 /// for a local plan and for a review group horizon: entering `Blocked` stores the
 /// reported diagnosis, leaving it drops the stale report, and a commit travels
 /// only with the transition that finished the step.
-fn transition<P: StepPersistence>(
+fn transition(
     repo_root: &Path,
-    persistence: &P,
+    persistence: &dyn StepPersistence,
     plan: &mut Plan,
     step_id: &str,
     status: PlanItemStatus,
@@ -680,14 +681,12 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::llm::CapabilityTree;
-    use crate::models::ModelRef;
-    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
-
     use crate::context::ContextManager;
     use crate::control::context::{CancellationToken, EventSink, LoopContext};
     use crate::control::prompt::PromptBuilder;
     use crate::control::turn::TurnLoopConfig;
+    use crate::models::ModelRef;
+    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
@@ -729,7 +728,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(turn_capability_expr()),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -738,9 +737,10 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
+            let caps = turn_capability_expr();
             let prompt_builder =
-                PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
+                PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache)
+                    .with_patch_strategy(crate::workflow::PatchStrategy::LineAnchor);
             LoopContext::new(
                 &self.cancel,
                 &self.events,

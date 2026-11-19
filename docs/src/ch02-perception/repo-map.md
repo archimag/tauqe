@@ -97,13 +97,11 @@ parsed:
 
 1. Read the tracked file list.
 2. Classify every path with `lstat`.
-3. Drop every file already present in the active context: those files travel
-   verbatim, so repeating their symbols would duplicate tokens.
-4. Send regular files of supported languages to the Tree-sitter extractor.
-5. Keep every remaining regular file as a plain path entry, so unsupported
+3. Send regular files of supported languages to the Tree-sitter extractor.
+4. Keep every remaining regular file as a plain path entry, so unsupported
    languages and data files still appear in the outline.
-6. Sort and deduplicate the tracked entries.
-7. Format symbols and plain paths within the token budget.
+5. Sort and deduplicate the tracked entries.
+6. Format symbols and plain paths within the token budget.
 The pipeline is deterministic substrate: it lives in `crates/tools/src/repomap.rs`
 and is rendered into the prompt by the engine, which never derives a symbol on
 its own.
@@ -168,10 +166,11 @@ reads code contours or folder layout, never both.
 
 ### 3.6 Stability across a turn
 
-The eager map is generated once for a turn and frozen. Regenerating it after
-research would drop the files research just added and rewrite thousands of
-cached prompt tokens, so the map is part of the stable prefix. Targeted outlines
-requested during research are round feedback, not a new map.
+The eager map is generated once for a turn and frozen, even if files change
+while the turn runs. It does not use the active context to select files, so
+adding files to context cannot change the map within or between turns. A later
+turn can reflect repository changes that affect the rendered outline. Targeted
+outlines requested during research are round feedback, not a new map.
 
 ---
 
@@ -196,8 +195,7 @@ requested during research are round feedback, not a new map.
 
 ## 5. Related Chapters
 
-- [The Context Model](context-model.md) — the working set the map
-  complements and the context files the map excludes.
+- [The Context Model](context-model.md) — the working set the map complements.
 - [Research Engine](research-engine.md) — where targeted outlines are requested
   and bounded.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) —

@@ -1,13 +1,17 @@
 //! Usage RPC publication and adapters for core-owned accounting.
 
+#[cfg(test)]
 use crate::state::AppState;
 use crate::transport::OutChannel;
+#[cfg(test)]
 use std::sync::Arc;
-pub use tauqe_core::api::UsageGuard;
-use tauqe_core::api::{UsageTotals, UsageTotalsSnapshot};
+#[cfg(test)]
+pub use tauqe_flow::api::UsageGuard;
+use tauqe_flow::api::{UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::model::ModelUsageTotalsEvent;
 use tauqe_protocol::{events, Event};
 
+#[cfg(test)]
 fn publisher(out: OutChannel) -> impl Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static {
     move |operation_id, snapshot| publish_snapshot(&out, operation_id, snapshot)
 }
@@ -49,7 +53,7 @@ pub(crate) fn wire_snapshot(snapshot: &UsageTotalsSnapshot) -> tauqe_protocol::U
 
 /// Projects provider metrics without replacing unknown values with zeros.
 pub(crate) fn wire_usage(
-    usage: &tauqe_core::providers::ModelUsageInfo,
+    usage: &tauqe_flow::api::types::ModelUsageInfo,
 ) -> tauqe_protocol::ModelUsageInfo {
     tauqe_protocol::ModelUsageInfo {
         prompt_tokens: usage.prompt_tokens,
@@ -59,6 +63,20 @@ pub(crate) fn wire_usage(
         cached_tokens: usage.cached_tokens,
         cost: usage.cost,
     }
+}
+
+pub(crate) fn publish_legacy_usage(out: &OutChannel, op_id: &str, snapshot: &UsageTotalsSnapshot) {
+    let totals = snapshot.operation_totals();
+    out.send_event(&Event {
+        method: events::MODEL_USAGE.to_string(),
+        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+            operation_id: op_id.to_string(),
+            usage: wire_usage(&totals.to_usage_info()),
+            session_total_cost: snapshot.session.cost,
+            current_cost: Some(totals.cost),
+        })
+        .ok(),
+    });
 }
 
 fn wire_totals(totals: &UsageTotals) -> tauqe_protocol::UsageTotals {
@@ -73,10 +91,11 @@ fn wire_totals(totals: &UsageTotals) -> tauqe_protocol::UsageTotals {
     }
 }
 
+#[cfg(test)]
 impl AppState {
     pub async fn begin_usage(self: &Arc<Self>, operation_id: &str) -> UsageGuard {
         self.application
-            .begin_usage(operation_id, publisher(self.out.clone()))
+            .test_begin_usage(operation_id, publisher(self.out.clone()))
             .await
     }
 
@@ -93,14 +112,17 @@ impl AppState {
 
     pub async fn reset_lifetime_usage(self: &Arc<Self>) -> UsageTotalsSnapshot {
         self.application
-            .reset_lifetime_usage(publisher(self.out.clone()))
+            .reset_project_usage(Arc::new(crate::publication::Publisher {
+                out: self.out.clone(),
+            }))
             .await
+            .unwrap()
     }
 
     #[cfg(test)]
     pub async fn reload_usage_lifetime(self: &Arc<Self>) {
         self.application
-            .reload_usage_lifetime(publisher(self.out.clone()))
+            .test_reload_usage_lifetime(publisher(self.out.clone()))
             .await;
     }
 }

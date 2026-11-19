@@ -13,6 +13,8 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 2. **Footer is for Indicators:**
    - The bottom footer is reserved conceptually for operational telemetry, indicators, and status feedback.
    - Navigation controls and interactive workflow triggers belong in the header or dedicated view panes, not in the footer.
+   - Show the engine's declared current action, not a fixed sequence of past or future phases. A new admitted request replaces deterministic activity and may carry a localized, typed reason. Use model status when no deterministic action is declared. The next deterministic activity replaces the request reason without changing the round counter.
+   - The overall turn round counts admitted provider calls. Legacy phase-event counters can describe local attempts and must not populate overall turn progress.
 
 ---
 

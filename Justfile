@@ -2,7 +2,7 @@ default: dev
 
 dev *args="":
     cargo build --release -p tauqe-server
-    cargo run --release -p tauqe-tui -- {{args}}
+    TAUQE_DEV_OPENAI_CACHE=1 cargo run --release -p tauqe-tui -- {{args}}
 
 install:
     cargo install --path crates/server --locked
@@ -37,15 +37,10 @@ loc-no-tests:
     (cd "$tmp" && tokei crates)
 
 [group('tauqe')]
-[doc('Verify the change set: compilation, lints, tests, and markdown hygiene')]
+[doc('Verify the change set with Clippy, tests, and doctests')]
 [metadata('timeout', '1200')]
 verify:
     rust-script scripts/verify.rs
-
-verify-cargo *args="--workspace":
-    cargo check {{args}} --all-targets
-    cargo clippy {{args}} --all-targets -- -D warnings
-    cargo test {{args}}
 
 [group('tauqe')]
 [doc('Rewrite source read from stdin onto stdout')]
@@ -63,8 +58,20 @@ check *args="--workspace":
 [doc('Run the workspace test suite')]
 [metadata('timeout', '900')]
 test *args="--workspace":
+    just test-binaries {{args}}
+    just test-doc
+
+[group('tauqe')]
+[doc('Run a short OpenAI cache probe using two identical ChatGPT plan requests')]
+[metadata('timeout', '600')]
+openai-cache-probe:
+    cargo test -p tauqe-core --lib providers::openai::cache_live_probe::openai_cache_probe -- --exact --ignored --nocapture
+
+test-binaries *args="--workspace":
     cargo nextest run {{args}} --no-fail-fast --retries 0
-    cargo test --doc -p tauqe-core -p tauqe-protocol -p tauqe-tools
+
+test-doc *args="-p tauqe-flow -p tauqe-core -p tauqe-protocol -p tauqe-tools":
+    cargo test --doc {{args}}
 
 [group('tauqe')]
 [doc('Lint every workspace target, denying warnings')]

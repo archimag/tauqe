@@ -1,7 +1,7 @@
 pub mod capture;
 pub mod modals;
 
-pub use modals::{ActiveModal, ModalState};
+pub use modals::{ActiveModal, ChatGptDialog, ModalState};
 
 use ratatui::layout::Rect;
 use tauqe_protocol::{
@@ -1728,6 +1728,7 @@ pub struct OnboardingState {
     pub config_path: Option<String>,
     pub default_config_path: String,
     pub has_api_key: bool,
+    pub uses_chatgpt: bool,
     pub credentials_path: Option<String>,
     pub default_credentials_path: String,
     pub has_tui_config: bool,
@@ -1791,6 +1792,7 @@ impl Default for OnboardingState {
             config_skipped: false,
             config_path: None,
             default_config_path: "tauqe.toml".to_string(),
+            uses_chatgpt: false,
             has_api_key: false,
             credentials_path: None,
             default_credentials_path: "~/.config/tauqe/credentials.toml".to_string(),
@@ -1818,6 +1820,10 @@ impl OnboardingState {
     /// Workstation step. Optional phases the developer deliberately dismissed
     /// are recorded via `config_skipped` / `workstation_skipped`, so the flow
     /// never loops back to a phase the developer already left.
+    pub fn needs_api_key(&self) -> bool {
+        !self.uses_chatgpt && !self.has_api_key
+    }
+
     pub fn next_step(&self) -> OnboardingStep {
         if !self.has_git {
             return OnboardingStep::Git;
@@ -1825,7 +1831,7 @@ impl OnboardingState {
         if !self.has_config && !self.config_skipped {
             return OnboardingStep::Config;
         }
-        if !self.has_api_key {
+        if self.needs_api_key() {
             return OnboardingStep::Credentials;
         }
         if !self.has_tui_config && !self.workstation_skipped {
@@ -1862,6 +1868,7 @@ impl OnboardingState {
         self.has_git = status.has_git;
         self.has_config = status.has_config;
         self.has_api_key = status.has_api_key;
+        self.uses_chatgpt = status.model.provider == tauqe_protocol::model::ProviderKind::OpenAI;
         self.default_config_path = status.default_config_path.clone();
         self.default_credentials_path = status.default_credentials_path.clone();
         if status.config_path.is_some() {
@@ -2019,6 +2026,7 @@ pub struct AppState {
     /// new dialog extends one subsystem instead of scattering a field across
     /// several files (Conventions §7).
     pub modals: ModalState,
+    pub prefer_usage_tokens: bool,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
     pub server_log_path: std::path::PathBuf,
@@ -2094,6 +2102,7 @@ impl AppState {
             input_editor: init.input_editor,
             tui_config: init.tui_config,
             modals: ModalState::default(),
+            prefer_usage_tokens: false,
             notification: None,
             turn_started_at: None,
             server_log_path: init.server_log_path,
@@ -2302,6 +2311,7 @@ impl AppState {
     /// order of the variant alone decides which open surface wins (c-1).
     fn modal_is_open(&self, modal: ActiveModal) -> bool {
         match modal {
+            ActiveModal::ChatGptSignIn => self.modals.chatgpt.is_some(),
             ActiveModal::ServerDisconnected => self.modals.server_disconnected.is_some(),
             ActiveModal::Squash => self.modals.squash_dialog.is_some(),
             ActiveModal::ReviewTruncation => self.modals.confirm_review_truncation.is_some(),

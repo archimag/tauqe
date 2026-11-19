@@ -6,15 +6,15 @@
 //! once here so every subsystem emits events and mutates context through a
 //! single code path.
 
-use crate::contracts::Project;
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::state::AppState;
 use crate::transport::OutChannel;
-use tauqe_core::providers::StreamEvent;
-use tauqe_protocol::{events, Event, ModelEscalatedEvent};
-use tokio::sync::mpsc;
+use tauqe_protocol::{events, Event};
 
 /// Emits a server event with an optional serialized parameter payload.
 pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -56,64 +56,18 @@ pub(crate) fn withdraw_streamed_attempt(
         .ok(),
     );
 }
-/// Relays the coder promotions a batch raises to the client.
-/// Relays the coder promotions a batch raises to the client.
-///
-/// The batch channel carries the telemetry the implementation machinery raises
-/// while it executes a horizon, and the coordinate a client renders is the
-/// promotion of a coder rung. The relay drains that channel for the whole run
-/// and translates every promotion into the `model/escalated` event the
-/// interface already reads, so an intra-role promotion becomes as visible as
-/// the Architect contour reports its own. Every other coordinate is absorbed
-/// here: step telemetry reaches the client through the turn's own sink, and
-/// the channel exists so the executor never parks on a full queue.
-///
-/// The returned task settles once every sender is gone, so a supervisor drops
-/// its own sender and joins it to publish the last promotion before the
-/// terminal batch report leaves.
-pub(crate) fn spawn_escalation_relay(
-    out: OutChannel,
-    operation_id: String,
-    mut events_rx: mpsc::Receiver<StreamEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(event) = events_rx.recv().await {
-            if let StreamEvent::TierEscalated {
-                tier,
-                model,
-                role,
-                effort,
-            } = event
-            {
-                emit(
-                    &out,
-                    events::MODEL_ESCALATED,
-                    serde_json::to_value(ModelEscalatedEvent {
-                        operation_id: operation_id.clone(),
-                        model: model.project(),
-                        role: Some(role.project()),
-                        alias: None,
-                        effort: effort.map(crate::contracts::Project::project),
-                        tier,
-                    })
-                    .ok(),
-                );
-            }
-        }
-    })
-}
-
 /// Publishes each context snapshot at the boundary selected by core preparation.
+#[cfg(test)]
 pub(crate) async fn prepare_implementation_step(
     state: &Arc<AppState>,
-    operation: &tauqe_core::api::OperationGuard,
+    operation: &tauqe_flow::api::OperationGuard,
     root: &Path,
     config: &tauqe_core::config::AppConfig,
     request: &tauqe_core::workflow::implementation::StepTurnRequest,
-) -> Result<String, tauqe_core::api::StepPreparationError> {
+) -> Result<String, tauqe_flow::api::StepPreparationError> {
     state
         .application
-        .prepare_implementation_step(operation, root, config, request, |snapshot| {
+        .test_prepare_implementation_step(operation, root, config, request, |snapshot| {
             crate::handlers::context::publish_context(&state.out, &snapshot);
         })
         .await
@@ -229,7 +183,7 @@ mod tests {
         );
         tauqe_core::plan::storage::PlanStorage::save_plan(&root, &plan).unwrap();
         let (out, mut receiver) = OutChannel::new();
-        let (history, _) = mpsc::unbounded_channel();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(
             tauqe_core::config::AppConfig::default(),
             root.clone(),
@@ -237,7 +191,7 @@ mod tests {
             out,
         );
         let (_, cancel) = watch::channel(false);
-        let operation = state.application.try_begin_operation().unwrap();
+        let operation = state.application.test_begin_operation().unwrap();
         let request = tauqe_core::workflow::implementation::StepTurnRequest {
             scope,
             title: "Preload".into(),
@@ -304,47 +258,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&second);
     }
 
-    /// The relay is the single translation seam between the batch channel and
-    /// the wire: a coder promotion becomes `model/escalated` under the
-    /// operation of the batch, every other coordinate is absorbed, and the task
-    /// settles once the channel closes.
-    #[tokio::test]
-    async fn test_escalation_relay_publishes_a_promotion_and_ends_on_close() {
-        let (out, mut rx) = OutChannel::new();
-        let (stream_tx, stream_rx) = mpsc::channel(8);
-        let relay = spawn_escalation_relay(out, "op-batch".to_string(), stream_rx);
+    #[test]
+    fn coder_promotion_preserves_the_batch_id_on_the_wire() {
+        use tauqe_core::providers::StreamEvent;
+        use tauqe_flow::api::{ApplicationEvent, ApplicationObserver};
 
-        stream_tx
-            .send(StreamEvent::TextDelta("absorbed".to_string()))
-            .await
-            .expect("the relay is listening");
-        stream_tx
-            .send(StreamEvent::TierEscalated {
+        let (out, mut rx) = OutChannel::new();
+        crate::publication::Publisher { out }.publish(
+            "op-batch",
+            ApplicationEvent::Stream(StreamEvent::TierEscalated {
                 tier: 2,
                 model: tauqe_core::models::ModelRef::openrouter("shared/model"),
                 role: tauqe_core::models::ModelRole::Coder,
                 effort: Some(tauqe_core::models::ReasoningEffort::High),
-            })
-            .await
-            .expect("the relay is listening");
-        drop(stream_tx);
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
-            .await
-            .expect("the relay settles once the channel closes")
-            .expect("the relay task joins");
-
-        let mut published = Vec::new();
-        while let Ok(line) = rx.try_recv() {
-            published.push(line);
-        }
-        assert_eq!(
-            published.len(),
-            1,
-            "only the promotion reaches the client: {published:?}"
+            }),
         );
-        let event: serde_json::Value =
-            serde_json::from_str(&published[0]).expect("the event is valid JSON");
+        let event: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(event["method"], events::MODEL_ESCALATED);
         assert_eq!(event["params"]["operation_id"], "op-batch");
         assert_eq!(event["params"]["tier"], 2);

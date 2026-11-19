@@ -1,7 +1,12 @@
 //! Client-side plan lookup, summary, and validation.
+#[cfg(test)]
 use super::implementation::id_key;
+#[cfg(test)]
 use super::PlanImplementationProjection;
-use std::{collections::HashSet, fmt};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::fmt;
+#[cfg(test)]
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanSummary};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanValidationError {
@@ -70,13 +75,15 @@ impl fmt::Display for PlanValidationError {
 }
 
 impl std::error::Error for PlanValidationError {}
-pub trait PlanProjection {
+#[cfg(test)]
+pub(crate) trait PlanProjection {
     fn summary(&self) -> PlanSummary;
     fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem>;
     #[cfg(test)]
     fn find_concept_item_mut(&mut self, item_id: &str) -> Option<&mut ConceptItem>;
     fn validate(&self) -> Result<(), Vec<PlanValidationError>>;
 }
+#[cfg(test)]
 impl PlanProjection for Plan {
     fn summary(&self) -> PlanSummary {
         let (total, completed) = self.implementation.count_stats();

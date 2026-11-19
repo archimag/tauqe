@@ -17,7 +17,6 @@ use crate::control::context::LoopContext;
 use crate::control::outcome::{ResponseEnvelope, SystemError};
 use crate::edits::EditFileOp;
 use crate::edits::EditOperation;
-use crate::edits::EditProposal;
 use crate::edits::StagedEditsState;
 use crate::edits::VerificationVerdict;
 use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnapshot};
@@ -25,8 +24,7 @@ use crate::llm::LlmCapability;
 use crate::llm::LlmCommand;
 use crate::providers::StreamEvent;
 use crate::toolchain::{
-    format_staged_content, run_post_hooks_with_config, run_verification_pipeline_with_config,
-    VerificationStatus,
+    run_post_hooks_with_config, run_verification_pipeline_with_config, VerificationStatus,
 };
 use crate::workflow::verification::{build_verification_retry_prompt, extract_error_paths};
 use similar::{ChangeTag, TextDiff};
@@ -190,7 +188,7 @@ pub struct EditState {
     /// Virtual change set the staging attempts converged on.
     staged: StagedEditsState,
     /// Operations that converged, in change-set order.
-    cumulative_edits: Vec<EditOperation>,
+    edit_batches: Vec<Vec<EditOperation>>,
     /// Paths the change set touched so far, in first-touch order.
     pub(crate) modified_paths: Vec<String>,
     /// Working-copy status captured before the first application.
@@ -205,7 +203,7 @@ impl EditState {
         Self {
             project,
             staged: StagedEditsState::default(),
-            cumulative_edits: Vec::new(),
+            edit_batches: Vec::new(),
             modified_paths: Vec::new(),
             initial_worktree,
             attempts: 0,
@@ -215,7 +213,7 @@ impl EditState {
     /// Adopts the virtual change set the staging attempts of the turn converged on.
     pub(crate) fn adopt_staging(&mut self, staging: &StagingState) {
         self.staged = staging.staged_state.clone().unwrap_or_default();
-        self.cumulative_edits = staging.cumulative_edits.clone();
+        self.edit_batches = staging.edit_batches.clone();
     }
 
     /// Records the paths the change set touched, keeping the first-touch order.
@@ -256,27 +254,13 @@ pub(crate) async fn execute_edit_step(
 ) -> Result<EditStepVerdict, SystemError> {
     state.attempts += 1;
 
-    // 1. Format the virtual change set in memory when a formatter is declared.
-    format_staged_files(ctx.repo_root, &state.project, &mut state.staged, ctx.cancel).await;
-
-    // 2. Back up the pre-turn bytes of every touched path, then write the change
-    // set to the working tree so verification runs against real bytes.
     let touched_paths = collect_staged_paths(&state.staged);
     transaction.backup.record_paths(&touched_paths);
 
-    let proposal = EditProposal {
-        summary: format!("edit round {}", state.attempts),
-        edits: state.cumulative_edits.clone(),
-    };
-
+    let batches: Vec<_> = state.edit_batches.iter().map(Vec::as_slice).collect();
     if let Err(err) = ctx
         .policy
-        .apply_temporary(
-            ctx.repo_root,
-            &state.project,
-            ctx.context_manager,
-            &proposal,
-        )
+        .apply_temporary_batches(ctx.repo_root, &state.project, ctx.context_manager, &batches)
         .await
     {
         return Ok(EditStepVerdict::ApplyFailed {
@@ -461,28 +445,6 @@ fn collect_staged_paths(staged: &StagedEditsState) -> Vec<String> {
     paths
 }
 
-async fn format_staged_files(
-    repo_root: &Path,
-    project: &ProjectConfig,
-    staged: &mut StagedEditsState,
-    cancel: &crate::control::context::CancellationToken,
-) {
-    if project.format.is_none() {
-        return;
-    }
-    for bytes in staged.staged_files.values_mut() {
-        if let Ok(content_str) = std::str::from_utf8(bytes) {
-            if let Some(outcome) =
-                format_staged_content(repo_root, content_str, Some(&cancel.receiver())).await
-            {
-                if outcome.formatted {
-                    *bytes = outcome.content.into_bytes();
-                }
-            }
-        }
-    }
-}
-
 fn emit_cumulative_diff(ctx: &LoopContext<'_>, backup: &DiskBackup) {
     let root = ctx.repo_root.to_path_buf();
     let files = backup.files.clone();
@@ -493,9 +455,50 @@ fn emit_cumulative_diff(ctx: &LoopContext<'_>, backup: &DiskBackup) {
     }
 }
 
+/// Shows only changes accepted by atomic patch staging.
+pub(super) fn emit_staged_patch_diff(
+    ctx: &LoopContext<'_>,
+    before: Option<&StagedEditsState>,
+    result: &crate::edits::StageEditsResult,
+) {
+    let events = crate::blocking::run_blocking(|| {
+        let originals = result
+            .successful_paths
+            .iter()
+            .map(|path| {
+                let original = if before.is_some_and(|state| state.deleted_paths.contains(path)) {
+                    None
+                } else {
+                    before
+                        .and_then(|state| state.staged_files.get(path))
+                        .cloned()
+                        .or_else(|| {
+                            crate::context::verify_path_within_repo(ctx.repo_root, path).ok()?;
+                            std::fs::read(ctx.repo_root.join(path)).ok()
+                        })
+                };
+                (path.clone(), original)
+            })
+            .collect();
+        compute_diff_events(&originals, |path| {
+            result.staged_state.staged_files.get(path).cloned()
+        })
+    });
+    for event in events {
+        ctx.events.emit(event);
+    }
+}
+
 fn compute_cumulative_diff_events(
     root: &Path,
     backup_files: &HashMap<String, Option<Vec<u8>>>,
+) -> Vec<StreamEvent> {
+    compute_diff_events(backup_files, |path| std::fs::read(root.join(path)).ok())
+}
+
+fn compute_diff_events(
+    backup_files: &HashMap<String, Option<Vec<u8>>>,
+    current_bytes: impl Fn(&str) -> Option<Vec<u8>>,
 ) -> Vec<StreamEvent> {
     let mut paths: Vec<&String> = backup_files.keys().collect();
     paths.sort();
@@ -509,8 +512,7 @@ fn compute_cumulative_diff_events(
 
     for path in paths {
         let original = backup_files.get(path).and_then(|opt| opt.as_deref());
-        let full_path = root.join(path);
-        let current = std::fs::read(&full_path).ok();
+        let current = current_bytes(path);
 
         if original == current.as_deref() {
             continue;
@@ -672,16 +674,68 @@ fn compute_file_hunks(
     hunks
 }
 
+const MAX_HEALING_OUTPUT_BYTES: usize = 4096;
+const MAX_HEALING_DIAGNOSTIC_BYTES: usize = 768;
+const MAX_HEALING_AUTO_FILES: usize = 4;
+
+/// Limits only the model-facing report, leaving the captured command output intact.
+fn compact_verification_output(result: &crate::toolchain::ToolchainCheckResult) -> String {
+    if result.diagnostics.is_empty() {
+        let output = result.combined_output.trim();
+        if output.len() <= MAX_HEALING_OUTPUT_BYTES {
+            return output.to_string();
+        }
+
+        // Keep startup failures and the final test or linker summary.
+        const MARKER: &str = "\n[... command output omitted ...]\n";
+        let side = (MAX_HEALING_OUTPUT_BYTES - MARKER.len()) / 2;
+        let head = clip_utf8(output, side);
+        let mut tail_start = output.len() - side;
+        while !output.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let tail = &output[tail_start..];
+        return format!("{head}{MARKER}{tail}");
+    }
+
+    let rendered = crate::toolchain::format_diagnostics(&result.diagnostics);
+    let total = rendered.lines().count();
+    let mut report = String::new();
+    const NOTICE_BYTES: usize = 64;
+    for (index, line) in rendered.lines().enumerate() {
+        let clipped = clip_utf8(line, MAX_HEALING_DIAGNOSTIC_BYTES);
+        let suffix = if clipped.len() < line.len() {
+            "…"
+        } else {
+            ""
+        };
+        if report.len() + clipped.len() + suffix.len() + 1 > MAX_HEALING_OUTPUT_BYTES - NOTICE_BYTES
+        {
+            report.push_str(&format!("[{} more diagnostic(s) omitted]", total - index));
+            return report;
+        }
+        report.push_str(clipped);
+        report.push_str(suffix);
+        report.push('\n');
+    }
+    report.pop();
+    report
+}
+
+fn clip_utf8(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn format_verification_failure_report(
     results: &[crate::toolchain::ToolchainCheckResult],
 ) -> String {
     let mut report = String::new();
     for r in results.iter().filter(|r| !r.success) {
-        let body = if r.diagnostics.is_empty() {
-            r.combined_output.trim().to_string()
-        } else {
-            crate::toolchain::format_diagnostics(&r.diagnostics)
-        };
+        let body = compact_verification_output(r);
         report.push_str(&format!(
             "Command `{}` failed:\n```\n{}\n```\n\n",
             r.command, body
@@ -702,6 +756,10 @@ async fn auto_register_error_files(ctx: &mut LoopContext<'_>, report: &str) {
     let added = crate::blocking::run_blocking(|| {
         let mut added = Vec::new();
         for path in error_paths {
+            // The model can request more files if the first diagnostics do not suffice.
+            if added.len() == MAX_HEALING_AUTO_FILES {
+                break;
+            }
             if ctx.context_manager.effective_access_for(&path) != Some(ContextAccess::Editable)
                 && ctx
                     .context_manager
@@ -716,11 +774,6 @@ async fn auto_register_error_files(ctx: &mut LoopContext<'_>, report: &str) {
     if !added.is_empty() {
         ctx.events
             .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
-        // The error files the report named are the hot files of the healing
-        // round: the churn mark stales the rendered prefix, so the reseed the
-        // next round performs renders them with the anchors of the bytes the
-        // model must fix instead of leaving them outside the frozen prefix.
-        ctx.note_context_churn(&added, &[]);
     }
 }
 
@@ -737,6 +790,51 @@ mod tests {
     use crate::prompt::json::JsonPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::research::journal::TurnResearchJournal;
+
+    fn failed_command(output: String) -> crate::toolchain::ToolchainCheckResult {
+        crate::toolchain::ToolchainCheckResult {
+            success: false,
+            is_cancelled: false,
+            command: "just verify".into(),
+            stdout: String::new(),
+            stderr: String::new(),
+            combined_output: output,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn healing_output_retains_the_start_and_failure_tail_of_unparsed_output() {
+        let result = failed_command(format!(
+            "starting tests\n{}\nFAIL tests::roundtrip: values differ",
+            "шум\n".repeat(MAX_HEALING_OUTPUT_BYTES)
+        ));
+        let report = compact_verification_output(&result);
+        assert!(report.len() <= MAX_HEALING_OUTPUT_BYTES);
+        assert!(report.starts_with("starting tests"));
+        assert!(report.ends_with("FAIL tests::roundtrip: values differ"));
+        assert!(report.contains("command output omitted"));
+    }
+
+    #[test]
+    fn healing_output_prioritizes_located_errors_and_bounds_long_diagnostics() {
+        let mut result = failed_command("raw terminal output".into());
+        result.diagnostics = (1..=20)
+            .rev()
+            .map(|line| tauqe_tools::toolchain::Diagnostic {
+                file: Some("src/lib.rs".into()),
+                code: Some("E0308".into()),
+                line: Some(line),
+                message: "несовпадение типов ".repeat(MAX_HEALING_DIAGNOSTIC_BYTES),
+                ..Default::default()
+            })
+            .collect();
+        let report = compact_verification_output(&result);
+        assert!(report.len() <= MAX_HEALING_OUTPUT_BYTES);
+        assert!(report.starts_with("src/lib.rs:1: error[E0308]:"));
+        assert!(report.contains("more diagnostic(s) omitted"));
+        assert!(!report.contains("raw terminal output"));
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -775,7 +873,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(crate::control::turn::turn_capability_expr()),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -869,12 +967,12 @@ mod tests {
             .staged_files
             .insert("a.rs".to_string(), b"fn a() -> i32 { 1 }\n".to_vec());
         state
-            .cumulative_edits
-            .push(EditOperation::Replace(EditReplace {
+            .edit_batches
+            .push(vec![EditOperation::Replace(EditReplace {
                 path: "a.rs".to_string(),
                 old_text: "fn a() {}\n".to_string(),
                 new_text: "fn a() -> i32 { 1 }\n".to_string(),
-            }));
+            })]);
         let mut transaction = TurnTransaction::new(&root);
         let mut ctx = fixture.context();
 

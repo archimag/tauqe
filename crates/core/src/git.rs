@@ -336,7 +336,7 @@ pub mod diff {
 
     pub use tauqe_tools::git::diff::{
         find_last_non_ai_commit, get_commit_diff, get_commits_ahead, get_cumulative_diff,
-        get_cumulative_file_diffs, get_diff, get_diff_stat, CommitSummary,
+        get_cumulative_file_diffs, get_diff, get_diff_stat, CommitSummary, FileDiff,
     };
 
     /// Squashes every commit ahead of `base_ref` into one developer-authored commit.

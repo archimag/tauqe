@@ -48,3 +48,8 @@ source = "https://openrouter.ai/docs/guides/overview/models.md"
 id = "openrouter/models"
 title = "OpenRouter List Models API"
 source = "https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties.md"
+
+[[outer_docs]]
+id = "openai"
+title = "OpenAI Docs"
+source = "https://developers.openai.com/llms.txt"

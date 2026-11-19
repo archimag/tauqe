@@ -9,10 +9,12 @@
 use crate::config::project::ProjectConfig;
 use std::path::Path;
 
+use crate::edits::EditOperation;
+#[cfg(test)]
 use crate::edits::EditProposal;
 
 use super::atomic::commit_staged_edits;
-use super::stage::prepare_staged_edits_with_config;
+use super::stage::prepare_edit_batches;
 use super::EditError;
 use crate::context::ContextManager;
 use crate::mockups::is_mockups_path;
@@ -30,7 +32,7 @@ pub(crate) async fn apply_edit_proposal(
     proposal: &EditProposal,
 ) -> Result<Vec<String>, EditError> {
     let project = crate::toolchain::effective_project_config(repo_root, None).await;
-    apply_edit_proposal_with_config(repo_root, &project, context_manager, proposal).await
+    apply_edit_proposal_with_config(repo_root, &project, context_manager, &[&proposal.edits]).await
 }
 
 /// Applies an EditProposal under an already resolved project configuration,
@@ -44,19 +46,12 @@ pub async fn apply_edit_proposal_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     context_manager: &mut ContextManager,
-    proposal: &EditProposal,
+    batches: &[&[EditOperation]],
 ) -> Result<Vec<String>, EditError> {
     // The change set is applied and formatted purely in memory first, so the
     // working tree only ever receives code the project filter already accepted.
-    let result = prepare_staged_edits_with_config(
-        repo_root,
-        project,
-        context_manager,
-        &proposal.edits,
-        None,
-        None,
-    )
-    .await;
+    let result =
+        prepare_edit_batches(repo_root, project, context_manager, batches, None, None).await;
     if let Some(failed) = result.failed_files.into_iter().next() {
         return Err(failed.error);
     }

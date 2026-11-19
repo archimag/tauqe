@@ -19,6 +19,7 @@ mod modules;
 mod outer_docs;
 pub(crate) mod paths;
 mod providers;
+pub(crate) use providers::update_credentials;
 mod repl;
 mod review;
 
@@ -50,7 +51,7 @@ pub use paths::{
 pub(crate) use paths::{is_repo_config_path, is_repo_module_path};
 pub use providers::{
     find_credentials_file, has_openrouter_key, write_credentials_file, write_credentials_stub,
-    OpenRouterConfig, ProvidersConfig,
+    OpenAiConfig, OpenRouterConfig, ProvidersConfig,
 };
 pub use review::{ReviewConfig, ReviewGroupConfig, ReviewPreset};
 
@@ -172,7 +173,10 @@ impl TryFrom<AppConfigRaw> for AppConfig {
         } = raw;
 
         Ok(AppConfig {
-            models: ModelsConfig::resolve(models, providers.catalog())?,
+            models: ModelsConfig::resolve(
+                models,
+                &providers.catalog().cloned().collect::<Vec<_>>(),
+            )?,
             providers,
             repl,
             project,
@@ -190,7 +194,7 @@ impl TryFrom<AppConfigRaw> for AppConfig {
 
 impl AppConfig {
     /// Models registered in the provider catalog, in declaration order.
-    pub fn model_catalog(&self) -> &[ModelCatalogEntry] {
+    fn model_catalog(&self) -> impl Iterator<Item = &ModelCatalogEntry> {
         self.providers.catalog()
     }
 
@@ -201,7 +205,7 @@ impl AppConfig {
     /// without restating a display name.
     #[cfg(test)]
     fn resolve_model_spec(&self, spec: &str) -> Result<ModelRef, String> {
-        ModelsConfig::resolve_model_spec(self.model_catalog(), spec)
+        ModelsConfig::resolve_model_spec(&self.model_catalog().cloned().collect::<Vec<_>>(), spec)
     }
 
     /// Returns the catalog alias registered for a model, if any.
@@ -247,7 +251,7 @@ impl AppConfig {
     }
 
     /// Summary of effective concrete models assigned to all semantic roles.
-    pub fn roles_summary(&self) -> ModelRolesSummary {
+    fn roles_summary(&self) -> ModelRolesSummary {
         let fallback = self.configured_models().into_iter().next();
         self.models.roles_summary_with_fallback(fallback)
     }
@@ -269,10 +273,10 @@ impl AppConfig {
             architect: self.models.role_entries(ModelRole::Architect),
             repl: self.models.role_entries(ModelRole::REPL),
             reviewer: self.models.role_entries(ModelRole::Reviewer),
-            catalog: if self.model_catalog().is_empty() {
+            catalog: if self.model_catalog().next().is_none() {
                 None
             } else {
-                Some(self.model_catalog().to_vec())
+                Some(self.model_catalog().cloned().collect())
             },
         });
         summary

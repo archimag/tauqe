@@ -1,7 +1,11 @@
-use tauqe_protocol::{PlanItem, PlanItemStatus};
-pub trait PlanStatusProjection {
+use tauqe_protocol::PlanItem;
+#[cfg(test)]
+use tauqe_protocol::PlanItemStatus;
+#[cfg(test)]
+pub(crate) trait PlanStatusProjection {
     fn next(&self) -> Self;
 }
+#[cfg(test)]
 impl PlanStatusProjection for PlanItemStatus {
     fn next(&self) -> Self {
         match self {

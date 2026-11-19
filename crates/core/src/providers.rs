@@ -1,7 +1,10 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
+mod openai;
+pub use openai::login::{ChatGptSignIn, ChatGptSignInUi};
 pub mod openrouter;
 pub mod retry;
+mod sse;
 pub mod types;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -46,78 +49,74 @@ pub fn format_session_id(prefix: &str, identifier: &str) -> String {
     session.chars().take(SESSION_ID_MAX_LEN).collect()
 }
 
-// Provider callbacks carry the stream sender and the cancellation receiver on
-// top of the payload, so a session-aware call reaches eight parameters.
-#[allow(clippy::too_many_arguments)]
+/// A single model invocation, independent of the provider's HTTP representation.
+#[derive(Debug, Clone)]
+pub struct LlmRequest<'a> {
+    pub model: &'a str,
+    pub messages: Vec<ChatMessage>,
+    pub response_format: Option<ResponseFormat>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub session_id: Option<&'a str>,
+}
+
+impl<'a> LlmRequest<'a> {
+    pub fn new(model: &'a str, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            model,
+            messages,
+            response_format: None,
+            reasoning_effort: None,
+            session_id: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("Sign in to {0} to continue")]
+    AuthenticationRequired(ProviderKind),
+    #[error("{0}")]
+    PlanLimitReached(String),
+    #[error(transparent)]
+    Transient(anyhow::Error),
+    #[error(transparent)]
+    Request(anyhow::Error),
+}
+
+impl From<std::io::Error> for ProviderError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Request(error.into())
+    }
+}
+
+pub type ProviderResult = Result<(), ProviderError>;
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()>;
+    ) -> ProviderResult;
+}
 
-    /// Effort-aware chat streaming.
-    ///
-    /// Providers that expose a native reasoning parameter translate the
-    /// optional reasoning effort into it. The default implementation ignores
-    /// the effort and delegates to `stream_chat`, so existing providers stay
-    /// compatible without any change.
-    async fn stream_chat_with_effort(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        _reasoning_effort: Option<ReasoningEffort>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.stream_chat(model, messages, response_format, tx, cancel_rx)
-            .await
-    }
+fn chatgpt_credentials_path(config: &AppConfig) -> anyhow::Result<std::path::PathBuf> {
+    config
+        .explicit_credentials_path
+        .clone()
+        .or_else(|| {
+            crate::config::paths::dirs_config()
+                .or_else(|| crate::config::paths::dirs_home().map(|home| home.join(".config")))
+                .map(|dir| dir.join("tauqe/credentials.toml"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cannot locate user credentials"))
+}
 
-    /// Session-aware chat streaming.
-    ///
-    /// `session_id` binds one logical context (an interactive dialogue, a plan
-    /// execution, a review audit) to a single downstream provider backend, so
-    /// the backend keeps its prompt-prefix cache warm across requests.
-    /// Providers that cannot express the affinity ignore the identifier; the
-    /// default implementation forwards to `stream_chat_with_effort`.
-    async fn stream_chat_with_session(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        _session_id: Option<&str>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.stream_chat_with_effort(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            tx,
-            cancel_rx,
-        )
-        .await
-    }
-
-    async fn stream_text(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.stream_chat(model, messages, None, tx, cancel_rx).await
-    }
+pub async fn sign_out_chatgpt(config: &AppConfig) -> anyhow::Result<bool> {
+    openai::login::sign_out(chatgpt_credentials_path(config)?).await
 }
 
 /// Builds the provider for `kind`, wrapped in the universal retry decorator.
@@ -127,11 +126,16 @@ pub trait LlmProvider: Send + Sync {
 /// broken event stream — is retried uniformly without any caller knowing about
 /// the policy. Fatal failures, such as a rejected API key, are reported
 /// immediately.
-pub fn create_provider(
+pub fn create_provider_with_login(
     kind: ProviderKind,
     config: &AppConfig,
+    login: Option<std::sync::Arc<ChatGptSignIn>>,
 ) -> anyhow::Result<Box<dyn LlmProvider>> {
-    match kind {
+    let provider: Box<dyn LlmProvider> = match kind {
+        ProviderKind::OpenAI => {
+            let path = chatgpt_credentials_path(config)?;
+            Box::new(openai::OpenAiProvider::new(path, login)?)
+        }
         ProviderKind::OpenRouter => {
             let api_key = config
                 .providers
@@ -140,13 +144,13 @@ pub fn create_provider(
                 .and_then(|o| o.api_key.as_deref())
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("OpenRouter API key is not configured"))?;
-            let provider = OpenRouterProvider::new(api_key.to_string());
-            Ok(Box::new(RetryingProvider::new(
-                Box::new(provider),
-                RetryConfig::default(),
-            )))
+            Box::new(OpenRouterProvider::new(api_key.to_string()))
         }
-    }
+    };
+    Ok(Box::new(RetryingProvider::new(
+        provider,
+        RetryConfig::default(),
+    )))
 }
 
 #[cfg(test)]

@@ -113,8 +113,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::llm::CapabilityTree;
-    use crate::llm::LlmCapability;
     use crate::models::ModelRef;
     use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
     use crate::workflow::EditProtocolKind;
@@ -166,7 +164,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(crate::control::turn::turn_capability_expr()),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -175,7 +173,7 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
+            let caps = crate::control::turn::turn_capability_expr();
             let prompt_builder =
                 PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
             LoopContext::new(

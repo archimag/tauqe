@@ -47,7 +47,7 @@ use tokio::task::JoinHandle;
 /// completed stream as an orphan. It equals the cancellation convergence grace
 /// the turn machinery grants a workflow before force-aborting it, so the daemon
 /// answers one question — how long may a task take to stop? — with one number.
-pub(crate) const TASK_EXIT_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) use tauqe_flow::api::TASK_EXIT_DEADLINE;
 
 // Task-scoped override of `TASK_EXIT_DEADLINE`.
 //
@@ -86,9 +86,9 @@ where
 }
 
 #[cfg(test)]
-pub(crate) use tauqe_core::api::abort_and_reap_with_deadline;
+pub(crate) use tauqe_flow::api::abort_and_reap_with_deadline;
 #[cfg(test)]
-pub(crate) use tauqe_core::api::{Awaited, TaskExit};
+pub(crate) use tauqe_flow::api::{Awaited, TaskExit};
 
 #[cfg(test)]
 pub(crate) async fn abort_and_reap<T>(
@@ -105,7 +105,7 @@ pub(crate) async fn await_bounded<T>(
     task: &str,
     handle: JoinHandle<T>,
 ) -> Awaited<T> {
-    tauqe_core::api::await_with_deadline(operation, task, task_exit_deadline(), handle).await
+    tauqe_flow::api::await_with_deadline(operation, task, task_exit_deadline(), handle).await
 }
 
 #[cfg(test)]

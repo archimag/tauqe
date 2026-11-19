@@ -6,20 +6,15 @@
 //! signals between steps. The persistence adapter decides which document records
 //! the lifecycle, so a local plan and a review group horizon share one loop.
 
-use std::path::Path;
-
+use crate::control::execution::TurnInputs;
+use crate::workflow::batch::QueueInterruption;
 use tokio::sync::watch;
-
-use crate::plan::{Plan, PlanItemStatus};
-use crate::review::IssueStatus;
 
 use crate::control::context::LoopContext;
 use crate::control::outcome::{LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
 use crate::control::plan::step::{
     run_plan_step_loop_with, PlanStepArtifact, PlanStepLoopConfig, StepPersistence,
 };
-use crate::review::ReviewStorage;
-use crate::workflow::implementation::ExecutionScope;
 /// Configuration for running a sequence of plan steps.
 #[derive(Debug, Clone)]
 pub struct PlanSequenceLoopConfig {
@@ -55,232 +50,13 @@ pub struct PlanSequenceArtifact {
     /// Artifacts of the individual steps that ran and succeeded.
     pub executed_steps: Vec<PlanStepArtifact>,
     /// Reason the sequence finished.
-    pub(crate) stop: PlanSequenceStop,
+    pub stop: PlanSequenceStop,
 }
 
 impl PlanSequenceArtifact {
     /// Returns `true` if every step in the sequence completed successfully.
     pub fn is_success(&self) -> bool {
         self.stop.is_completed()
-    }
-}
-
-/// Persistence of the remediation horizon owned by one review group.
-///
-/// A review group fixes one root cause through one coherent change set, so its
-/// findings share a single sequence of steps. That horizon is a plain
-/// implementation of steps, which is why it runs through the same sequence loop
-/// as a local plan: only the document that records the lifecycle differs, and it
-/// is the review session that owns the group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewGroupPersistence {
-    /// Identifier of the review session that owns the group.
-    review_id: String,
-    /// Identifier of the group whose horizon is executed.
-    group_id: String,
-}
-
-impl ReviewGroupPersistence {
-    /// Addresses the horizon of one review group.
-    fn new(review_id: impl Into<String>, group_id: impl Into<String>) -> Self {
-        Self {
-            review_id: review_id.into(),
-            group_id: group_id.into(),
-        }
-    }
-}
-
-impl StepPersistence for ReviewGroupPersistence {
-    fn load(&self, repo_root: &Path) -> Result<Plan, SystemError> {
-        let session = ReviewStorage::load_review(repo_root, &self.review_id)
-            .map_err(|err| {
-                SystemError::Other(format!(
-                    "Failed to load review session '{}': {}",
-                    self.review_id, err
-                ))
-            })?
-            .ok_or_else(|| {
-                SystemError::Other(format!("Review session '{}' not found", self.review_id))
-            })?;
-        let group = session
-            .groups
-            .iter()
-            .find(|group| group.id == self.group_id)
-            .ok_or_else(|| {
-                SystemError::Other(format!(
-                    "Review session '{}' declares no group '{}'",
-                    self.review_id, self.group_id
-                ))
-            })?;
-
-        // The step loop reads a document, and the horizon of a group is exactly
-        // that: the steps it declares. The header the loop never reads carries
-        // the identity of the group the steps belong to.
-        Ok(Plan::from_parts(
-            session.id.clone(),
-            group.title.clone(),
-            group.description.clone(),
-            0,
-            0,
-            Vec::new(),
-            group.implementation.items.clone(),
-        ))
-    }
-
-    fn persist(&self, repo_root: &Path, plan: &Plan) -> Result<(), SystemError> {
-        let updated = ReviewStorage::update_group_subplan(
-            repo_root,
-            &self.review_id,
-            &self.group_id,
-            plan.implementation.items.clone(),
-        )
-        .map_err(|err| {
-            SystemError::Other(format!(
-                "Failed to persist the horizon of review group '{}' in session '{}': {}",
-                self.group_id, self.review_id, err
-            ))
-        })?;
-
-        match updated {
-            Some(_) => Ok(()),
-            None => Err(SystemError::Other(format!(
-                "Review session '{}' declares no group '{}'",
-                self.review_id, self.group_id
-            ))),
-        }
-    }
-}
-
-/// Persistence of the degenerate one-step horizon a single review finding owns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewFindingPersistence {
-    /// Identifier of the review session that owns the finding.
-    review_id: String,
-    /// Audit ordinal of the executed finding.
-    item_id: u32,
-}
-
-impl ReviewFindingPersistence {
-    /// Addresses the degenerate horizon of one review finding.
-    fn new(review_id: impl Into<String>, item_id: u32) -> Self {
-        Self {
-            review_id: review_id.into(),
-            item_id,
-        }
-    }
-}
-
-impl StepPersistence for ReviewFindingPersistence {
-    fn load(&self, repo_root: &Path) -> Result<Plan, SystemError> {
-        let scope = ExecutionScope::ReviewFinding {
-            review_id: self.review_id.clone(),
-            item_id: self.item_id,
-        };
-        scope
-            .resolve(repo_root)
-            .map(|frame| frame.plan)
-            .map_err(|failure| SystemError::Other(failure.into_reason()))
-    }
-
-    fn persist(&self, repo_root: &Path, plan: &Plan) -> Result<(), SystemError> {
-        let step_id = self.item_id.to_string();
-        let Some(step) = plan.implementation.find_item(&step_id) else {
-            return Err(SystemError::Other(format!(
-                "The degenerate horizon of review finding #{} does not carry the step '{}'",
-                self.item_id, step_id
-            )));
-        };
-        let commit = step.commit.clone();
-        let persisted = match step.status {
-            PlanItemStatus::InProgress => ReviewStorage::update_session_item_status(
-                repo_root,
-                &self.review_id,
-                self.item_id,
-                IssueStatus::InProgress,
-            ),
-            PlanItemStatus::Todo => ReviewStorage::update_session_item_status(
-                repo_root,
-                &self.review_id,
-                self.item_id,
-                IssueStatus::Todo,
-            ),
-            // A completed step records the commit of the change set that carried
-            // it. The verdict of the finding is never written here: it is stated
-            // exactly once, by the settlement of the run that addressed it.
-            PlanItemStatus::Done => ReviewStorage::update_session_item(
-                repo_root,
-                &self.review_id,
-                self.item_id,
-                |issue| {
-                    if let Some(commit) = commit
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|hash| !hash.is_empty())
-                    {
-                        issue.commit = Some(commit.to_string());
-                    }
-                },
-            ),
-            PlanItemStatus::Blocked | PlanItemStatus::Discussion | PlanItemStatus::Cancelled => {
-                return Ok(())
-            }
-        };
-        persisted.map_err(|err| {
-            SystemError::Other(format!(
-                "Failed to persist the lifecycle of review finding #{}: {}",
-                self.item_id, err
-            ))
-        })?;
-        Ok(())
-    }
-}
-
-/// Persistence of the horizon a review batch member executes.
-///
-/// A member addresses either the unified horizon of an architectural group or
-/// the degenerate horizon of a single finding, so the adapter selects the
-/// storage that owns the addressed entity and the step loop stays unaware of
-/// which one it drives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewMemberPersistence {
-    /// The unified horizon of an architectural review group.
-    Group(ReviewGroupPersistence),
-    /// The degenerate one-step horizon of a single review finding.
-    Finding(ReviewFindingPersistence),
-}
-
-impl ReviewMemberPersistence {
-    /// Selects the persistence of the review entity a scope addresses.
-    pub fn of(scope: &ExecutionScope) -> Option<Self> {
-        match scope {
-            ExecutionScope::ReviewGroup {
-                review_id,
-                group_id,
-            } => Some(Self::Group(ReviewGroupPersistence::new(
-                review_id.as_str(),
-                group_id.as_str(),
-            ))),
-            ExecutionScope::ReviewFinding { review_id, item_id } => Some(Self::Finding(
-                ReviewFindingPersistence::new(review_id.as_str(), *item_id),
-            )),
-            ExecutionScope::Plan { .. } => None,
-        }
-    }
-}
-
-impl StepPersistence for ReviewMemberPersistence {
-    fn load(&self, repo_root: &Path) -> Result<Plan, SystemError> {
-        match self {
-            Self::Group(group) => group.load(repo_root),
-            Self::Finding(finding) => finding.load(repo_root),
-        }
-    }
-
-    fn persist(&self, repo_root: &Path, plan: &Plan) -> Result<(), SystemError> {
-        match self {
-            Self::Group(group) => group.persist(repo_root, plan),
-            Self::Finding(finding) => finding.persist(repo_root, plan),
-        }
     }
 }
 
@@ -312,9 +88,9 @@ pub(crate) async fn run_plan_sequence_loop<S: AsRef<str>>(
 /// The sequence semantics belong to this loop alone: a local plan and a review
 /// group horizon differ only in the adapter that loads and persists the steps, so
 /// both observe the same soft-stop boundary and the same cancellation precedence.
-pub async fn run_plan_sequence_loop_with<S: AsRef<str>, P: StepPersistence>(
+pub async fn run_plan_sequence_loop_with<S: AsRef<str>>(
     ctx: &mut LoopContext<'_>,
-    persistence: &P,
+    persistence: &dyn StepPersistence,
     step_ids: &[S],
     config: &PlanSequenceLoopConfig,
     soft_stop_rx: Option<&watch::Receiver<bool>>,
@@ -326,18 +102,11 @@ pub async fn run_plan_sequence_loop_with<S: AsRef<str>, P: StepPersistence>(
     for step_id in step_ids {
         let step_id = step_id.as_ref();
 
-        // 1. Hard cancellation check takes priority over soft stop (Conventions.md §6.3).
-        ctx.check_cancelled()?;
-
-        // 2. Soft stop observed strictly between steps (Conventions.md §6.2).
-        if let Some(rx) = soft_stop_rx {
-            if *rx.borrow() {
-                tracing::info!(
-                    repo_root = %ctx.repo_root.display(),
-                    executed = executed_steps.len(),
-                    remaining = step_ids.len().saturating_sub(executed_steps.len()),
-                    "plan sequence stopped between steps"
-                );
+        match QueueInterruption::before_next(ctx.cancel.is_cancelled(), soft_stop_rx) {
+            Some(QueueInterruption::Cancelled) => return Err(SystemError::Cancelled),
+            Some(QueueInterruption::Stopped) => {
+                tracing::info!(repo_root = %ctx.repo_root.display(), executed = executed_steps.len(),
+                    remaining = step_ids.len().saturating_sub(executed_steps.len()), "plan sequence stopped between steps");
                 return Ok(LoopResult::Success(LoopSuccess::new(
                     PlanSequenceArtifact {
                         executed_steps,
@@ -346,10 +115,13 @@ pub async fn run_plan_sequence_loop_with<S: AsRef<str>, P: StepPersistence>(
                     ResponseEnvelope::default(),
                 )));
             }
+            None => {}
         }
 
-        // 3. Execute individual step.
-        let step_result = run_plan_step_loop_with(ctx, persistence, step_id, &config.step).await?;
+        let mut inputs = TurnInputs::default();
+        let mut member = inputs.prepare_member(ctx);
+        let step_result =
+            run_plan_step_loop_with(&mut member, persistence, step_id, &config.step).await?;
         match step_result {
             LoopResult::Success(success) => {
                 executed_steps.push(success.value);
@@ -395,13 +167,9 @@ mod tests {
     use std::path::Path;
 
     use crate::providers::mock::{MockLlmProvider, MockResponse};
-    use crate::review::ReviewStorage;
 
-    use crate::llm::CapabilityTree;
-    use crate::llm::LlmCapability;
     use crate::models::ModelRef;
-    use crate::plan::{ConceptItem, Plan, PlanImplementation, PlanItem, PlanItemStatus};
-    use crate::review::{ReviewGroup, ReviewSession};
+    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
     use crate::workflow::EditProtocolKind;
 
     use crate::config::ModelsConfig;
@@ -450,7 +218,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(crate::control::turn::turn_capability_expr()),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -459,9 +227,10 @@ mod tests {
         }
 
         fn context(&mut self) -> LoopContext<'_> {
-            let caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
+            let caps = crate::control::turn::turn_capability_expr();
             let prompt_builder =
-                PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache);
+                PromptBuilder::new(&self.provider, &self.model, &self.protocol, &mut self.cache)
+                    .with_patch_strategy(crate::workflow::PatchStrategy::LineAnchor);
             LoopContext::new(
                 &self.cancel,
                 &self.events,
@@ -677,119 +446,5 @@ mod tests {
             .expect_err("must be cancelled");
 
         assert!(matches!(err, SystemError::Cancelled));
-    }
-
-    fn stored_review_group(root: &Path, review_id: &str, group_id: &str) {
-        let session = ReviewSession {
-            id: review_id.to_string(),
-            title: "Review".to_string(),
-            created_at: 1,
-            groups: vec![ReviewGroup {
-                id: group_id.to_string(),
-                title: "Bound the emit length".to_string(),
-                description: Some("One shared root cause".to_string()),
-                implementation: PlanImplementation {
-                    items: vec![
-                        PlanItem {
-                            id: "1".to_string(),
-                            title: "Step 1".to_string(),
-                            files: vec!["one.rs".to_string()],
-                            ..PlanItem::default()
-                        },
-                        PlanItem {
-                            id: "2".to_string(),
-                            title: "Step 2".to_string(),
-                            files: vec!["two.rs".to_string()],
-                            ..PlanItem::default()
-                        },
-                    ],
-                    ..PlanImplementation::default()
-                },
-                ..ReviewGroup::default()
-            }],
-            ..ReviewSession::default()
-        };
-        ReviewStorage::save_session(root, &session).expect("save review session");
-    }
-
-    #[tokio::test]
-    async fn review_group_horizon_runs_through_the_sequence_loop() {
-        let mut fixture = Fixture::new(
-            &[("one.rs", "fn one() {}\n"), ("two.rs", "fn two() {}\n")],
-            vec![
-                MockResponse::text(
-                    serde_json::json!({
-                        "message": "Update one",
-                        "action": {
-                            "kind": "edit",
-                            "changes": [{
-                                "op": "replace",
-                                "path": "one.rs",
-                                "to": "",
-                                "start": "",
-                                "end": "",
-                                "content": "",
-                                "old_text": "fn one() {}\n",
-                                "new_text": "fn one() -> i32 { 1 }\n"
-                            }],
-                            "commit_message": "feat(one): update one",
-                            "message": "",
-                            "reason": ""
-                        }
-                    })
-                    .to_string(),
-                ),
-                MockResponse::text(
-                    serde_json::json!({
-                        "message": "Update two",
-                        "action": {
-                            "kind": "edit",
-                            "changes": [{
-                                "op": "replace",
-                                "path": "two.rs",
-                                "to": "",
-                                "start": "",
-                                "end": "",
-                                "content": "",
-                                "old_text": "fn two() {}\n",
-                                "new_text": "fn two() -> i32 { 2 }\n"
-                            }],
-                            "commit_message": "feat(two): update two",
-                            "message": "",
-                            "reason": ""
-                        }
-                    })
-                    .to_string(),
-                ),
-            ],
-        );
-        let root = fixture.dir.path().to_path_buf();
-        stored_review_group(&root, "review-1", "group-1");
-
-        let persistence = ReviewGroupPersistence::new("review-1", "group-1");
-        let mut ctx = fixture.context();
-        let result =
-            run_plan_sequence_loop_with(&mut ctx, &persistence, &["1", "2"], &test_config(), None)
-                .await
-                .expect("sequence loop succeeds");
-
-        assert!(result.is_success());
-        let success = result.into_success().expect("success");
-        assert_eq!(success.value.executed_steps.len(), 2);
-
-        // The lifecycle of the group horizon is durable in the review session:
-        // both steps reached Done together with the commit that produced them.
-        let session = ReviewStorage::load_review(&root, "review-1")
-            .expect("load review")
-            .expect("review exists");
-        let group = session
-            .groups
-            .iter()
-            .find(|group| group.id == "group-1")
-            .expect("group exists");
-        assert_eq!(group.implementation.items[0].status, PlanItemStatus::Done);
-        assert!(group.implementation.items[0].commit.is_some());
-        assert_eq!(group.implementation.items[1].status, PlanItemStatus::Done);
-        assert!(group.implementation.items[1].commit.is_some());
     }
 }

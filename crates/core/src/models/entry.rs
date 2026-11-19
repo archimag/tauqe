@@ -86,7 +86,7 @@ impl ModelEntry {
     /// `level_up = true` explicitly allows it. Consumers
     /// read the marker through this accessor so the participation rule has
     /// a single authoritative statement.
-    pub fn level_up(&self) -> Option<bool> {
+    pub(crate) fn level_up(&self) -> Option<bool> {
         self.level_up
     }
 
@@ -97,13 +97,13 @@ impl ModelEntry {
     /// attempt instead of the coder default. Every consumer reads the value
     /// through this accessor, so the adaptive default has one authoritative
     /// statement instead of a repeated number.
-    pub fn attempts(&self) -> u32 {
+    pub(crate) fn attempts(&self) -> u32 {
         resolve_attempts(self.attempts, self.level_up, DEFAULT_CODER_ATTEMPTS)
     }
 
     /// Renders the entry as the canonical model specification, with the
     /// configured reasoning depth appended when one is set.
-    pub fn display_label(&self) -> String {
+    pub(crate) fn display_label(&self) -> String {
         match self.effort {
             Some(effort) => format!("{} [{}]", self.model.to_spec(), effort),
             None => self.model.to_spec(),
@@ -396,7 +396,7 @@ impl ArchitectTier {
     /// The created tier carries neither an attempt budget nor a level-up
     /// marker, so it keeps the Architect default budget and participates in
     /// ladder escalation.
-    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
+    pub(crate) fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
         Self {
             model,
             effort,
@@ -410,7 +410,8 @@ impl ArchitectTier {
     /// An absent marker means the tier participates in ladder escalation:
     /// `level_up = false` excludes the entry from automatic escalation;
     /// `level_up = true` explicitly allows it.
-    pub fn level_up(&self) -> Option<bool> {
+    #[cfg(test)]
+    pub(crate) fn level_up(&self) -> Option<bool> {
         self.level_up
     }
 

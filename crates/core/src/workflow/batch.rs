@@ -199,6 +199,27 @@ impl BatchUsage {
     }
 }
 
+/// Interruption observed before starting the next member of an ordered run.
+pub(crate) enum QueueInterruption {
+    Cancelled,
+    Stopped,
+}
+
+impl QueueInterruption {
+    pub(crate) fn before_next(
+        cancelled: bool,
+        soft_stop: Option<&watch::Receiver<bool>>,
+    ) -> Option<Self> {
+        if cancelled {
+            Some(Self::Cancelled)
+        } else if soft_stop.is_some_and(|rx| *rx.borrow()) {
+            Some(Self::Stopped)
+        } else {
+            None
+        }
+    }
+}
+
 /// Reason a batch supervisor stopped processing steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchStop {
@@ -301,16 +322,13 @@ impl BatchExecution {
         tracing::info!(scheduled = steps.len(), "batch started");
 
         for step in steps {
-            // Hard cancellation wins over a soft stop when both are pending: an
-            // explicit reset must never be downgraded to a graceful stop.
-            if *cancel_rx.borrow() {
-                stop = BatchStop::Cancelled;
-                break;
-            }
-            // A soft-stop request observed between steps stops the queue before
-            // the next step starts, so the running step is never interrupted.
-            if *soft_stop_rx.borrow() {
-                stop = BatchStop::Stopped;
+            if let Some(interruption) =
+                QueueInterruption::before_next(*cancel_rx.borrow(), Some(soft_stop_rx))
+            {
+                stop = match interruption {
+                    QueueInterruption::Cancelled => BatchStop::Cancelled,
+                    QueueInterruption::Stopped => BatchStop::Stopped,
+                };
                 break;
             }
 

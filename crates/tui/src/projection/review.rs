@@ -1,9 +1,9 @@
 //! Client-side review grouping, counters, and status cycling.
 #[cfg(test)]
-use tauqe_protocol::ModelRef;
+use tauqe_protocol::{IssueStatus, ModelRef};
 use tauqe_protocol::{
-    IssueStatus, PlanImplementation, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem,
-    ReviewItemStatus, ReviewSession, DEFAULT_REVIEW_GROUP_ID,
+    PlanImplementation, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewItemStatus,
+    ReviewSession, DEFAULT_REVIEW_GROUP_ID,
 };
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,17 +12,19 @@ pub struct ReviewSummary {
     title: String,
     description: Option<String>,
     created_at: u64,
-    pub model: ModelRef,
+    model: ModelRef,
     /// Actionable findings, excluding the terminal `Skipped` and `Rejected`
     /// outcomes (see [`ReviewProjection::stats`]).
-    pub total_items: usize,
+    pub(crate) total_items: usize,
     /// Findings resolved as `Fixed`.
-    pub fixed_items: usize,
+    pub(crate) fixed_items: usize,
 }
 
-pub trait ReviewStatusProjection {
+#[cfg(test)]
+pub(crate) trait ReviewStatusProjection {
     fn next(&self) -> Self;
 }
+#[cfg(test)]
 impl ReviewStatusProjection for IssueStatus {
     fn next(&self) -> Self {
         match self {

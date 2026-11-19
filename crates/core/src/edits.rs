@@ -18,10 +18,11 @@
 
 mod model;
 pub use model::operation;
+pub(crate) use model::{normalize_repo_path, EditProposal};
 pub use model::{
-    normalize_repo_path, ChangeConversionError, EditCreate, EditDelete, EditFileOp, EditFileStatus,
-    EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOutcome, EditOverwrite, EditProposal,
-    EditReplace, StructuredChangeProposal, VerificationVerdict,
+    EditCreate, EditDelete, EditFileOp, EditFileStatus, EditLineAnchor, EditMove, EditMoveDir,
+    EditOperation, EditOutcome, EditOverwrite, EditReplace, StructuredChangeProposal,
+    VerificationVerdict,
 };
 mod apply;
 pub(crate) mod atomic;
@@ -37,7 +38,9 @@ pub(crate) use apply::apply_edit_proposal_with_config;
 pub use protocol::{ContextRequest, EditProtocolFactory};
 #[cfg(test)]
 pub(crate) use stage::prepare_staged_edits;
-pub(crate) use stage::{prepare_staged_edits_with_config, stage_and_validate_edits};
+pub(crate) use stage::{
+    prepare_staged_edits_with_config, stage_and_validate_edits, stage_apply_patch,
+};
 pub use tauqe_tools::edits::anchor;
 pub use tauqe_tools::edits::fuzzy;
 pub use tauqe_tools::edits::staging;

@@ -44,6 +44,11 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("footer.stopping", "[Stopping after current step]", "Footer badge while a soft batch stop is pending", None),
         item("footer.retrying", "⟳ Reconnecting {}/{} in {}s", "Footer indicator counting down the seconds until the next provider attempt", None),
         item("footer.retrying_cancel", "C-g to cancel", "Footer hint naming the chord that aborts a reconnect pause", None),
+        item("footer.round", "[Round {}]", "Footer badge for an admitted model round; the placeholder receives the round number or the round and limit separated by a slash", None),
+        item("footer.request.patch_repair", "Repairing patch", "Footer detail while the model corrects a patch rejected by staging", None),
+        item("footer.request.post_hook_repair", "Fixing post-hook failure", "Footer detail while the model corrects a failed project post-hook", None),
+        item("footer.request.verification_repair", "Fixing verification failure", "Footer detail while the model corrects a failed verification pass", None),
+        item("footer.request.empty_response_retry", "Retrying after an empty response", "Footer detail for an admitted model call retrying an empty response", None),
         item("footer.history_stats", "{} entries (~{} tokens)", "Footer history size indicator", None),
 
         // ------------------------------------------------------------------
@@ -55,7 +60,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("footer.usage.session", "session", "Footer usage label for the accumulated session total", None),
         item("footer.usage.last", "last", "Footer usage label for the last completed operation", None),
         item("footer.usage.now", "now", "Footer usage label for the operation currently in flight", None),
-        item("footer.usage.tok", "tok", "Footer usage unit suffix shown for token counts when no cost is known", None),
+        item("footer.usage.tok", "tok", "Footer usage unit suffix for token counts", None),
 
         // ------------------------------------------------------------------
         // Bounded-turn phase pipeline (footer FSM telemetry).
@@ -123,6 +128,16 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         // Modal dialog titles.
         // ------------------------------------------------------------------
+        item("dialog.chatgpt.signed_out", "Signed out of ChatGPT.", "ChatGPT sign-out completed", None),
+        item("dialog.chatgpt.revocation_unconfirmed", "Signed out locally. Check the connection in ChatGPT settings.", "Remote revocation could not be confirmed", None),
+        item("dialog.chatgpt.title", "Sign in with ChatGPT", "Title for the OpenAI sign-in dialog", None),
+        item("dialog.chatgpt.question", "Use your ChatGPT plan for {} and continue this action?", "Sign-in prompt with the requested model", None),
+        item("dialog.chatgpt.wait", "Complete sign-in in your browser to resume {}.", "Sign-in pending for the requested model", None),
+        item("dialog.chatgpt.copy", "Press C to copy the sign-in link.", "Manual browser fallback", None),
+        item("dialog.chatgpt.continue", "Continue with ChatGPT", "Open the authorization page", None),
+        item("dialog.chatgpt.open_failed", "Could not open the browser. Press C to copy the link.", "Browser launch failed", None),
+        item("dialog.chatgpt.copied", "Sign-in link copied.", "Link copied to the clipboard", None),
+        item("dialog.chatgpt.copy_failed", "Could not copy the sign-in link.", "Clipboard copy failed", None),
         item("dialog.confirm_cancel.title", "Confirm Cancellation", "Title for active turn cancellation popup", None),
         item("dialog.confirm_quit.title", "Confirm Quit", "Title for unsaved changes exit dialog", None),
         item("dialog.confirm_detach_focus.title", "Confirm Detach Focus", "Title for discussion focus detach dialog", None),
@@ -1503,7 +1518,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.usage.map", "Repository Map", "Usage dialog heading for the tokens the repository map consumed", None),
         item("dialog.usage.repomap_tokens", "Map tokens", "Usage dialog row label for the tokens spent on the repository map", None),
         item("dialog.usage.empty", "No usage recorded in this session yet.", "Usage dialog placeholder when no operation has completed", None),
-        item("dialog.usage.footer", "j / k or ↑ / ↓ scroll • PgUp / PgDn page • Home top • Shift+C reset • Esc close", "Usage dialog footer hint including the project telemetry reset chord", None),
+        item("dialog.usage.footer", "Tab USD/tokens • Shift+L sign out of ChatGPT • Shift+C reset • Esc close", "Usage dialog footer hint for navigation, footer units, and project telemetry reset", None),
         item("notify.usage_reset", "Project telemetry reset", "Notification after the usage dialog resets the persisted project lifetime totals", None),
 
         // ------------------------------------------------------------------

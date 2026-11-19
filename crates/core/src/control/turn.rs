@@ -19,13 +19,12 @@ mod step_outcome_tests;
 use crate::edits::VerificationVerdict;
 use crate::llm::CapabilityTree;
 use crate::llm::LlmCapability;
-use crate::llm::{LlmCommand, TextCommand};
 use crate::workflow::turn::TurnPhase;
 
 use super::context::LoopContext;
 use super::outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
 use crate::git::state::snapshot_worktree;
-use crate::prompt::ContourKind;
+use crate::providers::types::TurnRequestReason;
 use crate::providers::StreamEvent;
 use crate::workflow::retry::build_patch_retry_prompt;
 
@@ -120,7 +119,7 @@ pub struct TurnArtifact {
 
 impl TurnArtifact {
     /// Reports a turn that closed without touching the working tree.
-    fn without_change_set(rounds_spent: usize, envelope: ResponseEnvelope) -> Self {
+    pub fn without_change_set(rounds_spent: usize, envelope: ResponseEnvelope) -> Self {
         Self {
             modified_paths: Vec::new(),
             commit_hash: None,
@@ -133,7 +132,7 @@ impl TurnArtifact {
 }
 
 /// Concludes a turn that produced no change set.
-fn completed_without_change_set(
+pub(super) fn completed_without_change_set(
     rounds_spent: usize,
     envelope: ResponseEnvelope,
 ) -> LoopResult<TurnArtifact> {
@@ -143,41 +142,32 @@ fn completed_without_change_set(
     ))
 }
 
-/// Announces a phase transition of the bounded turn.
-///
-/// The interface event and the journal record are emitted together, so a phase
-/// the turn enters is never visible on one surface and missing from the other.
-fn announce_turn_phase(
-    ctx: &LoopContext<'_>,
-    phase: TurnPhase,
-    round: usize,
-    max_rounds: Option<usize>,
-    detail: impl Into<String>,
-) {
+/// Announces deterministic work without spending a model round.
+fn announce_turn_phase(ctx: &LoopContext<'_>, phase: TurnPhase) {
     tracing::info!(
         repo_root = %ctx.repo_root.display(),
         phase = %phase,
-        round,
-        max_rounds,
         "bounded turn entered a phase"
     );
     ctx.events.emit(StreamEvent::TurnPhase {
         phase,
-        round: Some(round),
-        max_rounds,
-        detail: Some(detail.into()),
+        round: None,
+        max_rounds: None,
+        detail: None,
     });
 }
 
-/// Reports whether the turn executes one isolated step.
-///
-/// The regime of a turn is declared by the brief the loop that drives it handed to
-/// the assembly, so no contour is ever inferred from the shape of a response.
-fn is_step_contour(ctx: &LoopContext<'_>) -> bool {
-    ctx.prompt_builder
-        .turn_brief
-        .as_ref()
-        .is_some_and(|brief| brief.contour == ContourKind::Step)
+/// Whether a text-only answer can complete the work requested by the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TurnCompletion {
+    AnswerAllowed,
+    ActionRequired,
+}
+
+fn has_edits(envelope: &ResponseEnvelope) -> bool {
+    EDIT_CAPABILITIES
+        .iter()
+        .any(|capability| envelope.has(*capability))
 }
 
 /// Reports whether the round declared how the task ends.
@@ -199,42 +189,6 @@ async fn resolve_project_config(ctx: &mut LoopContext<'_>) -> ProjectConfig {
         .await
 }
 
-/// Returns the last answer the model produced in this turn.
-fn last_answer(ctx: &LoopContext<'_>) -> String {
-    ctx.transcript()
-        .messages()
-        .into_iter()
-        .rfind(|message| message.role == "assistant")
-        .map(|message| message.content)
-        .unwrap_or_else(|| {
-            "The turn reached its round budget before producing an answer.".to_string()
-        })
-}
-
-/// Maps the exhausted round budget to the outcome the contour declares.
-///
-/// An isolated step reports the stop as a domain failure, because the harness that
-/// owns it escalates the execution instead of answering the developer. A dialogue is
-/// closed by the answer it was asked for, so it carries the last answer the model
-/// wrote beside the notice that names the limit it reached.
-fn budget_outcome(ctx: &mut LoopContext<'_>) -> LoopResult<TurnArtifact> {
-    let spent = ctx.rounds_spent();
-    if is_step_contour(ctx) {
-        return LoopResult::Exhausted(FailureReport::new(
-            "Turn round budget exhausted",
-            spent,
-            Vec::new(),
-        ));
-    }
-    let answer = last_answer(ctx);
-    let text = format!(
-        "{answer}\n\n---\n**[Round Budget Reached]** The turn spent its whole budget of {spent} provider call(s). The answer above is the last one the model produced; ask again to continue from the material the turn already gathered."
-    );
-    let envelope =
-        ResponseEnvelope::from_commands(&[LlmCommand::Text(TextCommand { content: text })]);
-    completed_without_change_set(spent, envelope)
-}
-
 /// Runs the bounded turn lifecycle.
 ///
 /// The loop is the single place a turn is driven: the model alternates between
@@ -246,46 +200,50 @@ pub async fn run_turn_loop(
     ctx: &mut LoopContext<'_>,
     initial_envelope: Option<ResponseEnvelope>,
     config: &TurnLoopConfig,
+    completion: TurnCompletion,
 ) -> Result<LoopResult<TurnArtifact>, SystemError> {
     ctx.check_cancelled()?;
     ctx.set_turn_round_limit(Some(config.max_turn_rounds));
 
     let mut transaction = TurnTransaction::new(ctx.repo_root);
-    let outcome = run_turn_loop_inner(ctx, initial_envelope, config, &mut transaction).await;
+    let outcome =
+        run_turn_loop_inner(ctx, initial_envelope, config, completion, &mut transaction).await;
     // Every exit that did not settle the transaction unwinds it here, so a
     // cancellation, a healing round whose request failed, an exhausted budget, and a
     // change set the substrate refused all leave the repository at its pre-turn
     // revision.
     transaction.rollback(ctx).await;
-    match outcome {
-        Err(SystemError::RoundBudgetExhausted) => Ok(budget_outcome(ctx)),
-        other => other,
-    }
+    outcome
 }
 
 async fn run_turn_loop_inner(
     ctx: &mut LoopContext<'_>,
     initial_envelope: Option<ResponseEnvelope>,
     config: &TurnLoopConfig,
+    completion: TurnCompletion,
     transaction: &mut TurnTransaction,
 ) -> Result<LoopResult<TurnArtifact>, SystemError> {
     let mut envelope = match initial_envelope {
-        Some(envelope) => envelope,
-        None => {
-            announce_turn_phase(
-                ctx,
-                TurnPhase::Proposal,
-                1,
-                Some(config.max_turn_rounds),
-                "Awaiting initial response",
-            );
-            ctx.request_round().await?
+        Some(envelope) => {
+            // A caller can provide the opening answer without replaying its
+            // request here. Capture that context before its edits reach disk.
+            let items = ctx.context_manager.get_state().items;
+            let files = ctx
+                .prompt_builder
+                .input_cache
+                .context_files(ctx.repo_root, &items)
+                .await
+                .map_err(|error| SystemError::Other(error.to_string()))?;
+            ctx.transcript().remember_files(&files);
+            envelope
         }
+        None => ctx.request_round().await?,
     };
 
     let mut staging = StagingState::default();
     let mut edit: Option<EditState> = None;
     let mut declared_summary: Option<String> = None;
+    let mut pending_edit_envelope = None;
     let mut healing_rounds = 0usize;
     let mut satisfied_rounds = 0usize;
     let mut empty_rounds = 0usize;
@@ -294,7 +252,9 @@ async fn run_turn_loop_inner(
         ctx.check_cancelled()?;
 
         // 1. Discovery: the round the model produced may widen the context it reads.
-        let discovery = execute_research_step(ctx, &mut envelope, &config.research).await?;
+        let repairing = !staging.failed.is_empty();
+        let discovery =
+            execute_research_step(ctx, &mut envelope, &config.research, repairing).await?;
         let mut request_next_round = match discovery.kind {
             ResearchStepKind::Idle => false,
             ResearchStepKind::Widened => {
@@ -316,10 +276,8 @@ async fn run_turn_loop_inner(
         }
 
         // 2. A change set the round proposed: stage it, then apply and verify it.
-        if EDIT_CAPABILITIES
-            .iter()
-            .any(|capability| envelope.has(*capability))
-        {
+        if has_edits(&envelope) {
+            announce_turn_phase(ctx, TurnPhase::Staging);
             if declared_summary.is_none() {
                 declared_summary = declared_commit_message(&envelope);
             }
@@ -340,15 +298,11 @@ async fn run_turn_loop_inner(
             };
 
             // 2a. Virtual staging, repaired from the same budget the turn draws on.
-            let mut attempt = execute_staging_step(ctx, &mut envelope, &mut staging);
-            while !staging.failed.is_empty() {
-                announce_turn_phase(
-                    ctx,
-                    TurnPhase::Staging,
-                    staging.attempts,
-                    Some(config.max_turn_rounds),
-                    format!("Patch retry {}", staging.attempts),
-                );
+            let attempt = execute_staging_step(ctx, &mut envelope, &mut staging);
+            if !attempt.addressed {
+                return Ok(LoopResult::Diverged(envelope));
+            }
+            if !staging.failed.is_empty() {
                 for (path, reason) in &attempt.refusals {
                     tracing::warn!(
                         repo_root = %ctx.repo_root.display(),
@@ -370,15 +324,14 @@ async fn run_turn_loop_inner(
                     &[],
                     ctx.prompt_builder.patch_strategy,
                 );
-                let mut reply = ctx
+                pending_edit_envelope.get_or_insert(envelope);
+                envelope = ctx
                     .request_repair(&repair_prompt, staging.staged_state.as_ref())
                     .await?;
-                attempt = execute_staging_step(ctx, &mut reply, &mut staging);
-                if !attempt.addressed {
-                    // The repair round answered with something other than a change set,
-                    // so its answer is not staging's to interpret and travels upward.
-                    return Ok(LoopResult::Diverged(reply));
-                }
+                continue;
+            }
+            if let Some(original) = pending_edit_envelope.take() {
+                envelope = original;
             }
 
             let abandoned = render_failures(&staging.abandoned, ctx.prompt_builder.patch_strategy);
@@ -402,13 +355,7 @@ async fn run_turn_loop_inner(
             state.adopt_staging(&staging);
 
             // 2b. One application and verification pass over the converged change set.
-            announce_turn_phase(
-                ctx,
-                TurnPhase::Verification,
-                healing_rounds + 1,
-                Some(config.max_turn_rounds),
-                "Verifying project toolchain",
-            );
+            announce_turn_phase(ctx, TurnPhase::Verification);
 
             match execute_edit_step(ctx, &mut *state, transaction).await? {
                 EditStepVerdict::Passed(verification) => {
@@ -464,31 +411,44 @@ async fn run_turn_loop_inner(
                 }
                 EditStepVerdict::HookFailed { report } => {
                     let retry_prompt = prepare_healing(ctx, &report, &mut healing_rounds).await;
-                    announce_turn_phase(
-                        ctx,
-                        TurnPhase::Healing,
-                        healing_rounds,
-                        Some(config.max_turn_rounds),
-                        format!("Post-hook healing round {healing_rounds}"),
-                    );
-                    envelope = ctx.request_healing(&retry_prompt).await?;
+                    staging = StagingState::default();
+                    envelope = ctx
+                        .request_healing(&retry_prompt, TurnRequestReason::PostHookRepair)
+                        .await?;
                     continue;
                 }
                 EditStepVerdict::VerificationFailed { report } => {
                     let retry_prompt = prepare_healing(ctx, &report, &mut healing_rounds).await;
-                    announce_turn_phase(
-                        ctx,
-                        TurnPhase::Healing,
-                        healing_rounds,
-                        Some(config.max_turn_rounds),
-                        format!("Healing round {healing_rounds}"),
-                    );
                     // The healing round re-enters the loop, so the model may widen the
                     // context before it proposes the corrected change set.
-                    envelope = ctx.request_healing(&retry_prompt).await?;
+                    staging = StagingState::default();
+                    envelope = ctx
+                        .request_healing(&retry_prompt, TurnRequestReason::VerificationRepair)
+                        .await?;
                     continue;
                 }
             }
+        }
+
+        if repairing {
+            if discovery.kind == ResearchStepKind::Idle || holds_a_higher_contour_command(&envelope)
+            {
+                return Ok(LoopResult::Diverged(envelope));
+            }
+            let feedback = ctx.journal.render_round_feedback();
+            let diagnostic = build_patch_retry_prompt(
+                &staging.succeeded,
+                &staging.failed,
+                &[],
+                ctx.prompt_builder.patch_strategy,
+            );
+            envelope = ctx
+                .request_repair(
+                    &format!("{feedback}\n\n{diagnostic}"),
+                    staging.staged_state.as_ref(),
+                )
+                .await?;
+            continue;
         }
 
         if request_next_round {
@@ -500,7 +460,9 @@ async fn run_turn_loop_inner(
 
         // A round that declared how the task ends, or a dialogue that answered in
         // prose, concludes the turn without touching the working tree.
-        if declares_terminal(&envelope) || (!is_step_contour(ctx) && envelope_has_text(&envelope)) {
+        if declares_terminal(&envelope)
+            || (completion == TurnCompletion::AnswerAllowed && envelope_has_text(&envelope))
+        {
             return Ok(completed_without_change_set(ctx.rounds_spent(), envelope));
         }
 
@@ -566,7 +528,7 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(turn_capability_expr()),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -581,7 +543,8 @@ mod tests {
                 &self.model,
                 &self.protocol,
                 &mut self.cache,
-            );
+            )
+            .with_patch_strategy(crate::workflow::PatchStrategy::LineAnchor);
             LoopContext::new(
                 &self.cancel,
                 &self.events,
@@ -593,6 +556,76 @@ mod tests {
                 prompt_builder,
             )
         }
+    }
+
+    #[tokio::test]
+    async fn apply_patch_retries_atomically_and_previews_only_accepted_edits() {
+        let invalid = "*** Begin Patch\n*** Update File: hello.rs\n@@\n-original\n+refused\n*** Update File: hidden.rs\n@@\n-hidden\n+refused\n*** End Patch";
+        let valid =
+            "*** Begin Patch\n*** Update File: hello.rs\n@@\n-original\n+accepted\n*** End Patch";
+        let response = |patch: &str| {
+            serde_json::json!({
+            "message": "Update hello",
+            "action": {"kind": "edit", "patch": patch, "commit_message": "Update hello", "reason": ""}
+        }).to_string()
+        };
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "original\n"), ("hidden.rs", "hidden\n")],
+            vec![
+                MockResponse::text(response(invalid)),
+                MockResponse::text(response(valid)),
+            ],
+        );
+        fixture.context.remove_file("hidden.rs").unwrap();
+        let (events, mut rx) = EventSink::channel();
+        fixture.events = events;
+        let mut ctx = fixture.context();
+        ctx.prompt_builder.patch_strategy = crate::workflow::PatchStrategy::ApplyPatch;
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_success());
+        let requests = fixture.provider.requests();
+        assert_eq!(requests.len(), 2);
+        let schema = serde_json::to_value(&requests[0].response_format).unwrap();
+        let edit_branch = schema
+            .pointer("/json_schema/schema/properties/action/anyOf")
+            .and_then(|branches| {
+                branches
+                    .as_array()?
+                    .iter()
+                    .find(|branch| branch["properties"]["kind"]["enum"][0] == "edit")
+            })
+            .unwrap();
+        assert_eq!(edit_branch["properties"]["patch"]["type"], "string");
+        assert!(edit_branch["properties"].get("changes").is_none());
+        assert!(requests[1]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("Patch staging failed"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.dir.path().join("hello.rs")).unwrap(),
+            "accepted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.dir.path().join("hidden.rs")).unwrap(),
+            "hidden\n"
+        );
+        let hunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                StreamEvent::EditHunk { new_text, .. } => Some(new_text),
+                _ => None,
+            })
+            .collect();
+        assert!(!hunks.is_empty());
+        assert!(hunks.iter().all(|text| text.contains("accepted")));
     }
 
     /// Builds the change set of a replacement of `hello.rs`.
@@ -635,9 +668,14 @@ mod tests {
         let mut fixture = Fixture::new(&[], vec![MockResponse::text("Turn text result")]);
         let mut ctx = fixture.context();
 
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         assert!(outcome.is_success());
         let success = outcome.into_success().expect("success");
         assert!(success.value.modified_paths.is_empty());
@@ -655,9 +693,14 @@ mod tests {
         );
         let mut ctx = fixture.context();
 
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         assert!(outcome.is_success());
         let success = outcome.into_success().expect("success");
         assert_eq!(success.value.modified_paths, vec!["hello.rs"]);
@@ -739,7 +782,13 @@ mod tests {
     /// A phase the turn enters is journaled, not only streamed to the interface.
     #[tokio::test]
     async fn turn_loop_journals_the_phase_it_enters() {
-        let mut fixture = Fixture::new(&[], vec![MockResponse::text("Turn text result")]);
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "fn hello() {}\n")],
+            vec![MockResponse::text(change_set(
+                "fn hello() {}\n",
+                "fn hello() -> i32 { 1 }\n",
+            ))],
+        );
         let captured = CapturedLog::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
@@ -749,9 +798,14 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
 
         let mut ctx = fixture.context();
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         drop(guard);
 
         assert!(outcome.is_success());
@@ -761,7 +815,7 @@ mod tests {
             "the phase transition must reach the journal: {logged}"
         );
         assert!(
-            logged.to_lowercase().contains("proposal"),
+            logged.contains("staging"),
             "the journal names the phase it entered: {logged}"
         );
     }
@@ -780,9 +834,14 @@ mod tests {
         );
         let mut ctx = fixture.context();
 
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         assert!(outcome.is_success());
         assert!(
             fixture.provider.requests().len() >= 2,
@@ -799,10 +858,9 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["The file defines one function.".to_string()]);
-        assert_eq!(texts, vec!["The file defines one function.".to_string()]);
     }
 
-    /// A file delivered by a discovery round is reseeded into the prefix of the next round.
+    /// A file delivered by a discovery round is appended to the next round.
     #[tokio::test]
     async fn a_delivered_file_reaches_the_request_of_the_next_round() {
         let mut fixture = Fixture::new(
@@ -829,24 +887,34 @@ mod tests {
         crate::git::cmd::commit_with_developer_author(root, "add helper", false).unwrap();
 
         let mut ctx = fixture.context();
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         assert!(outcome.is_success());
 
         let requests = fixture.provider.requests();
         assert_eq!(requests.len(), 2, "discovery round followed by conclusion");
-        let second_context = requests[1]
-            .messages
-            .iter()
-            .find(|m| m.content.starts_with("<context>"))
-            .expect("context block present");
-        assert!(
-            second_context
-                .content
-                .contains("pub const ANSWER: i32 = 42;"),
-            "the delivered file must be present in the second round context"
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(requests[1].response_format, requests[0].response_format);
+        assert_eq!(
+            requests[1]
+                .messages
+                .iter()
+                .map(|m| m.content.matches("pub const ANSWER: i32 = 42;").count())
+                .sum::<usize>(),
+            1
         );
+        assert!(requests[1]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("pub const ANSWER: i32 = 42;"));
     }
     /// A healing round re-enters the loop, so the model may widen the context before
     /// it proposes the corrected change set. The round that follows a healing round is
@@ -877,7 +945,7 @@ mod tests {
             ..TurnLoopConfig::default()
         };
 
-        let outcome = run_turn_loop(&mut ctx, None, &config)
+        let outcome = run_turn_loop(&mut ctx, None, &config, TurnCompletion::AnswerAllowed)
             .await
             .expect("runs loop");
         assert!(
@@ -889,6 +957,8 @@ mod tests {
             requests.len() >= 2,
             "the failed verification opens a healing round"
         );
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(requests[1].response_format, requests[0].response_format);
         let healing_request = requests[1]
             .messages
             .iter()
@@ -898,6 +968,146 @@ mod tests {
         assert!(
             healing_request.contains("Code verification failed"),
             "the healing round carries the verification report"
+        );
+    }
+
+    #[tokio::test]
+    async fn healing_restores_the_dirty_original_from_formatted_bytes() {
+        let config = r#"
+[models]
+repl = ["openrouter:a/b"]
+[project.format]
+command = "sed"
+args = ["s/broken/formatted/"]
+[project.verify]
+command = "grep"
+args = ["-qx", "developer work", "hello.rs"]
+"#;
+        let original = "developer work\n";
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "committed\n"), ("tauqe.toml", config)],
+            vec![
+                MockResponse::text(change_set(original, "broken\n")),
+                MockResponse::text(change_set("formatted\n", original)),
+            ],
+        );
+        let path = fixture.dir.path().join("hello.rs");
+        std::fs::write(&path, original).unwrap();
+        let outcome = run_turn_loop(
+            &mut fixture.context(),
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_success());
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+        let requests = fixture.provider.requests();
+        assert_eq!(requests.len(), 2);
+        let baseline = requests[0]
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("<context>"))
+            .unwrap();
+        assert!(baseline.content.contains(original));
+        assert!(requests[1].messages.contains(baseline));
+        let latest = &requests[1].messages.last().unwrap().content;
+        assert!(latest.contains("Code verification failed"));
+        assert!(latest.contains("formatted\n"));
+        assert!(latest.contains("<current_versions>"));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Work {
+        Call(usize, Option<TurnRequestReason>),
+        Phase(TurnPhase),
+    }
+
+    fn observed_work(rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamEvent>) -> Vec<Work> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                StreamEvent::TurnRoundStarted { round, reason, .. } => {
+                    Some(Work::Call(round, reason))
+                }
+                StreamEvent::TurnPhase {
+                    phase,
+                    round,
+                    max_rounds,
+                    ..
+                } => {
+                    assert_eq!((round, max_rounds), (None, None));
+                    Some(Work::Phase(phase))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn verification_repair_can_research_before_staging_and_verifying_again() {
+        let config = r#"
+[models]
+repl = ["openrouter:a/b"]
+[project.format]
+command = "sed"
+args = ["s/broken/formatted/"]
+[project.verify]
+command = "grep"
+args = ["-qx", "developer work", "hello.rs"]
+"#;
+        let original = "developer work\n";
+        let research = serde_json::json!({
+            "message": "Read the helper first.",
+            "action": {
+                "kind": "research",
+                "context_requests": [{ "path": "helper.rs", "access": "read_only" }]
+            }
+        });
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "committed\n"), ("tauqe.toml", config)],
+            vec![
+                MockResponse::text(change_set(original, "broken\n")),
+                MockResponse::text(research.to_string()),
+                MockResponse::text(change_set("formatted\n", original)),
+            ],
+        );
+        let root = fixture.dir.path();
+        std::fs::write(root.join("helper.rs"), "pub const HELPER: i32 = 1;\n").unwrap();
+        crate::git::cmd::stage_files(root, &["helper.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(root, "add helper", false).unwrap();
+        std::fs::write(root.join("hello.rs"), original).unwrap();
+        let (events, mut rx) = EventSink::channel();
+        fixture.events = events;
+
+        let outcome = run_turn_loop(
+            &mut fixture.context(),
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await;
+        let work = observed_work(&mut rx);
+        let success = outcome
+            .unwrap_or_else(|error| panic!("turn failed after {work:?}: {error:?}"))
+            .into_success()
+            .expect("the corrected change set passed verification");
+        assert_eq!(
+            success.value.verification,
+            Some(VerificationVerdict::Passed)
+        );
+        assert_eq!(
+            work,
+            vec![
+                Work::Call(1, None),
+                Work::Phase(TurnPhase::Staging),
+                Work::Phase(TurnPhase::Verification),
+                Work::Call(2, Some(TurnRequestReason::VerificationRepair)),
+                Work::Phase(TurnPhase::Research),
+                Work::Call(3, None),
+                Work::Phase(TurnPhase::Staging),
+                Work::Phase(TurnPhase::Verification),
+            ]
         );
     }
 
@@ -913,16 +1123,237 @@ mod tests {
             responses.push(MockResponse::text("The repair was applied."));
         }
         let mut fixture = Fixture::new(&[("hello.rs", "fn hello() {}\n")], responses);
+        let (events, mut rx) = EventSink::channel();
+        fixture.events = events;
         let mut ctx = fixture.context();
 
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         assert!(outcome.is_success(), "the repaired change set must commit");
+        assert_eq!(
+            observed_work(&mut rx),
+            vec![
+                Work::Call(1, None),
+                Work::Phase(TurnPhase::Staging),
+                Work::Call(2, Some(TurnRequestReason::PatchRepair)),
+                Work::Phase(TurnPhase::Staging),
+                Work::Phase(TurnPhase::Verification),
+            ]
+        );
         assert_eq!(
             std::fs::read_to_string(fixture.dir.path().join("hello.rs")).unwrap(),
             "fn hello() -> i32 { 1 }\n"
         );
+    }
+
+    fn reread_files(paths: &[&str]) -> String {
+        let requests: Vec<_> = paths
+            .iter()
+            .map(|path| serde_json::json!({"path": path, "access": "editable"}))
+            .collect();
+        serde_json::json!({"message":"Checking anchors", "action":{"kind":"research", "context_requests": requests}}).to_string()
+    }
+
+    #[tokio::test]
+    async fn repair_rereads_current_anchors_and_preserves_partial_staging() {
+        let anchor = crate::edits::anchor::encode_anchor("context.rs", 0);
+        let other = crate::edits::anchor::encode_anchor("other.rs", 0);
+        let edits = |changes: serde_json::Value| {
+            serde_json::json!({
+            "message":"Edit files", "action":{"kind":"edit", "changes":changes, "commit_message":"Update both files"}
+        }).to_string()
+        };
+        let replace = |path: &str, token: &str, content: &str| {
+            serde_json::json!({
+                "op":"replace", "path":path, "to":"", "start":token, "end":token, "content":content
+            })
+        };
+        let pending = edits(serde_json::json!([
+            replace("context.rs", "RWfQ", "new context"),
+            replace("other.rs", &other, "staged other")
+        ]));
+        let corrected = edits(serde_json::json!([replace(
+            "context.rs",
+            &anchor,
+            "new context"
+        )]));
+        for step in [false, true] {
+            let capabilities = if step {
+                turn_capability_expr()
+            } else {
+                crate::control::repl::repl_capability_expr(None)
+            };
+            let mut fixture = Fixture::new(
+                &[
+                    ("context.rs", "original context\n"),
+                    ("other.rs", "original other\n"),
+                    ("helper.rs", "newly discovered helper\n"),
+                ],
+                vec![
+                    MockResponse::text(pending.clone()),
+                    MockResponse::text(reread_files(&["context.rs", "other.rs", "helper.rs"])),
+                    MockResponse::text(reread_files(&["context.rs", "other.rs"])),
+                    MockResponse::text(corrected.clone()),
+                ],
+            );
+            fixture.protocol = JsonPromptProtocol::new(capabilities);
+            fixture.context.remove_file("helper.rs").unwrap();
+            let mut config = crate::config::AppConfig::default();
+            config.repl.patch_strategy = crate::workflow::PatchStrategy::LineAnchor;
+            let turn = crate::control::execution::TurnExecutionConfig {
+                repo_root: fixture.dir.path(),
+                provider: &fixture.provider,
+                model: &fixture.model,
+                protocol: &fixture.protocol,
+                config: &config,
+                session_id: None,
+                reasoning_effort: None,
+            };
+            let prompt = "Update both files".to_owned();
+            if step {
+                let result = crate::control::step::run_step_execution(
+                    &mut fixture.context,
+                    &mut fixture.policy,
+                    &fixture.cancel,
+                    &fixture.events,
+                    turn,
+                    prompt,
+                )
+                .await
+                .unwrap();
+                assert!(result.is_success());
+            } else {
+                use crate::control::repl::{run_repl_execution, ReplExecutionConfig};
+                let result = run_repl_execution(
+                    &mut fixture.context,
+                    &mut fixture.policy,
+                    &fixture.cancel,
+                    &fixture.events,
+                    ReplExecutionConfig {
+                        turn,
+                        prompt,
+                        history: None,
+                        focus: None,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(result.is_success());
+            }
+            let requests = fixture.provider.requests();
+            assert_eq!(requests.len(), 4);
+            for pair in requests.windows(2) {
+                assert!(pair[1].messages.starts_with(&requests[0].messages));
+                assert!(!pair[1]
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "assistant"));
+                assert_eq!(pair[1].response_format, pair[0].response_format);
+            }
+            assert!(requests[2]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("newly discovered helper")));
+            assert!(!requests[3]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("newly discovered helper"));
+            {
+                let before = &requests[2].messages;
+                let after = &requests[3].messages;
+                assert_eq!(&before[..before.len() - 1], &after[..after.len() - 1]);
+                assert_eq!(
+                    requests[3]
+                        .messages
+                        .iter()
+                        .filter(|message| message.content.contains("staged other"))
+                        .count(),
+                    1
+                );
+            }
+            for request in &requests[2..] {
+                let feedback = &request.messages.last().unwrap().content;
+                let original = format!("{anchor} | original context");
+                assert!(request.messages[..request.messages.len() - 1]
+                    .iter()
+                    .any(|message| message.content.contains(&original)));
+                assert!(!feedback.contains(&original));
+                assert!(feedback.contains(&format!("{other} | staged other")));
+                assert!(feedback.contains("RWfQ"));
+                assert!(!feedback.contains("Do not request those paths again"));
+            }
+            for (path, expected) in [("context.rs", "new context"), ("other.rs", "staged other")] {
+                assert_eq!(
+                    std::fs::read_to_string(fixture.dir.path().join(path))
+                        .unwrap()
+                        .trim_end(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_rereads_spend_the_shared_budget() {
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "original\n")],
+            vec![
+                MockResponse::text(change_set("missing", "changed")),
+                MockResponse::text(reread_files(&["hello.rs"])),
+                MockResponse::text(reread_files(&["hello.rs"])),
+            ],
+        );
+        let mut ctx = fixture.context();
+        ctx.set_turn_brief(Some(TurnBrief::step()));
+        let config = TurnLoopConfig {
+            max_turn_rounds: 3,
+            ..Default::default()
+        };
+        assert!(crate::control::step::run_step_turn(&mut ctx, &config)
+            .await
+            .unwrap()
+            .is_exhausted());
+        assert_eq!(fixture.provider.requests().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(fixture.dir.path().join("hello.rs")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_after_failed_verification_restores_the_dirty_worktree() {
+        let verify = "[project.verify]\ncommand = \"false\"\n";
+        let mut fixture = Fixture::new(
+            &[("hello.rs", "committed\n"), ("tauqe.toml", verify)],
+            vec![MockResponse::text(change_set(
+                "developer work\n",
+                "broken\n",
+            ))],
+        );
+        let file = fixture.dir.path().join("hello.rs");
+        std::fs::write(&file, "developer work\n").unwrap();
+        let config = TurnLoopConfig {
+            max_turn_rounds: 1,
+            ..Default::default()
+        };
+        let result = crate::control::step::run_step_turn(&mut fixture.context(), &config)
+            .await
+            .unwrap();
+        let LoopResult::Exhausted(report) = result else {
+            panic!("expected step exhaustion")
+        };
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.reason, "Turn round budget exhausted");
+        assert_eq!(fixture.provider.requests().len(), 1);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "developer work\n");
     }
 
     /// A step whose round only discovers reports the exhausted budget as a domain
@@ -943,7 +1374,7 @@ mod tests {
             ..TurnLoopConfig::default()
         };
 
-        let outcome = run_turn_loop(&mut ctx, None, &config)
+        let outcome = crate::control::step::run_step_turn(&mut ctx, &config)
             .await
             .expect("runs loop");
         assert!(outcome.is_exhausted());
@@ -966,14 +1397,15 @@ mod tests {
             ],
         );
         let mut ctx = fixture.context();
-        let config = TurnLoopConfig {
-            max_turn_rounds: 1,
-            ..TurnLoopConfig::default()
-        };
-
-        let outcome = run_turn_loop(&mut ctx, None, &config)
-            .await
-            .expect("runs loop");
+        let mut config = crate::config::AppConfig::default();
+        config.repl.max_turn_rounds = 1;
+        let outcome = crate::control::run_repl_loop(
+            &mut ctx,
+            &crate::control::ReplLoopConfig::from_app_config(&config),
+            None,
+        )
+        .await
+        .expect("runs loop");
         assert_eq!(
             fixture.provider.requests().len(),
             1,
@@ -981,14 +1413,9 @@ mod tests {
         );
         let success = outcome.into_success().expect("the dialogue still answers");
         let text = success
-            .response
-            .commands()
-            .iter()
-            .find_map(|command| match command {
-                LlmCommand::Text(command) => Some(command.content.clone()),
-                _ => None,
-            })
-            .expect("the answer travels upward");
+            .value
+            .message
+            .expect("the dialogue reports the answer");
         assert!(text.contains("Let me list the tree"));
         assert!(text.contains("Round Budget Reached"));
     }
@@ -998,7 +1425,6 @@ mod tests {
     #[tokio::test]
     async fn a_contour_without_edits_answers_in_text() {
         let mut fixture = Fixture::new(&[], vec![MockResponse::text("Nothing to change.")]);
-        let mut ctx = fixture.context();
         let narrowed = CapabilityTree::root(
             RESEARCH_CAPABILITIES
                 .iter()
@@ -1006,16 +1432,20 @@ mod tests {
                 .chain([LlmCapability::TextMessage])
                 .map(CapabilityTree::leaf),
         );
+        fixture.protocol = JsonPromptProtocol::new(narrowed.clone());
+        let mut ctx = fixture.context();
         let mut ctx = ctx.reborrow_with_capabilities(narrowed);
 
-        let outcome = run_turn_loop(&mut ctx, None, &TurnLoopConfig::default())
-            .await
-            .expect("runs loop");
+        let outcome = run_turn_loop(
+            &mut ctx,
+            None,
+            &TurnLoopConfig::default(),
+            TurnCompletion::AnswerAllowed,
+        )
+        .await
+        .expect("runs loop");
         let success = outcome.into_success().expect("success");
         assert!(success.value.modified_paths.is_empty());
         assert!(success.response.has(LlmCapability::TextMessage));
     }
 }
-
-#[cfg(test)]
-mod step_edit_completion_tests;

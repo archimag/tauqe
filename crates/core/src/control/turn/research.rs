@@ -121,6 +121,7 @@ async fn handle_research_commands(
     ctx: &mut LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
+    repairing: bool,
 ) -> Result<Option<ResearchFeedback>, SystemError> {
     ctx.check_cancelled()?;
 
@@ -130,6 +131,8 @@ async fn handle_research_commands(
     if commands.is_empty() {
         return Ok(None);
     }
+
+    super::announce_turn_phase(ctx, TurnPhase::Research);
 
     // The round marks its own boundary: the feedback published below covers the
     // records that follow it, so the model is told what this round delivered
@@ -234,7 +237,7 @@ async fn handle_research_commands(
             config.token_budget,
             config.repomap_token_budget,
             config.research_limits,
-            true,
+            !repairing,
             Some(&ctx.cancel.receiver()),
         )
         .await;
@@ -246,7 +249,6 @@ async fn handle_research_commands(
         ctx.journal.record_outcome(&outcome);
 
         if !outcome.added_files.is_empty() {
-            ctx.mark_context_churn();
             ctx.events
                 .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
         }
@@ -316,8 +318,9 @@ pub(crate) async fn execute_research_step(
     ctx: &mut LoopContext<'_>,
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
+    repairing: bool,
 ) -> Result<ResearchStep, SystemError> {
-    let Some(feedback) = handle_research_commands(ctx, envelope, config).await? else {
+    let Some(feedback) = handle_research_commands(ctx, envelope, config, repairing).await? else {
         return Ok(ResearchStep::default());
     };
 
@@ -330,10 +333,12 @@ pub(crate) async fn execute_research_step(
             ctx.journal.push_block(EMPTY_RESEARCH_DIRECTIVE);
         }
         ResearchStepKind::AlreadySatisfied => {
-            ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
-            announce_research_round(ctx, &feedback);
+            if !repairing {
+                ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
+            }
+            announce_research_summary(ctx, &feedback);
         }
-        ResearchStepKind::Widened => announce_research_round(ctx, &feedback),
+        ResearchStepKind::Widened => announce_research_summary(ctx, &feedback),
         ResearchStepKind::Idle => {}
     }
 
@@ -360,25 +365,12 @@ fn classify_research_round(feedback: &ResearchFeedback) -> ResearchStepKind {
     ResearchStepKind::AlreadySatisfied
 }
 
-/// Announces the round a step spent on the interface and in the journal.
-///
-/// The ordinal is the one the round boundary of the journal carries, so the label
-/// names the investigation round the step executed rather than a counter a contour
-/// keeps of its own.
-fn announce_research_round(ctx: &LoopContext<'_>, feedback: &ResearchFeedback) {
-    let round = ctx.journal.round_index();
+/// Publishes the discovery summary without a separate display ordinal.
+fn announce_research_summary(ctx: &LoopContext<'_>, feedback: &ResearchFeedback) {
     ctx.events.emit(StreamEvent::TextDelta(format!(
-        "\n\n---\n**[Round {}]** {}\n\n",
-        round,
+        "\n\n{}\n\n",
         format_round_summary(feedback)
     )));
-    super::announce_turn_phase(
-        ctx,
-        TurnPhase::Research,
-        round,
-        None,
-        format!("Research round {round}"),
-    );
 }
 
 fn format_round_summary(feedback: &ResearchFeedback) -> String {
@@ -540,7 +532,13 @@ mod tests {
                 journal: TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(responses),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(CapabilityTree::set(
+                    RESEARCH_CAPABILITIES
+                        .iter()
+                        .copied()
+                        .chain([LlmCapability::TextMessage])
+                        .map(CapabilityTree::leaf),
+                )),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -591,10 +589,14 @@ mod tests {
         })]);
         let mut ctx = fixture.context();
 
-        let result =
-            handle_research_commands(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-                .await
-                .expect("executes");
+        let result = handle_research_commands(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert!(result.is_none());
         assert_eq!(envelope.len(), 1);
     }
@@ -608,10 +610,14 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let result =
-            handle_research_commands(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-                .await
-                .expect("executes");
+        let result = handle_research_commands(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert!(result.is_some());
         let fb = result.unwrap();
         assert!(!fb.feedback_blocks.is_empty());
@@ -628,10 +634,14 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let result =
-            handle_research_commands(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-                .await
-                .expect("executes");
+        let result = handle_research_commands(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert!(result.is_none());
         assert!(envelope.is_empty());
         assert!(!fixture.journal.is_empty());
@@ -649,19 +659,20 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("executes");
+        let step = execute_research_step(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert_eq!(step.kind, ResearchStepKind::Widened);
         assert!(
             ctx.context_manager
                 .contains("helper.rs")
                 .expect("the path resolves"),
             "the delivered file joins the context"
-        );
-        assert!(
-            ctx.transcript().prefix_is_stale(),
-            "the widened context marks the transcript prefix stale"
         );
     }
 
@@ -681,9 +692,14 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("executes");
+        let step = execute_research_step(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert_eq!(step.kind, ResearchStepKind::AlreadySatisfied);
         assert!(
             fixture
@@ -711,7 +727,7 @@ mod tests {
             ..ResearchLoopConfig::default()
         };
 
-        let step = execute_research_step(&mut ctx, &mut envelope, &config)
+        let step = execute_research_step(&mut ctx, &mut envelope, &config, false)
             .await
             .expect("executes");
         assert_eq!(step.kind, ResearchStepKind::DeadEnd);
@@ -737,9 +753,14 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(&mut ctx, &mut envelope, &ResearchLoopConfig::default())
-            .await
-            .expect("executes");
+        let step = execute_research_step(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+        )
+        .await
+        .expect("executes");
         assert_eq!(step.kind, ResearchStepKind::Widened);
         assert_eq!(step.feedback.missing_files, vec!["missing.rs".to_string()]);
         assert!(

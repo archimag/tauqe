@@ -12,21 +12,14 @@
 //! Verification Healing. New knowledge is only ever appended, and an identical
 //! repeated block is not appended twice, so re-requesting the same outline never
 //! inflates the tail.
-//! inflates the tail.
 //!
 //! A round is also the unit of feedback. [`TurnResearchJournal::begin_round`]
 //! marks its boundary and [`TurnResearchJournal::render_round_feedback`]
 //! renders only the records the open round produced, so the model is told what
 //! its own round delivered instead of receiving the whole turn's investigation
-//! again. The files a round added to the context travel in that feedback as
-//! their own `<file>` elements, rendered by the very cache the prompt renders
-//! them with, so a delivered file carries the anchors of the context block.
+//! again. The prompt builder delivers effective file versions alongside these findings.
 
-use crate::context::ContextFileContent;
-use crate::prompt::ContextBlockCache;
-use crate::workflow::PatchStrategy;
-
-use super::{AddedFileContent, ResearchRoundOutcome};
+use super::ResearchRoundOutcome;
 
 /// Opening marker of the epistemic tail.
 const JOURNAL_OPEN: &str = "<research_journal>";
@@ -38,7 +31,6 @@ const JOURNAL_CLOSE: &str = "</research_journal>";
 pub struct TurnResearchJournal {
     entries: Vec<String>,
     round: RoundSection,
-    patch_strategy: PatchStrategy,
 }
 
 /// Records produced by the research round currently open.
@@ -53,8 +45,6 @@ struct RoundSection {
     index: Option<usize>,
     /// Feedback blocks recorded since the boundary.
     blocks: Vec<String>,
-    /// Files the round added to the context.
-    files: Vec<AddedFileContent>,
 }
 
 impl TurnResearchJournal {
@@ -75,15 +65,6 @@ impl TurnResearchJournal {
         self.round.index.unwrap_or(0)
     }
 
-    /// Declares how a rendered file element addresses the lines of its file.
-    ///
-    /// Under [`PatchStrategy::LineAnchor`] an element carries the opaque anchor
-    /// of every line, exactly as the context block of the round does, so the
-    /// feedback of a round addresses the bytes it delivered.
-    pub(crate) fn set_patch_strategy(&mut self, patch_strategy: PatchStrategy) {
-        self.patch_strategy = patch_strategy;
-    }
-
     /// Appends one feedback block.
     ///
     /// Blank blocks carry no knowledge and are dropped. A block identical to one
@@ -102,74 +83,16 @@ impl TurnResearchJournal {
         self.round.blocks.push(block.to_string());
     }
 
-    /// Appends every feedback block and delivered file produced by one round.
-    ///
-    /// The round outcome is read-only here: the journal observes what the round
-    /// learned and never rewrites the context the round already applied. The
-    /// delivered files travel beside the blocks, because the feedback of the
-    /// round is where the model reads the bytes it just gained.
+    /// Records the findings of one round.
     pub(crate) fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
             self.push_block(block.as_str());
         }
-        for file in &outcome.added_file_contents {
-            self.record_round_file(file);
-        }
     }
 
-    /// Records one file the open round added to the context.
-    ///
-    /// A path recorded twice keeps its first entry: one round delivers a file
-    /// once, whatever the number of requests that named it.
-    fn record_round_file(&mut self, file: &AddedFileContent) {
-        if self
-            .round
-            .files
-            .iter()
-            .any(|existing| existing.path == file.path)
-        {
-            return;
-        }
-        self.round.files.push(file.clone());
-    }
-
-    /// Renders the feedback of the round currently open.
-    ///
-    /// Only the records the open round produced are rendered: the results,
-    /// listings, and diagnostics it reported, followed by the `<file>` elements
-    /// of the files it added to the context. Rendering is a pure function of
-    /// those records, so rendering the same round twice produces the very same
-    /// bytes and never moves a token the provider already cached.
+    /// Renders findings from the current round. File versions are delivered by the transcript.
     pub(crate) fn render_round_feedback(&self) -> String {
-        let mut parts = self.round.blocks.clone();
-        if let Some(files) = self.render_round_files() {
-            parts.push(files);
-        }
-        parts.join("\n\n")
-    }
-
-    /// Renders the files the open round delivered as one `<context>` block.
-    ///
-    /// The elements come from the cache the prompt renders them with, so an
-    /// element carries the same anchors, the same bytes, and the same `access`
-    /// attribute the `<context>` block of the round renders.
-    fn render_round_files(&self) -> Option<String> {
-        if self.round.files.is_empty() {
-            return None;
-        }
-        let mut cache = ContextBlockCache::default();
-        let mut out = String::from("<context>\n");
-        for file in &self.round.files {
-            let content = ContextFileContent {
-                path: file.path.clone(),
-                access: file.access,
-                content: file.content.clone(),
-                insertion_seq: 0,
-            };
-            out.push_str(cache.element(&content, file.access, self.patch_strategy));
-        }
-        out.push_str("</context>");
-        Some(out)
+        self.round.blocks.join("\n\n")
     }
 
     /// Reports whether the journal holds no findings.
@@ -303,61 +226,5 @@ mod tests {
         let tail = journal.rendered().expect("the tail renders");
         assert!(tail.contains("regex=\"alpha\""), "{tail}");
         assert!(tail.contains("<dir_list_feedback"), "{tail}");
-    }
-
-    /// A round renders the files it delivered as their own `<file>` elements,
-    /// carrying the line anchors the patch strategy addresses.
-    #[test]
-    fn test_round_feedback_renders_the_delivered_files() {
-        use crate::edits::anchor::encode_anchor;
-
-        let mut journal = TurnResearchJournal::default();
-        journal.set_patch_strategy(PatchStrategy::LineAnchor);
-        journal.begin_round(1);
-        let mut outcome = ResearchRoundOutcome::default();
-        outcome.added_file_contents.push(AddedFileContent {
-            path: "src/a.rs".to_string(),
-            access: crate::context::ContextAccess::ReadOnly,
-            content: "alpha\nbeta\n".to_string(),
-        });
-        journal.record_outcome(&outcome);
-
-        let feedback = journal.render_round_feedback();
-        assert!(feedback.starts_with("<context>\n"), "{feedback}");
-        assert!(
-            feedback.contains(r#"path="src/a.rs" access="read_only""#),
-            "{feedback}"
-        );
-        assert!(
-            feedback.contains(&format!("{} | alpha", encode_anchor("src/a.rs", 0))),
-            "{feedback}"
-        );
-        assert!(
-            feedback.contains(&format!("{} | beta", encode_anchor("src/a.rs", 1))),
-            "{feedback}"
-        );
-        assert!(feedback.ends_with("</context>"), "{feedback}");
-    }
-
-    /// Rendering the same round twice produces the very same bytes, so a
-    /// repeated assembly never moves a token the provider already cached.
-    #[test]
-    fn test_round_feedback_is_byte_identical_when_rendered_again() {
-        let mut journal = TurnResearchJournal::default();
-        journal.set_patch_strategy(PatchStrategy::LineAnchor);
-        journal.begin_round(1);
-        journal.push_block("<repo_dirs_feedback>\nsrc\n</repo_dirs_feedback>");
-        let mut outcome = ResearchRoundOutcome::default();
-        outcome.added_file_contents.push(AddedFileContent {
-            path: "src/a.rs".to_string(),
-            access: crate::context::ContextAccess::Editable,
-            content: "alpha\n".to_string(),
-        });
-        journal.record_outcome(&outcome);
-
-        assert_eq!(
-            journal.render_round_feedback(),
-            journal.render_round_feedback()
-        );
     }
 }

@@ -343,7 +343,7 @@ fn is_openable_scheme(url: &str) -> bool {
 /// work therefore runs on the blocking pool while the caller awaits it, so the
 /// interface keeps drawing and keeps draining the daemon (c-4). A host that
 /// cannot spawn a browser reports `false`, which degrades to the clipboard.
-async fn launch_in_browser(url: &str) -> bool {
+pub(crate) async fn launch_in_browser(url: &str) -> bool {
     let address = url.to_string();
     tokio::task::spawn_blocking(move || open::that_detached(address).is_ok())
         .await

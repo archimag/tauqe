@@ -6,48 +6,19 @@ use std::sync::Arc;
 
 use tauqe_protocol::{
     errors, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult, ContextClearParams,
-    ContextRemoveParams, ContextSetAccessParams, Request, RequestId, Response,
+    ContextRemoveParams, ContextSetAccessParams, Request, Response,
 };
 
+use crate::publication::Publisher;
 use crate::state::AppState;
-use tauqe_core::api::{ContextError, ContextOperation};
-
-/// Claims the operation slot for a context mutation.
-///
-/// Every turn reasons over a clone of the context and merges that clone back when
-/// it finishes, so a mutation applied in between would be overwritten, or
-/// resurrected from the turn's frozen snapshot. Sampling the slot once cannot
-/// prevent that: a turn registering between the check and the mutation races it.
-/// The mutation therefore claims the slot instead of observing it, which makes the
-/// refusal and the mutation one atomic decision.
-fn claim_context_mutation(
-    req_id: &RequestId,
-    state: &Arc<AppState>,
-) -> Result<ContextOperation, Box<Response>> {
-    state.application.begin_context_change().map_err(|_| {
-        tracing::warn!(
-            code = errors::OPERATION_IN_PROGRESS,
-            "Refused to register a new operation: a slot is already active"
-        );
-        Box::new(Response::err(
-            req_id.clone(),
-            errors::OPERATION_IN_PROGRESS,
-            "Context cannot be modified while a turn or batch is running",
-        ))
-    })
-}
+use tauqe_flow::api::ContextError;
 
 pub async fn handle_context_get(req: Request, state: &Arc<AppState>) -> Response {
-    let ctx_state = state.context_state().await;
+    let ctx_state = state.application.context_state().await;
     Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match claim_context_mutation(&req.id, state) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: ContextAddParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
@@ -59,15 +30,20 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let ctx_state = match operation
-        .add_file(
+    let ctx_state = match state
+        .application
+        .add_context_file(
             params.path,
             context_access_domain(params.access),
             params.layer.map(context_layer_domain),
+            &Publisher {
+                out: state.out.clone(),
+            },
         )
         .await
     {
         Ok(snapshot) => snapshot,
+        Err(ContextError::Busy) => return busy(req.id),
         Err(error) => {
             let code = match error {
                 ContextError::PinnedAddition => errors::PINNED_PROTECTED,
@@ -78,17 +54,10 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    crate::handlers::context::publish_context(&state.out, &ctx_state);
-
     Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match claim_context_mutation(&req.id, state) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: ContextAddPatternParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -101,16 +70,22 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             }
         };
 
-    let addition = match operation
-        .add_pattern(params.pattern, context_access_domain(params.access))
+    let addition = match state
+        .application
+        .add_context_pattern(
+            params.pattern,
+            context_access_domain(params.access),
+            &Publisher {
+                out: state.out.clone(),
+            },
+        )
         .await
     {
         Ok(outcome) => outcome,
+        Err(ContextError::Busy) => return busy(req.id),
         Err(error) => return Response::err(req.id, errors::ADD_PATTERN_FAILED, error.to_string()),
     };
     let ctx_state = addition.state;
-
-    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
     let result = ContextAddPatternResult {
         added_count: addition.added_count,
@@ -123,11 +98,6 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
 }
 
 pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match claim_context_mutation(&req.id, state) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: ContextRemoveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
     {
         Some(p) => p,
@@ -136,22 +106,25 @@ pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Respo
         }
     };
 
-    let ctx_state = match operation.remove_file(params.path).await {
+    let ctx_state = match state
+        .application
+        .remove_context_file(
+            params.path,
+            &Publisher {
+                out: state.out.clone(),
+            },
+        )
+        .await
+    {
         Ok(snapshot) => snapshot,
+        Err(ContextError::Busy) => return busy(req.id),
         Err(error) => return Response::err(req.id, errors::REMOVE_FAILED, error.to_string()),
     };
-
-    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
     Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match claim_context_mutation(&req.id, state) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: ContextSetAccessParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -164,25 +137,26 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
             }
         };
 
-    let ctx_state = match operation
-        .set_access(params.path, context_access_domain(params.access))
+    let ctx_state = match state
+        .application
+        .set_context_access(
+            params.path,
+            context_access_domain(params.access),
+            &Publisher {
+                out: state.out.clone(),
+            },
+        )
         .await
     {
         Ok(snapshot) => snapshot,
+        Err(ContextError::Busy) => return busy(req.id),
         Err(error) => return Response::err(req.id, errors::SET_ACCESS_FAILED, error.to_string()),
     };
-
-    crate::handlers::context::publish_context(&state.out, &ctx_state);
 
     Response::ok_typed(req.id, &context_state_dto(&ctx_state))
 }
 
 pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match claim_context_mutation(&req.id, state) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     // Params are optional (a bare clear clears the User and Auto layers), but a
     // present payload must parse cleanly: a malformed payload must never silently
     // degrade into a destructive "clear all". The Pinned layer is protected and is
@@ -201,11 +175,18 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
         None => ContextClearParams::default(),
     };
 
-    let ctx_state = match operation
-        .clear(params.layer.map(context_layer_domain))
+    let ctx_state = match state
+        .application
+        .clear_manual_context(
+            params.layer.map(context_layer_domain),
+            &Publisher {
+                out: state.out.clone(),
+            },
+        )
         .await
     {
         Ok(snapshot) => snapshot,
+        Err(ContextError::Busy) => return busy(req.id),
         Err(error) => {
             let code = match error {
                 ContextError::PinnedClear => errors::PINNED_PROTECTED,
@@ -215,9 +196,15 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
         }
     };
 
-    crate::handlers::context::publish_context(&state.out, &ctx_state);
-
     Response::ok_typed(req.id, &context_state_dto(&ctx_state))
+}
+
+fn busy(id: tauqe_protocol::RequestId) -> Response {
+    Response::err(
+        id,
+        errors::OPERATION_IN_PROGRESS,
+        ContextError::Busy.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -503,7 +490,7 @@ mod tests {
             .await
             .expect("fixture context mutation runs")
             .unwrap();
-        assert_eq!(state.context_state().await.items.len(), 2);
+        assert_eq!(state.application.context_state().await.items.len(), 2);
 
         let warm_session = state.session_uuid().await;
 
@@ -667,7 +654,7 @@ mod tests {
             "the running operation must keep owning the slot"
         );
         assert!(
-            state.context_state().await.items.is_empty(),
+            state.application.context_state().await.items.is_empty(),
             "a refused context mutation must not reach the manager"
         );
 
@@ -737,7 +724,7 @@ mod tests {
             .await
             .expect("fixture context mutation runs")
             .unwrap();
-        let resident = state.context_state().await;
+        let resident = state.application.context_state().await;
         let document = resident
             .items
             .iter()

@@ -46,7 +46,7 @@ fn test_plan_refine_types_serde_and_helpers() {
     );
 
     let success_res = PlanRefineResult::Success {
-        plan: plan.clone(),
+        plan: Box::new(plan.clone()),
         explanation: Some("All decomposed".to_string()),
     };
     assert!(success_res.is_success());

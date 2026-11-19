@@ -121,9 +121,11 @@ impl FromStr for EditProtocolKind {
 pub enum PatchStrategy {
     /// Search/replace blocks that echo the replaced lines.
     SearchReplace,
-    /// Opaque line anchors naming a range of lines without echoing them (default).
-    #[default]
+    /// Opaque line anchors naming a range of lines without echoing them.
     LineAnchor,
+    /// Codex patch with file sections and context hunks.
+    #[default]
+    ApplyPatch,
 }
 
 impl std::convert::TryFrom<String> for PatchStrategy {
@@ -140,6 +142,7 @@ impl PatchStrategy {
         match self {
             Self::SearchReplace => "search_replace",
             Self::LineAnchor => "line_anchor",
+            Self::ApplyPatch => "apply_patch",
         }
     }
 }
@@ -157,8 +160,9 @@ impl FromStr for PatchStrategy {
         match s.trim().to_ascii_lowercase().as_str() {
             "search_replace" => Ok(Self::SearchReplace),
             "line_anchor" => Ok(Self::LineAnchor),
+            "apply_patch" => Ok(Self::ApplyPatch),
             other => Err(format!(
-                "Unknown patch strategy '{}'. Expected 'search_replace' or 'line_anchor'",
+                "Unknown patch strategy '{}'. Expected 'apply_patch', 'search_replace', or 'line_anchor'",
                 other
             )),
         }
@@ -170,7 +174,8 @@ mod patch_strategy_tests {
     use super::*;
     #[test]
     fn test_patch_strategy_serde_default_and_parsing() {
-        assert_eq!(PatchStrategy::default(), PatchStrategy::LineAnchor);
+        assert_eq!(PatchStrategy::default(), PatchStrategy::ApplyPatch);
+        assert_eq!("apply_patch".parse(), Ok(PatchStrategy::ApplyPatch));
         assert_eq!(
             serde_json::to_string(&PatchStrategy::SearchReplace).unwrap(),
             "\"search_replace\""

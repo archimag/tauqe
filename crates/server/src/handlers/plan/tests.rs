@@ -79,7 +79,7 @@ async fn test_state_with_provider(
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     state
 }
 
@@ -1186,14 +1186,7 @@ async fn test_plan_step_binds_the_plan_session() {
         "message": "Set value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 1 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 1 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -1262,7 +1255,7 @@ fn test_collect_plan_context_files_dedups_and_recurses() {
     // Recurses into children, collapses normalized duplicates across `files`
     // and `readonly_files`, and preserves first-seen order.
     assert_eq!(
-        super::engine::collect_plan_context_files(&plan),
+        tauqe_flow::api::collect_plan_context_files(&plan),
         vec![
             "src/shared.rs".to_string(),
             "src/ref.rs".to_string(),
@@ -1480,14 +1473,7 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
         "message": "Fix value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 100 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 100 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -1590,14 +1576,7 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
         "message": "Fix value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 7 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 7 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -1985,14 +1964,12 @@ impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
         tauqe_core::models::ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<tauqe_core::providers::ChatMessage>,
-        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
         _cancel_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         let _ = tx.send(tauqe_core::providers::StreamEvent::Cancelled).await;
         Ok(())
     }
@@ -2074,14 +2051,7 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
         "message": "Set value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 5 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 5 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -2652,7 +2622,7 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -2812,16 +2782,23 @@ async fn test_handle_plan_delete_broadcasts_typed_focus_release() {
     let res = super::storage_ops::handle_plan_delete(req, &state).await;
     assert!(res.error.is_none(), "delete failed: {:?}", res.error);
 
-    let mut release = None;
-    while let Ok(raw) = rx.try_recv() {
-        if raw.contains(events::DISCUSSION_FOCUS_CHANGED) {
-            release = Some(raw);
-        }
-    }
-    let release = release.expect("the focus release must be broadcast");
-    assert!(
-        release.contains("\"kind\":\"none\""),
-        "the release must carry an explicit detached focus: {release}"
+    assert_eq!(res.result, Some(serde_json::json!({"deleted": true})));
+    assert!(PlanStorage::load_plan(dir.path(), "typed-focus")
+        .unwrap()
+        .is_none());
+    let published: Vec<tauqe_protocol::Event> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .collect();
+    assert_eq!(
+        published
+            .iter()
+            .map(|event| event.method.as_str())
+            .collect::<Vec<_>>(),
+        [events::DISCUSSION_FOCUS_CHANGED, events::PLAN_LIST_CHANGED]
+    );
+    assert_eq!(
+        published[0].params.as_ref().unwrap()["focus"]["kind"],
+        "none"
     );
 
     assert!(state.discussion_focus().await.is_none());
@@ -3007,16 +2984,7 @@ async fn test_plan_step_structured_protocol_execution() {
         "message": "Set value to 42",
         "action": {
             "kind": "edit",
-            "changes": [
-                {
-                    "op": "replace",
-                    "path": "src.rs",
-                    "to": "",
-                    "old_text": "pub fn value() -> i32 { 0 }",
-                    "new_text": "pub fn value() -> i32 { 42 }",
-                    "content": ""
-                }
-            ],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 42 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -3103,14 +3071,7 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
         "message": "Fix value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 9 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 9 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -3203,14 +3164,7 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
         "message": "Set value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 3 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 3 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -3334,7 +3288,7 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let operation = Arc::new(
         state
@@ -3434,14 +3388,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
         "message": "Fix value",
         "action": {
             "kind": "edit",
-            "changes": [{
-                "op": "replace",
-                "path": "src.rs",
-                "to": "",
-                "old_text": "pub fn value() -> i32 { 0 }",
-                "new_text": "pub fn value() -> i32 { 11 }",
-                "content": ""
-            }],
+            "patch": "*** Begin Patch\n*** Update File: src.rs\n@@\n-pub fn value() -> i32 { 0 }\n+pub fn value() -> i32 { 11 }\n*** End Patch",
             "commit_message": "done",
             "message": "",
             "reason": ""
@@ -3473,7 +3420,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let operation = Arc::new(
         state
@@ -3570,7 +3517,7 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let operation = Arc::new(
         state
@@ -3650,14 +3597,12 @@ impl tauqe_core::providers::LlmProvider for ParkingProvider {
         tauqe_core::models::ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<tauqe_core::providers::ChatMessage>,
-        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         _tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
         _cancel_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         let _ = self.entered.send(());
         std::future::pending::<()>().await;
         Ok(())
@@ -3782,15 +3727,18 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
     // The exited step task no longer holds the session lock: a subsequent
     // interactive turn reaches the provider within a bounded timeout instead
     // of blocking indefinitely behind the abandoned step.
-    crate::handlers::model::start_model_turn(
-        &state,
-        "Probe the session lock".to_string(),
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("the probe turn starts once the operation slot is free");
+    state
+        .application
+        .ask(
+            tauqe_flow::api::ModelAskInput::Prompt {
+                text: "Probe the session lock".into(),
+            },
+            Arc::new(crate::publication::Publisher {
+                out: state.out.clone(),
+            }),
+        )
+        .await
+        .expect("the probe turn starts once the operation slot is free");
     tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
         .await
         .expect("the probe turn must acquire the session lock and reach the provider")
@@ -3927,7 +3875,7 @@ async fn test_plan_refine_force_aborted_contour_answers_cancelled() {
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -4013,14 +3961,12 @@ impl tauqe_core::providers::LlmProvider for CancellingFinalRoundProvider {
         tauqe_core::models::ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<tauqe_core::providers::ChatMessage>,
-        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
         _cancel_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         let _ = self.entered.send(());
         self.release.notified().await;
         let _ = tx
@@ -4094,7 +4040,7 @@ async fn test_plan_refine_answers_cancelled_before_the_destructive_horizon_write
         hist_tx,
         out,
     );
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),

@@ -63,7 +63,8 @@ use std::borrow::Cow;
 ///
 /// This convenience wrapper compiles `pattern` on every call. When matching many
 /// paths against one pattern, compile once with [`GlobPattern::new`] and reuse it.
-pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
     GlobPattern::new(pattern).matches(path)
 }
 

@@ -51,17 +51,12 @@ pub(crate) fn apply_credentials(
             match std::fs::read_to_string(explicit_path) {
                 Ok(content) => match toml::from_str::<providers::Credentials>(&content) {
                     Ok(creds) => Some(creds),
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to parse credentials file {}: {}",
-                            explicit_path.display(),
-                            err
-                        );
+                    Err(_) => {
                         let msg = format!(
-                            "Failed to parse credentials file {}: {}",
-                            explicit_path.display(),
-                            err
+                            "Failed to parse credentials file {}",
+                            explicit_path.display()
                         );
+                        tracing::warn!("{msg}");
                         config.config_error = match config.config_error.take() {
                             Some(prev) => Some(format!("{}; {}", prev, msg)),
                             None => Some(msg),

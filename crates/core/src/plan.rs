@@ -1,7 +1,8 @@
 mod model;
+pub(crate) use model::PlanValidationError;
 pub use model::{
     ConceptItem, Plan, PlanImplementation, PlanItem, PlanItemStatus, PlanRejection,
-    PlanRejectionKind, PlanScopeEvaluation, PlanSummary, PlanSynthesisResult, PlanValidationError,
+    PlanRejectionKind, PlanScopeEvaluation, PlanSummary, PlanSynthesisResult,
 };
 pub mod matcher;
 pub mod prompt;
@@ -36,4 +37,4 @@ pub fn find_duplicate_item_ids(items: &[PlanItem]) -> Option<String> {
     walk(items, &mut HashSet::new())
 }
 
-pub use model::{DiscussionPlanAction, DiscussionPlanUpdate};
+pub use crate::llm::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};

@@ -8,108 +8,29 @@
 
 use crate::config::project::ProjectConfig;
 
-use std::borrow::Cow;
-
-use crate::capabilities::{
-    capability_expr_schema, compose_structured_protocol_instructions, decode_capability_expr,
-    PromptRenderContext,
-};
+use crate::capabilities::{decode_capability_expr, PromptRenderContext};
 use crate::edits::protocol::structured::{
     resolve_decoded_edits, StructuredEditProtocol, StructuredPayload,
 };
-use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
-use crate::llm::CapabilityTree;
-use crate::llm::LlmCapability;
-use crate::llm::{LlmCommand, TextCommand};
-use crate::workflow::EditProtocolKind;
-use crate::workflow::PatchStrategy;
+use crate::llm::{CapabilityTree, LlmCapability, LlmCommand, TextCommand};
+use crate::workflow::{EditProtocolKind, PatchStrategy};
 
 use super::protocol::PromptProtocol;
-use crate::control::repl::dialogue_capability_expr;
-use crate::control::turn::turn_capability_expr;
-
-/// Operating mode of the structured transport.
-///
-/// The mode is derived from the capability surface: a surface that permits file
-/// edits runs the edit transport, while a surface that edits nothing runs the
-/// conversational transport and streams the single field it declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JsonPromptMode {
-    /// Edit transport, selected by a surface that permits file modifications.
-    Edits,
-    /// Conversational transport streaming `stream_field` to the interface.
-    Discussion { stream_field: String },
-}
 
 /// Structured Output (JSON Schema) prompt protocol.
 pub struct JsonPromptProtocol {
-    mode: JsonPromptMode,
     capabilities: CapabilityTree,
     /// Project declaration the round observes, when the contour carries one.
     project: Option<ProjectConfig>,
 }
 
-impl Default for JsonPromptProtocol {
-    fn default() -> Self {
-        Self::with_capabilities(dialogue_capability_expr(false, false))
-    }
-}
-
 impl JsonPromptProtocol {
-    /// Protocol of an isolated step turn, whose base surface is the turn contour.
-    pub fn edits() -> Self {
-        Self::with_capabilities(turn_capability_expr())
-    }
-
-    /// Protocol of an interactive dialogue that authors and amends plans.
-    /// Protocol of an interactive dialogue that authors and amends plans.
-    #[cfg(test)]
-    pub(crate) fn discussion() -> Self {
-        Self::with_capabilities(dialogue_capability_expr(true, false))
-    }
-
-    /// Dialogue protocol that streams a custom response field.
-    #[cfg(test)]
-    fn with_stream_field(stream_field: &str) -> Self {
-        let capabilities = dialogue_capability_expr(true, false);
-        let mode = Self::mode_for_field(&capabilities, stream_field);
+    /// Constructs a working structured protocol with the contour's capability tree.
+    pub fn new(capabilities: CapabilityTree) -> Self {
         Self {
-            mode,
             capabilities,
             project: None,
-        }
-    }
-
-    /// Protocol carrying `capabilities`, with the mode derived from them.
-    pub(crate) fn with_capabilities(capabilities: CapabilityTree) -> Self {
-        let mode = Self::mode_for(&capabilities);
-        Self {
-            mode,
-            capabilities,
-            project: None,
-        }
-    }
-
-    /// Active operating mode of this transport.
-    #[cfg(test)]
-    fn mode(&self) -> &JsonPromptMode {
-        &self.mode
-    }
-
-    /// Derives the mode of `capabilities` for the default `message` channel.
-    fn mode_for(capabilities: &CapabilityTree) -> JsonPromptMode {
-        Self::mode_for_field(capabilities, "message")
-    }
-
-    /// Derives the mode of `capabilities` for the given streamed field.
-    fn mode_for_field(capabilities: &CapabilityTree, stream_field: &str) -> JsonPromptMode {
-        if has_any_edit(capabilities) {
-            JsonPromptMode::Edits
-        } else {
-            JsonPromptMode::Discussion {
-                stream_field: stream_field.to_string(),
-            }
         }
     }
 }
@@ -127,27 +48,26 @@ impl PromptProtocol for JsonPromptProtocol {
         self.capabilities.clone()
     }
 
-    fn with_capability_expr(&self, expr: CapabilityTree) -> Box<dyn PromptProtocol> {
-        let mode = Self::mode_for(&expr);
-        Box::new(Self {
-            mode,
-            capabilities: expr,
-            project: self.project.clone(),
-        })
-    }
-
     fn with_project(&self, project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
         // The declaration travels beside the capability tree, so the schema the
         // round is constrained by and the decoder that reads its answer observe
         // one project.
         Box::new(Self {
-            mode: self.mode.clone(),
             capabilities: self.capabilities.clone(),
             project,
         })
     }
 
     fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand> {
+        self.decode_with_strategy(raw_text, context_paths, PatchStrategy::SearchReplace)
+    }
+
+    fn decode_with_strategy(
+        &self,
+        raw_text: &str,
+        context_paths: &[String],
+        strategy: PatchStrategy,
+    ) -> Vec<LlmCommand> {
         // A structured round is one JSON object, and every command below is
         // read from this single decoding instead of re-parsing the response
         // once per field.
@@ -170,14 +90,16 @@ impl PromptProtocol for JsonPromptProtocol {
         // capability the tree does not declare is never extracted from a
         // response.
         if let Some(root) = payload.root() {
-            let ctx =
-                PromptRenderContext::new(context_paths, None).with_project(self.project.as_ref());
+            let ctx = PromptRenderContext::new(context_paths, None)
+                .with_project(self.project.as_ref())
+                .with_patch_strategy(strategy);
             let mut edits = Vec::new();
             for command in decode_capability_expr(&self.capabilities, root, &ctx) {
                 match command {
                     // The module decodes paths but holds no working
                     // context, so the edit batch is resolved against the
                     // context paths of this round once the walk collected it.
+                    cmd @ LlmCommand::ApplyPatch { .. } => commands.push(cmd),
                     cmd if is_edit_capability(crate::llm::command_capability(&cmd)) => {
                         edits.push(cmd)
                     }
@@ -201,56 +123,12 @@ impl PromptProtocol for JsonPromptProtocol {
         _has_eager_repo_map: bool,
         patch_strategy: PatchStrategy,
     ) -> String {
-        // The editable paths travel through the protocol contract, so the
-        // parameter is bound explicitly here.
-        let _ = editable_paths;
-        match &self.mode {
-            JsonPromptMode::Edits => {
-                // Structured Output always exposes the `repo_maps` schema field,
-                // so its reference describes the field regardless of the outline.
-                StructuredEditProtocol.system_instructions_for(
-                    &self.capabilities,
-                    editable_paths,
-                    patch_strategy,
-                    self.project.as_ref(),
-                )
-            }
-            JsonPromptMode::Discussion { .. } => {
-                // A discussion turn edits no file, so the editable paths still
-                // reach the render context that composes the operational rules
-                // of the active capability tree.
-                let render = PromptRenderContext::new(editable_paths, None)
-                    .with_eager_repo_map(_has_eager_repo_map)
-                    .with_project(self.project.as_ref())
-                    .with_patch_strategy(patch_strategy);
-                // The schema declares the response structure, so the section
-                // carries only the operational rules of the active capability
-                // tree: the very call that renders an edit surface names exactly
-                // the mechanics that surface cannot express through a field, and
-                // a narrowed tree never advertises a capability it dropped. No
-                // streamed field earns a bullet of its own either, because the
-                // schema already declares the property that carries it.
-                let operational =
-                    compose_structured_protocol_instructions(&self.capabilities, &render);
-                let mut instructions = String::from(
-                    "## Mode: Structured Discussion\nYou are operating in Structured Discussion mode. Formulate all responses as a valid JSON object matching the discussion_response schema:\n",
-                );
-                let schema = capability_expr_schema(&self.capabilities, &render);
-                if let Ok(schema_str) = serde_json::to_string_pretty(&schema) {
-                    instructions.push_str("```json\n");
-                    instructions.push_str(&schema_str);
-                    instructions.push_str("\n```\n\n");
-                }
-                if !operational.is_empty() {
-                    instructions.push_str(&operational);
-                    instructions.push('\n');
-                }
-                instructions.push_str(
-                    "Output ONLY raw valid JSON matching this schema, without any outer markdown fences or markdown wrapping.\n",
-                );
-                instructions
-            }
-        }
+        StructuredEditProtocol.system_instructions_for(
+            &self.capabilities,
+            editable_paths,
+            patch_strategy,
+            self.project.as_ref(),
+        )
     }
 
     fn response_format(
@@ -269,29 +147,24 @@ impl PromptProtocol for JsonPromptProtocol {
         // `with_project` answers a caller that passes none, so the composed
         // schema and the rendered instructions observe one project.
         let project = project.or(self.project.as_ref());
-        match &self.mode {
-            JsonPromptMode::Edits => {
-                let render = PromptRenderContext::new(editable_paths, None)
-                    .with_project(project)
-                    .with_patch_strategy(patch_strategy);
-                StructuredEditProtocol.response_format_for(&self.capabilities, &render)
-            }
-            JsonPromptMode::Discussion { .. } => {
-                let render = PromptRenderContext::new(editable_paths, None)
-                    .with_project(project)
-                    .with_patch_strategy(patch_strategy);
-                Some(crate::providers::ResponseFormat::JsonSchema {
-                    json_schema: crate::providers::JsonSchemaDefinition {
-                        name: "discussion_response".to_string(),
-                        description: Some(
-                            "Structured response for discussion and planning modes".to_string(),
-                        ),
-                        strict: Some(true),
-                        schema: Cow::Owned(capability_expr_schema(&self.capabilities, &render)),
-                    },
-                })
-            }
-        }
+        let render = PromptRenderContext::new(editable_paths, None)
+            .with_project(project)
+            .with_patch_strategy(patch_strategy);
+        StructuredEditProtocol.response_format_for(&self.capabilities, &render)
+    }
+
+    fn create_stream_filter_with_strategy(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+        strategy: PatchStrategy,
+    ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
+        Box::new(
+            JsonStreamFilter::new(editable_paths, repo_root)
+                .with_staged_contents(staged_contents)
+                .with_changes_preview(strategy != PatchStrategy::ApplyPatch),
+        )
     }
 
     fn create_stream_filter(
@@ -300,15 +173,9 @@ impl PromptProtocol for JsonPromptProtocol {
         repo_root: std::path::PathBuf,
         staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        match &self.mode {
-            JsonPromptMode::Edits => Box::new(
-                JsonStreamFilter::new(editable_paths, repo_root)
-                    .with_staged_contents(staged_contents),
-            ),
-            JsonPromptMode::Discussion { stream_field } => Box::new(
-                DiscussionStreamFilter::with_target_field(stream_field.clone()),
-            ),
-        }
+        Box::new(
+            JsonStreamFilter::new(editable_paths, repo_root).with_staged_contents(staged_contents),
+        )
     }
 }
 
@@ -326,19 +193,11 @@ fn is_edit_capability(capability: Option<LlmCapability>) -> bool {
     )
 }
 
-fn has_any_edit(capabilities: &CapabilityTree) -> bool {
-    capabilities.contains(LlmCapability::EditReplace)
-        || capabilities.contains(LlmCapability::EditCreate)
-        || capabilities.contains(LlmCapability::EditDelete)
-        || capabilities.contains(LlmCapability::EditMove)
-        || capabilities.contains(LlmCapability::EditMoveDir)
-        || capabilities.contains(LlmCapability::EditOverwrite)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::ContextAccess;
+    use crate::control::turn::turn_capability_expr;
     use crate::edits::EditOperation;
     use crate::edits::EditReplace;
     use crate::llm::{
@@ -394,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_name_and_capabilities() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         assert_eq!(protocol.name(), "structured");
         for capability in [
             LlmCapability::TextMessage,
@@ -420,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_decode_answer_without_changes() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let output = r#"{"message":"Hello there! How can I help you?","action":{"kind":"answer"}}"#;
         let commands = protocol.decode(output, &[]);
         assert_eq!(
@@ -433,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_decode_invalid_structured_change_emits_protocol_error() {
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{
             "message": "Bad change",
             "changes": [
@@ -466,7 +325,7 @@ mod tests {
         // an answer without edits would silently discard the change set the
         // model promised, so the defect travels through the protocol-error
         // channel where the bounded turn can retry it.
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{
             "message": "Editing",
             "changes": [
@@ -497,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_decode_file_edit() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let output = r#"{
             "message": "Fix the bug",
             "action": {
@@ -540,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_decode_repo_outline_requests() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let output = r#"{
             "message":"Outlining",
             "action":{
@@ -570,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_decode_dir_list_requests() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let output = r#"{
             "message":"Listing",
             "action":{
@@ -599,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_decode_research_requests() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let output = r#"{
             "message":"Need more context",
             "action":{
@@ -632,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_decode_outer_doc_requests_from_structured_json_and_xml_fallback() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
 
         // A request names the mount point of one project declaration, and a
         // blank identifier grants nothing.
@@ -672,13 +531,12 @@ mod tests {
 
     #[test]
     fn test_narrowed_capability_set_filters_decoded_commands() {
-        let protocol = JsonPromptProtocol::edits()
-            .with_capability_expr(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         assert_eq!(
             protocol.capability_expr().leaves(),
             vec![LlmCapability::TextMessage]
         );
-
         let output = r#"{"message":"Need context","changes":[{"op":"create","path":"src/a.rs","to":"","old_text":"","new_text":"","content":"x"}],"context_requests":["src/b.rs"],"suggested_actions":[]}"#;
         let commands = protocol.decode(output, &[]);
         assert!(!commands.is_empty());
@@ -688,176 +546,30 @@ mod tests {
     }
 
     #[test]
-    fn test_discussion_mode_capabilities() {
-        let protocol = JsonPromptProtocol::discussion();
-        assert_eq!(protocol.name(), "structured");
-        assert!(protocol.supports(LlmCapability::TextMessage));
-        assert!(protocol.supports(LlmCapability::PlanCreation));
-        assert!(protocol.supports(LlmCapability::PlanUpdate));
-        assert!(protocol.supports(LlmCapability::ContextRequest));
-        // A plan discussion carries the full dialogue surface, so its transport
-        // derives the edit mode and composes the composite registry schema.
-        assert!(protocol.supports(LlmCapability::EditReplace));
-        assert_eq!(protocol.mode(), &JsonPromptMode::Edits);
-    }
-
-    #[test]
-    fn test_mode_is_derived_from_the_capability_surface() {
-        // A surface that permits file edits always runs in edit mode, so widening
-        // a discussion surface switches the transport instead of keeping a
-        // conversational schema that would reject the change set.
-        let edits = dialogue(false, false);
-        assert_eq!(JsonPromptProtocol::mode_for(&edits), JsonPromptMode::Edits);
-        assert_eq!(
-            JsonPromptProtocol::mode_for_field(&edits, "summary"),
-            JsonPromptMode::Edits
-        );
-
-        // A surface without file edits keeps the conversational channel, and a
-        // custom field name is preserved for it.
-        let text_only =
-            CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::PlanUpdate]);
-        assert_eq!(
-            JsonPromptProtocol::mode_for(&text_only),
-            JsonPromptMode::Discussion {
-                stream_field: "message".to_string()
-            }
-        );
-        assert_eq!(
-            JsonPromptProtocol::mode_for_field(&text_only, "summary"),
-            JsonPromptMode::Discussion {
-                stream_field: "summary".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn test_discussion_constructors_derive_the_mode_from_their_surface() {
-        // The constructors no longer hardcode the conversational mode: they hand
-        // their surface to the same derivation the capability-set path uses.
-        let discussion = JsonPromptProtocol::discussion();
-        assert_eq!(discussion.capability_expr(), dialogue(true, false));
-        assert_eq!(
-            discussion.mode(),
-            &JsonPromptProtocol::mode_for(&dialogue(true, false))
-        );
-
-        let custom = JsonPromptProtocol::with_stream_field("summary");
-        assert_eq!(custom.capability_expr(), dialogue(true, false));
-        assert_eq!(
-            custom.mode(),
-            &JsonPromptProtocol::mode_for_field(&dialogue(true, false), "summary")
-        );
-    }
-
-    #[test]
-    fn test_file_edits_surface_composes_the_registry_edit_schema() {
-        // The mode is a projection of the surface: a surface that permits file
-        // edits runs in edit mode, so its response schema is the registry
-        // composition, where `plan_update` is already declared and the change
-        // composition, where `plan_create` is already declared and the change
-        // single source of truth across both discussions.
-        let widened = JsonPromptProtocol::with_capabilities(dialogue(false, false));
-        let format = widened
-            .response_format(&[], PatchStrategy::SearchReplace, None)
-            .expect("edit mode always carries a response schema");
-        let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
-            panic!("edit mode composes a JSON schema");
-        };
-        let schema = flattened_surface(&json_schema.schema);
-        assert!(schema["properties"].get("changes").is_some());
-        assert!(schema["properties"].get("plan_create").is_some());
-        assert!(schema["properties"].get("context_requests").is_some());
-        assert!(schema["properties"].get("repo_searches").is_some());
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-    }
-
-    #[test]
-    fn test_conversational_surface_composes_the_discussion_schema() {
-        // The complementary branch: without file edits the derived mode streams
-        // the `message` field and answers with the discussion schema.
-        let text_only = CapabilityTree::from_leaves([
-            LlmCapability::TextMessage,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::ContextRequest,
-        ]);
-        let protocol = JsonPromptProtocol::with_capabilities(text_only);
-        let format = protocol
-            .response_format(&[], PatchStrategy::SearchReplace, None)
-            .expect("discussion mode composes a response schema");
-        let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
-            panic!("discussion mode composes a JSON schema");
-        };
-        assert_eq!(json_schema.name, "discussion_response");
-        assert!(json_schema.schema["properties"].get("changes").is_none());
-    }
-
-    #[test]
-    fn test_discussion_instructions_own_the_mode_section() {
-        // A structured discussion is a surface that edits no file, so it streams
-        // the conversational channel and renders the discussion section itself.
-        let conversational = CapabilityTree::from_leaves([
-            LlmCapability::TextMessage,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::ContextRequest,
-        ]);
-        let protocol = JsonPromptProtocol::with_capabilities(conversational);
-        let instructions = protocol.system_instructions(&[], false, PatchStrategy::SearchReplace);
-
-        // The protocol renders the discussion section itself, with the same
-        // `##`-section structure the edit reference uses.
-        assert!(instructions.starts_with("## Mode: Structured Discussion\n"));
-        assert!(instructions.contains("matching the discussion_response schema"));
-        // The response structure belongs to the schema alone, so the section
-        // names no field of the surface it describes.
-        for field in ["message", "plan_create", "plan_update", "context_requests"] {
-            assert!(
-                !instructions.contains(&format!("- `{field}`:")),
-                "the discussion section restates the schema field `{field}`"
-            );
+    fn test_working_surfaces_compose_the_edit_schema() {
+        for tree in [
+            dialogue(false, false),
+            dialogue(true, false),
+            dialogue(false, true),
+            crate::control::turn::turn_capability_expr(),
+        ] {
+            let protocol = JsonPromptProtocol::new(tree);
+            let crate::providers::ResponseFormat::JsonSchema { json_schema } = protocol
+                .response_format(&[], PatchStrategy::SearchReplace, None)
+                .expect("structured schema")
+            else {
+                panic!("expected edit schema")
+            };
+            let schema = flattened_surface(&json_schema.schema);
+            assert!(schema["properties"].get("changes").is_some());
+            assert!(schema["properties"].get("context_requests").is_some());
+            assert_eq!(schema["additionalProperties"], false);
         }
-        assert!(instructions.ends_with("markdown wrapping.\n"));
-        assert!(!instructions.contains("Code Modification Protocol"));
-    }
-
-    #[test]
-    fn test_discussion_instructions_follow_the_active_capability_tree() {
-        // Narrowing the surface removes a property from the schema, so the
-        // rendered reference must stop naming it as well: the text and the wire
-        // stay one projection of the same tree.
-        let without_research = CapabilityTree::from_leaves([
-            LlmCapability::TextMessage,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-        ]);
-        let narrowed = JsonPromptProtocol::with_capabilities(without_research).system_instructions(
-            &[],
-            false,
-            PatchStrategy::SearchReplace,
-        );
-        assert!(narrowed.starts_with("## Mode: Structured Discussion\n"));
-        assert!(!narrowed.contains("`plan_create`:"));
-        assert!(!narrowed.contains("`plan_update`:"));
-        assert!(!narrowed.contains("`context_requests`"));
-        assert!(!narrowed.contains("`repo_searches`"));
-
-        // A surface that edits no file states no change-set mechanics either.
-        let text_only = CapabilityTree::from_leaves([LlmCapability::TextMessage]);
-        let bare = JsonPromptProtocol::with_capabilities(text_only).system_instructions(
-            &[],
-            false,
-            PatchStrategy::SearchReplace,
-        );
-        assert!(bare.starts_with("## Mode: Structured Discussion\n"));
-        assert!(!bare.contains("`changes`"));
-        assert!(!bare.contains("`plan_update`"));
     }
 
     #[test]
     fn test_decode_discussion_response() {
-        let protocol = JsonPromptProtocol::discussion();
+        let protocol = JsonPromptProtocol::new(dialogue(true, false));
         let plan_output = r#"{
             "message": "Let us refine the concept.",
             "action": {
@@ -920,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_discussion_streaming_filter_integration() {
-        let protocol = JsonPromptProtocol::discussion();
+        let protocol = JsonPromptProtocol::new(dialogue(true, false));
         let mut filter = protocol.create_stream_filter(
             vec![],
             std::path::PathBuf::from("/tmp"),
@@ -955,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_decode_control_fields_from_structured_json() {
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
         let research_output = r#"{
             "message": "Need the git chapter",
             "scratchpad": "Verified: json decoder fixed.",
@@ -1015,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_decode_abort_from_structured_json_and_xml_fallback() {
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{
             "message": "The native build needs approval.",
             "action": {
@@ -1052,7 +764,7 @@ mod tests {
     fn test_decode_custom_tool_from_structured_json_and_xml_fallback() {
         let text_only =
             CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::CustomTools]);
-        let protocol = JsonPromptProtocol::edits().with_capability_expr(text_only);
+        let protocol = JsonPromptProtocol::new(text_only);
         let output = r#"{
             "message": "Running the declared probe.",
             "custom_tools": [{"name": "probe", "args": {"n": "10"}}]
@@ -1063,7 +775,6 @@ mod tests {
                 name: "probe".to_string(),
                 args: serde_json::json!({ "n": "10" }),
             })));
-
         // An empty array requests no execution.
         let idle = r#"{"message": "x", "custom_tools": []}"#;
         assert!(!protocol
@@ -1074,8 +785,8 @@ mod tests {
 
     #[test]
     fn test_narrowed_capability_set_blocks_control_field_decoding() {
-        let protocol = JsonPromptProtocol::edits()
-            .with_capability_expr(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         let output = r#"{
             "message": "Only text",
             "changes": [],
@@ -1094,12 +805,12 @@ mod tests {
 
     #[test]
     fn test_with_capabilities_derives_mode_from_file_edits() {
-        let with_edits = JsonPromptProtocol::with_capabilities(dialogue(false, false));
+        let with_edits = JsonPromptProtocol::new(dialogue(false, false));
         assert_eq!(with_edits.name(), "structured");
         assert!(with_edits.supports(LlmCapability::EditReplace));
         assert_eq!(with_edits.capability_expr(), dialogue(false, false));
 
-        let no_edits = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
+        let no_edits = JsonPromptProtocol::new(CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::PlanUpdate,
         ]));
@@ -1112,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_decode_uses_the_context_paths_for_resolution_and_membership() {
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let context_paths = vec!["crates/core/src/lib.rs".to_string()];
 
         // A unique suffix of a context file resolves to the context path.
@@ -1155,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_decode_plan_update_from_structured_json() {
-        let protocol = JsonPromptProtocol::discussion();
+        let protocol = JsonPromptProtocol::new(dialogue(true, false));
         let output = r#"{
             "message": "Plan refined",
             "action": {
@@ -1175,12 +886,15 @@ mod tests {
             })
             .expect("plan command");
         assert_eq!(plan.id.as_deref(), Some("p-9"));
-        assert_eq!(plan.action, crate::plan::DiscussionPlanAction::Save);
+        assert_eq!(
+            plan.action,
+            crate::llm::discussion::DiscussionPlanAction::Save
+        );
     }
 
     #[test]
     fn test_decode_malformed_plan_update_emits_protocol_error() {
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(dialogue(true, false));
         let output = r#"{
             "message": "Refining",
             "action": {
@@ -1204,7 +918,7 @@ mod tests {
     #[test]
     fn test_capability_switch_filters_unadvertised_commands() {
         let research = CapabilityTree::from_leaves([LlmCapability::ContextRequest]);
-        let protocol = JsonPromptProtocol::with_capabilities(research);
+        let protocol = JsonPromptProtocol::new(research);
         let output = r#"{
             "message": "x",
             "changes": [{"op": "create", "path": "a.rs", "to": "", "old_text": "", "new_text": "", "content": "fn x() {}"}],
@@ -1224,7 +938,7 @@ mod tests {
         // A round whose only conversational channel is empty must not surface
         // its JSON scaffolding as text: the REPL streamed nothing for it, and
         // session history must record the same nothing (plus phase banners).
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{"message":"","action":{"kind":"edit","changes":[],"verify":{"target":"none","on_success":"silent"}}}"#;
         let commands = protocol.decode(output, &[]);
         assert!(
@@ -1240,7 +954,7 @@ mod tests {
         // summary and nothing else, so an empty summary decodes into a success
         // that carries no payload. The bounded turn can then re-ask the model
         // instead of recording a silent conclusion.
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{
             "message": "",
             "action": {
@@ -1262,7 +976,7 @@ mod tests {
         // An empty object is the smallest silent structured round: it carries no
         // conversational channel and no actionable field, so the decoded surface
         // stays empty and never degrades into raw JSON text.
-        let protocol = JsonPromptProtocol::with_capabilities(CapabilityTree::from_leaves([
+        let protocol = JsonPromptProtocol::new(CapabilityTree::from_leaves([
             LlmCapability::TextMessage,
             LlmCapability::EditReplace,
         ]));
@@ -1285,7 +999,7 @@ mod tests {
         // payload the round stated: an omitted field becomes the empty string
         // its atomic command carries, so the bounded turn decides how to
         // complete a claim nobody stated.
-        let protocol = JsonPromptProtocol::default();
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
 
         let empty_terminal = r#"{
             "message": "",
@@ -1363,7 +1077,7 @@ mod tests {
         // being folded into the conversational text. The decision belongs to the
         // review discussion regime alone, so the transport runs on that surface:
         // the shared dialogue head never advertises the field.
-        let protocol = JsonPromptProtocol::with_capabilities(dialogue(false, true));
+        let protocol = JsonPromptProtocol::new(dialogue(false, true));
         let output = r#"{
             "message": "Recording the decision.",
             "action": {
@@ -1387,7 +1101,7 @@ mod tests {
         assert_eq!(decision.item_id, 7);
         assert_eq!(
             decision.status,
-            crate::review::ReviewDecisionStatus::Rejected
+            crate::llm::discussion::ReviewDecisionStatus::Rejected
         );
         assert_eq!(decision.note, "The guard is released after the await");
 
@@ -1414,7 +1128,7 @@ mod tests {
         // The tree scopes decoding: a round that declares the edit branch
         // yields its change set and no discovery command, even though the
         // response carries fields of the branches it did not select.
-        let protocol = JsonPromptProtocol::edits();
+        let protocol = JsonPromptProtocol::new(turn_capability_expr());
         let output = r#"{
             "message": "Editing",
             "action": {
@@ -1447,78 +1161,5 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| matches!(command, LlmCommand::CommitMessage(_))));
-    }
-    #[test]
-    fn discussion_instructions_compose_the_active_capability_tree() {
-        // The section is the composition of the active tree, so a property is
-        // named only by the capability that owns an operational rule for it.
-        let plan_tree = CapabilityTree::from_leaves([
-            LlmCapability::TextMessage,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::ContextRequest,
-        ]);
-        let text_only = CapabilityTree::from_leaves([LlmCapability::TextMessage]);
-
-        let authored = JsonPromptProtocol::with_capabilities(plan_tree.clone())
-            .system_instructions(&[], false, PatchStrategy::SearchReplace);
-        let plain = JsonPromptProtocol::with_capabilities(text_only).system_instructions(
-            &[],
-            false,
-            PatchStrategy::SearchReplace,
-        );
-        for text in [&authored, &plain] {
-            for property in [
-                "plan_create",
-                "plan_update",
-                "context_requests",
-                "repo_searches",
-            ] {
-                assert!(
-                    !text.contains(&format!("`{property}`")),
-                    "the discussion section names the schema property `{property}`: {text}"
-                );
-            }
-            assert!(text.starts_with("## Mode: Structured Discussion\n"));
-            assert!(text.contains("matching the discussion_response schema"));
-        }
-
-        // The composition is live: a capability that carries an operational rule
-        // contributes it, while an authorship capability carries none, so the
-        // plan properties never reach text whose tree declares them beside it.
-        let render = PromptRenderContext::new(&[], None);
-        let with_edit =
-            CapabilityTree::from_leaves([LlmCapability::TextMessage, LlmCapability::EditReplace]);
-        assert!(
-            compose_structured_protocol_instructions(&with_edit, &render).contains("`changes`"),
-            "the change-set mechanics follow the capability that owns them"
-        );
-        assert!(
-            compose_structured_protocol_instructions(&plan_tree, &render).is_empty(),
-            "a discussion tree names no plan property, because the schema owns it"
-        );
-    }
-
-    #[test]
-    fn a_custom_streamed_field_earns_no_hand_written_bullet() {
-        // The discussion section is the composition of the active tree, so a
-        // streamed field never earns a bullet the schema does not declare.
-        let protocol = JsonPromptProtocol {
-            mode: JsonPromptMode::Discussion {
-                stream_field: "summary".to_string(),
-            },
-            capabilities: CapabilityTree::from_leaves([
-                LlmCapability::TextMessage,
-                LlmCapability::PlanCreation,
-                LlmCapability::PlanCreation,
-            ]),
-            project: None,
-        };
-        let instructions = protocol.system_instructions(&[], false, PatchStrategy::SearchReplace);
-        assert!(!instructions.contains("`summary`"));
-        assert!(!instructions.contains("Conversational Markdown response"));
-        assert!(instructions.starts_with("## Mode: Structured Discussion\n"));
-        assert!(instructions.contains("matching the discussion_response schema"));
-        assert!(instructions.ends_with("markdown wrapping.\n"));
     }
 }

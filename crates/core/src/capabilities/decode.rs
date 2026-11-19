@@ -5,7 +5,6 @@
 //! tree so every leaf reads its property from the exact object level the
 //! composed schema declared.
 
-#[cfg(test)]
 use crate::config::project::ProjectConfig;
 use crate::context::ContextAccess;
 use crate::edits::EditFileOp;
@@ -13,6 +12,8 @@ use crate::edits::StructuredChangeProposal;
 use crate::llm::discussion::normalize_repo_map_path;
 use crate::llm::discussion::DirListRequest;
 use crate::llm::discussion::RepoSearchRequest;
+use crate::llm::discussion::ReviewUpdateProposal;
+use crate::llm::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
 use crate::llm::CapabilityTree;
 use crate::llm::DocTopic;
 use crate::llm::LlmCapability;
@@ -22,8 +23,6 @@ use crate::llm::{
     RepoMapCommand, RepoSearchCommand, ScratchpadCommand, TextCommand, TurnErrorCommand,
     TurnSkipCommand,
 };
-use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
-use crate::review::ReviewUpdateProposal;
 use crate::workflow::PatchStrategy;
 use serde::Deserialize;
 use serde_json::Value;
@@ -118,6 +117,25 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
                 content: content.to_string(),
             })]
         }
+        LlmCapability::EditReplace if ctx.patch_strategy == PatchStrategy::ApplyPatch => {
+            match node.get("patch") {
+                Some(Value::String(patch)) => vec![LlmCommand::ApplyPatch {
+                    patch: patch.clone(),
+                }],
+                _ => vec![LlmCommand::ProtocolError {
+                    message: "The edit action requires a string patch field.".into(),
+                }],
+            }
+        }
+        LlmCapability::EditCreate
+        | LlmCapability::EditDelete
+        | LlmCapability::EditMove
+        | LlmCapability::EditMoveDir
+        | LlmCapability::EditOverwrite
+            if ctx.patch_strategy == PatchStrategy::ApplyPatch =>
+        {
+            Vec::new()
+        }
         LlmCapability::EditOverwrite if ctx.patch_strategy == PatchStrategy::LineAnchor => {
             Vec::new()
         }
@@ -208,7 +226,7 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
             {
                 return Vec::new();
             }
-            decode_custom_tools(node)
+            decode_custom_tools(node, ctx.project)
         }
     }
 }
@@ -456,16 +474,31 @@ fn decode_abort(node: &Value) -> Vec<LlmCommand> {
     })]
 }
 
-fn decode_custom_tools(node: &Value) -> Vec<LlmCommand> {
+fn decode_custom_tools(node: &Value, project: Option<&ProjectConfig>) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
     if let Some(t_val) = node.get("custom_tools").and_then(Value::as_array) {
         for item in t_val {
             if let (Some(name), Some(args)) =
                 (item.get("name").and_then(Value::as_str), item.get("args"))
             {
+                let mut args = args.clone();
+                if let Some(resolved) = project.and_then(|project| {
+                    let spec = project.commands.get(name)?;
+                    project.resolve(&format!("commands.{name}"), spec).ok()
+                }) {
+                    if let Some(object) = args.as_object_mut() {
+                        for parameter in resolved.parameters {
+                            if parameter.default.is_some()
+                                && object.get(&parameter.name).is_some_and(Value::is_null)
+                            {
+                                object.remove(&parameter.name);
+                            }
+                        }
+                    }
+                }
                 commands.push(LlmCommand::CustomTool(CustomToolCommand {
                     name: name.to_string(),
-                    args: args.clone(),
+                    args,
                 }));
             }
         }
@@ -485,6 +518,47 @@ mod tests {
     use crate::edits::EditOverwrite;
     use crate::edits::EditReplace;
     use serde_json::json;
+
+    #[test]
+    fn custom_tool_decoder_omits_only_nulls_for_resolved_defaults() {
+        let project: ProjectConfig = serde_json::from_value(json!({
+            "commands": {
+                "probe": {"command": "just", "parameters": [
+                    {"name": "target"}, {"name": "limit", "default": "10"}
+                ]},
+                "alias": {"command": "@probe"}
+            }
+        }))
+        .unwrap();
+        for (input, expected) in [
+            (
+                json!({"target":"src","limit":null}),
+                json!({"target":"src"}),
+            ),
+            (
+                json!({"target":"src","limit":3}),
+                json!({"target":"src","limit":3}),
+            ),
+            (json!({"target":"src"}), json!({"target":"src"})),
+            (
+                json!({"target":null,"unknown":null}),
+                json!({"target":null,"unknown":null}),
+            ),
+            (json!({}), json!({})),
+        ] {
+            let commands = decode_custom_tools(
+                &json!({"custom_tools":[{"name":"alias","args":input}]}),
+                Some(&project),
+            );
+            assert_eq!(
+                commands,
+                vec![LlmCommand::CustomTool(CustomToolCommand {
+                    name: "alias".into(),
+                    args: expected
+                })]
+            );
+        }
+    }
 
     fn project_with_command() -> ProjectConfig {
         serde_json::from_str(r#"{"commands": {"check": {"command": "just", "args": ["check"]}}}"#)

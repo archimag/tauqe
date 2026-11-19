@@ -19,9 +19,14 @@ paths = ["crates/core/src"]
 prompt = "Audit harness engine invariants: bounded-turn FSM, capability registry, prompt layout, context, and provider streaming."
 
 [[review.presets.groups]]
+name = "flow"
+paths = ["crates/flow/src"]
+prompt = "Audit session ownership, operation admission and cancellation, scenario persistence, and event ordering."
+
+[[review.presets.groups]]
 name = "server"
 paths = ["crates/server/src"]
-prompt = "Audit RPC daemon: concurrency control (OperationGuard), request dispatching, and streaming transport."
+prompt = "Audit RPC daemon: RPC projections, request dispatching, and streaming transport."
 
 [[review.presets.groups]]
 name = "tui"

@@ -38,7 +38,7 @@ impl DiagnosticSeverity {
 
     /// Tolerant constructor: trims the input, matches case-insensitively, and
     /// resolves any unknown or empty spelling to [`DiagnosticSeverity::Error`].
-    pub fn parse_lossy(raw: &str) -> Self {
+    pub(crate) fn parse_lossy(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "warning" => Self::Warning,
             "note" => Self::Note,
@@ -338,12 +338,12 @@ pub struct ProjectPostHookResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectHookOutcome {
     /// Name of the hook entry as declared by the project configuration.
-    pub name: String,
+    pub(crate) name: String,
     /// Whether the hook completed successfully.
     pub success: bool,
     /// Compact failure reason or summary, never the raw command transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 #[cfg(test)]

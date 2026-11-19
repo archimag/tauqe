@@ -267,6 +267,8 @@ pub struct ReplView {
     pub reasoning: ReasoningState,
     pub theme_mode: crate::config::ThemeMode,
     pub text: String,
+    /// Admitted round numbers and their byte offsets in the answer buffer.
+    pub(crate) answer_rounds: Vec<(usize, usize)>,
     pub markdown_lines: Vec<Line<'static>>,
     /// Authoritative usage snapshot mirrored from `model/usageTotals`.
     ///
@@ -310,6 +312,7 @@ pub struct ReplView {
     pub turn_phase: Option<tauqe_protocol::TurnPhase>,
     pub turn_round: Option<usize>,
     pub turn_max_rounds: Option<usize>,
+    pub turn_request_reason: Option<tauqe_protocol::model::TurnRequestReason>,
     pub turn_phase_detail: Option<String>,
     pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     /// Work the model executes in this turn, declared by the daemon.
@@ -366,6 +369,7 @@ impl Default for ReplView {
             reasoning: ReasoningState::default(),
             theme_mode: crate::config::ThemeMode::default(),
             text: String::new(),
+            answer_rounds: Vec::new(),
             markdown_lines: Vec::new(),
             usage_totals: UsageTotalsSnapshot::default(),
             status: TurnStatus::default(),
@@ -389,6 +393,7 @@ impl Default for ReplView {
             turn_phase: None,
             turn_round: None,
             turn_max_rounds: None,
+            turn_request_reason: None,
             turn_phase_detail: None,
             plan_context: None,
             work_context: None,
@@ -425,6 +430,7 @@ impl ReplView {
     pub fn reset_turn_buffers(&mut self) {
         self.reasoning.clear();
         self.text.clear();
+        self.answer_rounds.clear();
         self.markdown_lines.clear();
         self.code_blocks.clear();
         self.links.clear();
@@ -439,8 +445,7 @@ impl ReplView {
         self.retrying = None;
         self.prompt_rolled_back = false;
         self.turn_phase = None;
-        self.turn_round = None;
-        self.turn_max_rounds = None;
+        self.clear_round_progress();
         self.turn_phase_detail = None;
         self.repomap_tokens = None;
         self.copy_flash = None;
@@ -550,28 +555,84 @@ impl ReplView {
         self.reasoning.update_markdown();
     }
 
+    pub(crate) fn start_answer_round(&mut self, round: usize) {
+        if self
+            .answer_rounds
+            .last()
+            .is_some_and(|&(last, _)| last == round)
+        {
+            return;
+        }
+        self.answer_rounds.push((round, self.text.len()));
+        self.render_markdown_now();
+    }
+
+    /// Withdraws the partial answer of the current round without moving its boundary.
+    pub(crate) fn reset_answer_stream(&mut self) {
+        let offset = self.answer_rounds.last().map_or(0, |&(_, offset)| offset);
+        self.text.truncate(offset);
+        self.copy_flash = None;
+        self.render_markdown_now();
+    }
+
     pub(crate) fn render_markdown_now(&mut self) {
         let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
         let mut theme = crate::markdown::MarkdownTheme::answer_themed(self.theme_mode);
         if self.content_width > 0 {
             theme.max_width = Some(self.content_width);
         }
-        let (lines, blocks, links) =
-            crate::markdown::render_markdown_with_blocks(&self.text, &theme, flashing_id);
-        self.markdown_lines = lines;
-        self.links = links;
-        self.code_blocks = blocks
-            .into_iter()
-            .map(|b| ModelCodeBlock {
-                id: b.id,
-                lang: b.lang,
-                code: b.content,
-                raw_start_line: b.start_line,
-                raw_end_line: b.end_line,
-                visual_start_line: b.start_line,
-                visual_end_line: b.end_line,
-            })
-            .collect();
+        self.markdown_lines.clear();
+        self.code_blocks.clear();
+        self.links.clear();
+        let engine = crate::theme::engine::current_engine();
+        let sections = std::iter::once((None, 0)).chain(
+            self.answer_rounds
+                .iter()
+                .map(|&(round, start)| (Some(round), start)),
+        );
+        let ends = self
+            .answer_rounds
+            .iter()
+            .map(|&(_, start)| start)
+            .chain(std::iter::once(self.text.len()));
+        for ((round, start), end) in sections.zip(ends) {
+            if let Some(round) = round {
+                if !self.markdown_lines.is_empty() {
+                    self.markdown_lines.push(Line::default());
+                }
+                self.markdown_lines.push(Line::styled(
+                    active_t("footer.round").replacen("{}", &round.to_string(), 1),
+                    engine.fg(engine.palette().status_info),
+                ));
+            }
+            if start == end {
+                continue;
+            }
+            let row_offset = self.markdown_lines.len();
+            let block_offset = self.code_blocks.len();
+            let link_offset = self.links.len();
+            let (lines, blocks, links) = crate::markdown::render_markdown_with_blocks(
+                &self.text[start..end],
+                &theme,
+                flashing_id.and_then(|id| id.checked_sub(block_offset)),
+            );
+            self.markdown_lines.extend(lines);
+            self.code_blocks
+                .extend(blocks.into_iter().map(|b| ModelCodeBlock {
+                    id: block_offset + b.id,
+                    lang: b.lang,
+                    code: b.content,
+                    raw_start_line: row_offset + b.start_line,
+                    raw_end_line: row_offset + b.end_line,
+                    visual_start_line: row_offset + b.start_line,
+                    visual_end_line: row_offset + b.end_line,
+                }));
+            self.links.extend(links.into_iter().map(|mut link| {
+                link.id += link_offset;
+                link.line_idx += row_offset;
+                link
+            }));
+        }
         self.markdown_dirty = false;
         self.last_markdown_render = Some(Instant::now());
     }
@@ -892,6 +953,13 @@ impl ReplView {
     }
     pub fn is_busy(&self) -> bool {
         self.status.is_busy()
+    }
+
+    /// Clears the admitted-call counter at a turn boundary, not on reconnect.
+    pub(crate) fn clear_round_progress(&mut self) {
+        self.turn_round = None;
+        self.turn_max_rounds = None;
+        self.turn_request_reason = None;
     }
 
     /// Closes the in-flight usage window when a turn reaches a terminal status.

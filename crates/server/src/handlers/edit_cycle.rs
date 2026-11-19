@@ -1,209 +1,37 @@
-//! Exactly-once closure of the edit cycle.
-//!
-//! `edit/started` and `edit/finished` form one protocol transaction: every
-//! opening is answered by exactly one closing that carries an [`EditOutcome`].
-//! The cycle belongs to the server, because it is the lifecycle of RPC events;
-//! the core engine knows nothing about the pair.
-//!
-//! The owner of a cycle is an [`EditCycle`] handle shared through an `Arc`.
-//! Whoever reaches the end of the cycle first closes it: the closing wins
-//! through one atomic `compare_exchange`, so a second and every later closing
-//! is a no-op. When the last reference is dropped while the cycle is still
-//! open — a panicking turn task or a forced abort — the drop guard closes it
-//! as the last resort.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::contracts::Project;
 use crate::handlers::common::emit;
 use crate::transport::OutChannel;
-use tauqe_core::edits::{EditOutcome, VerificationVerdict};
+use tauqe_flow::api::EditCycleEvent;
+#[cfg(test)]
+use tauqe_flow::api::{EditCycle, EditTermination};
 use tauqe_protocol::edit::{EditFinishedEvent, EditStartedEvent};
 use tauqe_protocol::events;
 
-/// Typed reason a cycle ended.
-///
-/// The reason is declared by the code that ends the cycle and is never
-/// inferred from text. Every variant owns a non-empty description, so a
-/// closing without an applied change set always explains itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EditTermination {
-    /// The turn concluded with a conversational answer instead of a change set.
-    ///
-    /// A dialogue closes an answered turn through [`EditCycle::close_answered`],
-    /// which reports no error; this variant classifies the endings of the step
-    /// contours, where a step that answers instead of committing did not deliver
-    /// the change it owed.
-    Answered,
-    /// The turn proposed file edits, but they could not be converged or applied by virtual staging.
-    StagingRefused,
-    /// The operation was cancelled by the developer.
-    Cancelled,
-    /// The streamed attempt was withdrawn and its edits are void.
-    Withdrawn,
-    /// The model provider failed before the change set was applied.
-    ProviderError,
-    /// The model output violated the protocol, so no change set was applied.
-    ///
-    /// Built from the typed protocol-failure fact of the turn, never from the
-    /// wording of the diagnostic that explains it.
-    ProtocolFailure,
-    /// The turn was aborted before it could close the cycle itself.
-    Aborted,
+#[cfg(test)]
+pub(crate) fn edit_cycle(out: OutChannel, operation_id: impl Into<String>) -> EditCycle {
+    let operation_id = operation_id.into();
+    EditCycle::new(move |event| publish(&out, &operation_id, event))
 }
 
-impl EditTermination {
-    /// Human-readable reason carried by an unapplied closing.
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            Self::Answered => {
-                "The turn concluded with an answer without proposing any file change."
-            }
-            Self::StagingRefused => {
-                "The proposed edits could not be staged or applied to the repository."
-            }
-            Self::Cancelled => "The operation was cancelled before the edits were applied.",
-            Self::Withdrawn => {
-                "The streamed attempt was withdrawn, so its proposed edits were discarded."
-            }
-            Self::ProviderError => "The model provider failed before the edits could be applied.",
-            Self::ProtocolFailure => {
-                "The model response violated the edit protocol, so no change set was applied."
-            }
-            Self::Aborted => "The turn was aborted before the edit cycle could finish normally.",
-        }
-    }
-}
-
-/// Owner of one operation's edit cycle.
-pub(crate) struct EditCycle {
-    out: OutChannel,
-    operation_id: String,
-    open: AtomicBool,
-}
-
-impl EditCycle {
-    /// Creates a handle whose cycle is not open yet.
-    pub(crate) fn new(out: OutChannel, operation_id: impl Into<String>) -> Self {
-        Self {
+pub(crate) fn publish(out: &OutChannel, operation_id: &str, event: EditCycleEvent) {
+    match event {
+        EditCycleEvent::Started => emit(
             out,
-            operation_id: operation_id.into(),
-            open: AtomicBool::new(false),
-        }
-    }
-
-    /// Reports whether the cycle is currently open.
-    #[cfg(test)]
-    pub(crate) fn is_open(&self) -> bool {
-        self.open.load(Ordering::SeqCst)
-    }
-
-    /// Opens the cycle and publishes `edit/started`.
-    ///
-    /// Opening an already open cycle is a no-op, so a relay and an owner may
-    /// both announce the start. After a closing the cycle may be opened again
-    /// for the next escalation rung. Returns whether this call opened it.
-    pub(crate) fn open(&self) -> bool {
-        if self.open.swap(true, Ordering::SeqCst) {
-            return false;
-        }
-        emit(
-            &self.out,
             events::EDIT_STARTED,
             serde_json::to_value(EditStartedEvent {
-                operation_id: self.operation_id.clone(),
+                operation_id: operation_id.into(),
             })
             .ok(),
-        );
-        true
-    }
-
-    /// Closes the cycle from the outcome of an application attempt.
-    ///
-    /// An applied outcome never carries an error. An unapplied outcome always
-    /// carries a reason: the error it already names, or the description of
-    /// `termination` when it names none. The one ending outside that rule is a
-    /// conversational answer, which [`EditCycle::close_answered`] closes without
-    /// an error because nothing was refused. Returns whether this call won the
-    /// closing; a losing call publishes nothing.
-    pub(crate) fn close_outcome(
-        &self,
-        termination: EditTermination,
-        mut outcome: EditOutcome,
-    ) -> bool {
-        if outcome.applied {
-            outcome.error = None;
-        } else {
-            let named = outcome
-                .error
-                .take()
-                .filter(|error| !error.trim().is_empty());
-            outcome.error = Some(named.unwrap_or_else(|| termination.description().to_string()));
-        }
-        self.finish(outcome)
-    }
-
-    /// Closes the cycle without an applied change set for a typed reason.
-    pub(crate) fn close_unapplied(
-        &self,
-        termination: EditTermination,
-        changed_files: Vec<String>,
-        verification: Option<VerificationVerdict>,
-    ) -> bool {
-        self.close_outcome(
-            termination,
-            EditOutcome {
-                applied: false,
-                error: None,
-                changed_files,
-                commit_hash: None,
-                verification,
-            },
-        )
-    }
-
-    /// Closes the cycle for a turn that answered without a change set.
-    ///
-    /// A conversational answer is a successful ending of a dialogue rather than
-    /// a refused change, so the closing names no error: nothing was staged,
-    /// nothing was lost, and there is nothing for the developer to repair.
-    /// Returns whether this call won the closing.
-    pub(crate) fn close_answered(&self) -> bool {
-        self.finish(EditOutcome {
-            applied: false,
-            error: None,
-            changed_files: Vec::new(),
-            commit_hash: None,
-            verification: None,
-        })
-    }
-
-    /// Arbitrates the closing and publishes `edit/finished` for the winner.
-    fn finish(&self, outcome: EditOutcome) -> bool {
-        if self
-            .open
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
-        emit(
-            &self.out,
+        ),
+        EditCycleEvent::Finished(outcome) => emit(
+            out,
             events::EDIT_FINISHED,
             serde_json::to_value(EditFinishedEvent {
-                operation_id: self.operation_id.clone(),
+                operation_id: operation_id.into(),
                 outcome: outcome.project(),
             })
             .ok(),
-        );
-        true
-    }
-}
-
-impl Drop for EditCycle {
-    /// Last resort on unwind: an open cycle is closed as aborted.
-    fn drop(&mut self) {
-        self.close_unapplied(EditTermination::Aborted, Vec::new(), None);
+        ),
     }
 }
 
@@ -211,6 +39,7 @@ impl Drop for EditCycle {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tauqe_core::edits::{EditOutcome, VerificationVerdict};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     const ALL: [EditTermination; 7] = [
@@ -252,7 +81,7 @@ mod tests {
     #[test]
     fn a_second_closing_publishes_nothing() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-1");
+        let cycle = edit_cycle(out, "op-1");
         assert!(cycle.open());
         assert!(!cycle.open(), "opening an open cycle is a no-op");
 
@@ -274,7 +103,7 @@ mod tests {
     #[test]
     fn a_closing_without_an_open_cycle_publishes_nothing() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-2");
+        let cycle = edit_cycle(out, "op-2");
         assert!(!cycle.close_unapplied(EditTermination::Answered, Vec::new(), None));
         assert!(drain(&mut rx).is_empty());
     }
@@ -282,7 +111,7 @@ mod tests {
     #[test]
     fn a_refusal_always_carries_a_reason_and_a_success_never_does() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-3");
+        let cycle = edit_cycle(out, "op-3");
 
         for termination in ALL {
             cycle.open();
@@ -329,7 +158,7 @@ mod tests {
     #[test]
     fn a_named_error_is_kept_for_an_unapplied_outcome() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-4");
+        let cycle = edit_cycle(out, "op-4");
         cycle.open();
         // The typed protocol failure is the classification of this ending, and the
         // named error the outcome carries must still reach the client verbatim
@@ -349,7 +178,7 @@ mod tests {
     #[test]
     fn dropping_an_open_cycle_closes_it_as_aborted() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = Arc::new(EditCycle::new(out, "op-5"));
+        let cycle = Arc::new(edit_cycle(out, "op-5"));
         cycle.open();
         let sibling = Arc::clone(&cycle);
         drop(cycle);
@@ -372,7 +201,7 @@ mod tests {
     #[test]
     fn dropping_a_closed_cycle_publishes_nothing() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-6");
+        let cycle = edit_cycle(out, "op-6");
         cycle.open();
         cycle.close_unapplied(EditTermination::Answered, Vec::new(), None);
         drop(cycle);
@@ -385,11 +214,10 @@ mod tests {
     #[test]
     fn a_closed_cycle_may_be_reopened_for_the_next_rung() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-7");
+        let cycle = edit_cycle(out, "op-7");
         assert!(cycle.open());
         assert!(cycle.close_unapplied(EditTermination::Withdrawn, Vec::new(), None));
         assert!(cycle.open());
-        assert!(cycle.is_open());
         assert!(cycle.close_unapplied(EditTermination::Answered, Vec::new(), None));
         assert_eq!(
             methods(&drain(&mut rx)),
@@ -405,7 +233,7 @@ mod tests {
     #[test]
     fn an_answered_ending_carries_no_error() {
         let (out, mut rx) = OutChannel::new();
-        let cycle = EditCycle::new(out, "op-8");
+        let cycle = edit_cycle(out, "op-8");
         assert!(cycle.open());
         assert!(cycle.close_answered());
         assert!(!cycle.close_answered(), "a closed cycle publishes nothing");

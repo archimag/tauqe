@@ -548,6 +548,7 @@ mod tests {
             input_editor: crate::editor::InputEditor::default(),
             tui_config: crate::config::TuiConfig::default(),
             modals: crate::app::ModalState::default(),
+            prefer_usage_tokens: false,
             notification: None,
             turn_started_at: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),

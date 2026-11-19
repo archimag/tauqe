@@ -51,7 +51,7 @@ impl std::convert::From<&str> for DocTopic {
 
 impl DocTopic {
     /// Every documentation topic in canonical prompt order.
-    pub const ALL: &'static [DocTopic] = &[
+    pub(crate) const ALL: &'static [DocTopic] = &[
         Self::Overview,
         Self::Context,
         Self::Workflow,
@@ -64,7 +64,7 @@ impl DocTopic {
     ];
 
     /// Canonical lower-case identifier used on the wire.
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Overview => "overview",
             Self::Context => "context",

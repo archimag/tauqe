@@ -45,6 +45,10 @@ impl CommandStreamFilter {
 }
 
 impl EditStreamFilter for CommandStreamFilter {
+    fn exclude_disk_sources(&mut self, paths: std::collections::HashSet<String>) {
+        self.inner.exclude_disk_sources(paths);
+    }
+
     fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.raw.push_str(chunk);
         self.inner.push_chunk(chunk)

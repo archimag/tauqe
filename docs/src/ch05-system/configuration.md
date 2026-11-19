@@ -119,7 +119,7 @@ it runs a declared command line and reads its exit status.
 - **Phase** — one verification stage: `check`, `lint`, or `test`.
 - **Patch strategy** — how a change set names the lines it replaces: by the text it
   echoes (`search_replace`) or by the opaque anchors rendered beside them
-  (`line_anchor`).
+  (`line_anchor`), or by file sections and context hunks (`apply_patch`, the default).
 - **Project command** — a declared command line with literal arguments and an optional
   timeout.
 - **Reference** — an executable written as `@` plus the name of another declared
@@ -163,6 +163,7 @@ range.
 
 | `patch_strategy` | A range is addressed by | Prompt rendering |
 | --- | --- | --- |
+| `apply_patch` (default) | Codex file sections and context hunks | raw file text |
 | `search_replace` | the replaced lines, echoed verbatim and matched exactly | the raw text of every context line |
 | `line_anchor` | two opaque anchors naming the first and last replaced line | the opaque anchor of every context line |
 

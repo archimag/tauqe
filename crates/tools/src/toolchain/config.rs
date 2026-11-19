@@ -88,19 +88,19 @@ pub struct ProjectParameterSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProjectCommandSpec {
     /// Executable to run, or `@<name>` referring to `[project.commands.<name>]`.
-    pub command: String,
+    pub(crate) command: String,
     /// Literal arguments passed to the executable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
+    pub(crate) args: Vec<String>,
     /// Wall-clock budget of a single invocation, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
+    pub(crate) timeout_secs: Option<u64>,
     /// Human-readable purpose of the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Named parameters a caller may supply, in declaration order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parameters: Vec<ProjectParameterSpec>,
+    pub(crate) parameters: Vec<ProjectParameterSpec>,
 }
 
 /// A fully resolved command line, ready to be spawned without a shell.
@@ -237,7 +237,7 @@ pub struct ProjectConfig {
     pub verify: Option<ProjectCommandSpec>,
     /// Optional in-memory formatting filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<ProjectCommandSpec>,
+    pub(crate) format: Option<ProjectCommandSpec>,
     /// Optional disk-side post-hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_hook: Option<ProjectCommandSpec>,

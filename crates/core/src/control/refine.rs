@@ -182,9 +182,7 @@ pub async fn run_structured_refine(
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<StructuredRefineOutcome> {
     let repo_root = config.repo_root;
-    let protocol: Box<dyn PromptProtocol> =
-        PlanRefinePromptProtocol::new().with_capability_expr(architect_synthesis_capability_expr());
-
+    let protocol: Box<dyn PromptProtocol> = Box::new(PlanRefinePromptProtocol::new());
     let mut policy = DirectApplyPolicy::new();
     let mut input_cache = TurnInputCache::default();
     let mut journal = TurnResearchJournal::default();

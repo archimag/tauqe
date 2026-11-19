@@ -29,7 +29,7 @@ use super::item::IssueStatus;
 pub struct PostAnalysisTriageOutput {
     /// Identity of the finding this entry routes.
     #[serde(default)]
-    pub uuid: String,
+    pub(crate) uuid: String,
     /// Status the analysis routed this finding to.
     ///
     /// Only two statuses are meaningful and the enforced schema admits no other:
@@ -39,11 +39,11 @@ pub struct PostAnalysisTriageOutput {
     /// because a finding the analysis failed to route stays with the engineer
     /// instead of silently entering execution.
     #[serde(default)]
-    pub status: IssueStatus,
+    pub(crate) status: IssueStatus,
     /// The open question the engineer must answer, stated for a finding routed to
     /// `discussion` and absent for a finding routed to `todo`.
     #[serde(default)]
-    pub discussion_topic: Option<String>,
+    pub(crate) discussion_topic: Option<String>,
 }
 
 /// One model-emitted cluster of findings that share a root cause.
@@ -51,13 +51,13 @@ pub struct PostAnalysisTriageOutput {
 pub struct PostAnalysisGroupOutput {
     /// Title of the shared root cause.
     #[serde(default)]
-    pub title: String,
+    pub(crate) title: String,
     /// Explanation of why exactly these findings belong together.
     #[serde(default)]
-    pub description: String,
+    pub(crate) description: String,
     /// Identities of the findings that manifest this root cause.
     #[serde(default)]
-    pub issue_ids: Vec<String>,
+    pub(crate) issue_ids: Vec<String>,
 }
 
 /// Model-emitted post-analysis payload.
@@ -71,14 +71,14 @@ pub struct PostAnalysisGroupOutput {
 pub struct PostAnalysisOutput {
     /// Global verdict over the whole session.
     #[serde(default)]
-    pub summary: String,
+    pub(crate) summary: String,
     /// Initial routing of every finding of the session.
     #[serde(default)]
-    pub triage: Vec<PostAnalysisTriageOutput>,
+    pub(crate) triage: Vec<PostAnalysisTriageOutput>,
     /// Identities of the findings that stand on their own.
     #[serde(default)]
-    pub independent_issues: Vec<String>,
+    pub(crate) independent_issues: Vec<String>,
     /// Clusters of findings that share one architectural root cause.
     #[serde(default)]
-    pub architectural_groups: Vec<PostAnalysisGroupOutput>,
+    pub(crate) architectural_groups: Vec<PostAnalysisGroupOutput>,
 }

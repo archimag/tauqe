@@ -1,17 +1,6 @@
-//! Plan RPC handlers facade.
-//!
-//! The plan subsystem is decomposed into focused submodules: shared helpers
-//! (`common`), the CRUD RPC handlers (`storage_ops`), the single-phase architect
-//! horizon-synthesis engine (`engine`), the two-phase creation and directed
-//! modification pipeline (`two_phase`), and batch orchestration (`batch`), which
-//! drives the engine's unified implementation pipeline over the executed horizon.
-//! This facade re-exports exactly the entry points other handlers and the review
-//! subsystem depend on, keeping the public surface auditable and stable.
+//! RPC handlers for plan commands.
 
 mod batch;
-mod common;
-mod engine;
-mod horizon;
 mod storage_ops;
 mod two_phase;
 

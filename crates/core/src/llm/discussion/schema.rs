@@ -23,8 +23,8 @@
 
 use std::sync::OnceLock;
 
-use crate::plan::PlanItemStatus;
-use crate::review::{ReviewDecisionStatus, ReviewUpdateProposal};
+use crate::llm::discussion::{ReviewDecisionStatus, ReviewUpdateProposal};
+use crate::plan_item::PlanItemStatus;
 
 /// Process-wide cache of the plan creation payload.
 static PLAN_CREATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
@@ -52,7 +52,7 @@ static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 /// inside the provider size quotas. The deepest level seals `children` to an
 /// empty array, so a deeper node is rejected by the schema instead of being
 /// silently truncated.
-pub const PLAN_TREE_DEPTH: usize = 3;
+pub(crate) const PLAN_TREE_DEPTH: usize = 3;
 
 /// Generates the plan creation payload of the plan contract.
 ///
@@ -64,7 +64,7 @@ pub const PLAN_TREE_DEPTH: usize = 3;
 ///
 /// The payload is assembled once and served by a shared reference, so a caller
 /// that composes or serializes it pays no per-call deep copy of the tree.
-pub fn plan_create_schema() -> &'static serde_json::Value {
+pub(crate) fn plan_create_schema() -> &'static serde_json::Value {
     PLAN_CREATE_SCHEMA.get_or_init(|| {
         plan_payload_schema(
             "save",
@@ -79,7 +79,7 @@ pub fn plan_create_schema() -> &'static serde_json::Value {
 /// alone, so a response that patches an existing plan states it here. The object
 /// shares the field shape of [`plan_create_schema`] and differs only in the
 /// action it admits, so the two payloads can never drift apart.
-pub fn plan_update_schema() -> &'static serde_json::Value {
+pub(crate) fn plan_update_schema() -> &'static serde_json::Value {
     PLAN_UPDATE_SCHEMA.get_or_init(|| {
         plan_payload_schema(
             "update",
@@ -315,7 +315,7 @@ fn plan_item_definition(level: usize) -> serde_json::Value {
 /// The definitions are assembled once and served by a shared reference, so a
 /// consumer that embeds them clones the reference once instead of paying a
 /// per-call deep copy of the tree.
-pub fn plan_schema_definitions() -> &'static serde_json::Value {
+pub(crate) fn plan_schema_definitions() -> &'static serde_json::Value {
     PLAN_SCHEMA_DEFINITIONS.get_or_init(|| {
         let mut definitions = serde_json::Map::new();
         // The levels are grouped by kind — every concept level, then every
@@ -348,7 +348,7 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
 ///
 /// The payload is assembled once and served by a shared reference, so a caller
 /// that composes or serializes it pays no per-call deep copy of the tree.
-pub fn review_update_schema() -> &'static serde_json::Value {
+pub(crate) fn review_update_schema() -> &'static serde_json::Value {
     REVIEW_UPDATE_SCHEMA.get_or_init(|| {
         serde_json::json!({
             "type": ["object", "null"],
@@ -485,18 +485,18 @@ mod tests {
         plan_schema_definitions, plan_update_schema, review_update_schema, PLAN_TREE_DEPTH,
     };
     use crate::llm::discussion::DiscussionResponse;
-    use crate::plan::PlanItemStatus;
-    use crate::review::ReviewUpdateProposal;
+    use crate::llm::discussion::ReviewUpdateProposal;
+    use crate::plan_item::PlanItemStatus;
 
     /// Declaring source of the plan model, embedded at compile time.
     ///
     /// The parity suite reads the declarations themselves instead of a
     /// serialized projection of them, so a field hidden from a fixture by
     /// `skip_serializing_if` stays visible to the comparison.
-    const PLAN_ITEM_SOURCE: &str = include_str!("../../plan/model/item.rs");
+    const PLAN_ITEM_SOURCE: &str = include_str!("../../plan_item.rs");
 
     /// Declaring source of the plan payload wire model.
-    const DISCUSSION_SOURCE: &str = include_str!("../../plan/model/update.rs");
+    const DISCUSSION_SOURCE: &str = include_str!("plan.rs");
 
     /// A deliberate divergence between a declared field and the schema.
     struct SchemaFieldExemption {
@@ -565,7 +565,7 @@ mod tests {
         panic!("the declaration of {struct_name} must carry a complete struct body");
     }
 
-    /// Declared `pub` fields of a struct, read from its source declaration.
+    /// Declared fields of a struct, read from its source declaration.
     ///
     /// Doc comments, plain comments, and serde attribute blocks — including
     /// multi-line ones — are skipped, so the enumeration reports the fields the
@@ -588,9 +588,10 @@ mod tests {
                 open_attributes += bracket_balance(line);
                 continue;
             }
-            let declaration = line.strip_prefix("pub ").unwrap_or_else(|| {
-                panic!("every field of {struct_name} is declared `pub`, found: {line}")
-            });
+            let declaration = line
+                .strip_prefix("pub ")
+                .or_else(|| line.strip_prefix("pub(crate) "))
+                .unwrap_or(line);
             let (name, _) = declaration
                 .split_once(':')
                 .unwrap_or_else(|| panic!("a field of {struct_name} carries no name: {line}"));

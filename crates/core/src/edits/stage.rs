@@ -116,6 +116,43 @@ pub fn stage_and_validate_edits(
     })
 }
 
+/// Stages a complete patch with the same admission and config checks as other edits.
+pub(crate) fn stage_apply_patch(
+    repo_root: &Path,
+    context_manager: &ContextManager,
+    patch: &str,
+    initial_staged: Option<&StagedEditsState>,
+) -> Result<(StageEditsResult, Vec<Vec<EditOperation>>), super::EditError> {
+    crate::blocking::run_blocking(|| {
+        let context: Vec<_> = context_manager
+            .get_state()
+            .items
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        tauqe_tools::edits::apply_patch::stage_apply_patch_with_batches(
+            repo_root,
+            &project_config(repo_root),
+            &context,
+            patch,
+            initial_staged,
+            Some(validate_project_config),
+        )
+        .map(|(result, batches)| {
+            let batches = batches
+                .into_iter()
+                .map(|batch| {
+                    batch
+                        .into_iter()
+                        .map(super::substrate::engine_operation)
+                        .collect()
+                })
+                .collect();
+            (result.into(), batches)
+        })
+    })
+}
+
 /// Resolves the effective project configuration and stages `edits` under it.
 ///
 /// This is the entry point for callers outside a bounded turn, which own no frozen
@@ -158,21 +195,47 @@ pub async fn prepare_staged_edits_with_config(
     initial_staged: Option<&StagedEditsState>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> StageEditsResult {
+    prepare_edit_batches(
+        repo_root,
+        project,
+        context_manager,
+        &[edits],
+        initial_staged,
+        cancel_rx,
+    )
+    .await
+}
+
+pub(super) async fn prepare_edit_batches(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    context_manager: &ContextManager,
+    batches: &[&[EditOperation]],
+    initial_staged: Option<&StagedEditsState>,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> StageEditsResult {
     let context: Vec<String> = context_manager
         .get_state()
         .items
         .into_iter()
         .map(|item| item.path)
         .collect();
-    tauqe_tools::edits::prepare_staged_edits_with_config_and_validator(
+    let batches: Vec<Vec<_>> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .cloned()
+                .map(super::substrate::tool_operation)
+                .collect()
+        })
+        .collect();
+    let slices: Vec<_> = batches.iter().map(Vec::as_slice).collect();
+    tauqe_tools::edits::prepare_edit_batches(
         repo_root,
         project,
         &context,
-        &edits
-            .iter()
-            .cloned()
-            .map(super::substrate::tool_operation)
-            .collect::<Vec<_>>(),
+        &slices,
         initial_staged,
         Some(validate_project_config),
         cancel_rx,

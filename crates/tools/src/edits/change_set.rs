@@ -90,7 +90,8 @@ pub struct StageEditsResult {
 }
 
 impl StageEditsResult {
-    pub fn is_success(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_success(&self) -> bool {
         self.failed_files.is_empty()
     }
 }

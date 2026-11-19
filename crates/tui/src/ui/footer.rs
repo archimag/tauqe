@@ -41,8 +41,26 @@ fn render_footer_with_engine(
 
     // 2. Usage indicator (Σ session · last · now), degrading by width instead
     // of ever cutting a number in half (c-4).
-    let usage_budget = (area.width.saturating_sub(2) as usize).saturating_sub(24);
-    if let Some(usage_str) = format_footer_usage(&state.model.usage_totals, usage_budget) {
+    let round_badge = state
+        .model
+        .is_busy()
+        .then(|| {
+            state.model.turn_round.map(|round| {
+                let number = match state.model.turn_max_rounds {
+                    Some(max) => format!("{round}/{max}"),
+                    None => round.to_string(),
+                };
+                active_t("footer.round").replacen("{}", &number, 1)
+            })
+        })
+        .flatten();
+    let round_width = round_badge.as_deref().map_or(0, |badge| badge.width() + 1);
+    let usage_budget = (area.width.saturating_sub(2) as usize).saturating_sub(24 + round_width);
+    if let Some(usage_str) = format_footer_usage(
+        &state.model.usage_totals,
+        state.prefer_usage_tokens,
+        usage_budget,
+    ) {
         footer_spans.push(Span::styled(
             usage_str,
             engine.fg(palette.status_warning).bold(),
@@ -75,11 +93,7 @@ fn render_footer_with_engine(
                 (active_t("status.research"), palette.status_info)
             }
             Some(tauqe_protocol::TurnPhase::Proposal) => {
-                if state.model.status == TurnStatus::Thinking {
-                    (active_t("status.thinking"), palette.text_secondary)
-                } else {
-                    (active_t("phase.proposal"), palette.status_warning)
-                }
+                (active_t("phase.proposal"), palette.status_warning)
             }
             Some(tauqe_protocol::TurnPhase::Staging) => {
                 (active_t("status.staging"), palette.button_active_bg)
@@ -100,10 +114,25 @@ fn render_footer_with_engine(
             },
         };
 
-        footer_spans.push(Span::styled(
+        let status = Span::styled(
             format!("{} {}", spin, status_name),
             engine.fg(status_color).bold(),
-        ));
+        );
+        if let Some(badge) = round_badge {
+            let badge = Span::styled(badge, engine.fg(palette.status_info).bold());
+            let prefix_width: usize = footer_spans.iter().map(Span::width).sum();
+            if prefix_width + status.width() + 1 + badge.width()
+                > usize::from(area.width.saturating_sub(2))
+            {
+                // Keep the current status and round ahead of branding and usage.
+                footer_spans.clear();
+            }
+            footer_spans.push(status);
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(badge);
+        } else {
+            footer_spans.push(status);
+        }
 
         // A reconnect pause is in flight: the daemon publishes the remaining
         // seconds, so the footer mirrors that countdown and names the chord
@@ -135,35 +164,24 @@ fn render_footer_with_engine(
             ));
         }
 
-        // Turn telemetry (phase pipeline, round/detail, and the active file) is
-        // rendered unconditionally while a turn owns the interface, so a
-        // transient notification can never erase the phase pipeline or the file
-        // the model is working on. The notification follows as a compact badge
-        // on the same status line instead of replacing the telemetry.
-        if let Some(phase) = state.model.turn_phase {
-            let inner_width = area.width.saturating_sub(2) as usize;
-            if inner_width >= 80 {
-                footer_spans.push(Span::raw(" "));
-                footer_spans.extend(render_turn_phase_pipeline(engine, phase));
-            }
-        }
-
-        if let Some(detail) = &state.model.turn_phase_detail {
+        // A corrective request owns the detail until deterministic work replaces it.
+        use tauqe_protocol::model::TurnRequestReason;
+        let request_detail = state.model.turn_request_reason.map(|reason| {
+            active_t(match reason {
+                TurnRequestReason::PatchRepair => "footer.request.patch_repair",
+                TurnRequestReason::PostHookRepair => "footer.request.post_hook_repair",
+                TurnRequestReason::VerificationRepair => "footer.request.verification_repair",
+                TurnRequestReason::EmptyResponseRetry => "footer.request.empty_response_retry",
+            })
+        });
+        if let Some(detail) = request_detail
+            .as_deref()
+            .or(state.model.turn_phase_detail.as_deref())
+        {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("[{}]", detail),
                 engine.fg(palette.status_warning).bold(),
-            ));
-        } else if let Some(round) = state.model.turn_round {
-            footer_spans.push(Span::raw(" "));
-            let round_str = if let Some(max) = state.model.turn_max_rounds {
-                format!("[Round {}/{}]", round, max)
-            } else {
-                format!("[Round {}]", round)
-            };
-            footer_spans.push(Span::styled(
-                round_str,
-                engine.fg(palette.status_info).bold(),
             ));
         }
 
@@ -299,47 +317,13 @@ pub fn format_notification(
     }
 }
 
-pub fn render_turn_phase_pipeline(
-    engine: &ThemeEngine,
-    current: tauqe_protocol::TurnPhase,
-) -> Vec<Span<'static>> {
-    let palette = engine.palette();
-    let phases = [
-        (tauqe_protocol::TurnPhase::Research, "phase.research"),
-        (tauqe_protocol::TurnPhase::Proposal, "phase.proposal"),
-        (tauqe_protocol::TurnPhase::Staging, "phase.staging"),
-        (
-            tauqe_protocol::TurnPhase::Verification,
-            "phase.verification",
-        ),
-        (tauqe_protocol::TurnPhase::Healing, "phase.healing"),
-    ];
-
-    let mut spans = Vec::new();
-    spans.push(Span::styled("[", engine.fg(palette.text_muted)));
-    for (idx, (phase, key)) in phases.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled("→", engine.fg(palette.text_muted)));
-        }
-        let label = active_t(key);
-        if *phase == current {
-            spans.push(Span::styled(label, engine.fg(palette.status_info).bold()));
-        } else {
-            spans.push(Span::styled(label, engine.fg(palette.text_muted)));
-        }
-    }
-    spans.push(Span::styled("]", engine.fg(palette.text_muted)));
-    spans
-}
-
 /// Renders every tier of the compact usage summary, richest first.
 ///
-/// Money outranks tokens: as soon as any slot carries a known cost the footer
-/// shows currency, otherwise the token counts stand in under an explicit `tok`
-/// unit. The list runs from the three labelled slots down to the session total
+/// Use the preferred unit when available, falling back to the other unit.
+/// The list runs from the three labelled slots down to the session total
 /// alone, so a caller picks the richest variant that fits instead of truncating
 /// a number mid-digit (c-4, c-5).
-pub fn footer_usage_variants(snapshot: &UsageTotalsSnapshot) -> Vec<String> {
+fn footer_usage_variants(snapshot: &UsageTotalsSnapshot, prefer_tokens: bool) -> Vec<String> {
     let cur = snapshot.cur.as_ref();
     let has_money = snapshot.session.cost > 0.0
         || snapshot.prev.cost > 0.0
@@ -348,7 +332,7 @@ pub fn footer_usage_variants(snapshot: &UsageTotalsSnapshot) -> Vec<String> {
         || snapshot.prev.total_tokens > 0
         || cur.is_some_and(|totals| totals.total_tokens > 0);
 
-    if has_money {
+    if has_money && !(prefer_tokens && has_tokens) {
         usage_variants(
             format_money(snapshot.session.cost),
             format_money(snapshot.prev.cost),
@@ -372,8 +356,12 @@ pub fn footer_usage_variants(snapshot: &UsageTotalsSnapshot) -> Vec<String> {
 /// Returns `None` when the snapshot carries neither money nor tokens, and when
 /// even the session-only form does not fit: the footer then drops the field
 /// entirely rather than showing a severed value (c-4).
-pub fn format_footer_usage(snapshot: &UsageTotalsSnapshot, budget: usize) -> Option<String> {
-    footer_usage_variants(snapshot)
+fn format_footer_usage(
+    snapshot: &UsageTotalsSnapshot,
+    prefer_tokens: bool,
+    budget: usize,
+) -> Option<String> {
+    footer_usage_variants(snapshot, prefer_tokens)
         .into_iter()
         .find(|variant| UnicodeWidthStr::width(variant.as_str()) <= budget)
 }
@@ -452,7 +440,7 @@ mod tests {
 
     #[test]
     fn footer_usage_prefers_money_and_labels_every_slot() {
-        let variants = footer_usage_variants(&money_snapshot(Some(0.002)));
+        let variants = footer_usage_variants(&money_snapshot(Some(0.002)), false);
         assert_eq!(
             variants,
             vec![
@@ -465,14 +453,14 @@ mod tests {
 
     #[test]
     fn footer_usage_drops_the_in_flight_slot_when_no_operation_runs() {
-        let variants = footer_usage_variants(&money_snapshot(None));
+        let variants = footer_usage_variants(&money_snapshot(None), false);
         assert_eq!(variants[0], "Σ $0.0150 session · $0.0050 last");
         assert_eq!(variants[1], "Σ $0.0150 · $0.0050");
     }
 
     #[test]
     fn footer_usage_falls_back_to_tokens_when_no_cost_is_known() {
-        let variants = footer_usage_variants(&token_snapshot());
+        let variants = footer_usage_variants(&token_snapshot(), false);
         assert_eq!(
             variants[0],
             "Σ 1200 tok session · 300 tok last · 50 tok now"
@@ -482,28 +470,42 @@ mod tests {
     }
 
     #[test]
+    fn footer_usage_prefers_tokens_when_selected_and_both_units_are_available() {
+        let mut snapshot = token_snapshot();
+        snapshot.session.cost = 0.015;
+        assert_eq!(
+            format_footer_usage(&snapshot, true, 80).as_deref(),
+            Some("Σ 1200 tok session · 300 tok last · 50 tok now")
+        );
+        assert_eq!(
+            format_footer_usage(&snapshot, false, 80).as_deref(),
+            Some("Σ $0.0150 session · $0.0000 last · $0.0000 now")
+        );
+    }
+
+    #[test]
     fn footer_usage_is_absent_without_money_or_tokens() {
         let empty = UsageTotalsSnapshot::default();
-        assert!(footer_usage_variants(&empty).is_empty());
-        assert_eq!(format_footer_usage(&empty, 200), None);
+        assert!(footer_usage_variants(&empty, false).is_empty());
+        assert_eq!(format_footer_usage(&empty, false, 200), None);
     }
 
     #[test]
     fn footer_usage_degrades_by_budget_without_cutting_numbers() {
         let snapshot = money_snapshot(Some(0.002));
         assert_eq!(
-            format_footer_usage(&snapshot, 46).as_deref(),
+            format_footer_usage(&snapshot, false, 46).as_deref(),
             Some("Σ $0.0150 session · $0.0050 last · $0.0020 now")
         );
         assert_eq!(
-            format_footer_usage(&snapshot, 45).as_deref(),
+            format_footer_usage(&snapshot, false, 45).as_deref(),
             Some("Σ $0.0150 · $0.0050 · $0.0020")
         );
         assert_eq!(
-            format_footer_usage(&snapshot, 9).as_deref(),
+            format_footer_usage(&snapshot, false, 9).as_deref(),
             Some("Σ $0.0150")
         );
-        assert_eq!(format_footer_usage(&snapshot, 8), None);
+        assert_eq!(format_footer_usage(&snapshot, false, 8), None);
     }
 
     #[test]
@@ -517,6 +519,8 @@ mod tests {
         state.model.status = TurnStatus::Responding;
         state.model.turn_round = Some(2);
         state.model.turn_max_rounds = Some(5);
+        state.model.turn_request_reason =
+            Some(tauqe_protocol::model::TurnRequestReason::EmptyResponseRetry);
 
         terminal
             .draw(|frame| {
@@ -531,6 +535,35 @@ mod tests {
             content.contains("[Round 2/5]"),
             "the typed round counter must drive the badge: {content:?}"
         );
+        assert!(content.contains(&active_t("footer.request.empty_response_retry")));
+    }
+
+    #[test]
+    fn narrow_footer_keeps_an_unlimited_round_ahead_of_detail() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(33, 3)).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Responding;
+        state.model.turn_round = Some(7);
+        state.model.turn_phase_detail = Some("Loading additional context".into());
+        terminal
+            .draw(|frame| render_footer(frame, &state, frame.area()))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("[Round 7]"), "{content:?}");
+        assert!(
+            content.contains(&active_t("status.responding")),
+            "{content:?}"
+        );
+        assert!(!content.contains("Loading additional context"));
     }
 
     #[test]
@@ -625,8 +658,8 @@ mod tests {
         let backend = TestBackend::new(120, 3);
         let mut terminal = Terminal::new(backend).expect("terminal created");
         let mut state = crate::app::test_state();
-        state.model.status = TurnStatus::Staging;
-        state.model.turn_phase = Some(tauqe_protocol::TurnPhase::Staging);
+        state.model.status = TurnStatus::Thinking;
+        state.model.turn_phase = Some(tauqe_protocol::TurnPhase::Proposal);
         state.notify_warning("Patch applied");
 
         terminal
@@ -639,18 +672,64 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
 
-        // The autonomous-turn telemetry survives the transient notification ...
         assert!(
-            content.contains("Research"),
-            "phase pipeline must remain visible next to a notification: {content:?}"
+            content.contains(&active_t("phase.proposal")),
+            "the declared action must remain visible next to a notification: {content:?}"
         );
-        // ... while the notification is still rendered on the same status line.
+        assert!(
+            !content.contains(&active_t("status.thinking")),
+            "model status must not replace the declared action: {content:?}"
+        );
+        assert!(
+            !content.contains(&active_t("phase.research"))
+                && !content.contains(&active_t("phase.verification")),
+            "the footer must not render a phase ladder: {content:?}"
+        );
         assert!(
             content.contains("Patch applied"),
             "notification must remain visible next to the telemetry: {content:?}"
         );
     }
+    #[tokio::test]
+    async fn legacy_phase_attempt_does_not_render_turn_round_progress() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+        use tauqe_protocol::{events, Event, TurnPhase, TurnPhaseEvent};
+        use tokio::sync::Mutex;
 
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let event = Event {
+            method: events::TURN_PHASE.to_string(),
+            params: Some(
+                serde_json::to_value(TurnPhaseEvent {
+                    operation_id: "op-legacy".to_string(),
+                    phase: TurnPhase::Staging,
+                    round: Some(2),
+                    max_rounds: Some(5),
+                    detail: None,
+                })
+                .unwrap(),
+            ),
+        };
+        let mut is_reasoning = false;
+        crate::rpc::events::handle_event(event, &state, &mut is_reasoning).await;
+
+        let state = state.lock().await;
+        assert_eq!(state.model.turn_round, None);
+        assert_eq!(state.model.turn_max_rounds, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).expect("terminal created");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains(&active_t("status.staging")), "{content:?}");
+        assert!(!content.contains("[Round"), "{content:?}");
+    }
     #[test]
     fn busy_footer_shows_the_reconnect_countdown() {
         use ratatui::backend::TestBackend;

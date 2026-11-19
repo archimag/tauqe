@@ -190,8 +190,7 @@ impl PlanStorage {
     /// "What" section survives intact. The operation removes `Done` steps too, so
     /// it deliberately bypasses the `Done` immutability guard enforced by
     /// [`Self::save_plan`]; the client is responsible for demanding the strict
-    /// two-tier confirmation documented on
-    /// [`Plan::has_started_or_completed_steps`] before dispatching it.
+    /// two-tier confirmation before dispatching it when any leaf is done or in progress.
     ///
     /// Returns `None` when no stored plan carries the requested id.
     pub fn clear_horizon(repo_root: &Path, plan_id: &str) -> Result<Option<Plan>> {

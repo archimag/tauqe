@@ -42,6 +42,18 @@ pub trait ApplyPolicy: Send + Sync {
         project: &ProjectConfig,
         context_manager: &mut ContextManager,
         proposal: &EditProposal,
+    ) -> anyhow::Result<Vec<String>> {
+        self.apply_temporary_batches(repo_root, project, context_manager, &[&proposal.edits])
+            .await
+    }
+
+    /// Writes the net result of accepted rounds in a single transaction.
+    async fn apply_temporary_batches(
+        &mut self,
+        repo_root: &Path,
+        project: &ProjectConfig,
+        context_manager: &mut ContextManager,
+        batches: &[&[EditOperation]],
     ) -> anyhow::Result<Vec<String>>;
 
     /// Makes a verified change set permanent, returning an optional commit hash.
@@ -92,15 +104,15 @@ impl ApplyPolicy for DirectApplyPolicy {
         .await
     }
 
-    async fn apply_temporary(
+    async fn apply_temporary_batches(
         &mut self,
         repo_root: &Path,
         project: &ProjectConfig,
         context_manager: &mut ContextManager,
-        proposal: &EditProposal,
+        batches: &[&[EditOperation]],
     ) -> anyhow::Result<Vec<String>> {
         let changed_files =
-            apply_edit_proposal_with_config(repo_root, project, context_manager, proposal).await?;
+            apply_edit_proposal_with_config(repo_root, project, context_manager, batches).await?;
         Ok(changed_files)
     }
 

@@ -220,10 +220,9 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         self.capabilities.clone()
     }
 
-    fn with_capability_expr(&self, expr: CapabilityTree) -> Box<dyn PromptProtocol> {
-        Box::new(Self { capabilities: expr })
+    fn with_project(&self, _project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
+        Box::new(self.clone())
     }
-
     fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
         // A synthesis round never mutates the plan, so the payload is refused
         // before it is decoded: a horizon that silently dropped the mutation

@@ -26,6 +26,17 @@ pub enum DiscussionTarget {
     },
 }
 
+impl DiscussionTarget {
+    /// Session that owns the finding discussed by a review or group focus.
+    pub fn review_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Review { id } => Some(id),
+            Self::ReviewGroup { session_id, .. } => Some(session_id),
+            Self::Plan { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DiscussionFocus {
     #[default]
@@ -34,11 +45,4 @@ pub enum DiscussionFocus {
         target: DiscussionTarget,
         focused_items: Vec<String>,
     },
-}
-
-/// Result and change notification of one atomic focus mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FocusUpdate {
-    pub focus: DiscussionFocus,
-    pub changed: bool,
 }

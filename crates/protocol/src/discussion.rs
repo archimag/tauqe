@@ -8,9 +8,9 @@ pub(crate) use normalize::{
     deserialize_null_as_default, deserialize_repo_path_list, deserialize_repo_search_requests,
 };
 
-pub mod normalize;
+pub(crate) mod normalize;
 
-pub use normalize::normalize_repo_map_path;
+pub(crate) use normalize::normalize_repo_map_path;
 /// Declarative repository search request emitted during a research or discussion turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSearchRequest {
@@ -19,7 +19,8 @@ pub struct RepoSearchRequest {
 }
 
 impl RepoSearchRequest {
-    pub fn new(path: impl Into<String>, regex: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn new(path: impl Into<String>, regex: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             regex: regex.into(),

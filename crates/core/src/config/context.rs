@@ -73,7 +73,7 @@ pub struct ContextConfig {
     #[serde(default = "default_token_budget", alias = "files_token_budget")]
     pub token_budget: usize,
     #[serde(default = "default_repomap_token_budget")]
-    pub repomap_token_budget: usize,
+    pub(crate) repomap_token_budget: usize,
     #[serde(default = "default_include_repo_map")]
     pub include_repo_map: bool,
     /// Repository search queries honored in one Discovery round.

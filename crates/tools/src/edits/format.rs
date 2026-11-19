@@ -58,7 +58,8 @@ use crate::toolchain::{resolve_formatter, FormatterResolution};
 /// attempt stops the filter instead of waiting for it. A repository that declares
 /// no filter keeps the authored content, and a filter that fails or times out
 /// does the same: a broken formatter never blocks a turn.
-pub async fn prepare_staged_edits_with_config_and_validator(
+#[cfg(test)]
+async fn prepare_staged_edits_with_config_and_validator(
     repo_root: &Path,
     project: &ProjectConfig,
     context: &[String],
@@ -67,11 +68,34 @@ pub async fn prepare_staged_edits_with_config_and_validator(
     config_validator: Option<StagedConfigValidator>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> StageEditsResult {
+    prepare_edit_batches(
+        repo_root,
+        project,
+        context,
+        &[edits],
+        initial_staged,
+        config_validator,
+        cancel_rx,
+    )
+    .await
+}
+
+/// Revalidates accepted rounds in order and formats the net change once.
+/// Each round resolves anchors against the content left by its predecessor.
+pub async fn prepare_edit_batches(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    context: &[String],
+    batches: &[&[EditOperation]],
+    initial_staged: Option<&StagedEditsState>,
+    config_validator: Option<StagedConfigValidator>,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> StageEditsResult {
     let inputs = Arc::new(StagingInputs::new(
         repo_root,
         project,
         context,
-        edits,
+        batches,
         initial_staged,
     ));
     let mut result = stage_off_the_executor(Arc::clone(&inputs), config_validator).await;
@@ -90,7 +114,7 @@ struct StagingInputs {
     repo_root: PathBuf,
     project: ProjectConfig,
     context: Vec<String>,
-    edits: Vec<EditOperation>,
+    batches: Vec<Vec<EditOperation>>,
     initial_staged: Option<StagedEditsState>,
 }
 
@@ -100,28 +124,60 @@ impl StagingInputs {
         repo_root: &Path,
         project: &ProjectConfig,
         context: &[String],
-        edits: &[EditOperation],
+        batches: &[&[EditOperation]],
         initial_staged: Option<&StagedEditsState>,
     ) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
             project: project.clone(),
             context: context.to_vec(),
-            edits: edits.to_vec(),
+            batches: batches.iter().map(|batch| batch.to_vec()).collect(),
             initial_staged: initial_staged.cloned(),
         }
     }
 
     /// Runs the staging state machine over the captured inputs.
     fn stage(&self, config_validator: Option<StagedConfigValidator>) -> StageEditsResult {
-        stage_and_validate_edits_inner(
+        let mut batches = self.batches.iter();
+        let mut result = stage_and_validate_edits_inner(
             &self.repo_root,
             &self.project,
             &self.context,
-            &self.edits,
+            batches.next().map(Vec::as_slice).unwrap_or_default(),
             self.initial_staged.as_ref(),
             config_validator,
-        )
+        );
+        if batches.len() == 0 || !result.failed_files.is_empty() {
+            return result;
+        }
+        let mut seen: std::collections::HashSet<_> =
+            result.successful_paths.iter().cloned().collect();
+        for batch in batches {
+            let round = stage_and_validate_edits_inner(
+                &self.repo_root,
+                &self.project,
+                &self.context,
+                batch,
+                Some(&result.staged_state),
+                config_validator,
+            );
+            result.staged_state = round.staged_state;
+            result.successful_edits.extend(round.successful_edits);
+            result.successful_paths.extend(
+                round
+                    .successful_paths
+                    .into_iter()
+                    .filter(|path| seen.insert(path.clone())),
+            );
+            result.failed_files = round.failed_files;
+            if !result.failed_files.is_empty() {
+                break;
+            }
+        }
+        result.successful_paths.retain(|path| {
+            !result.staged_state.deleted_paths.contains(path) || self.repo_root.join(path).exists()
+        });
+        result
     }
 }
 

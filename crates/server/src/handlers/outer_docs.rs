@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tauqe_core::api::CacheError;
+use tauqe_flow::api::CacheError;
 use tauqe_protocol::{
     errors, OuterDocsCacheEntry, OuterDocsCacheListResult, OuterDocsCacheRemoveParams,
     OuterDocsCacheRemoveResult, Request, Response,
@@ -45,21 +45,6 @@ pub async fn handle_outer_docs_cache_list(req: Request, state: &Arc<AppState>) -
 /// OuterDocs layer is reconciled in the same request, so a document the cache
 /// no longer holds leaves the layer that still names it.
 pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>) -> Response {
-    // The removal rewrites the cache the context reasons over, so it claims the
-    // operation slot instead of sampling it: a turn registering in between
-    // would merge a context clone that still names the removed documents.
-    let operation = match state.application.begin_context_change() {
-        Ok(operation) => operation,
-        Err(_) => {
-            tracing::warn!(
-                code = errors::OPERATION_IN_PROGRESS,
-                "Refused to register a new operation: a slot is already active"
-            );
-            return Response::err(req.id, errors::OPERATION_IN_PROGRESS,
-                "The external documentation cache cannot be modified while a turn or batch is running");
-        }
-    };
-
     let params: OuterDocsCacheRemoveParams = match req
         .params
         .and_then(|params| serde_json::from_value(params).ok())
@@ -69,17 +54,20 @@ pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>)
             return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid path");
         }
     };
-    let outcome = match operation.remove_outer_docs_cache(params.path).await {
+    let observer = crate::publication::Publisher {
+        out: state.out.clone(),
+    };
+    let removed = match state
+        .application
+        .remove_cached_documents(params.path, &observer)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => return Response::err(req.id, cache_error_code(&error), error.to_string()),
     };
-    if let Some(ctx_state) = outcome.context_update {
-        crate::handlers::context::publish_context(&state.out, &ctx_state);
-    }
-
     let result = OuterDocsCacheRemoveResult {
-        removed_files: outcome.removed.removed_files,
-        removed_bytes: outcome.removed.removed_bytes,
+        removed_files: removed.removed_files,
+        removed_bytes: removed.removed_bytes,
     };
     Response::ok_typed(req.id, &result)
 }
@@ -87,6 +75,7 @@ pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>)
 /// The wire error code of one cache removal refusal.
 fn cache_error_code(error: &CacheError) -> &'static str {
     match error {
+        CacheError::Busy => errors::OPERATION_IN_PROGRESS,
         CacheError::InvalidPath(_) => errors::INVALID_PARAMS,
         CacheError::NotFound(_) => errors::NOT_FOUND,
         CacheError::Failed(_) => errors::INTERNAL_ERROR,
@@ -285,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_removal_preserves_busy_precedence_over_invalid_parameters() {
+    async fn cache_removal_decodes_before_admission() {
         let dir = TestDir::new();
         let state = test_state(&dir);
         let operation = state.try_begin_operation().unwrap();
@@ -294,7 +283,7 @@ mod tests {
             &state,
         )
         .await;
-        assert_eq!(response.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+        assert_eq!(response.error.unwrap().code, errors::INVALID_PARAMS);
         drop(operation);
         let response = handle_outer_docs_cache_remove(
             request(2, methods::OUTER_DOCS_CACHE_REMOVE, None),

@@ -287,6 +287,14 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     // Render exactly the modal the canonical ordering reports as top-most, so the
     // visible window is always the window that receives input.
     match state.active_modal() {
+        Some(ActiveModal::ChatGptSignIn) => {
+            if let Some(dialog) = &state.modals.chatgpt {
+                crate::dialogs::render::render_modal_confirm(
+                    frame,
+                    crate::dialogs::render::confirm::chatgpt_params(dialog),
+                );
+            }
+        }
         Some(ActiveModal::ServerDisconnected) => {
             if let Some(msg) = &state.modals.server_disconnected {
                 render_disconnected_popup(frame, msg);

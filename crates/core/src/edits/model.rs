@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 pub mod operation;
 mod proposal;
+pub(crate) use operation::normalize_repo_path;
 pub use operation::{
-    normalize_repo_path, EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir,
-    EditOperation, EditOverwrite, EditReplace,
+    EditCreate, EditDelete, EditLineAnchor, EditMove, EditMoveDir, EditOperation, EditOverwrite,
+    EditReplace,
 };
-pub use proposal::{ChangeConversionError, EditProposal, StructuredChangeProposal};
+pub(crate) use proposal::EditProposal;
+pub use proposal::StructuredChangeProposal;
 fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -41,7 +43,7 @@ impl std::convert::TryFrom<String> for EditFileOp {
 }
 
 impl EditFileOp {
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Replace => "replace",
             Self::Create => "create",

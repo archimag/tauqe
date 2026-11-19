@@ -84,7 +84,7 @@ impl PostAnalysisRegrouping {
         })
     }
 
-    pub(crate) fn is_for_review(&self, id: &str) -> bool {
+    pub fn is_for_review(&self, id: &str) -> bool {
         self.review_id == id
     }
 

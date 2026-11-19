@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::edits::anchor::decode_anchor;
@@ -20,6 +20,9 @@ pub trait EditStreamFilter: Send {
     /// Flushes any buffered content at the end of generation.
     fn finish(self: Box<Self>) -> Vec<StreamEvent>;
 
+    /// Prevents disk fallback for paths deleted or replaced by non-text data in staging.
+    fn exclude_disk_sources(&mut self, _paths: HashSet<String>) {}
+
     /// Discards everything the filter buffered so far.
     ///
     /// The transport voids an interrupted attempt and re-issues the request, so
@@ -39,19 +42,6 @@ pub(crate) fn resolve_path(candidate: &str, editable_paths: &[String], is_create
                 .trim_start_matches('/')
                 .to_string()
         })
-}
-
-/// Returns the content of a previewed file from staged memory or, failing that,
-/// from the working tree through the repository boundary.
-fn current_file_content(
-    staged: &HashMap<String, String>,
-    repo_root: &Path,
-    path: &str,
-) -> Result<String, String> {
-    if let Some(content) = staged.get(path) {
-        return Ok(content.clone());
-    }
-    read_repository_source(repo_root, path)
 }
 
 /// Reads a model-named file for the streaming preview.
@@ -274,12 +264,14 @@ pub(crate) struct StagingSimulator {
     /// looked before the change set, so a batch of anchored ranges resolves
     /// against this snapshot while `staged_contents` keeps the cumulative result.
     original_contents: HashMap<String, String>,
+    excluded_disk_sources: HashSet<String>,
     repo_root: PathBuf,
 }
 
 impl StagingSimulator {
     fn new(staged_contents: HashMap<String, String>, repo_root: PathBuf) -> Self {
         Self {
+            excluded_disk_sources: HashSet::new(),
             original_contents: staged_contents.clone(),
             staged_contents,
             repo_root,
@@ -314,7 +306,7 @@ impl StagingSimulator {
         if let Some(content) = self.original_contents.get(path) {
             return Ok(content.clone());
         }
-        let content = current_file_content(&self.staged_contents, &self.repo_root, path)?;
+        let content = self.current_content(path)?;
         self.original_contents
             .insert(path.to_string(), content.clone());
         Ok(content)
@@ -356,7 +348,17 @@ impl StagingSimulator {
 
     /// Returns the current content from staged memory or, failing that, from disk.
     fn current_content(&self, path: &str) -> Result<String, String> {
-        current_file_content(&self.staged_contents, &self.repo_root, path)
+        if let Some(content) = self.staged_contents.get(path) {
+            return Ok(content.clone());
+        }
+        if !self.excluded_disk_sources.is_empty()
+            && self
+                .excluded_disk_sources
+                .contains(&resolve_preview_read_path(&self.repo_root, path)?)
+        {
+            return Err(format!("No current text for '{path}'"));
+        }
+        read_repository_source(&self.repo_root, path)
     }
 
     /// Applies a replace hunk in memory and records the updated file content.
@@ -405,7 +407,7 @@ impl StagingSimulator {
         if let Some(content) = self.staged_contents.remove(from) {
             self.staged_contents.insert(to.to_string(), content);
         } else {
-            match read_repository_source(&self.repo_root, from) {
+            match self.current_content(from) {
                 Ok(content) => {
                     self.staged_contents.insert(to.to_string(), content);
                 }
@@ -543,6 +545,18 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn a_virtually_deleted_file_cannot_supply_preview_bytes_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("old.txt"), "disk original").unwrap();
+        let mut simulator = StagingSimulator::new(HashMap::new(), root.path().to_owned());
+        simulator.excluded_disk_sources.insert("old.txt".into());
+        assert!(simulator.current_content("./old.txt").is_err());
+        assert!(simulator.original_content("old.txt").is_err());
+        simulator.overwrite("old.txt", "recreated".into());
+        assert_eq!(simulator.current_content("old.txt").unwrap(), "recreated");
     }
 
     /// An anchored range whose anchors and content are owned by the test.

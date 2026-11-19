@@ -205,11 +205,9 @@ repl = ["openrouter:~google/gemini-flash-latest"]
 # # `git` runs every turn inside a checkpointed transaction that rolls the working
 # # tree back on failure; `naive` writes bytes directly and keeps no checkpoint.
 # workflow = "git"
-# # `line_anchor` names an inclusive line range through the compact opaque anchors
-# # rendered beside every context line, so the model copies a short token instead
-# # of reproducing the text it replaces; `search_replace` echoes the replaced text
-# # and matches it exactly.
-# patch_strategy = "line_anchor"
+# # apply_patch uses a Codex patch with file sections and context hunks.
+# # line_anchor addresses ranges by opaque anchors. search_replace echoes the old text.
+# patch_strategy = "apply_patch"
 # # Total budget of LLM rounds granted to a single turn: research, staging retries,
 # # verification healing, and empty response retries all spend from this pool.
 # max_turn_rounds = 16

@@ -6,7 +6,7 @@ pub use capability::CapabilityTree;
 
 mod classification;
 mod kind;
-pub use classification::command_capability;
+pub(crate) use classification::command_capability;
 pub use kind::LlmCapability;
 
 pub mod command;

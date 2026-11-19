@@ -136,21 +136,18 @@ dialogue session identifier. The mode-specific rules of the prompt are gated on
 the typed kind the brief carries, never on a heuristic that infers a regime from
 the shape of a surface.
 
-### 3.2.2 TurnPhase
+### 3.2.2 Current work and round progress
 
-The five phases are surfaced to the interface as turn-phase events:
+The bounded turn announces research when it processes discovery commands, staging
+when it starts processing a patch, and verification when it enters the application
+and verification pass. These events describe current work, not positions in a
+fixed sequence, and carry no round or attempt counters.
 
-| Phase | Repeats | Meaning |
-| --- | --- | --- |
-| `Research` | yes, bounded | widen the working set until contracts are known |
-| `Proposal` | once per model interaction | produce minimal coherent edits |
-| `Staging` | yes, bounded | validate edits against a virtual tree |
-| `Verification` | once per applied proposal | run the project toolchain |
-| `Healing` | yes, bounded | repair what verification rejected |
-
-Research, Staging, and Healing carry a round counter and a maximum, because they
-repeat; Proposal is emitted for every model interaction and Verification runs once
-per applied proposal.
+The admitted provider call has a separate event with a one-based round number, an
+optional budget, and an optional typed reason for patch, post-hook, or verification
+repair. The request replaces the previous activity. A subsequent deterministic
+operation replaces the request reason without advancing the round. Rebuilding the
+prompt prefix does not announce work or spend a round.
 
 ### 3.2.3 Capabilities and commands
 

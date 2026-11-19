@@ -1,7 +1,7 @@
 //! RPC conversion for the application discussion scenario.
 use crate::contracts::Project;
 
-use tauqe_core::api as core;
+use tauqe_flow::api as core;
 use tauqe_protocol as wire;
 
 pub(crate) fn target_from_dto(target: wire::DiscussionTarget) -> core::DiscussionTarget {
@@ -34,5 +34,21 @@ pub(crate) fn focus_dto(focus: core::DiscussionFocus) -> wire::DiscussionFocus {
                 focused_items,
             }
         }
+    }
+}
+
+impl Project for wire::DiscussionFocus {
+    type Target = core::DiscussionFocus;
+
+    fn project(self) -> Self::Target {
+        focus_from_dto(self)
+    }
+}
+
+impl Project for core::DiscussionFocus {
+    type Target = wire::DiscussionFocus;
+
+    fn project(self) -> Self::Target {
+        focus_dto(self)
     }
 }

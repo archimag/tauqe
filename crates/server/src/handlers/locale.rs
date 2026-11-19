@@ -1,9 +1,7 @@
 //! RPC adaptation for headless locale generation.
 use crate::state::AppState;
 use std::sync::Arc;
-use tauqe_core::api::{
-    LocaleExecutionConfig, LocaleGenerationError, UsageObserver, UsageTotalsSnapshot,
-};
+use tauqe_flow::api::LocaleGenerationError;
 use tauqe_protocol::{errors, LocaleGenerateParams, Request, Response};
 
 pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Response {
@@ -18,62 +16,25 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
             )
         }
     };
-    let prepared = match state
-        .application
-        .prepare_locale_generation(tauqe_core::locale::LocaleGenerateParams {
-            language: params.language,
-            items: params
-                .items
-                .into_iter()
-                .map(|item| tauqe_core::locale::LocaleCatalogItem {
-                    key: item.key,
-                    english: item.english,
-                    context: item.context,
-                    max_width: item.max_width,
-                })
-                .collect(),
-        })
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return locale_error(req.id, e),
+    let input = tauqe_flow::api::types::LocaleGenerateParams {
+        language: params.language,
+        items: params
+            .items
+            .into_iter()
+            .map(|item| tauqe_flow::api::types::LocaleCatalogItem {
+                key: item.key,
+                english: item.english,
+                context: item.context,
+                max_width: item.max_width,
+            })
+            .collect(),
     };
-    #[cfg(test)]
-    let provider = match state.provider_override.lock().await.clone() {
-        Some(p) => Ok(p),
-        None => prepared.provider(),
-    };
-    #[cfg(not(test))]
-    let provider = prepared.provider();
-    let provider = match provider {
-        Ok(p) => p,
-        Err(e) => return locale_error(req.id, e),
-    };
-    let operation = match state.try_begin_operation() {
-        Ok(op) => op,
-        Err(()) => {
-            return Response::err(
-                req.id,
-                errors::OPERATION_IN_PROGRESS,
-                "Another operation is already running",
-            )
-        }
-    };
-    let observer = Arc::new(Observer {
-        state: Arc::clone(state),
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
     });
     match state
         .application
-        .generate_locale(
-            &operation,
-            prepared,
-            provider,
-            observer,
-            LocaleExecutionConfig {
-                operation_id: format!("op-{}", crate::state::next_operation_id()),
-                exit_deadline: crate::reap::task_exit_deadline(),
-            },
-        )
+        .generate_locale(input, observer, crate::reap::task_exit_deadline())
         .await
     {
         Ok(result) => Response::ok_typed(
@@ -88,6 +49,7 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
 }
 fn locale_error(id: tauqe_protocol::RequestId, error: LocaleGenerationError) -> Response {
     let code = match &error {
+        LocaleGenerationError::Busy => errors::OPERATION_IN_PROGRESS,
         LocaleGenerationError::Invalid(_) => errors::INVALID_PARAMS,
         LocaleGenerationError::Provider(_) => errors::NO_API_KEY,
         LocaleGenerationError::Model(_) => errors::MODEL_ERROR,
@@ -95,27 +57,6 @@ fn locale_error(id: tauqe_protocol::RequestId, error: LocaleGenerationError) -> 
     };
     Response::err(id, code, error.to_string())
 }
-struct Observer {
-    state: Arc<AppState>,
-}
-impl UsageObserver for Observer {
-    fn publish_usage_totals(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
-        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
-    }
-    fn publish_usage(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
-        self.state.out.send_event(&tauqe_protocol::Event {
-            method: tauqe_protocol::events::MODEL_USAGE.into(),
-            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-                operation_id: id.into(),
-                usage: crate::usage::wire_usage(&snapshot.operation_totals().to_usage_info()),
-                session_total_cost: snapshot.session.cost,
-                current_cost: Some(snapshot.operation_totals().cost),
-            })
-            .ok(),
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +64,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
-    use tauqe_core::providers::{ChatMessage, LlmProvider, StreamEvent};
+    use tauqe_core::providers::{LlmProvider, StreamEvent};
     use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
 
     /// Hard budget for a fixture whose subject is a task that reaches no
@@ -183,7 +124,7 @@ mod tests {
 
     async fn state_with_provider(provider: Arc<dyn LlmProvider>) -> Arc<AppState> {
         let state = bare_state();
-        *state.provider_override.lock().await = Some(provider);
+        state.application.test_set_provider(provider).await;
         state
     }
 
@@ -207,7 +148,7 @@ mod tests {
         provider: Arc<dyn LlmProvider>,
     ) -> (Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let (state, rx) = state_with_wire();
-        *state.provider_override.lock().await = Some(provider);
+        state.application.test_set_provider(provider).await;
         (state, rx)
     }
 
@@ -393,14 +334,12 @@ mod tests {
             tauqe_core::models::ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
             _cancel_rx: tokio::sync::watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> tauqe_core::providers::ProviderResult {
             let _ = tx.send(StreamEvent::Usage(self.usage.clone())).await;
             let _ = tx.send(StreamEvent::Cancelled).await;
             Ok(())
@@ -534,14 +473,12 @@ mod tests {
             tauqe_core::models::ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            _request: tauqe_core::providers::LlmRequest<'_>,
             _tx: tokio::sync::mpsc::Sender<StreamEvent>,
             _cancel_rx: tokio::sync::watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> tauqe_core::providers::ProviderResult {
             // The marker and the sender stay alive across the park: the future
             // only ever completes by being aborted, exactly like a provider call
             // that hangs instead of reacting to the cancellation signal.
@@ -619,14 +556,12 @@ mod tests {
             tauqe_core::models::ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
             _cancel_rx: tokio::sync::watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> tauqe_core::providers::ProviderResult {
             // The marker and the sender stay alive across the park: the future
             // only ever completes by being aborted, exactly like a provider call
             // that fails and then hangs instead of returning.
@@ -685,14 +620,12 @@ mod tests {
             tauqe_core::models::ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
             _cancel_rx: tokio::sync::watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> tauqe_core::providers::ProviderResult {
             // The payload and the channel close first, so the handler's event loop
             // ends and reaches its completed-stream await while this task is still
             // running. The abort such an await would otherwise rely on lands only at

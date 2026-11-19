@@ -93,6 +93,15 @@ pub struct JsonSchemaDefinition {
     pub strict: Option<bool>,
 }
 
+/// Why a bounded turn requests a corrective model round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRequestReason {
+    PatchRepair,
+    PostHookRepair,
+    VerificationRepair,
+    EmptyResponseRetry,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     ReasoningDelta(String),
@@ -144,6 +153,12 @@ pub enum StreamEvent {
         round: Option<usize>,
         max_rounds: Option<usize>,
         detail: Option<String>,
+    },
+    /// One-based progress of an admitted model call in a bounded turn.
+    TurnRoundStarted {
+        round: usize,
+        max_rounds: Option<usize>,
+        reason: Option<TurnRequestReason>,
     },
     RepoMapTokens(usize),
     /// The turn advanced to the next rung of the model ladder.

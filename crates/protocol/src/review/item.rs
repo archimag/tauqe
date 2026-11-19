@@ -19,6 +19,7 @@ pub enum IssueType {
 
 impl IssueType {
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Bug => "bug",
@@ -29,7 +30,7 @@ impl IssueType {
         }
     }
 
-    pub fn display_badge(&self) -> &'static str {
+    pub(crate) fn display_badge(&self) -> &'static str {
         match self {
             Self::Bug => "BUG",
             Self::Security => "SEC",
@@ -66,7 +67,8 @@ impl IssueStatus {
     /// until its spelling is declared here, and a test pins every declared
     /// spelling to the serde representation, which is what actually travels on
     /// the wire.
-    pub fn as_str(&self) -> &'static str {
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Discussion => "discussion",
             Self::Todo => "todo",

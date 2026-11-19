@@ -1,7 +1,7 @@
 //! Legacy model payload behavior retained after removing unused RPC exports.
 use super::*;
-use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
-use crate::review::ReviewDecisionStatus;
+use crate::llm::discussion::ReviewDecisionStatus;
+use crate::plan_item::{ConceptItem, PlanItem, PlanItemStatus};
 #[test]
 fn test_discussion_plan_action_display_and_serde() {
     assert_eq!(DiscussionPlanAction::Update.to_string(), "update");

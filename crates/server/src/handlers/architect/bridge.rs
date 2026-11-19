@@ -1,197 +1,24 @@
-//! Provider bindings and RPC event projection for the core Architect contour.
-use crate::contracts::Project;
+//! Wire regression tests for Architect stream publication.
+#![cfg(test)]
 use std::sync::Arc;
 
-use crate::handlers::common::{emit, withdraw_streamed_attempt};
+use crate::handlers::common::emit;
 use crate::state::{AppState, OperationGuard};
 #[cfg(test)]
 use crate::usage::UsageGuard;
-use async_trait::async_trait;
 use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::context::ContextManager;
-use tauqe_core::control::refine::{ProviderResolver, StructuredRefineOutcome};
-use tauqe_core::models::{ArchitectTier, ProviderKind};
+use tauqe_core::control::refine::StructuredRefineOutcome;
+use tauqe_core::models::ArchitectTier;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::workflow::WorkflowOptions;
-use tauqe_protocol::{
-    events, ModelConnectionRetryingEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
-    RepoMapInfoEvent, TurnPhaseEvent,
-};
+use tauqe_protocol::events;
 #[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
-use super::resolve_architect_provider;
-
-/// Provider resolver the Architect contour consults when it escalates.
-///
-/// A provider client is bound to one provider kind, so the contour asks the
-/// adapter for a freshly resolved client whenever a promoted rung is served by
-/// another provider. The resolver snapshots the configuration the synthesis
-/// started on and delegates to the shared architect resolution path, which also
-/// serves the provider seam of the handler test suite.
-pub(crate) struct ArchitectProviderResolver {
-    state: Arc<AppState>,
-    config: AppConfig,
-}
-
-impl ArchitectProviderResolver {
-    /// Binds the resolver to the state and configuration of one synthesis.
-    pub(crate) fn new(state: Arc<AppState>, config: AppConfig) -> Self {
-        Self { state, config }
-    }
-}
-
-#[async_trait]
-impl ProviderResolver for ArchitectProviderResolver {
-    async fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
-        resolve_architect_provider(&self.state, &self.config, kind)
-            .await
-            .map_err(anyhow::Error::msg)
-    }
-}
-
-pub(crate) use tauqe_core::api::ContourRelaySummary;
-struct Observer {
-    state: Arc<AppState>,
-}
-#[async_trait]
-impl tauqe_core::api::ArchitectObserver for Observer {
-    async fn pace(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
-        self.state.out.pace_event(event, cancel).await;
-    }
-    fn usage_totals(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
-        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
-    }
-    fn publish(&self, op_id: &str, event: StreamEvent) {
-        match event {
-            StreamEvent::TextDelta(delta) => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_TEXT_DELTA,
-                    serde_json::to_value(ModelDeltaEvent {
-                        operation_id: op_id.to_string(),
-                        delta,
-                    })
-                    .ok(),
-                );
-            }
-            StreamEvent::ReasoningDelta(delta) => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_REASONING_DELTA,
-                    Some(serde_json::json!({
-                        "operation_id": op_id,
-                        "delta": delta,
-                    })),
-                );
-            }
-            StreamEvent::TierEscalated {
-                tier,
-                model,
-                role,
-                effort,
-            } => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_ESCALATED,
-                    serde_json::to_value(ModelEscalatedEvent {
-                        operation_id: op_id.to_string(),
-                        model: model.project(),
-                        role: Some(role.project()),
-                        alias: None,
-                        effort: effort.map(crate::contracts::Project::project),
-                        tier,
-                    })
-                    .ok(),
-                );
-            }
-            StreamEvent::TurnPhase {
-                phase,
-                round,
-                max_rounds,
-                detail,
-            } => {
-                emit(
-                    &self.state.out,
-                    events::TURN_PHASE,
-                    serde_json::to_value(TurnPhaseEvent {
-                        operation_id: op_id.to_string(),
-                        phase: phase.project(),
-                        round,
-                        max_rounds,
-                        detail,
-                    })
-                    .ok(),
-                );
-            }
-            StreamEvent::RepoMapTokens(tokens) => {
-                emit(
-                    &self.state.out,
-                    events::TURN_REPOMAP,
-                    serde_json::to_value(RepoMapInfoEvent {
-                        operation_id: op_id.to_string(),
-                        tokens,
-                    })
-                    .ok(),
-                );
-            }
-            StreamEvent::RetryingConnection {
-                attempt,
-                max_attempts,
-                delay_secs,
-                reason,
-            } => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_CONNECTION_RETRYING,
-                    serde_json::to_value(ModelConnectionRetryingEvent {
-                        operation_id: op_id.to_string(),
-                        attempt,
-                        max_attempts,
-                        delay_secs,
-                        reason,
-                    })
-                    .ok(),
-                );
-            }
-            // The retry decorator withdrew an attempt that broke mid-stream, so
-            // the fragments it already streamed belong to an answer nobody will
-            // keep: the accumulator drops them together with the client copy.
-            StreamEvent::ResetStream => {
-                withdraw_streamed_attempt(&self.state.out, op_id, || {});
-            }
-            StreamEvent::Usage(_) => {}
-            StreamEvent::ContextChanged(ctx_state) => {
-                crate::handlers::context::publish_context(&self.state.out, &ctx_state);
-            }
-            StreamEvent::Cancelled => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_CANCELLED,
-                    Some(serde_json::json!({ "operation_id": op_id })),
-                );
-            }
-            StreamEvent::Error(message) => {
-                emit(
-                    &self.state.out,
-                    events::MODEL_ERROR,
-                    serde_json::to_value(ModelErrorEvent {
-                        operation_id: op_id.to_string(),
-                        message,
-                    })
-                    .ok(),
-                );
-            }
-            // The contour reports the end of the synthesis once, after it has
-            // released the context it widened.
-            StreamEvent::Done => {}
-            // Editing, toolchain, and escalation telemetry of other contours
-            // never reaches an architect synthesis.
-            _ => {}
-        }
-    }
-}
+#[cfg(test)]
+use tauqe_flow::api::ContourRelaySummary;
 #[cfg(test)]
 async fn relay_contour_events(
     state: Arc<AppState>,
@@ -200,8 +27,10 @@ async fn relay_contour_events(
     events_rx: mpsc::Receiver<StreamEvent>,
     cancel: watch::Receiver<bool>,
 ) -> ContourRelaySummary {
-    tauqe_core::api::relay_architect_events(
-        Arc::new(Observer { state }),
+    tauqe_flow::api::test_relay_architect_events(
+        Arc::new(crate::publication::Publisher {
+            out: state.out.clone(),
+        }),
         op_id,
         usage,
         events_rx,
@@ -209,6 +38,7 @@ async fn relay_contour_events(
     )
     .await
 }
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_contour_synthesis(
     state: &Arc<AppState>,
@@ -222,13 +52,11 @@ pub(crate) async fn run_contour_synthesis(
     intro_header: String,
     budget_hint: String,
 ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
-    let config = state.application.configuration().await.config.clone();
-    let resolver = Arc::new(ArchitectProviderResolver::new(state.clone(), config));
     state
         .application
-        .run_architect_contour(
+        .test_run_architect_contour(
             operation,
-            tauqe_core::api::PlanHorizonContour {
+            tauqe_flow::api::PlanHorizonContour {
                 operation_id: op_id.to_string(),
                 task,
                 context,
@@ -238,9 +66,8 @@ pub(crate) async fn run_contour_synthesis(
                 intro_header,
                 budget_hint,
             },
-            resolver,
-            Arc::new(Observer {
-                state: state.clone(),
+            Arc::new(crate::publication::Publisher {
+                out: state.out.clone(),
             }),
         )
         .await
@@ -497,7 +324,10 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
             success_payload("The horizon follows from the gathered material"),
         )]));
-        *state.provider_override.lock().await = Some(provider.clone() as Arc<dyn LlmProvider>);
+        state
+            .application
+            .test_set_provider(provider.clone() as Arc<dyn LlmProvider>)
+            .await;
 
         let config = state.application.configuration().await.config.clone();
         let models = config.models.clone();
@@ -562,31 +392,6 @@ mod tests {
         );
 
         drop(operation);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The resolver is awaited inside the proposal round, so it must resolve on
-    /// whatever runtime polls the contour. A current-thread runtime is the exact
-    /// host that used to panic inside the bridge's blocking hop.
-    #[tokio::test]
-    async fn resolver_resolves_an_installed_client_on_a_current_thread_runtime() {
-        let (state, _events, root) = test_state("resolver");
-        let installed: Arc<dyn LlmProvider> =
-            Arc::new(MockLlmProvider::scripted([MockResponse::text("unused")]));
-        *state.provider_override.lock().await = Some(installed.clone());
-
-        let config = state.application.configuration().await.config.clone();
-        let resolver = ArchitectProviderResolver::new(Arc::clone(&state), config);
-
-        let resolved = resolver
-            .resolve(ProviderKind::OpenRouter)
-            .await
-            .expect("the installed client resolves on a current-thread runtime");
-        assert!(
-            std::ptr::eq(&*resolved, &*installed),
-            "the resolver must return the client installed through the test seam"
-        );
-
         let _ = std::fs::remove_dir_all(&root);
     }
 

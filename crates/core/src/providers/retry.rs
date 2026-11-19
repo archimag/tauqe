@@ -36,8 +36,10 @@ use crate::models::ProviderKind;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
 
-use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
+#[cfg(test)]
+use super::{ChatMessage, ReasoningEffort};
+use super::{LlmRequest, ProviderError, ProviderResult, StreamEvent};
 
 /// Total attempts made for one request, including the first one.
 const DEFAULT_MAX_ATTEMPTS: u32 = 4;
@@ -145,17 +147,12 @@ impl RetryingProvider {
 
     /// Runs one request to completion, re-issuing it while the failure is
     /// transient and the retry budget lasts.
-    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> ProviderResult {
         let max_attempts = self.config.max_attempts.max(1);
         let mut attempt: u32 = 0;
 
@@ -166,17 +163,7 @@ impl RetryingProvider {
                 return Ok(());
             }
 
-            let outcome = self
-                .attempt(
-                    model,
-                    messages.clone(),
-                    response_format.clone(),
-                    reasoning_effort,
-                    session_id,
-                    &tx,
-                    &cancel_rx,
-                )
-                .await;
+            let outcome = self.attempt(request.clone(), &tx, &cancel_rx).await;
 
             if outcome.cancelled {
                 return Ok(());
@@ -194,7 +181,7 @@ impl RetryingProvider {
                 }
                 let _ = tx.send(StreamEvent::Error(reason.clone())).await;
                 tracing::warn!(
-                    model = %model,
+                    model = %request.model,
                     attempt,
                     max_attempts,
                     retryable,
@@ -203,7 +190,8 @@ impl RetryingProvider {
                 );
                 return Err(match outcome.transport_error {
                     Some(err) => err,
-                    None => anyhow::anyhow!(reason),
+                    None if retryable => ProviderError::Transient(anyhow::anyhow!(reason)),
+                    None => ProviderError::Request(anyhow::anyhow!(reason)),
                 });
             }
 
@@ -215,7 +203,7 @@ impl RetryingProvider {
 
             let delay = self.config.delay_for(attempt);
             tracing::warn!(
-                model = %model,
+                model = %request.model,
                 attempt,
                 max_attempts,
                 delay_ms = %delay.as_millis(),
@@ -239,28 +227,15 @@ impl RetryingProvider {
     /// it, so a runaway generation or a vanished client drops the future at once
     /// and aborts the downstream response instead of draining an unbounded
     /// stream.
-    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
+        request: LlmRequest<'_>,
         tx: &mpsc::Sender<StreamEvent>,
         cancel_rx: &watch::Receiver<bool>,
     ) -> AttemptOutcome {
         let ceiling = self.max_stream_bytes;
         let (inner_tx, mut inner_rx) = mpsc::channel::<StreamEvent>(RELAY_CAPACITY);
-        let mut stream = self.inner.stream_chat_with_session(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            session_id,
-            inner_tx,
-            cancel_rx.clone(),
-        );
+        let mut stream = self.inner.stream(request, inner_tx, cancel_rx.clone());
 
         let mut observed = AttemptOutcome::default();
 
@@ -301,7 +276,7 @@ struct AttemptOutcome {
     /// Error reported on the stream channel by the provider.
     stream_error: Option<String>,
     /// Error returned by the provider call itself.
-    transport_error: Option<anyhow::Error>,
+    transport_error: Option<ProviderError>,
     /// The attempt observed a cancellation signal.
     cancelled: bool,
 }
@@ -349,7 +324,7 @@ impl AttemptOutcome {
             .is_some_and(is_retryable_message);
 
         match self.transport_error.as_ref() {
-            Some(err) => Some((err.to_string(), is_retryable_error(err) || stream_retryable)),
+            Some(err) => Some((err.to_string(), matches!(err, ProviderError::Transient(_)))),
             None => self
                 .stream_error
                 .as_deref()
@@ -386,70 +361,13 @@ impl LlmProvider for RetryingProvider {
         self.inner.kind()
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.run(model, messages, response_format, None, None, tx, cancel_rx)
-            .await
-    }
-
-    async fn stream_chat_with_effort(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.run(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            None,
-            tx,
-            cancel_rx,
-        )
-        .await
-    }
-
-    async fn stream_chat_with_session(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.run(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            session_id,
-            tx,
-            cancel_rx,
-        )
-        .await
-    }
-
-    async fn stream_text(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.run(model, messages, None, None, None, tx, cancel_rx)
-            .await
+    ) -> ProviderResult {
+        self.run(request, tx, cancel_rx).await
     }
 }
 
@@ -547,6 +465,14 @@ fn is_retryable_message(message: &str) -> bool {
 }
 
 /// Returns whether an error chain carries a transient transport failure.
+pub(super) fn classify_transport_error(error: anyhow::Error) -> ProviderError {
+    if is_retryable_error(&error) {
+        ProviderError::Transient(error)
+    } else {
+        ProviderError::Request(error)
+    }
+}
+
 fn is_retryable_error(err: &anyhow::Error) -> bool {
     if err.chain().any(|cause| {
         cause
@@ -725,39 +651,23 @@ mod tests {
             ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
             _cancel_rx: watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
-            let _ = tx.send(StreamEvent::Done).await;
-            Ok(())
-        }
-
-        async fn stream_chat_with_session(
-            &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
-            reasoning_effort: Option<ReasoningEffort>,
-            session_id: Option<&str>,
-            tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> ProviderResult {
             self.state.calls.fetch_add(1, Ordering::SeqCst);
             self.state
                 .sessions
                 .lock()
                 .expect("session log")
-                .push(session_id.map(str::to_string));
+                .push(request.session_id.map(str::to_string));
             self.state
                 .efforts
                 .lock()
                 .expect("effort log")
-                .push(reasoning_effort);
+                .push(request.reasoning_effort);
 
             let attempt = self
                 .state
@@ -784,7 +694,7 @@ mod tests {
                 return Ok(());
             }
             if let Some(message) = attempt.transport_error {
-                return Err(anyhow::anyhow!(message));
+                return Err(classify_transport_error(anyhow::anyhow!(message)));
             }
 
             let _ = tx.send(StreamEvent::Done).await;
@@ -806,7 +716,7 @@ mod tests {
         provider: &Arc<ScriptedProvider>,
         config: RetryConfig,
         session_id: Option<&str>,
-    ) -> (anyhow::Result<()>, Vec<StreamEvent>) {
+    ) -> (ProviderResult, Vec<StreamEvent>) {
         drive_with_ceiling(provider, config, session_id, DEFAULT_MAX_STREAM_BYTES).await
     }
 
@@ -817,7 +727,7 @@ mod tests {
         config: RetryConfig,
         session_id: Option<&str>,
         max_stream_bytes: usize,
-    ) -> (anyhow::Result<()>, Vec<StreamEvent>) {
+    ) -> (ProviderResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let retrying = RetryingProvider::new(Box::new(Arc::clone(provider)), config)
@@ -831,12 +741,12 @@ mod tests {
             events
         };
 
-        let stream = retrying.stream_chat_with_session(
-            "test-model",
-            vec![ChatMessage::user("hi")],
-            None,
-            Some(ReasoningEffort::High),
-            session_id,
+        let stream = retrying.stream(
+            LlmRequest {
+                reasoning_effort: Some(ReasoningEffort::High),
+                session_id,
+                ..LlmRequest::new("test-model", vec![ChatMessage::user("hi")])
+            },
             tx,
             cancel_rx,
         );
@@ -864,40 +774,13 @@ mod tests {
             self.0.kind()
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            model: &str,
-            messages: Vec<ChatMessage>,
-            response_format: Option<ResponseFormat>,
+            request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
             cancel_rx: watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
-            self.0
-                .stream_chat(model, messages, response_format, tx, cancel_rx)
-                .await
-        }
-
-        async fn stream_chat_with_session(
-            &self,
-            model: &str,
-            messages: Vec<ChatMessage>,
-            response_format: Option<ResponseFormat>,
-            reasoning_effort: Option<ReasoningEffort>,
-            session_id: Option<&str>,
-            tx: mpsc::Sender<StreamEvent>,
-            cancel_rx: watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
-            self.0
-                .stream_chat_with_session(
-                    model,
-                    messages,
-                    response_format,
-                    reasoning_effort,
-                    session_id,
-                    tx,
-                    cancel_rx,
-                )
-                .await
+        ) -> ProviderResult {
+            self.0.stream(request, tx, cancel_rx).await
         }
     }
 
@@ -905,7 +788,7 @@ mod tests {
     async fn drive_mock(
         mock: &Arc<MockLlmProvider>,
         config: RetryConfig,
-    ) -> (anyhow::Result<()>, Vec<StreamEvent>) {
+    ) -> (ProviderResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let retrying = RetryingProvider::new(Box::new(SharedMock(Arc::clone(mock))), config);
@@ -918,12 +801,11 @@ mod tests {
             events
         };
 
-        let stream = retrying.stream_chat_with_session(
-            "mock-model",
-            vec![ChatMessage::user("hi")],
-            None,
-            None,
-            Some("tauqe-plan-step-1"),
+        let stream = retrying.stream(
+            LlmRequest {
+                session_id: Some("tauqe-plan-step-1"),
+                ..LlmRequest::new("mock-model", vec![ChatMessage::user("hi")])
+            },
             tx,
             cancel_rx,
         );
@@ -1140,12 +1022,8 @@ mod tests {
 
         let stream = tokio::spawn(async move {
             retrying
-                .stream_chat_with_session(
-                    "test-model",
-                    vec![ChatMessage::user("hi")],
-                    None,
-                    None,
-                    None,
+                .stream(
+                    LlmRequest::new("test-model", vec![ChatMessage::user("hi")]),
                     tx,
                     cancel_rx,
                 )
@@ -1474,12 +1352,8 @@ mod tests {
 
         let stream = tokio::spawn(async move {
             retrying
-                .stream_chat_with_session(
-                    "mock-model",
-                    vec![ChatMessage::user("hi")],
-                    None,
-                    None,
-                    None,
+                .stream(
+                    LlmRequest::new("mock-model", vec![ChatMessage::user("hi")]),
                     tx,
                     cancel_rx,
                 )
@@ -1561,6 +1435,22 @@ mod tests {
             "the truncation of a retried attempt is withheld from the client"
         );
         assert!(streamed_text(&events).ends_with("{\"message\":\"partial\"}"));
+    }
+
+    #[test]
+    fn authentication_and_plan_limits_are_terminal_even_with_a_rate_limit_event() {
+        for error in [
+            ProviderError::AuthenticationRequired(ProviderKind::OpenRouter),
+            ProviderError::PlanLimitReached("Plan allowance exhausted".into()),
+        ] {
+            let reason = error.to_string();
+            let outcome = AttemptOutcome {
+                transport_error: Some(error),
+                stream_error: Some("HTTP error 429".into()),
+                ..Default::default()
+            };
+            assert_eq!(outcome.failure(), Some((reason, false)));
+        }
     }
 
     #[test]

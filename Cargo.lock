@@ -977,6 +977,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1961,11 +1974,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
  "getrandom 0.2.17",
  "indexmap",
+ "jsonwebtoken",
  "regex",
  "reqwest",
+ "ring",
  "schemars",
  "serde",
  "serde_json",
@@ -1977,11 +1993,31 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.0",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "tauqe-flow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tauqe-core",
+ "tauqe-flow",
+ "tauqe-tools",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2002,6 +2038,7 @@ dependencies = [
  "futures-util",
  "serde_json",
  "tauqe-core",
+ "tauqe-flow",
  "tauqe-protocol",
  "tauqe-tui",
  "time",

@@ -171,7 +171,7 @@ pub async fn initialize_connection(
         if let Some(val) = resp.result {
             if let Ok(status) = serde_json::from_value::<SystemStatusResult>(val) {
                 onboarding.apply_status(&status);
-                if !status.has_git || !status.has_config || !status.has_api_key {
+                if !status.has_git || !status.has_config || onboarding.needs_api_key() {
                     view_mode = ViewMode::Onboarding;
                     onboarding.step = onboarding.next_step();
                 }

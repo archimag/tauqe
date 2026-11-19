@@ -6,12 +6,15 @@ pub enum ProviderKind {
     #[default]
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "openai")]
+    OpenAI,
 }
 
 impl std::fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderKind::OpenRouter => f.write_str("openrouter"),
+            ProviderKind::OpenAI => f.write_str("openai"),
         }
     }
 }
@@ -71,7 +74,7 @@ impl ModelRef {
     /// renders the same text for humans; this method names the round-trip
     /// contract explicitly so persisted and wire values never depend on a
     /// presentation-oriented formatter.
-    pub fn to_spec(&self) -> String {
+    pub(crate) fn to_spec(&self) -> String {
         format!("{}:{}", self.provider, self.name)
     }
 }
@@ -90,7 +93,7 @@ impl std::fmt::Display for ModelRef {
 
 /// Parses a model reference from its configuration string form.
 ///
-/// Accepts an explicit `openrouter:` prefix or a bare provider-native name,
+/// Accepts an explicit `openai:` or `openrouter:` prefix, or a bare name,
 /// which defaults to OpenRouter. Surrounding whitespace is ignored.
 ///
 /// A colon in a bare name is ambiguous: OpenRouter appends routing variants
@@ -112,16 +115,23 @@ impl std::str::FromStr for ModelRef {
             let provider = prefix.trim().to_lowercase();
             let model_name = rest.trim();
 
-            if provider == "openrouter" {
+            if let Some(provider) = match provider.as_str() {
+                "openrouter" => Some(ProviderKind::OpenRouter),
+                "openai" => Some(ProviderKind::OpenAI),
+                _ => None,
+            } {
                 if model_name.is_empty() {
                     return Err("Model name cannot be empty".to_string());
                 }
-                return Ok(ModelRef::openrouter(model_name));
+                return Ok(Self {
+                    provider,
+                    name: model_name.to_owned(),
+                });
             }
 
             if !prefix.contains('/') && !is_openrouter_variant_suffix(model_name) {
                 return Err(format!(
-                    "Unknown model provider prefix '{}' in '{}'. Prefix OpenRouter models with 'openrouter:' or write a bare 'vendor/model' name",
+                    "Unknown model provider prefix '{}' in '{}'. Use 'openrouter:', 'openai:', or a bare OpenRouter model name",
                     provider, s
                 ));
             }
@@ -256,7 +266,10 @@ mod tests {
         // A bare name whose colon segment is neither a vendor path nor a known
         // routing suffix is a mistyped provider prefix, not part of a model name.
         assert!("anthropc:claude".parse::<ModelRef>().is_err());
-        assert!("openai:gpt-4".parse::<ModelRef>().is_err());
+        assert_eq!(
+            "openai:gpt-4".parse::<ModelRef>().unwrap().provider,
+            ProviderKind::OpenAI
+        );
 
         // A recognized routing suffix on a vendor path stays valid, with and
         // without the explicit provider prefix.

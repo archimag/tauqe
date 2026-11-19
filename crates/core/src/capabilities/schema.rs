@@ -26,9 +26,9 @@ use crate::llm::CapabilityTree;
 use crate::llm::DocTopic;
 use crate::llm::LlmCapability;
 use crate::llm::{
-    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
-    DirListCommand, DocRequestCommand, OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand,
-    RepoSearchCommand, ScratchpadCommand, TextCommand, TurnErrorCommand, TurnSkipCommand,
+    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, DirListCommand,
+    DocRequestCommand, OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand, RepoSearchCommand,
+    ScratchpadCommand, TextCommand, TurnErrorCommand, TurnSkipCommand,
 };
 use crate::workflow::PatchStrategy;
 use serde_json::{json, Map, Value};
@@ -61,7 +61,7 @@ fn string_property(description: &str) -> Value {
 /// enum declares it beside the operations the strategy itself defines.
 fn op_property(patch_strategy: PatchStrategy) -> Value {
     let (operations, description): (&[&str], &str) = match patch_strategy {
-        PatchStrategy::SearchReplace => (
+        PatchStrategy::SearchReplace | PatchStrategy::ApplyPatch => (
             &["replace", "create", "delete", "move", "move_dir", "overwrite"],
             "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'move_dir' for moving or renaming a directory subtree, 'overwrite' for replacing the entire content of an existing file",
         ),
@@ -211,7 +211,7 @@ fn projected_changes_schema(patch_strategy: PatchStrategy) -> Value {
     );
 
     let hidden_fields: &[&str] = match patch_strategy {
-        PatchStrategy::SearchReplace => &["start", "end"],
+        PatchStrategy::SearchReplace | PatchStrategy::ApplyPatch => &["start", "end"],
         PatchStrategy::LineAnchor => &["old_text", "new_text"],
     };
 
@@ -269,10 +269,17 @@ fn capability_schema(
         | LlmCapability::EditMove
         | LlmCapability::EditMoveDir
         | LlmCapability::EditOverwrite => {
-            map.insert(
-                "changes".to_string(),
-                projected_changes_schema(ctx.patch_strategy),
-            );
+            if ctx.patch_strategy == PatchStrategy::ApplyPatch {
+                map.insert(
+                    "patch".to_string(),
+                    string_property("Complete Codex patch document"),
+                );
+            } else {
+                map.insert(
+                    "changes".to_string(),
+                    projected_changes_schema(ctx.patch_strategy),
+                );
+            }
         }
         LlmCapability::ContextRequest => {
             let item = finalize_strict_object(
@@ -480,30 +487,56 @@ fn capability_schema(
             if project.commands.is_empty() {
                 return None;
             }
-            let mut item_obj = schemars_object::<CustomToolCommand>();
-            if let Some(props) = item_obj
-                .get_mut("properties")
-                .and_then(Value::as_object_mut)
-            {
-                props.insert(
-                    "args".to_string(),
-                    json!({
+            let variants: Vec<_> = project
+                .commands
+                .iter()
+                .filter_map(|(name, spec)| {
+                    let command = project.resolve(&format!("commands.{name}"), spec).ok()?;
+                    let mut properties = Map::new();
+                    let mut required = Vec::new();
+                    for parameter in command.parameters {
+                        let mut types = vec!["string", "number", "boolean"];
+                        let mut description = parameter
+                            .doc
+                            .filter(|doc| !doc.trim().is_empty())
+                            .unwrap_or_else(|| format!("Literal value for {}", parameter.name));
+                        if parameter.default.is_some() {
+                            types.push("null");
+                            description.push_str(". Use null to keep the declared default.");
+                        }
+                        required.push(parameter.name.clone());
+                        properties.insert(
+                            parameter.name,
+                            json!({"type": types, "description": description}),
+                        );
+                    }
+                    Some(json!({
                         "type": "object",
-                        "description": "Typed argument object validated against the argument schema declared for this command"
-                    }),
-                );
+                        "description": format!("Run the project command '{name}' with its declared arguments."),
+                        "properties": {
+                            "name": {"type": "string", "enum": [name], "description": "Name of the project command to run."},
+                            "args": {
+                                "type": "object",
+                                "description": "Values for the parameters declared by this command.",
+                                "properties": properties,
+                                "required": required,
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["name", "args"],
+                        "additionalProperties": false
+                    }))
+                })
+                .collect();
+            if variants.is_empty() {
+                return None;
             }
-            let item = finalize_strict_object(
-                item_obj,
-                "One invocation of a project-declared command, named from the allowlist and carrying the typed arguments the declaration validates",
-                &[("name", "Name of one project-declared command from the custom tool allowlist")],
-            );
             map.insert(
                 "custom_tools".to_string(),
                 json!({
                     "type": "array",
                     "description": "Typed invocations of the project commands declared in `[project.commands]`; each entry names one declared command, and an empty array requests no execution",
-                    "items": item
+                    "items": {"anyOf": variants}
                 }),
             );
         }
@@ -922,7 +955,7 @@ mod tests {
 
         let tools = Value::Object(capability_schema(LlmCapability::CustomTools, &ctx).unwrap());
         assert_eq!(tools["custom_tools"]["type"], "array");
-        let item = &tools["custom_tools"]["items"];
+        let item = &tools["custom_tools"]["items"]["anyOf"][0];
         assert_eq!(item["properties"]["name"]["type"], "string");
         assert_eq!(item["properties"]["args"]["type"], "object");
         assert_eq!(item["additionalProperties"], serde_json::json!(false));
@@ -997,7 +1030,7 @@ mod tests {
 
     #[test]
     fn the_review_schema_forwards_the_authoritative_protocol_schema() {
-        use crate::review::ReviewDecisionStatus;
+        use crate::llm::discussion::ReviewDecisionStatus;
 
         let ctx = PromptRenderContext::new(&[], None);
         let fragment = Value::Object(capability_schema(LlmCapability::ReviewUpdate, &ctx).unwrap());

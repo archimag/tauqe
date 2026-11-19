@@ -35,7 +35,7 @@ where
 /// can never address a location outside the repository; such a path yields
 /// `None` and the request is dropped. This is the crate's single shared
 /// normalizer for these paths, so every wire boundary applies the same rules.
-pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
+pub(crate) fn normalize_repo_map_path(raw: &str) -> Option<String> {
     normalize_repo_map_path_checked(raw).ok()
 }
 

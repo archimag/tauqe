@@ -16,7 +16,7 @@ use crate::edits::EditMoveDir;
 use crate::edits::EditOperation;
 use crate::edits::EditOverwrite;
 use crate::edits::EditReplace;
-use crate::plan::DiscussionPlanUpdate;
+use crate::llm::discussion::DiscussionPlanUpdate;
 
 use crate::llm::DocTopic;
 
@@ -30,9 +30,9 @@ use crate::llm::DocTopic;
 pub struct ContextRequestCommand {
     #[serde(deserialize_with = "crate::edits::operation::deserialize_repo_path")]
     #[schemars(schema_with = "inline_string_schema")]
-    pub path: String,
+    pub(crate) path: String,
     #[schemars(schema_with = "inline_context_access_schema")]
-    pub access: ContextAccess,
+    pub(crate) access: ContextAccess,
 }
 
 /// A search request across repository files using Rust/ripgrep regex.
@@ -41,8 +41,8 @@ pub struct ContextRequestCommand {
 pub struct RepoSearchCommand {
     #[serde(deserialize_with = "crate::llm::discussion::normalize::deserialize_repo_map_path")]
     #[schemars(schema_with = "inline_string_schema")]
-    pub path: String,
-    pub regex: String,
+    pub(crate) path: String,
+    pub(crate) regex: String,
 }
 
 /// A request for the compact repository directory tree.
@@ -56,7 +56,7 @@ pub struct RepoDirsCommand {}
 pub struct RepoMapCommand {
     #[serde(deserialize_with = "crate::llm::discussion::normalize::deserialize_repo_map_path")]
     #[schemars(schema_with = "inline_string_schema")]
-    pub path: String,
+    pub(crate) path: String,
 }
 
 /// A request for the tracked-file listing of one directory.
@@ -65,8 +65,8 @@ pub struct RepoMapCommand {
 pub struct DirListCommand {
     #[serde(deserialize_with = "crate::llm::discussion::normalize::deserialize_repo_map_path")]
     #[schemars(schema_with = "inline_string_schema")]
-    pub path: String,
-    pub recursive: bool,
+    pub(crate) path: String,
+    pub(crate) recursive: bool,
 }
 
 /// A request for harness system documentation by topic.
@@ -75,14 +75,14 @@ pub struct DirListCommand {
 pub struct DocRequestCommand {
     #[serde(default)]
     #[schemars(schema_with = "inline_doc_topic_schema")]
-    pub topic: DocTopic,
+    pub(crate) topic: DocTopic,
 }
 
 /// A request for one external document declared by the project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OuterDocRequestCommand {
-    pub id: String,
+    pub(crate) id: String,
 }
 
 /// Ephemeral working-memory notes.
@@ -91,7 +91,7 @@ pub struct OuterDocRequestCommand {
 pub struct ScratchpadCommand {
     /// Turn-local working memory: working hypotheses, verified findings, and the
     /// purpose of context still needed; empty when there is nothing to record.
-    pub notes: String,
+    pub(crate) notes: String,
 }
 
 /// Conversational text emitted to the user interface.
@@ -100,7 +100,7 @@ pub struct ScratchpadCommand {
 pub struct TextCommand {
     /// Conversational answer to the developer, formulated in the language of the
     /// request as readable Markdown.
-    pub content: String,
+    pub(crate) content: String,
 }
 
 /// Semantic blocker emitted when a precondition or assumption fails.
@@ -111,17 +111,17 @@ pub struct TextCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BlockedCommand {
-    pub reason: String,
+    pub(crate) reason: String,
     #[serde(default)]
-    pub details: String,
+    pub(crate) details: String,
 }
 
 /// Unconditional abort emitted when only the developer can act on the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AbortCommand {
-    pub reason: String,
-    pub recommendation: String,
+    pub(crate) reason: String,
+    pub(crate) recommendation: String,
 }
 
 /// Terminal commit message stated by the model when the turn succeeded.
@@ -131,7 +131,7 @@ pub struct CommitMessageCommand {
     /// English Conventional Commits header (`type(scope): description`) in
     /// imperative mood, lowercase, without a trailing period, at most 72
     /// characters; empty when the turn did not succeed.
-    pub commit_message: String,
+    pub(crate) commit_message: String,
 }
 
 /// Terminal error stated by the model when the turn failed.
@@ -145,7 +145,7 @@ pub struct CommitMessageCommand {
 pub struct TurnErrorCommand {
     /// Error message describing why the turn failed; empty otherwise.
     #[serde(default)]
-    pub error_message: String,
+    pub(crate) error_message: String,
 }
 
 /// Terminal skip reason stated by the model when the work is already satisfied.
@@ -154,17 +154,17 @@ pub struct TurnErrorCommand {
 pub struct TurnSkipCommand {
     /// Reason the work is already satisfied and no change is required; empty
     /// otherwise.
-    pub reason: String,
+    pub(crate) reason: String,
 }
 
 /// A typed invocation of one project-declared custom tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CustomToolCommand {
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
     #[schemars(schema_with = "free_form_json_schema")]
-    pub args: serde_json::Value,
+    pub(crate) args: serde_json::Value,
 }
 
 /// Normalized intent decoded from raw model output.
@@ -183,6 +183,8 @@ pub enum LlmCommand {
     Text(TextCommand),
     /// Replace text in an existing file.
     EditReplace(EditReplace),
+    /// Atomic Codex patch staged as a single document.
+    ApplyPatch { patch: String },
     /// Create a new file.
     EditCreate(EditCreate),
     /// Delete an existing file.
@@ -261,7 +263,7 @@ pub enum LlmCommand {
     /// against the session the turn names and never against whichever session
     /// happens to be active.
     ReviewUpdate {
-        update: crate::review::ReviewUpdateProposal,
+        update: crate::llm::discussion::ReviewUpdateProposal,
     },
     /// Ephemeral working-memory notes.
     Scratchpad(ScratchpadCommand),
@@ -288,7 +290,7 @@ pub enum LlmCommand {
 
 impl LlmCommand {
     /// Extracts the underlying [`EditOperation`] if this command is a file edit.
-    pub fn into_edit_operation(self) -> Option<EditOperation> {
+    pub(crate) fn into_edit_operation(self) -> Option<EditOperation> {
         match self {
             Self::EditReplace(op) => Some(op.into()),
             Self::EditCreate(op) => Some(op.into()),

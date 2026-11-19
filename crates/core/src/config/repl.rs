@@ -18,7 +18,7 @@ pub struct ReplConfig {
     pub workflow: WorkflowKind,
     /// Strategy that decides how a change set addresses the lines it replaces.
     #[serde(default)]
-    pub patch_strategy: PatchStrategy,
+    pub(crate) patch_strategy: PatchStrategy,
     /// Total budget of LLM rounds granted to a single turn: research, staging retries,
     /// verification healing, and empty response retries all spend from this pool.
     #[serde(default = "default_max_turn_rounds")]
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn test_repl_patch_strategy_defaults_and_overrides() {
         let config: AppConfig = toml::from_str("[repl]\n").unwrap();
-        assert_eq!(config.repl.patch_strategy, PatchStrategy::LineAnchor);
+        assert_eq!(config.repl.patch_strategy, PatchStrategy::ApplyPatch);
 
         let config: AppConfig =
             toml::from_str("[repl]\npatch_strategy = \"search_replace\"\n").unwrap();

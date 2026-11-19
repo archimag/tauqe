@@ -1,5 +1,5 @@
+use super::{LlmRequest, ModelUsageInfo, ProviderResult};
 use crate::models::ProviderKind;
-use crate::providers::ModelUsageInfo;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -7,16 +7,17 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tokio::sync::{mpsc, watch};
 
 use super::retry::JSON_TRUNCATION_MARKER;
-use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
+#[cfg(test)]
+use super::types::{ChatMessage, ReasoningEffort};
+use super::types::{ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
-use self::sse::{
-    find_sse_event_boundary, log_stream_completion, truncate_response_body, MAX_SSE_EVENT_BYTES,
-};
+use self::sse::{log_stream_completion, truncate_response_body};
 use self::types::{
     ChatCompletionRequest, GenerationResponse, ProviderPreferences, ReasoningOption, StreamOptions,
     StreamingChunk,
 };
+use super::sse::{find_sse_event_boundary, MAX_SSE_EVENT_BYTES};
 
 #[cfg(test)]
 pub(crate) mod catalog;
@@ -148,17 +149,19 @@ impl OpenRouterProvider {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
+        let LlmRequest {
+            model,
+            messages,
+            response_format,
+            reasoning_effort,
+            session_id,
+        } = request;
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -528,59 +531,15 @@ impl LlmProvider for OpenRouterProvider {
         ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
-    ) -> Result<()> {
-        self.execute_stream(model, messages, response_format, None, None, tx, cancel_rx)
+    ) -> ProviderResult {
+        self.execute_stream(request, tx, cancel_rx)
             .await
-    }
-
-    async fn stream_chat_with_effort(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> Result<()> {
-        self.execute_stream(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            None,
-            tx,
-            cancel_rx,
-        )
-        .await
-    }
-
-    async fn stream_chat_with_session(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> Result<()> {
-        self.execute_stream(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            session_id,
-            tx,
-            cancel_rx,
-        )
-        .await
+            .map_err(super::retry::classify_transport_error)
     }
 }
 
@@ -613,10 +572,7 @@ fn merge_usage(accumulated: Option<ModelUsageInfo>, incoming: ModelUsageInfo) ->
 mod tests {
     use std::borrow::Cow;
 
-    use super::sse::{
-        find_sse_event_boundary, truncate_response_body, MAX_SSE_EVENT_BYTES,
-        RESPONSE_BODY_LOG_CHARS,
-    };
+    use super::sse::{truncate_response_body, RESPONSE_BODY_LOG_CHARS};
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -651,7 +607,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", messages, tx, cancel_rx)
+                .stream(LlmRequest::new("test-model", messages), tx, cancel_rx)
                 .await
         });
 
@@ -720,7 +676,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", messages, tx, cancel_rx)
+                .stream(LlmRequest::new("test-model", messages), tx, cancel_rx)
                 .await
         });
 
@@ -768,7 +724,11 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .stream(
+                    LlmRequest::new("test-model", vec![ChatMessage::user("Hi")]),
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -839,7 +799,11 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .stream(
+                    LlmRequest::new("test-model", vec![ChatMessage::user("Hi")]),
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -905,7 +869,11 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .stream(
+                    LlmRequest::new("test-model", vec![ChatMessage::user("Hi")]),
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -982,7 +950,14 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_chat("test-model", vec![], response_format, tx, cancel_rx)
+                .stream(
+                    LlmRequest {
+                        response_format,
+                        ..LlmRequest::new("test-model", vec![])
+                    },
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -1034,11 +1009,12 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_chat_with_effort(
-                    "test-model",
-                    vec![],
-                    response_format,
-                    Some(ReasoningEffort::XHigh),
+                .stream(
+                    LlmRequest {
+                        response_format,
+                        reasoning_effort: Some(ReasoningEffort::XHigh),
+                        ..LlmRequest::new("test-model", vec![])
+                    },
                     tx,
                     cancel_rx,
                 )
@@ -1085,12 +1061,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         provider
-            .stream_chat_with_session(
-                "test-model",
-                vec![],
-                None,
-                None,
-                Some("tauqe-plan-test-123"),
+            .stream(
+                LlmRequest {
+                    session_id: Some("tauqe-plan-test-123"),
+                    ..LlmRequest::new("test-model", vec![])
+                },
                 tx,
                 cancel_rx,
             )
@@ -1115,7 +1090,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await
             .expect("plain stream should succeed");
         while rx.recv().await.is_some() {}
@@ -1190,7 +1165,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", messages, tx, cancel_rx)
+                .stream(LlmRequest::new("test-model", messages), tx, cancel_rx)
                 .await
         });
 
@@ -1229,7 +1204,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());
@@ -1269,7 +1244,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());
@@ -1311,7 +1286,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", vec![], tx, cancel_rx)
+                .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
                 .await
         });
 
@@ -1340,7 +1315,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(true);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_ok());
@@ -1376,7 +1351,7 @@ mod tests {
         drop(cancel_tx);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
         assert!(res.is_ok());
 
@@ -1462,7 +1437,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_text("test-model", vec![], tx, cancel_rx)
+                .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
                 .await
         });
 
@@ -1514,7 +1489,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());
@@ -1549,7 +1524,14 @@ mod tests {
         let response_format = Some(ResponseFormat::JsonObject);
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_chat("test-model", vec![], response_format, tx, cancel_rx)
+                .stream(
+                    LlmRequest {
+                        response_format,
+                        ..LlmRequest::new("test-model", vec![])
+                    },
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -1605,7 +1587,14 @@ mod tests {
         });
 
         let res = provider
-            .stream_chat("test-model", vec![], response_format, tx, cancel_rx)
+            .stream(
+                LlmRequest {
+                    response_format,
+                    ..LlmRequest::new("test-model", vec![])
+                },
+                tx,
+                cancel_rx,
+            )
             .await;
 
         assert!(res.is_err());
@@ -1649,7 +1638,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await
             .expect("a text answer may legitimately end at the token limit");
 
@@ -1692,7 +1681,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());
@@ -1729,7 +1718,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());
@@ -1762,7 +1751,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let res = provider
-            .stream_text("test-model", vec![], tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", vec![]), tx, cancel_rx)
             .await;
 
         assert!(res.is_err());

@@ -1,60 +1,19 @@
-//! Cross-group post-analysis of a review session.
-//!
-//! A grouped audit splits the repository into isolated slices and every group
-//! reports its own findings, so a defect that repeats across slices stays
-//! invisible inside any single group. Post-analysis is the Architect role's
-//! whole-session view: it reads every finding of the session together and names
-//! the systemic root causes behind them.
-//!
-//! Two invariants shape the orchestration:
-//!
-//! * The classification is the session itself, not a projection beside it.
-//!   Findings keep their identity and their content, while
-//!   `ReviewStorage::regroup_session` substitutes the session groups and
-//!   reassigns every finding in place, so re-running the analysis never rescans
-//!   the audited code and never rewrites a finding.
-//! * The routing is the same layer: the status every finding starts from is
-//!   applied by the same write, so a finding enters execution, or stays with the
-//!   engineer until the open decision is taken, exactly as the analysis decided.
-//!   A finding that is already being executed, or that already finished, keeps
-//!   the lifecycle state it earned, because re-running the analysis never
-//!   reopens a taken decision.
-//! * A finding whose type requires planning before execution never lands in the
-//!   group of independent findings: the layer mints a single-element
-//!   architectural group for it, so the requirement holds regardless of how the
-//!   classification described the finding.
-//! * Every reference must name a finding the session holds. A hallucinated
-//!   identifier is a typed refusal instead of a group that would render a
-//!   finding nothing can name.
-//!
-//! Core owns round preparation, provider execution, decoding, grouping/routing,
-//! persistence, and the completed history exchange. This adapter resolves provider
-//! fixtures, paces and publishes stream events, and maps typed failures to RPC.
+//! RPC adaptation for review post-analysis.
 use crate::contracts::Project;
-use std::path::Path;
-use std::sync::Arc;
-
-use tauqe_core::api::{
-    parse_review_analysis_target, PreparedReviewPostAnalysis, ReviewAnalysisCompletionError,
-    ReviewAnalysisExecutionError, ReviewAnalysisLoadError, ReviewAnalysisObserver,
-    ReviewAnalysisPersistenceError, ReviewAnalysisPreparationError, ReviewAnalysisUpdate,
-    UsageTotalsSnapshot,
-};
-use tauqe_core::models::ModelRole;
-use tauqe_core::models::ModelSelection;
-use tauqe_core::review::ReviewSession;
-use tauqe_protocol::model::{ReviewWorkPhase, TurnWorkContext, TurnWorkQueue};
-use tauqe_protocol::{
-    errors, events, ModelStartedEvent, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ResponseError, ReviewAnalyzeFinishedEvent, ReviewAnalyzeParams, ReviewAnalyzeResult,
-    ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent, ReviewReasoningDeltaEvent,
-};
-
-use crate::handlers::common::withdraw_streamed_attempt;
 use crate::reap::task_exit_deadline;
-use crate::state::{AppState, OperationGuard};
-
-use super::common::{emit, publish_review};
+use crate::state::AppState;
+use std::sync::Arc;
+#[cfg(test)]
+use tauqe_core::{models::ModelSelection, review::ReviewSession};
+use tauqe_flow::api::{
+    AnalyzeReviewError, ReviewAnalysisCompletionError, ReviewAnalysisExecutionError,
+    ReviewAnalysisLoadError, ReviewAnalysisPersistenceError, ReviewAnalysisPreparationError,
+};
+#[cfg(test)]
+use tauqe_protocol::events;
+use tauqe_protocol::{
+    errors, Request, Response, ResponseError, ReviewAnalyzeParams, ReviewAnalyzeResult,
+};
 
 /// Handles `review/analyze`: classifies the findings of one stored session into
 /// independent issues and architectural root-cause groups.
@@ -97,275 +56,72 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
         }
     };
 
-    // The identifier is never defaulted to the active session: an implicit target
-    // would rewrite the classification of whichever session happened to be
-    // focused, so the caller always names its subject.
-    let review_id = match parse_review_analysis_target(&params.review_id) {
-        Ok(id) => id,
-        Err(error) => return Response::err(req.id, errors::INVALID_PARAMS, error.to_string()),
-    };
-
-    // Post-analysis rewrites the stored session, so it claims the single
-    // operation slot before it reads anything: the whole read-modify-write
-    // cycle, including the identity healing below, runs inside the exclusion
-    // window it relies on. A bounded update or a deletion that samples the slot
-    // after this point is refused instead of having its write overwritten by
-    // the heal save, and a session deleted before the claim is never resurrected
-    // by it. Every early return below releases the slot through the guard.
-    let operation = match state.try_begin_operation() {
-        Ok(guard) => guard,
-        Err(()) => {
-            return Response::err(
-                req.id,
-                errors::OPERATION_IN_PROGRESS,
-                "Another operation is already running",
-            )
-        }
-    };
-
-    let repo_root = state.repo_root().await;
-    let session = match state
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
+    });
+    match state
         .application
-        .load_review_for_post_analysis(&operation, &repo_root, &review_id)
+        .analyze_review(
+            params.review_id,
+            params.model.map(Project::project),
+            observer,
+            task_exit_deadline(),
+        )
         .await
     {
-        Ok(session) => session,
-        Err(error) => {
-            let code = match &error {
-                ReviewAnalysisLoadError::MissingReviewId => errors::INVALID_PARAMS,
-                ReviewAnalysisLoadError::OperationNotOwned => errors::OPERATION_IN_PROGRESS,
-                ReviewAnalysisLoadError::NotFound(_) => errors::NOT_FOUND,
-                ReviewAnalysisLoadError::Storage(_) => errors::REVIEW_LOAD_FAILED,
-            };
-            return Response::err(req.id, code, error.to_string());
-        }
-    };
-
-    let analyzed = run_review_post_analysis(
-        state,
-        &repo_root,
-        &session,
-        params
-            .model
-            .as_ref()
-            .map(|value| value.clone().project())
-            .as_ref(),
-        &operation,
-        false,
-    )
-    .await;
-    match analyzed {
         Ok(session) => Response::ok_typed(
             req.id,
             &ReviewAnalyzeResult {
                 session: session.project(),
             },
         ),
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        },
+        Err(error) => {
+            let error = analyze_error(error);
+            Response::err(req.id, error.code, error.message)
+        }
     }
 }
 
-/// Runs the Architect post-analysis over one review session and persists the
-/// resulting classification layer.
-///
-/// Shared by the `review/analyze` handler and the automatic classification that
-/// follows a completed grouped audit, so both entry points resolve the model,
-/// stream, validate, persist, and publish through exactly one implementation.
-///
-/// Post-analysis regroups the session in place. It reads the session as stored,
-/// substitutes its groups, and rewrites the group of every finding, and therefore
-/// never rescans the audited code and never rewrites a finding's content. The one
-/// exception is the identity: a finding that carries none is healed with a UUIDv7
-/// before the prompt is built, because a classification can only reference what
-/// the stored session can name.
-///
-/// The heal save is a whole-document write, so the caller must already own the
-/// operation slot and have read the session inside it: a read taken outside the
-/// exclusion window the save relies on could overwrite a bounded update or
-/// resurrect a deleted session.
-///
-/// `is_batch` declares the execution context of the round: `false` for a
-/// standalone request, `true` for a member of a running batch. It is copied
-/// verbatim into the emitted `ModelStartedEvent`, so the interface freezes the
-/// shared turn and lets the batch supervisor emit the single terminal signal.
-/// Deriving it from the caller would conflate the storage contract with the
-/// execution context.
-///
-/// `selection` names the Architect configuration the round runs on: an absent
-/// value keeps the base rung of the architect ladder, while an explicit value
-/// is resolved by the same core policy plan refinement uses, so the daemon
-/// renders the configuration that policy returned instead of deriving the
-/// ladder a second time. A selection the architect role does not carry is
-/// refused by name before the provider call, because silently falling back to
-/// the base rung would classify the findings with a configuration nobody asked
-/// for.
-pub(super) async fn run_review_post_analysis(
+#[cfg(test)]
+async fn run_review_post_analysis(
     state: &Arc<AppState>,
-    repo_root: &Path,
-    session: &ReviewSession,
-    selection: Option<&ModelSelection>,
-    operation: &OperationGuard,
+    repo_root: &std::path::Path,
+    session: &tauqe_core::review::ReviewSession,
+    selection: Option<&tauqe_core::models::ModelSelection>,
+    operation: &crate::state::OperationGuard,
     is_batch: bool,
-) -> Result<ReviewSession, ResponseError> {
-    let prepared = state
-        .application
-        .prepare_review_post_analysis(operation, repo_root, session, selection)
-        .await
-        .map_err(|error| post_analysis_error(preparation_error_code(&error), error.to_string()))?;
-    let provider = resolve_post_analysis_provider(state, &prepared)
-        .await
-        .map_err(|error| post_analysis_error(errors::NO_API_KEY, error))?;
-    let session = &prepared.session;
-    let findings_count = session.items.len();
-    let model = prepared.tier.model.clone();
-    let reasoning_effort = prepared.tier.effort;
-    let op_id = format!("op-{}", operation.id());
-
-    emit(
-        &state.out,
-        events::MODEL_STARTED,
-        serde_json::to_value(ModelStartedEvent {
-            operation_id: op_id.clone(),
-            model: model.clone().project(),
-            role: Some(ModelRole::Architect.project()),
-            alias: None,
-            effort: reasoning_effort.map(crate::contracts::Project::project),
-            plan_context: None,
-            // The round classifies the findings of one stored session, so the
-            // running work names the session phase instead of leaving it
-            // anonymous; a batch member never settles the shared turn itself.
-            work_context: Some(TurnWorkContext::ReviewPhase {
-                review_id: session.id.clone(),
-                review_title: session.title.clone(),
-                phase: ReviewWorkPhase::PostAnalysis,
-                queue: TurnWorkQueue::default(),
-            }),
-            is_batch,
-        })
-        .ok(),
-    );
-    emit(
-        &state.out,
-        events::REVIEW_ANALYZE_STARTED,
-        serde_json::to_value(ReviewAnalyzeStartedEvent {
-            operation_id: op_id.clone(),
-            model: model.clone().project(),
-            findings_count,
-        })
-        .ok(),
-    );
-
-    let observer = Arc::new(ReviewAnalysisRpcObserver {
-        state: Arc::clone(state),
-        operation_id: op_id.clone(),
+) -> Result<tauqe_core::review::ReviewSession, ResponseError> {
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
     });
-    let stored = state
+    state
         .application
-        .execute_review_post_analysis(
+        .test_run_review_analysis(
             operation,
             repo_root,
-            &prepared,
-            provider,
+            session,
+            selection,
             observer,
+            is_batch,
             task_exit_deadline(),
         )
         .await
-        .map_err(execution_error)?;
-
-    publish_review(state, repo_root, &session.id).await;
-
-    emit(
-        &state.out,
-        events::REVIEW_ANALYZE_FINISHED,
-        serde_json::to_value(ReviewAnalyzeFinishedEvent {
-            operation_id: op_id,
-            session: stored.clone().project(),
-        })
-        .ok(),
-    );
-
-    Ok(stored)
+        .map_err(analyze_error)
 }
 
-/// Only scripted-provider injection remains in the RPC adapter.
-async fn resolve_post_analysis_provider(
-    _state: &Arc<AppState>,
-    prepared: &PreparedReviewPostAnalysis,
-) -> Result<Arc<dyn tauqe_core::providers::LlmProvider>, String> {
-    #[cfg(test)]
-    if let Some(provider) = _state.provider_override.lock().await.clone() {
-        return Ok(provider);
-    }
-    prepared.provider().map_err(|error| error.to_string())
-}
-
-struct ReviewAnalysisRpcObserver {
-    state: Arc<AppState>,
-    operation_id: String,
-}
-
-#[async_trait::async_trait]
-impl ReviewAnalysisObserver for ReviewAnalysisRpcObserver {
-    async fn pace(
-        &self,
-        event: &tauqe_core::providers::StreamEvent,
-        cancel: &mut tokio::sync::watch::Receiver<bool>,
-    ) {
-        self.state.out.pace_event(event, cancel).await;
-    }
-
-    fn publish(&self, update: ReviewAnalysisUpdate) {
-        match update {
-            ReviewAnalysisUpdate::Reasoning(delta) => emit(
-                &self.state.out,
-                events::REVIEW_REASONING_DELTA,
-                serde_json::to_value(ReviewReasoningDeltaEvent {
-                    operation_id: self.operation_id.clone(),
-                    delta,
-                })
-                .ok(),
-            ),
-            ReviewAnalysisUpdate::Content(delta) => emit(
-                &self.state.out,
-                events::REVIEW_CONTENT_DELTA,
-                serde_json::to_value(ReviewContentDeltaEvent {
-                    operation_id: self.operation_id.clone(),
-                    delta,
-                })
-                .ok(),
-            ),
-            ReviewAnalysisUpdate::Reset => {
-                withdraw_streamed_attempt(&self.state.out, &self.operation_id, || {})
-            }
-            _ => {}
-        }
-    }
-
-    fn publish_usage_totals(&self, operation_id: &str, snapshot: &UsageTotalsSnapshot) {
-        crate::usage::publish_snapshot(&self.state.out, operation_id, snapshot);
-    }
-
-    fn publish_usage(&self, snapshot: &UsageTotalsSnapshot) {
-        let operation_usage: ModelUsageInfo =
-            crate::usage::wire_usage(&snapshot.prev.to_usage_info());
-        let session_total_cost = snapshot.session.cost;
-        let current_cost = snapshot.prev.cost;
-        emit(
-            &self.state.out,
-            events::MODEL_USAGE,
-            serde_json::to_value(ModelUsageEvent {
-                operation_id: self.operation_id.clone(),
-                usage: operation_usage,
-                session_total_cost,
-                current_cost: Some(current_cost),
-            })
-            .ok(),
-        );
-    }
+fn analyze_error(error: AnalyzeReviewError) -> ResponseError {
+    let code = match &error {
+        AnalyzeReviewError::Busy => errors::OPERATION_IN_PROGRESS,
+        AnalyzeReviewError::Provider(_) => errors::NO_API_KEY,
+        AnalyzeReviewError::Load(error) => match error {
+            ReviewAnalysisLoadError::MissingReviewId => errors::INVALID_PARAMS,
+            ReviewAnalysisLoadError::OperationNotOwned => errors::OPERATION_IN_PROGRESS,
+            ReviewAnalysisLoadError::NotFound(_) => errors::NOT_FOUND,
+            ReviewAnalysisLoadError::Storage(_) => errors::REVIEW_LOAD_FAILED,
+        },
+        AnalyzeReviewError::Execution(error) => execution_error_code(error),
+    };
+    ResponseError::new(code, error.to_string())
 }
 
 fn preparation_error_code(error: &ReviewAnalysisPreparationError) -> &'static str {
@@ -377,8 +133,8 @@ fn preparation_error_code(error: &ReviewAnalysisPreparationError) -> &'static st
     }
 }
 
-fn execution_error(error: ReviewAnalysisExecutionError) -> ResponseError {
-    let code = match &error {
+fn execution_error_code(error: &ReviewAnalysisExecutionError) -> &'static str {
+    match error {
         ReviewAnalysisExecutionError::Preparation(error) => preparation_error_code(error),
         ReviewAnalysisExecutionError::Completion(error) => match error {
             ReviewAnalysisCompletionError::Cancelled(_) => errors::CANCELLED,
@@ -394,13 +150,7 @@ fn execution_error(error: ReviewAnalysisExecutionError) -> ResponseError {
             ReviewAnalysisPersistenceError::Storage(_) => errors::REVIEW_UPDATE_FAILED,
             ReviewAnalysisPersistenceError::NotFound(_) => errors::NOT_FOUND,
         },
-    };
-    post_analysis_error(code, error.to_string())
-}
-
-/// Builds a typed error for the post-analysis procedure.
-fn post_analysis_error(code: &'static str, message: String) -> ResponseError {
-    ResponseError::new(code, message)
+    }
 }
 
 #[cfg(test)]
@@ -489,10 +239,9 @@ mod tests {
         fixture
             .state
             .application
-            .begin_configuration_change()
-            .expect("configuration operation is free")
-            .replace_configuration(config.config, tauqe_core::api::ReloadSelection::Preserve)
-            .await;
+            .test_replace_configuration(config.config, tauqe_flow::api::ReloadSelection::Preserve)
+            .await
+            .unwrap();
     }
 
     fn finding(id: u32, uuid: &str, group: &str, status: IssueStatus) -> ReviewItem {
@@ -569,7 +318,7 @@ mod tests {
                 &[("Shared commit boundary", &[CORE_UUID])],
             )),
         ]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let first = analyze(&fixture, &session, None)
             .await
@@ -670,7 +419,7 @@ mod tests {
                 &[],
             ),
         )]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let stored = analyze(&fixture, &session, None)
             .await
@@ -710,7 +459,7 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
             classification("Root cause", &[foreign], &[]),
         )]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let err = analyze(&fixture, &session, None)
             .await
@@ -772,7 +521,7 @@ mod tests {
                 &[("Shared boundary", &[re_spelled.as_str()])],
             ),
         )]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let stored = analyze(&fixture, &session, None)
             .await
@@ -839,7 +588,7 @@ mod tests {
         })
         .to_string();
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let stored = analyze(&fixture, &session, None)
             .await
@@ -875,7 +624,7 @@ mod tests {
         })
         .to_string();
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let stored = analyze(&fixture, &session, None)
             .await
@@ -908,7 +657,7 @@ mod tests {
         let payload = classification("One shared boundary.", &[CORE_UUID], &[]);
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
         let injected: Arc<dyn LlmProvider> = provider.clone();
-        *fixture.state.provider_override.lock().await = Some(injected);
+        fixture.state.application.test_set_provider(injected).await;
         let selection = ModelSelection::Tier {
             model: ModelRef::openrouter("test/architect-strong"),
             effort: Some(ReasoningEffort::High),
@@ -947,7 +696,7 @@ mod tests {
         let payload = classification("One shared boundary.", &[CORE_UUID], &[]);
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
         let injected: Arc<dyn LlmProvider> = provider.clone();
-        *fixture.state.provider_override.lock().await = Some(injected);
+        fixture.state.application.test_set_provider(injected).await;
 
         let stored = analyze(&fixture, &session, None)
             .await
@@ -979,7 +728,7 @@ mod tests {
         let payload = classification("Unused payload.", &[], &[]);
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
         let injected: Arc<dyn LlmProvider> = provider.clone();
-        *fixture.state.provider_override.lock().await = Some(injected);
+        fixture.state.application.test_set_provider(injected).await;
         let selection = ModelSelection::Specific(ModelRef::openrouter("test/stranger"));
 
         let err = analyze(&fixture, &session, Some(&selection))
@@ -1018,7 +767,7 @@ mod tests {
             Arc::new(MockLlmProvider::scripted([MockResponse::text(
                 classification("One shared boundary.", &[CORE_UUID], &[]),
             )]));
-        *fixture.state.provider_override.lock().await = Some(injected);
+        fixture.state.application.test_set_provider(injected).await;
 
         // The client keeps its pipe open but stopped reading its stream.
         stall_outbound_transport(&fixture.state);
@@ -1135,7 +884,7 @@ mod tests {
             classification("", &[], &[]),
         )]));
         let injected: Arc<dyn LlmProvider> = provider.clone();
-        *fixture.state.provider_override.lock().await = Some(injected);
+        fixture.state.application.test_set_provider(injected).await;
 
         let err = analyze(&fixture, &session, None)
             .await

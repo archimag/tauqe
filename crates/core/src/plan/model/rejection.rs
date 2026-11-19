@@ -37,7 +37,7 @@ pub struct PlanRejection {
 
 impl PlanRejection {
     /// Creates a rejection of `kind` carrying the wording it reports.
-    pub(crate) fn new(kind: PlanRejectionKind, message: impl Into<String>) -> Self {
+    fn new(kind: PlanRejectionKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -50,7 +50,7 @@ impl PlanRejection {
     }
 
     /// Creates a rejection of a mutation the turn regime forbids.
-    pub fn mode_forbidden(message: impl Into<String>) -> Self {
+    pub(crate) fn mode_forbidden(message: impl Into<String>) -> Self {
         Self::new(PlanRejectionKind::ModeForbidden, message)
     }
 }

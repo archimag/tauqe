@@ -41,7 +41,37 @@ impl<'de> Deserialize<'de> for ModelCatalogEntry {
     where
         D: serde::Deserializer<'de>,
     {
-        struct CatalogEntryVisitor;
+        Self::deserialize_in(deserializer, None)
+    }
+}
+
+impl ModelCatalogEntry {
+    pub(crate) fn deserialize_in<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+        provider: Option<super::ProviderKind>,
+    ) -> Result<Self, D::Error> {
+        struct CatalogEntryVisitor(Option<super::ProviderKind>);
+
+        impl CatalogEntryVisitor {
+            fn model<E: serde::de::Error>(&self, spec: &str) -> Result<ModelRef, E> {
+                let mut model = spec.parse::<ModelRef>().map_err(E::custom)?;
+                if let Some(provider) = self.0 {
+                    if spec.trim().split_once(':').is_some_and(|(prefix, _)| {
+                        matches!(
+                            prefix.trim().to_ascii_lowercase().as_str(),
+                            "openai" | "openrouter"
+                        )
+                    }) && model.provider != provider
+                    {
+                        return Err(E::custom(format!(
+                            "Model {spec} belongs to a different provider than {provider}"
+                        )));
+                    }
+                    model.provider = provider;
+                }
+                Ok(model)
+            }
+        }
 
         impl<'de> serde::de::Visitor<'de> for CatalogEntryVisitor {
             type Value = ModelCatalogEntry;
@@ -54,10 +84,10 @@ impl<'de> Deserialize<'de> for ModelCatalogEntry {
             where
                 E: serde::de::Error,
             {
-                match value.parse::<ModelRef>() {
-                    Ok(model) => Ok(ModelCatalogEntry { model, alias: None }),
-                    Err(err) => Err(E::custom(err)),
-                }
+                Ok(ModelCatalogEntry {
+                    model: self.model(value)?,
+                    alias: None,
+                })
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -95,11 +125,7 @@ impl<'de> Deserialize<'de> for ModelCatalogEntry {
                     Some(model) => model,
                     None => return Err(serde::de::Error::missing_field("model")),
                 };
-                let model = match raw_model.parse::<ModelRef>() {
-                    Ok(model) => model,
-                    Err(err) => return Err(serde::de::Error::custom(err)),
-                };
-
+                let model = self.model(&raw_model)?;
                 Ok(ModelCatalogEntry {
                     model,
                     alias: normalize_alias(alias),
@@ -107,7 +133,7 @@ impl<'de> Deserialize<'de> for ModelCatalogEntry {
             }
         }
 
-        deserializer.deserialize_any(CatalogEntryVisitor)
+        deserializer.deserialize_any(CatalogEntryVisitor(provider))
     }
 }
 

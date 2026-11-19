@@ -3,9 +3,8 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-pub mod api;
-mod application;
 pub mod blocking;
+pub use tauqe_tools::atomic_write::write_atomic;
 pub(crate) mod capabilities;
 pub mod config;
 pub mod context;
@@ -16,13 +15,13 @@ pub mod edits;
 pub(crate) mod escape;
 pub mod git;
 pub mod history;
-mod infrastructure;
 pub mod llm;
 pub mod locale;
 pub mod mockups;
 pub mod models;
 pub mod outer_docs;
 pub mod plan;
+mod plan_item;
 pub mod prompt;
 pub mod providers;
 // The Tree-sitter repository map is deterministic substrate and now lives in
@@ -35,7 +34,3 @@ pub mod review;
 pub(crate) mod test_paths;
 pub mod toolchain;
 pub mod workflow;
-
-pub fn init() {
-    // Core initialization
-}

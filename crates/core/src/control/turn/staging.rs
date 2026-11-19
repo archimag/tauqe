@@ -24,9 +24,7 @@ use crate::workflow::PatchStrategy;
 use crate::control::context::LoopContext;
 use crate::control::outcome::ResponseEnvelope;
 use crate::edits::{stage_and_validate_edits, EditError, StagedEditsState};
-use crate::workflow::retry::{
-    format_patch_retry_reason, prepare_staged_for_retry, retain_retried_failed_files,
-};
+use crate::workflow::retry::{format_patch_retry_reason, retain_retried_failed_files};
 /// Cumulative virtual staging state of one turn.
 ///
 /// A turn stages its change set in as many attempts as the repair rounds it
@@ -38,7 +36,7 @@ pub struct StagingState {
     /// Virtual state the attempts converged on.
     pub(crate) staged_state: Option<StagedEditsState>,
     /// Operations that converged, in change-set order.
-    pub(crate) cumulative_edits: Vec<EditOperation>,
+    pub(crate) edit_batches: Vec<Vec<EditOperation>>,
     /// Paths whose edit reached the virtual state.
     pub(crate) succeeded: HashSet<String>,
     /// Paths the substrate refused in the latest attempt that addressed them.
@@ -70,37 +68,58 @@ pub(crate) fn execute_staging_step(
     envelope: &mut ResponseEnvelope,
     state: &mut StagingState,
 ) -> StagingStep {
-    let edits = extract_file_edits(envelope);
-    if edits.is_empty() {
+    let commands = envelope.take_any(super::edit::EDIT_CAPABILITIES);
+    if commands.is_empty() {
         return StagingStep::default();
     }
 
-    // A corrected change set is prepared before it is staged: the paths it
-    // re-edits leave the virtual state so they are staged again against their
-    // clean base, and a refusal the model left out of its corrected set is
-    // carried into the abandoned record instead of vanishing with the entry.
-    let unretried = retain_retried_failed_files(&mut state.failed, ctx.context_manager, &edits);
-    for (path, error) in unretried {
-        state.abandoned.entry(path).or_insert(error);
-    }
-    if let Some(staged) = state.staged_state.as_mut() {
-        prepare_staged_for_retry(
-            staged,
-            &mut state.cumulative_edits,
-            &mut state.succeeded,
-            ctx.context_manager,
-            &edits,
-        );
-    }
-
     state.attempts += 1;
-    let result = stage_and_validate_edits(
-        ctx.repo_root,
-        ctx.context_manager,
-        &edits,
-        state.staged_state.as_ref(),
-    );
+    let (result, patch_batches) = if let [LlmCommand::ApplyPatch { patch }] = commands.as_slice() {
+        state.failed.clear();
+        match crate::edits::stage_apply_patch(
+            ctx.repo_root,
+            ctx.context_manager,
+            patch,
+            state.staged_state.as_ref(),
+        ) {
+            Ok((result, batches)) => {
+                super::edit::emit_staged_patch_diff(ctx, state.staged_state.as_ref(), &result);
+                (result, Some(batches))
+            }
+            Err(error) => {
+                state.failed.insert("patch".to_string(), error);
+                return StagingStep {
+                    addressed: true,
+                    refusals: render_failures(&state.failed, ctx.prompt_builder.patch_strategy),
+                };
+            }
+        }
+    } else {
+        let edits: Vec<_> = commands
+            .into_iter()
+            .filter_map(LlmCommand::into_edit_operation)
+            .collect();
+        if edits.is_empty() {
+            return StagingStep::default();
+        }
+        let unretried = retain_retried_failed_files(&mut state.failed, ctx.context_manager, &edits);
+        for (path, error) in unretried {
+            state.abandoned.entry(path).or_insert(error);
+        }
+        (
+            stage_and_validate_edits(
+                ctx.repo_root,
+                ctx.context_manager,
+                &edits,
+                state.staged_state.as_ref(),
+            ),
+            None,
+        )
+    };
     let converged = result.successful_paths.len();
+    // Remember new destinations before apply registers them as context files.
+    ctx.transcript()
+        .remember_staged_paths(ctx.repo_root, &result.staged_state);
     state.staged_state = Some(result.staged_state);
     // Only a path that converged in this attempt answers its earlier refusal.
     // Clearing by the cumulative set would also erase the failure of a path
@@ -109,22 +128,16 @@ pub(crate) fn execute_staging_step(
         state.failed.remove(path);
         state.abandoned.remove(path);
     }
-    let converged_paths = result.successful_paths.clone();
     state.succeeded.extend(result.successful_paths);
-    state.cumulative_edits.extend(result.successful_edits);
+    if let Some(batches) = patch_batches {
+        state.edit_batches.extend(batches);
+    } else if !result.successful_edits.is_empty() {
+        state.edit_batches.push(result.successful_edits);
+    }
     for failure in result.failed_files {
         state.abandoned.remove(&failure.path);
         state.failed.insert(failure.path, failure.error);
     }
-
-    // The change set this attempt produced is the churn of the working set the
-    // model must read next: the members that converged relocate first, the
-    // members the substrate refused follow them, and the mark stales the rendered
-    // prefix so the repair or healing round re-reads the bytes it is about to
-    // address instead of the bytes the turn opened with.
-    let mut refused_paths: Vec<String> = state.failed.keys().cloned().collect();
-    refused_paths.sort();
-    ctx.note_context_churn(&converged_paths, &refused_paths);
 
     tracing::info!(
         repo_root = %ctx.repo_root.display(),
@@ -159,15 +172,6 @@ pub(super) fn render_failures(
         .collect();
     rendered.sort();
     rendered
-}
-
-/// Extracts all file edit operations from the envelope by draining its [`LlmCapability::FileEdits`].
-fn extract_file_edits(envelope: &mut ResponseEnvelope) -> Vec<EditOperation> {
-    envelope
-        .take_any(super::edit::EDIT_CAPABILITIES)
-        .into_iter()
-        .filter_map(LlmCommand::into_edit_operation)
-        .collect()
 }
 
 #[cfg(test)]
@@ -224,7 +228,13 @@ mod tests {
                 journal: crate::workflow::research::journal::TurnResearchJournal::default(),
                 provider: MockLlmProvider::scripted(Vec::new()),
                 model: ModelRef::openrouter("mock/model"),
-                protocol: JsonPromptProtocol::edits(),
+                protocol: JsonPromptProtocol::new(CapabilityTree::set(
+                    crate::control::turn::EDIT_CAPABILITIES
+                        .iter()
+                        .copied()
+                        .chain([LlmCapability::TextMessage])
+                        .map(CapabilityTree::leaf),
+                )),
                 cache: crate::control::cache::TurnInputCache::default(),
                 cancel: CancellationToken::new(),
                 events: EventSink::noop(),
@@ -371,20 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn an_attempt_marks_the_context_churn_of_its_change_set() {
+    fn a_second_patch_can_restore_the_initial_bytes() {
         let mut fixture = Fixture::new(&[("a.rs", TARGET)], &["a.rs"]);
-        let mut envelope = replace(
-            "pub fn compute() -> i32 { 0 }",
-            "pub fn compute() -> i32 { 42 }",
-        );
         let mut ctx = fixture.context();
-        assert!(!ctx.transcript().prefix_is_stale());
         let mut state = StagingState::default();
-
-        execute_staging_step(&mut ctx, &mut envelope, &mut state);
-        assert!(
-            ctx.transcript().prefix_is_stale(),
-            "the change set stales the rendered prefix"
+        let mut first = replace("{ 0 }", "{ 42 }");
+        let mut restore = replace("{ 42 }", "{ 0 }");
+        assert!(execute_staging_step(&mut ctx, &mut first, &mut state)
+            .refusals
+            .is_empty());
+        assert!(execute_staging_step(&mut ctx, &mut restore, &mut state)
+            .refusals
+            .is_empty());
+        assert_eq!(
+            state.staged_state.unwrap().staged_files["a.rs"],
+            TARGET.as_bytes()
         );
+        assert_eq!(state.edit_batches.len(), 2);
     }
 }

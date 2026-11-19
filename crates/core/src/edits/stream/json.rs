@@ -61,6 +61,7 @@ pub struct JsonStreamFilter {
     message_finished: bool,
     /// Forward lexer over the `changes` array of the payload.
     lex: ChangesLex,
+    changes_preview: bool,
     has_emitted_edit_started: bool,
     editable_paths: Vec<String>,
     staging: StagingSimulator,
@@ -89,6 +90,11 @@ pub struct JsonStreamFilter {
 }
 
 impl JsonStreamFilter {
+    pub(crate) fn with_changes_preview(mut self, enabled: bool) -> Self {
+        self.changes_preview = enabled;
+        self
+    }
+
     pub(crate) fn new(editable_paths: Vec<String>, repo_root: PathBuf) -> Self {
         Self {
             passthrough: None,
@@ -96,6 +102,7 @@ impl JsonStreamFilter {
             message_cursor: StringFieldCursor::new(),
             message_finished: false,
             lex: ChangesLex::default(),
+            changes_preview: true,
             has_emitted_edit_started: false,
             editable_paths,
             staging: StagingSimulator::new(HashMap::new(), repo_root),
@@ -524,6 +531,10 @@ struct MalformedChange {
     diagnostic: String,
 }
 impl EditStreamFilter for JsonStreamFilter {
+    fn exclude_disk_sources(&mut self, paths: std::collections::HashSet<String>) {
+        self.staging.excluded_disk_sources = paths;
+    }
+
     fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
@@ -572,6 +583,10 @@ impl EditStreamFilter for JsonStreamFilter {
             }
         }
 
+        if !self.changes_preview {
+            return events;
+        }
+
         // 2. Lex the changes array forward and report the elements that closed.
         //    The lexer resumes where the previous chunk stopped, so a long payload
         //    is never re-read from its start.
@@ -610,8 +625,10 @@ impl EditStreamFilter for JsonStreamFilter {
             }
         }
         // Synthesize any edit events left by a truncated or single-shot payload.
-        self.drain_completed_changes(&mut events);
-        self.flush_open_file(&mut events);
+        if self.changes_preview {
+            self.drain_completed_changes(&mut events);
+            self.flush_open_file(&mut events);
+        }
         events
     }
 
@@ -1029,6 +1046,32 @@ mod tests {
             }
         }
         (text, edits)
+    }
+
+    #[test]
+    fn patch_mode_streams_only_message_and_resets() {
+        let mut filter =
+            JsonStreamFilter::new(vec![], scratch_dir("patch-message")).with_changes_preview(false);
+        for message in ["first", "second"] {
+            let input = serde_json::json!({
+                "action": {"kind": "edit", "patch": "*** Begin Patch\n*** End Patch",
+                "changes": [{"op":"create","path":"unapproved.rs","content":"discard"}]},
+                "message": message,
+            })
+            .to_string();
+            let mut text = String::new();
+            for byte in input.chars() {
+                for event in filter.push_chunk(byte.encode_utf8(&mut [0; 4])) {
+                    match event {
+                        StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                        other => panic!("unexpected event: {other:?}"),
+                    }
+                }
+            }
+            assert_eq!(text, message);
+            filter.reset();
+        }
+        assert!(Box::new(filter).finish().is_empty());
     }
 
     #[test]

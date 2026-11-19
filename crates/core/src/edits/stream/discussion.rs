@@ -1,7 +1,7 @@
 use crate::llm::discussion::DiscussionContextRequest;
+use crate::llm::discussion::DiscussionPlanUpdate;
 use crate::llm::discussion::DiscussionResponse;
 use crate::llm::discussion::RepoSearchRequest;
-use crate::plan::DiscussionPlanUpdate;
 use tracing::{info, warn};
 
 use super::json::decode::{balanced_object_end, StringFieldCursor};
@@ -295,9 +295,9 @@ impl EditStreamFilter for DiscussionStreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::DiscussionPlanAction;
-    use crate::plan::PlanItem;
-    use crate::plan::PlanItemStatus;
+    use crate::llm::discussion::DiscussionPlanAction;
+    use crate::plan_item::PlanItem;
+    use crate::plan_item::PlanItemStatus;
 
     #[test]
     fn test_discussion_stream_filter_character_by_character() {

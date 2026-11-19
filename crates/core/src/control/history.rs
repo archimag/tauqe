@@ -69,10 +69,11 @@ pub async fn compact_history_if_needed_with_budget(
     ];
 
     let (tx, mut rx) = mpsc::channel(100);
-    let client_call = provider.stream_chat(
-        &model.name,
-        messages,
-        Some(crate::prompt::history_compaction_response_format()),
+    let client_call = provider.stream(
+        crate::providers::LlmRequest {
+            response_format: Some(crate::prompt::history_compaction_response_format()),
+            ..crate::providers::LlmRequest::new(&model.name, messages)
+        },
         tx,
         cancel_rx,
     );
@@ -653,10 +654,10 @@ mod tests {
             None,
         );
         assembly.turn_scratchpad = pad1;
-        let messages = assembly.assemble_chat_messages(
-            "Continue",
-            &crate::prompt::json::JsonPromptProtocol::default(),
+        let protocol = crate::prompt::json::JsonPromptProtocol::new(
+            crate::control::repl::dialogue_capability_expr(false, false),
         );
+        let messages = assembly.assemble_chat_messages("Continue", &protocol);
         // The scratchpad is rewritten on every round, so it travels in the
         // volatile tail of the transcript instead of the byte-stable head.
         let head = &messages[0].content;

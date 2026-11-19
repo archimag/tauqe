@@ -13,12 +13,12 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingAssignment {
     /// Identity of the finding, exactly as the session stores it.
-    pub uuid: String,
+    pub(crate) uuid: String,
     /// Group the finding now belongs to.
-    pub group_id: String,
+    pub(crate) group_id: String,
     /// Lifecycle status the finding is routed to, or `None` when the routing
     /// leaves the stored status unchanged.
-    pub status: Option<IssueStatus>,
+    pub(crate) status: Option<IssueStatus>,
 }
 impl ReviewStorage {
     /// Regroups the explicitly named review session in place.
@@ -33,7 +33,7 @@ impl ReviewStorage {
     /// `assignments` is keyed by the identity the session stores. A finding whose
     /// identity is not named keeps the group and the status it already has, so a
     /// partial classification never strands a finding outside the group list.
-    pub fn regroup_session(
+    pub(crate) fn regroup_session(
         repo_root: &Path,
         review_id: &str,
         verdict: String,

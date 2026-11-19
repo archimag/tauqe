@@ -28,6 +28,8 @@ pub const CONFIG_SET: &str = "config/set";
 pub const CONFIG_RELOAD: &str = "config/reload";
 pub const CONFIG_CREATE: &str = "config/create";
 
+pub const CHATGPT_SIGN_IN_CANCEL: &str = "credentials/chatgptSignInCancel";
+pub const CHATGPT_SIGN_OUT: &str = "credentials/chatgptSignOut";
 pub const CREDENTIALS_SAVE: &str = "credentials/save";
 pub const CREDENTIALS_CREATE_STUB: &str = "credentials/createStub";
 

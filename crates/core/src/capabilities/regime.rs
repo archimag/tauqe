@@ -53,7 +53,7 @@ pub fn shared_trunk_rules(
     let mut rules = vec![
         ContractRule::new(
             "Authoritative Source",
-            "The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.",
+            "Files in <context> preserve their first version in this turn. For paths listed in <current_versions>, use the latest content, anchors, access, or deletion shown there. Other paths retain their context version.",
         ),
     ];
 
@@ -128,6 +128,12 @@ pub fn intent_delta_rules(
 
         if capabilities.contains(LlmCapability::PlanCreation) {
             let proposal = "A broad request — one that touches several independent subsystems or contracts, or whose dependent stages must land in order — is answered by proposing planning instead of patching: explain briefly in plain text why decomposition is warranted and offer the developer the choice between drafting a plan and performing the whole change at once. Purely mechanical or localized work, such as a cross-cutting rename or one focused fix, is never broad and is executed immediately. A proposal is not a change: a non-empty `changes` array or a plan payload (`plan_create` or `plan_update`) in the same answer is strictly prohibited, and no plan document may be created until the developer explicitly confirms or requests one. Once the developer confirms, execute the task completely and never repeat the proposal; a proposal-only turn closes in the answer branch and states the offer in its `message`.".to_string();
+            let proposal =
+                if ctx.render.patch_strategy == crate::workflow::PatchStrategy::ApplyPatch {
+                    proposal.replace("a non-empty `changes` array", "a non-empty `patch` string")
+                } else {
+                    proposal
+                };
             rules.push(ContractRule::new("Plan-First Proposal", proposal));
         }
     }
@@ -139,6 +145,12 @@ pub fn intent_delta_rules(
             immutability,
         ));
         let mandatory_edits = "You are executing an implementation step. Every execution turn must produce concrete code changes in the `changes` array. Purely conversational responses, analysis, or explanations without code changes are strictly prohibited and will be rejected. If you need more information before editing, emit a discovery request through the research branch: `context_requests`, `repo_searches`, `repo_dirs`, `repo_maps`, or `dir_lists`. If the step cannot be implemented as specified, report a blocker via `blocked`.".to_string();
+        let mandatory_edits =
+            if ctx.render.patch_strategy == crate::workflow::PatchStrategy::ApplyPatch {
+                mandatory_edits.replace("in the `changes` array", "in the `patch` field")
+            } else {
+                mandatory_edits
+            };
         rules.push(ContractRule::new(
             "Mandatory Code Implementation",
             mandatory_edits,

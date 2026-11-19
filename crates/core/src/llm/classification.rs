@@ -1,17 +1,17 @@
 //! Capability classification of normalized model commands.
 
 use super::LlmCapability;
+use crate::llm::discussion::DiscussionPlanAction;
 use crate::llm::LlmCommand;
-use crate::plan::DiscussionPlanAction;
 
 /// Capability that this command realizes, or `None` when the command is a
 /// protocol diagnostic rather than a realized capability.
 pub fn command_capability(command: &LlmCommand) -> Option<LlmCapability> {
     match command {
         LlmCommand::Text(_) => Some(LlmCapability::TextMessage),
-        LlmCommand::EditReplace(_) | LlmCommand::EditLineAnchor(_) => {
-            Some(LlmCapability::EditReplace)
-        }
+        LlmCommand::EditReplace(_)
+        | LlmCommand::EditLineAnchor(_)
+        | LlmCommand::ApplyPatch { .. } => Some(LlmCapability::EditReplace),
         LlmCommand::EditCreate(_) => Some(LlmCapability::EditCreate),
         LlmCommand::EditDelete(_) => Some(LlmCapability::EditDelete),
         LlmCommand::EditMove(_) => Some(LlmCapability::EditMove),
@@ -46,8 +46,8 @@ mod tests {
     use crate::context::ContextAccess;
     use crate::edits::*;
     use crate::llm::command::*;
+    use crate::llm::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
     use crate::llm::*;
-    use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
     #[test]
     fn test_llm_command_capability_classification() {
         let text = LlmCommand::Text(TextCommand {
@@ -170,10 +170,10 @@ mod tests {
     #[test]
     fn test_llm_command_review_update_serde_roundtrip() {
         let command = LlmCommand::ReviewUpdate {
-            update: crate::review::ReviewUpdateProposal {
+            update: crate::llm::discussion::ReviewUpdateProposal {
                 item_id: 7,
                 group_id: None,
-                status: crate::review::ReviewDecisionStatus::Rejected,
+                status: crate::llm::discussion::ReviewDecisionStatus::Rejected,
                 note: "The reported race cannot happen".to_string(),
                 recommendations: vec!["Document the ordering".to_string()],
             },

@@ -32,15 +32,17 @@ impl Default for ReviewSynthesisResponse {
 }
 
 impl ReviewSynthesisResponse {
-    pub(crate) fn from_filter(filter: JsonFieldStreamFilter<ReviewFindingsOutput>) -> Self {
+    pub fn from_filter(filter: JsonFieldStreamFilter<ReviewFindingsOutput>) -> Self {
         Self { filter }
     }
 
-    pub fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+    #[cfg(test)]
+    fn push_chunk(&mut self, chunk: &str) -> Option<String> {
         self.filter.push_chunk(chunk)
     }
 
-    pub fn reset(&mut self) {
+    #[cfg(test)]
+    fn reset(&mut self) {
         *self = Self::default();
     }
 

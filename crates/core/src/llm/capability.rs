@@ -50,7 +50,7 @@ impl CapabilityTree {
     ///
     /// The block carries the empty label, so its children take part in the level
     /// that holds them instead of forming a branch of their own.
-    pub fn root(items: impl IntoIterator<Item = CapabilityTree>) -> Self {
+    pub(crate) fn root(items: impl IntoIterator<Item = CapabilityTree>) -> Self {
         Self::Set(String::new(), items.into_iter().collect())
     }
 
@@ -68,7 +68,7 @@ impl CapabilityTree {
     /// The label names the block, so placing it inside an
     /// [`AnyOf`](Self::AnyOf) turns it into the variant the label
     /// discriminates.
-    pub fn named_set(
+    pub(crate) fn named_set(
         label: impl Into<String>,
         items: impl IntoIterator<Item = CapabilityTree>,
     ) -> Self {
@@ -76,7 +76,7 @@ impl CapabilityTree {
     }
 
     /// Builds a disjunction of labeled branches.
-    pub fn any_of(
+    pub(crate) fn any_of(
         label: impl Into<String>,
         branches: impl IntoIterator<Item = CapabilityTree>,
     ) -> Self {
@@ -90,7 +90,7 @@ impl CapabilityTree {
     /// re-deriving the leaf shape by hand. The result is the same conjunction
     /// [`root`](Self::root) builds, so every consumer observes one tree shape
     /// whichever constructor produced it.
-    pub fn from_leaves(capabilities: impl IntoIterator<Item = LlmCapability>) -> Self {
+    pub(crate) fn from_leaves(capabilities: impl IntoIterator<Item = LlmCapability>) -> Self {
         Self::root(capabilities.into_iter().map(Self::Leaf))
     }
 
@@ -100,7 +100,7 @@ impl CapabilityTree {
     /// transparent root conjunction, and an [`AnyOf`](Self::AnyOf) reports the
     /// name of its union. A leaf carries no label, so the branch name is read
     /// here instead of being sniffed from the leaves.
-    pub fn label(&self) -> Option<&str> {
+    pub(crate) fn label(&self) -> Option<&str> {
         match self {
             Self::Leaf(_) => None,
             Self::Set(label, _) | Self::AnyOf(label, _) => Some(label.as_str()),
@@ -125,13 +125,14 @@ impl CapabilityTree {
     /// projection is total for every shape of the tree, so an empty `Set` or an
     /// empty `AnyOf` drops out of the surface rather than fabricating a
     /// capability the tree never declared.
-    pub fn leaves(&self) -> Vec<LlmCapability> {
+    pub(crate) fn leaves(&self) -> Vec<LlmCapability> {
         let mut leaves = Vec::new();
         self.walk_leaves(&mut leaves);
         leaves
     }
 
-    pub(crate) fn has_operational_capability(&self) -> bool {
+    #[cfg(test)]
+    fn has_operational_capability(&self) -> bool {
         match self {
             // A marker branch holds no leaf, yet it stays an operational
             // branch of its own, so narrowing keeps it in the tree.
@@ -174,7 +175,8 @@ impl CapabilityTree {
     /// Returns a filtered expression retaining only capabilities that satisfy
     /// `predicate`. A retained node keeps its label, so a filtered tree carries
     /// the same names as the tree it was filtered from.
-    pub fn filter<F>(&self, predicate: &F) -> Option<Self>
+    #[cfg(test)]
+    pub(crate) fn filter<F>(&self, predicate: &F) -> Option<Self>
     where
         F: Fn(LlmCapability) -> bool,
     {

@@ -1,6 +1,6 @@
 //! RPC projections for core-owned audit windows.
 
-use tauqe_core::review::window::ReviewWindow;
+use tauqe_flow::api::types::ReviewWindow;
 use tauqe_protocol::review::ReviewPreviewWindow;
 pub(super) fn window_dto(window: &ReviewWindow) -> ReviewPreviewWindow {
     ReviewPreviewWindow {

@@ -39,6 +39,7 @@
 //! single-finding run states whether the run addressed the finding or skipped
 //! it.
 
+use crate::workflow::batch::QueueInterruption;
 use std::path::Path;
 
 use crate::models::{ArchitectTier, ModelSelection};
@@ -192,13 +193,14 @@ impl<'a> PlanImplementationPipeline<'a> {
         tracing::info!(scope = ?self.scope, "implementation run started");
 
         loop {
-            // Hard cancellation wins over a soft stop when both are pending, so an
-            // explicit reset is never downgraded to a graceful stop.
-            if *cancel_rx.borrow() {
-                return self.report(totals, replans, PlanImplementationStop::Cancelled);
-            }
-            if *soft_stop_rx.borrow() {
-                return self.report(totals, replans, PlanImplementationStop::Stopped);
+            if let Some(interruption) =
+                QueueInterruption::before_next(*cancel_rx.borrow(), Some(soft_stop_rx))
+            {
+                let stop = match interruption {
+                    QueueInterruption::Cancelled => PlanImplementationStop::Cancelled,
+                    QueueInterruption::Stopped => PlanImplementationStop::Stopped,
+                };
+                return self.report(totals, replans, stop);
             }
 
             // The horizon is re-resolved from the storage that owns it before every

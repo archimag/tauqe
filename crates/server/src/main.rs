@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::FutureExt;
-use tauqe_core::history::HistoryMutation;
+use tauqe_flow::api::types::HistoryMutation;
 use tauqe_protocol::{
     errors, events, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
     HistoryEntryRolledBackEvent, Request, RequestId, Response, CLIENT_SHUTDOWN_WAIT,
@@ -24,6 +24,7 @@ mod discussion;
 mod dispatch;
 mod handlers;
 mod logging;
+mod publication;
 mod reap;
 mod state;
 mod transport;
@@ -35,12 +36,10 @@ use transport::OutChannel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tauqe_core::init();
-
-    let explicit_config = tauqe_core::api::cli_arg_value_from(std::env::args(), "--config");
+    let explicit_config = tauqe_flow::api::cli_arg_value_from(std::env::args(), "--config");
     let explicit_credentials =
-        tauqe_core::api::cli_arg_value_from(std::env::args(), "--credentials");
-    let repo_state = tauqe_core::api::discover_repository();
+        tauqe_flow::api::cli_arg_value_from(std::env::args(), "--credentials");
+    let repo_state = tauqe_flow::api::discover_repository();
     let repo_path = PathBuf::from(&repo_state.root);
 
     logging::install_panic_hook();
@@ -79,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // spot and leaving an open transaction behind.
     let shutdown_watch = shutdown_signal();
 
-    let config = tauqe_core::api::repository_configuration(
+    let config = tauqe_flow::api::repository_configuration(
         &repo_path,
         explicit_config.as_deref(),
         explicit_credentials.as_deref(),
@@ -100,16 +99,13 @@ async fn main() -> anyhow::Result<()> {
     // rebuild its session view from the authoritative result instead of
     // reconstructing it from append events alone.
     let out_for_history = state.out.clone();
-    let state_for_history = Arc::clone(&state);
     tokio::spawn(async move {
         while let Some(mutation) = history_rx.recv().await {
-            // The manager maintains the estimate as it appends, compacts,
-            // rolls back, and clears, so the probe reads a value instead of
-            // re-reading the journal per event and never takes the exclusive
-            // mutation guard away from page reads or a turn's adoption.
-            let estimated_tokens = state_for_history.history_token_estimate().await;
             let ev = match mutation {
-                HistoryMutation::Appended { item } => Event {
+                HistoryMutation::Appended {
+                    item,
+                    estimated_tokens,
+                } => Event {
                     method: events::HISTORY_ENTRY_ADDED.to_string(),
                     params: serde_json::to_value(HistoryEntryAddedEvent {
                         item: handlers::history::history_item_dto(item),
@@ -117,22 +113,21 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .ok(),
                 },
-                HistoryMutation::Compacted { summary, tail_ids } => {
-                    // The compacted session is the summary followed by the
-                    // preserved tail, so its entry count derives from the tail
-                    // size and needs no additional disk read.
-                    let total_count = tail_ids.len().saturating_add(1);
-                    Event {
-                        method: events::HISTORY_COMPACTED.to_string(),
-                        params: serde_json::to_value(HistoryCompactedEvent {
-                            summary: handlers::history::history_item_dto(summary),
-                            tail_ids,
-                            total_count,
-                            estimated_tokens,
-                        })
-                        .ok(),
-                    }
-                }
+                HistoryMutation::Compacted {
+                    summary,
+                    tail_ids,
+                    total_count,
+                    estimated_tokens,
+                } => Event {
+                    method: events::HISTORY_COMPACTED.to_string(),
+                    params: serde_json::to_value(HistoryCompactedEvent {
+                        summary: handlers::history::history_item_dto(summary),
+                        tail_ids,
+                        total_count,
+                        estimated_tokens,
+                    })
+                    .ok(),
+                },
                 // A rollback is neither an append nor a deletion: the record
                 // leaves the model context but stays in the chronicle with the
                 // discarded prompt and the interruption reason, so the client

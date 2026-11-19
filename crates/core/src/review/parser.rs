@@ -99,9 +99,9 @@ pub fn review_findings_response_format() -> ResponseFormat {
 #[derive(Debug, Deserialize)]
 pub struct ReviewFindingsOutput {
     #[serde(default)]
-    pub title: String,
+    pub(crate) title: String,
     #[serde(default)]
-    pub summary: String,
+    pub(crate) summary: String,
     #[serde(default)]
     findings: Vec<ReviewFindingOutput>,
 }
@@ -214,7 +214,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
 ///
 /// Compatibility wrapper around [`parse_review_output`] that discards the
 /// session title and the high-level summary.
-pub fn parse_review_findings(raw: &str) -> Vec<ReviewIssue> {
+pub(crate) fn parse_review_findings(raw: &str) -> Vec<ReviewIssue> {
     parse_review_output(raw).2
 }
 

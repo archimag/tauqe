@@ -46,14 +46,13 @@ pub mod review;
 // alone.
 //
 // A small fixed set of pure helpers is deliberately module-scoped and stays
-// reachable only through its module paths: `edit::normalize_repo_path`,
-// `discussion::normalize_repo_map_path`.
+// reachable only through its module path: `edit::normalize_repo_path`.
 // That test's module-scoped helper table is the authoritative record of the
 // exceptions, so a helper is never lifted to the root and a contract name is
 // never left behind at its module.
 pub use config::{
-    ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, ReviewPresetSummary,
-    SystemStatusResult, WorkflowKind,
+    ChatGptSignInId, ChatGptSignInPrompt, ConfigSetParams, ConfigState, CredentialsSaveParams,
+    EditProtocolKind, ReviewPresetSummary, SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -93,17 +92,18 @@ pub use errors::{
 // constant uses and re-exports the event as `MODEL_ERROR_EVENT`, so neither
 // contract group loses a member of its surface.
 pub use events::{
-    CONFIG_CHANGED, CONTEXT_CHANGED, DISCUSSION_FOCUS_CHANGED, EDIT_FILE_DONE, EDIT_FILE_RETRYING,
-    EDIT_FILE_STARTED, EDIT_FINISHED, EDIT_HUNK, EDIT_STARTED, GIT_COMMIT_CREATED,
-    GIT_SQUASH_COMPLETED, GIT_STATE_CHANGED, HISTORY_COMPACTED, HISTORY_ENTRY_ADDED,
-    HISTORY_ENTRY_ROLLED_BACK, MODEL_CANCELLED, MODEL_CHANGED, MODEL_CONNECTION_RETRYING,
-    MODEL_ERROR as MODEL_ERROR_EVENT, MODEL_ESCALATED, MODEL_FINISHED, MODEL_REASONING_DELTA,
-    MODEL_RESULT, MODEL_STARTED, MODEL_STREAM_RESET, MODEL_TEXT_DELTA, MODEL_USAGE,
-    MODEL_USAGE_TOTALS, PLAN_BATCH_FINISHED, PLAN_LIST_CHANGED, PLAN_UPDATED,
-    REVIEW_ANALYZE_FINISHED, REVIEW_ANALYZE_STARTED, REVIEW_BATCH_FINISHED, REVIEW_CANCELLED,
-    REVIEW_CONTENT_DELTA, REVIEW_ERROR, REVIEW_FINISHED, REVIEW_GROUP_FINISHED,
+    CHATGPT_SIGN_IN_CLOSED, CHATGPT_SIGN_IN_PROMPT, CONFIG_CHANGED, CONTEXT_CHANGED,
+    DISCUSSION_FOCUS_CHANGED, EDIT_FILE_DONE, EDIT_FILE_RETRYING, EDIT_FILE_STARTED, EDIT_FINISHED,
+    EDIT_HUNK, EDIT_STARTED, GIT_COMMIT_CREATED, GIT_SQUASH_COMPLETED, GIT_STATE_CHANGED,
+    HISTORY_COMPACTED, HISTORY_ENTRY_ADDED, HISTORY_ENTRY_ROLLED_BACK, MODEL_CANCELLED,
+    MODEL_CHANGED, MODEL_CONNECTION_RETRYING, MODEL_ERROR as MODEL_ERROR_EVENT, MODEL_ESCALATED,
+    MODEL_FINISHED, MODEL_REASONING_DELTA, MODEL_RESULT, MODEL_STARTED, MODEL_STREAM_RESET,
+    MODEL_TEXT_DELTA, MODEL_USAGE, MODEL_USAGE_TOTALS, PLAN_BATCH_FINISHED, PLAN_LIST_CHANGED,
+    PLAN_UPDATED, REVIEW_ANALYZE_FINISHED, REVIEW_ANALYZE_STARTED, REVIEW_BATCH_FINISHED,
+    REVIEW_CANCELLED, REVIEW_CONTENT_DELTA, REVIEW_ERROR, REVIEW_FINISHED, REVIEW_GROUP_FINISHED,
     REVIEW_GROUP_STARTED, REVIEW_LIST_CHANGED, REVIEW_REASONING_DELTA, REVIEW_STARTED,
     REVIEW_UPDATED, TOOLCHAIN_FINISHED, TOOLCHAIN_STARTED, TURN_PHASE, TURN_REPOMAP,
+    TURN_ROUND_STARTED,
 };
 pub use git::{
     GitCommitCreatedEvent, GitDiffParams, GitDiffResult, GitSquashApplyParams,
@@ -131,8 +131,9 @@ pub use model::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind,
     ReasoningEffort, RepoMapInfoEvent, ReviewBatchFinishedEvent, ReviewWorkPhase,
     StructuredAbortProposal, StructuredBlockedProposal, StructuredOutcomeProposal,
-    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent, TurnWorkContext,
-    TurnWorkItem, TurnWorkQueue, UsageTotals, UsageTotalsSnapshot,
+    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent, TurnRequestReason,
+    TurnRoundStartedEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue, UsageTotals,
+    UsageTotalsSnapshot,
 };
 
 pub use outer_docs::{
@@ -156,7 +157,7 @@ pub use review::{
     ReviewPostAnalysis, ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult,
     ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity,
     ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
-    ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
+    ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID,
 };
 
 pub use review::{
@@ -569,10 +570,7 @@ mod wire_contract_tracking {
     /// `module_scoped_helper_table_stays_honest` keeps the record exact: an
     /// entry that is lifted to the root or deleted fails that test, so the table
     /// can only shrink.
-    const MODULE_SCOPED_HELPERS: &[(&str, &str)] = &[
-        ("discussion", "normalize_repo_map_path"),
-        ("edit", "normalize_repo_path"),
-    ];
+    const MODULE_SCOPED_HELPERS: &[(&str, &str)] = &[("edit", "normalize_repo_path")];
 
     /// Sanctioned rename of a declared constant at the crate root.
     ///

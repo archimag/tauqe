@@ -5,23 +5,18 @@ pub mod context;
 pub(crate) mod edit_cycle;
 pub mod git;
 pub mod history;
-pub mod host;
 pub mod locale;
+pub(crate) mod login;
 pub mod model;
 pub mod outer_docs;
 pub mod plan;
 pub mod review;
 
 use crate::contracts::Project;
-use std::path::Path;
 use std::sync::Arc;
 
-use crate::state::{AppState, OperationGuard};
-use tauqe_core::edits::EditProtocolFactory;
-use tauqe_core::workflow::WorkflowFactory;
-use tauqe_protocol::{
-    errors, methods, InitializeResult, Request, RequestId, Response, PROTOCOL_VERSION,
-};
+use crate::state::AppState;
+use tauqe_protocol::{errors, methods, InitializeResult, Request, Response, PROTOCOL_VERSION};
 #[cfg(test)]
 use tokio::sync::watch;
 
@@ -99,6 +94,21 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::CREDENTIALS_CREATE_STUB => {
             config::handle_credentials_create_stub(req, state).await
         }
+        methods::CHATGPT_SIGN_OUT => match state.application.sign_out_chatgpt().await {
+            Ok(revoked) => Response::ok(req.id, serde_json::json!(revoked)),
+            Err(err) => Response::err(req.id, errors::CREDENTIALS_SAVE_FAILED, err.to_string()),
+        },
+        methods::CHATGPT_SIGN_IN_CANCEL => {
+            match serde_json::from_value::<tauqe_protocol::config::ChatGptSignInId>(
+                req.params.unwrap_or_default(),
+            ) {
+                Ok(params) => {
+                    state.login.dismiss(&params.id);
+                    Response::ok(req.id, serde_json::Value::Null)
+                }
+                Err(_) => Response::err(req.id, errors::INVALID_PARAMS, "Missing sign-in ID"),
+            }
+        }
         methods::SYSTEM_STATUS => config::handle_system_status(req, state).await,
 
         _ => Response::err(
@@ -109,209 +119,47 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
     }
 }
 
-/// Exclusion policy for state-mutating RPCs.
-///
-/// Two shapes exist, and every mutating handler declares which one it uses:
-///
-/// - **Slot-owning** ([`begin_exclusive_operation`]): the handler keeps the
-///   operation slot for its whole mutation, so no turn or batch can register
-///   between the check and the write. Every handler that mutates state a
-///   running turn merges back or swaps belongs here: rebinding a manager set
-///   (`client/initialize`, `repository/init`), rewriting commit history
-///   (`git/squashPreview`, `git/squashApply`), reading the commit range a
-///   squash message is generated from (`git/squashGenerateMessage`), and
-///   replacing the shared configuration and model selection (`config/set`,
-///   `config/reload`,
-///   `config/create`, `credentials/save`, `credentials/create_stub`,
-///   `model/select`), discarding the interaction history
-///   (`model/clearHistory`), and mutating the context a turn reasons over
-///   (`context/add`, `context/addPattern`, `context/remove`,
-///   `context/setAccess`, `context/clear`). The turns and batches themselves
-///   (`model/ask`, `plan/execute`, `plan/executePipeline`, `plan/refine`,
-///   `plan/replan`, `review/execute`, `review/analyze`, `locale/generate`)
-///   register the slot from the workflow they spawn, so they are mutually
-///   exclusive with every request above by construction.
-/// - **Slot-observing** ([`reject_if_operation_active`]): the handler performs
-///   one bounded write on a single record — `plan/save`, `plan/updateItem`,
-///   `plan/clearHorizon`, `plan/delete`, `plan/setActive`, `review/delete`,
-///   `review/updateItem`, `model/usageReset`. None of them mutates the context,
-///   the history, or the shared model selection a running turn clones, merges
-///   back, or swaps when it ends, and each change reaches disk as one atomic
-///   write of that record. A request that lands inside the registration window
-///   is therefore ordered before the operation's own writes to the same record
-///   rather than interleaved with them, and the operation owns the lifecycle of
-///   that record: a batch's terminal step status supersedes a client status
-///   picked for the step it executed, and `model/usageReset` clears only the
-///   lifetime totals, on top of which a turn registering afterwards accumulates
-///   its own completed window.
-///
-/// The distinction matters because a bare `is_operation_active()` observation
-/// is not mutual exclusion: a request that registers an operation between the
-/// check and the mutation runs concurrently with it. A handler therefore either
-/// claims the slot for its whole mutation or holds one of the bounded shapes
-/// above; sampling the slot without one of those guarantees is prohibited.
-pub(crate) fn reject_if_operation_active(
-    req_id: &RequestId,
-    state: &Arc<AppState>,
-    message: &str,
-) -> Option<Response> {
-    if state.is_operation_active() {
-        Some(Response::err(
-            req_id.clone(),
-            errors::OPERATION_IN_PROGRESS,
-            message,
-        ))
-    } else {
-        None
-    }
-}
-
-/// Claims the operation slot for a state-mutating request.
-///
-/// The returned [`OperationGuard`] owns the registration, so the whole mutation
-/// — a configuration rebind, a Git history rewrite, a repository
-/// re-initialization — is mutually exclusive with any concurrently starting
-/// turn or batch instead of merely observing that none was running at the
-/// first instruction. The guard clears the slot on drop, so every early return
-/// path of the handler releases it.
-///
-/// The failure keeps the established wire contract: a request arriving while
-/// another operation runs is answered with `OPERATION_IN_PROGRESS` and the
-/// handler-specific `message`.
-pub(crate) fn begin_exclusive_operation(
-    req_id: &RequestId,
-    state: &Arc<AppState>,
-    message: &str,
-) -> Result<OperationGuard, Box<Response>> {
-    state.try_begin_operation().map_err(|()| {
-        let refusal = Response::err(req_id.clone(), errors::OPERATION_IN_PROGRESS, message);
-        Box::new(refusal)
-    })
-}
-
-/// Claims typed configuration access before RPC parameter decoding, retaining
-/// the existing busy-error precedence while core owns admission.
-pub(crate) fn begin_configuration_change(
-    req_id: &RequestId,
-    state: &Arc<AppState>,
-    message: &str,
-) -> Result<tauqe_core::api::ConfigurationOperation, Box<Response>> {
-    state.application.begin_configuration_change().map_err(|_| {
-        tracing::warn!(
-            code = errors::OPERATION_IN_PROGRESS,
-            "Refused to register a new operation: a slot is already active"
-        );
-        Box::new(Response::err(
-            req_id.clone(),
-            errors::OPERATION_IN_PROGRESS,
-            message,
-        ))
-    })
-}
-
-/// Obtains the core-owned history cleanup lease before handling the request.
-pub(crate) fn begin_history_change(
-    req_id: &RequestId,
-    state: &Arc<AppState>,
-    message: &str,
-) -> Result<tauqe_core::api::HistoryOperation, Box<Response>> {
-    state.application.begin_history_change().map_err(|_| {
-        tracing::warn!(
-            code = errors::OPERATION_IN_PROGRESS,
-            "Refused to register a new operation: a slot is already active"
-        );
-        Box::new(Response::err(
-            req_id.clone(),
-            errors::OPERATION_IN_PROGRESS,
-            message,
-        ))
-    })
-}
-pub(crate) use tauqe_core::api::{run_preflight_verification, PreflightVerdict};
-
-/// Rebinds configuration, context, history, and usage telemetry to a
-/// repository root.
-///
-/// `client/initialize` and `repository/init` both resolve the authoritative
-/// repository root and then must rebind every long-lived manager to it. The
-/// sequence lives here once so the two entry points cannot drift apart. Both
-/// call it while owning the operation slot, so a rebind can never interleave
-/// with a turn or batch that registered concurrently.
-///
-/// Each step takes its own short-lived guard: no guard is ever held across
-/// another subsystem's `.await`. Rebuilding the history manager rereads the
-/// journal, so it is constructed on the blocking pool instead of stalling an
-/// async worker thread; attaching the mutation listener stays here, where the
-/// client event channel lives.
-pub(crate) async fn rebind_to_repository(
-    state: &Arc<AppState>,
-    repo_path: &Path,
-    operation: &tauqe_core::api::ConfigurationOperation,
-) {
-    let out = state.out.clone();
-    operation
-        .rebind_repository(repo_path, move |id, snapshot| {
-            crate::usage::publish_snapshot(&out, id, snapshot)
-        })
-        .await;
-}
+#[cfg(test)]
+pub(crate) use tauqe_flow::api::{run_preflight_verification, PreflightVerdict};
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
-    // Re-initialization rebinds the config, context, usage lifetime, and
-    // history, so it claims the operation slot instead of sampling it: a turn
-    // registering right after a plain check would have every one of those
-    // managers swapped underneath it.
-    let operation = match begin_configuration_change(
-        &req.id,
-        state,
-        "Cannot re-initialize the repository while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    // Reading the repository state shells out to git, so it is offloaded and
-    // resolved from the authoritative shared root instead of the process CWD.
-    let repo_state = match state.application.repository_state().await {
-        Ok(repository) => repository,
-        Err(error) => {
-            tracing::warn!(error=%error,"Failed to read repository state during initialize");
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
+    });
+    let initialized = match state.application.initialize_client(observer).await {
+        Ok(initialized) => initialized,
+        Err(tauqe_flow::api::InitializationError::Busy(_)) => {
             return Response::err(
                 req.id,
-                tauqe_protocol::errors::REPOSITORY_STATE_FAILED,
-                error.to_string(),
-            );
+                errors::OPERATION_IN_PROGRESS,
+                "Cannot re-initialize the repository while a model operation is in progress",
+            )
+        }
+        Err(error) => {
+            return Response::err(req.id, errors::REPOSITORY_STATE_FAILED, error.to_string())
         }
     };
-    rebind_to_repository(state, Path::new(&repo_state.root), &operation).await;
-
-    let (effective_model, workflow, edit_protocol, available_models) = {
-        let guard = state.application.configuration().await;
-        (
-            guard.config.resolve_model(&guard.selection),
-            guard.config.repl.workflow,
-            tauqe_protocol::EditProtocolKind::Structured,
-            guard.config.available_models(),
-        )
-    };
-
+    let config = initialized.configuration;
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION.to_string(),
         server_name: "tauqe-server".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-        repository: Some(git::repository_dto(repo_state)),
-        model: effective_model.project(),
-        workflow: Some(workflow.project()),
-        edit_protocol: Some(edit_protocol),
-        available_models: available_models
-            .into_iter()
-            .map(crate::contracts::Project::project)
-            .collect(),
-        available_workflows: WorkflowFactory::available_workflows()
+        repository: Some(git::repository_dto(initialized.repository)),
+        model: config.model.project(),
+        workflow: Some(config.workflow.project()),
+        edit_protocol: Some(tauqe_protocol::EditProtocolKind::Structured),
+        available_models: config
+            .available_models
             .into_iter()
             .map(Project::project)
             .collect(),
-        available_edit_protocols: EditProtocolFactory::available_protocols()
+        available_workflows: config
+            .available_workflows
+            .into_iter()
+            .map(Project::project)
+            .collect(),
+        available_edit_protocols: initialized
+            .available_edit_protocols
             .into_iter()
             .map(Project::project)
             .collect(),

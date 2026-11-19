@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tauqe_core::providers::StreamEvent;
+use tauqe_flow::api::types::StreamEvent;
 use tauqe_protocol::{Event, Response};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
@@ -175,6 +175,7 @@ fn is_pacing_exempt(event: &StreamEvent) -> bool {
         | StreamEvent::EditFileDone { .. }
         | StreamEvent::EditFileRetrying { .. }
         | StreamEvent::TurnPhase { .. }
+        | StreamEvent::TurnRoundStarted { .. }
         | StreamEvent::RepoMapTokens(_)
         | StreamEvent::TierEscalated { .. }
         | StreamEvent::ToolchainStarted { .. }

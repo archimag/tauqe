@@ -171,7 +171,7 @@ pub struct PlanReplanParams {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PlanRefineResult {
     Success {
-        plan: Plan,
+        plan: Box<Plan>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         explanation: Option<String>,
     },

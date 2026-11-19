@@ -1,18 +1,16 @@
-use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(test)]
 use tauqe_core::providers::LlmProvider;
 use tauqe_protocol::{
-    errors, events, Event, GitDiffParams, GitDiffResult, RepositoryListFilesResult, Request,
-    Response,
+    errors, GitDiffParams, GitDiffResult, RepositoryListFilesResult, Request, Response,
 };
 
 use crate::state::AppState;
 
 /// Converts the Git snapshot at the RPC boundary.
-pub(super) fn repository_dto(
-    state: tauqe_core::api::RepositoryState,
+pub(crate) fn repository_dto(
+    state: tauqe_flow::api::RepositoryState,
 ) -> tauqe_protocol::RepositoryState {
     tauqe_protocol::RepositoryState {
         root: state.root,
@@ -30,18 +28,6 @@ pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) ->
 }
 
 pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Response {
-    // Initialization rebinds every long-lived manager to the new root, so the
-    // slot is claimed rather than sampled: a turn registering right after a
-    // plain check would run against a context root that moved underneath it.
-    let operation = match super::begin_configuration_change(
-        &req.id,
-        state,
-        "Cannot initialize a repository while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     // A present payload must decode through the typed DTO: silently defaulting
     // an unparsable one would run a bare init and drop the requested initial
     // commit, which is the silent degradation the strict wire contract forbids.
@@ -59,27 +45,26 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
         None => tauqe_protocol::RepositoryInitParams::default(),
     };
 
-    let init_result = operation.initialize_repository(params.initial_commit).await;
-    match init_result {
-        Ok(repo_state) => {
-            // A freshly initialized project may now carry its own `tauqe.toml`,
-            // so configuration, context, and history are rebound to the new
-            // root exactly as `client/initialize` does.
-            super::rebind_to_repository(state, Path::new(&repo_state.root), &operation).await;
-
-            state.out.send_event(&Event {
-                method: events::GIT_STATE_CHANGED.to_string(),
-                params: Some(
-                    serde_json::json!({ "repository": repository_dto(repo_state.clone()) }),
-                ),
-            });
-
-            let result = tauqe_protocol::RepositoryInitResult {
-                repository: repository_dto(repo_state),
-            };
-            Response::ok_typed(req.id, &result)
-        }
-        Err(err) => Response::err(req.id, errors::INIT_FAILED, err.to_string()),
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
+    });
+    match state
+        .application
+        .initialize_repository(params.initial_commit, observer)
+        .await
+    {
+        Ok(repository) => Response::ok_typed(
+            req.id,
+            &tauqe_protocol::RepositoryInitResult {
+                repository: repository_dto(repository),
+            },
+        ),
+        Err(tauqe_flow::api::InitializationError::Busy(_)) => Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot initialize a repository while a model operation is in progress",
+        ),
+        Err(error) => Response::err(req.id, errors::INIT_FAILED, error.to_string()),
     }
 }
 
@@ -118,20 +103,6 @@ pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> Response {
-    // The preview reads the commit list and the cumulative diff a running turn
-    // may be rewriting, so the slot is claimed for the whole read: a torn
-    // preview would report a squash scope that never existed.
-    let _operation = match super::begin_exclusive_operation(
-        &req.id,
-        state,
-        "Cannot squash commits while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    // A present payload must decode through the typed DTO: silently dropping an
-    // unparsable one would resolve a base the client never asked for.
     let params: tauqe_protocol::GitSquashPreviewParams = match req.params {
         Some(payload) => match serde_json::from_value(payload) {
             Ok(params) => params,
@@ -146,15 +117,11 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
         None => tauqe_protocol::GitSquashPreviewParams::default(),
     };
 
-    let preview = match state
-        .application
-        .squash_preview(&_operation, params.base_ref)
-        .await
-    {
+    let preview = match state.application.squash_preview(params.base_ref).await {
         Ok(preview) => preview,
         Err(error) => return repository_error(req.id, errors::SQUASH_PREVIEW_FAILED, error),
     };
-    let tauqe_core::api::SquashPreview {
+    let tauqe_flow::api::SquashPreview {
         base_ref,
         session_base,
         upstream_base,
@@ -192,14 +159,6 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
 }
 
 pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match super::begin_exclusive_operation(
-        &req.id,
-        state,
-        "Cannot generate a squash message while a model operation is in progress",
-    ) {
-        Ok(op) => op,
-        Err(resp) => return *resp,
-    };
     let params: tauqe_protocol::GitSquashGenerateMessageParams = match req
         .params
         .and_then(|p| serde_json::from_value(p).ok())
@@ -207,32 +166,15 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         Some(p) => p,
         None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing base_ref parameter"),
     };
-    let prepared = match state
-        .application
-        .prepare_squash_message(&operation, &params.base_ref)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return squash_error(req.id, e),
-    };
-    #[cfg(test)]
-    let provider = state.provider_override.lock().await.clone();
-    #[cfg(not(test))]
-    let provider = None;
-    let observer = Arc::new(SquashObserver {
-        state: Arc::clone(state),
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
     });
     let result = match state
         .application
         .generate_squash_message(
-            &operation,
-            prepared,
-            provider,
+            &params.base_ref,
             observer,
-            tauqe_core::api::SquashMessageExecutionConfig {
-                operation_id: format!("op-{}", crate::state::next_operation_id()),
-                exit_deadline: crate::reap::task_exit_deadline(),
-            },
+            crate::reap::task_exit_deadline(),
         )
         .await
     {
@@ -256,60 +198,29 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
 fn repository_error(
     id: tauqe_protocol::RequestId,
     failed: &str,
-    error: tauqe_core::api::RepositoryError,
+    error: tauqe_flow::api::RepositoryError,
 ) -> Response {
     let code = match error {
-        tauqe_core::api::RepositoryError::Invalid(_) => errors::INVALID_PARAMS,
+        tauqe_flow::api::RepositoryError::Busy => errors::OPERATION_IN_PROGRESS,
+        tauqe_flow::api::RepositoryError::Invalid(_) => errors::INVALID_PARAMS,
         _ => failed,
     };
     Response::err(id, code, error.to_string())
 }
 fn squash_error(
     id: tauqe_protocol::RequestId,
-    error: tauqe_core::api::SquashMessageError,
+    error: tauqe_flow::api::SquashMessageError,
 ) -> Response {
     let code = match &error {
-        tauqe_core::api::SquashMessageError::Invalid(_) => errors::INVALID_PARAMS,
-        tauqe_core::api::SquashMessageError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
-        tauqe_core::api::SquashMessageError::Model(_) => errors::INTERNAL_ERROR,
-        tauqe_core::api::SquashMessageError::Cancelled(_) => errors::CANCELLED,
+        tauqe_flow::api::SquashMessageError::Busy => errors::OPERATION_IN_PROGRESS,
+        tauqe_flow::api::SquashMessageError::Invalid(_) => errors::INVALID_PARAMS,
+        tauqe_flow::api::SquashMessageError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
+        tauqe_flow::api::SquashMessageError::Model(_) => errors::INTERNAL_ERROR,
+        tauqe_flow::api::SquashMessageError::Cancelled(_) => errors::CANCELLED,
     };
     Response::err(id, code, error.to_string())
 }
-struct SquashObserver {
-    state: Arc<AppState>,
-}
-impl tauqe_core::api::UsageObserver for SquashObserver {
-    fn publish_usage_totals(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
-        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
-    }
-    fn publish_usage(&self, id: &str, snapshot: &tauqe_core::api::UsageTotalsSnapshot) {
-        self.state.out.send_event(&Event {
-            method: events::MODEL_USAGE.into(),
-            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-                operation_id: id.into(),
-                usage: crate::usage::wire_usage(&snapshot.operation_totals().to_usage_info()),
-                session_total_cost: snapshot.session.cost,
-                current_cost: Some(snapshot.operation_totals().cost),
-            })
-            .ok(),
-        });
-    }
-}
-
 pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Response {
-    // Squashing rewrites HEAD, so the slot is claimed for the whole rewrite: a
-    // turn that may hold an open Git transaction or be committing session work
-    // must never run concurrently with it.
-    let _operation = match super::begin_exclusive_operation(
-        &req.id,
-        state,
-        "Cannot squash commits while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: tauqe_protocol::GitSquashApplyParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -322,35 +233,36 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
             }
         };
 
+    let observer = crate::publication::Publisher {
+        out: state.out.clone(),
+    };
     let applied = match state
         .application
-        .apply_squash(&_operation, params.base_ref, params.message)
+        .apply_squash(params.base_ref, params.message, &observer)
         .await
     {
         Ok(result) => result,
         Err(error) => {
             let code = match &error {
-                tauqe_core::api::SquashApplyError::Invalid(_) => errors::INVALID_PARAMS,
-                tauqe_core::api::SquashApplyError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
-                tauqe_core::api::SquashApplyError::Squash(_) => errors::SQUASH_FAILED,
+                tauqe_flow::api::SquashApplyError::Busy => errors::OPERATION_IN_PROGRESS,
+                tauqe_flow::api::SquashApplyError::Invalid(_) => errors::INVALID_PARAMS,
+                tauqe_flow::api::SquashApplyError::Commits(_) => errors::COMMITS_AHEAD_FAILED,
+                tauqe_flow::api::SquashApplyError::Squash(_) => errors::SQUASH_FAILED,
             };
             return Response::err(req.id, code, error.to_string());
         }
     };
-    state.out.send_event(&Event {
-        method: events::GIT_STATE_CHANGED.into(),
-        params: Some(serde_json::json!({"repository":repository_dto(applied.repository)})),
-    });
-    let result = tauqe_protocol::GitSquashApplyResult {
+    Response::ok_typed(req.id, &squash_result_dto(applied))
+}
+
+pub(crate) fn squash_result_dto(
+    applied: tauqe_flow::api::AppliedSquash,
+) -> tauqe_protocol::GitSquashApplyResult {
+    tauqe_protocol::GitSquashApplyResult {
         squashed_commit: applied.commit,
         message: applied.message,
         base_ref: applied.base_ref,
-    };
-    state.out.send_event(&Event {
-        method: events::GIT_SQUASH_COMPLETED.into(),
-        params: serde_json::to_value(&result).ok(),
-    });
-    Response::ok_typed(req.id, &result)
+    }
 }
 
 #[cfg(test)]
@@ -463,7 +375,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.models.scribe = Some(tauqe_core::models::ModelRef::openrouter("test/scribe"));
         let state = AppState::new(config, root, history_sender, out);
-        *state.provider_override.lock().await = Some(provider);
+        state.application.test_set_provider(provider).await;
 
         let resp = handle_git_squash_generate_message(squash_message_request(), &state).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);

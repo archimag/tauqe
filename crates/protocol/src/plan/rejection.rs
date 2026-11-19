@@ -45,7 +45,8 @@ impl PlanRejection {
     }
 
     /// Creates a rejection of a payload the planning contract refuses.
-    pub fn payload_defect(message: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn payload_defect(message: impl Into<String>) -> Self {
         Self::new(PlanRejectionKind::PayloadDefect, message)
     }
 

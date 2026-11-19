@@ -248,7 +248,7 @@ fn resolve_identity<'a>(raw: &str, known_uuids: &'a [String]) -> Option<&'a str>
 /// The routing obeys the same rule: a triage entry that names a finding the
 /// session does not hold is rejected by its own identifier instead of deciding
 /// the lifecycle of nothing.
-pub fn validate_post_analysis(
+pub(crate) fn validate_post_analysis(
     output: &PostAnalysisOutput,
     known_uuids: &[String],
 ) -> Result<(), String> {

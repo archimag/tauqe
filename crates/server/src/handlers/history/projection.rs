@@ -1,5 +1,5 @@
 //! Explicit projection of domain history into the stable RPC contract.
-use tauqe_core::history::{HistoryEntryStatus, HistoryFileOperation, HistoryItem, HistoryKind};
+use tauqe_flow::api::types::{HistoryEntryStatus, HistoryFileOperation, HistoryItem, HistoryKind};
 
 pub(crate) fn history_item_dto(item: HistoryItem) -> tauqe_protocol::UiHistoryItem {
     tauqe_protocol::UiHistoryItem {

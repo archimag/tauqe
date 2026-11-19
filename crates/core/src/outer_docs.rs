@@ -144,7 +144,7 @@ pub(crate) fn is_clean_relative_path(path: &str) -> bool {
 /// The reported path is the logical path of the document — the declared
 /// identifier and the relative path below it — so the disk prefix the
 /// declaration compiles to never reaches the wire contract.
-pub(crate) fn list_cache_entries(repo_root: &Path) -> Result<Vec<CachedDocument>, String> {
+pub fn list_cache_entries(repo_root: &Path) -> Result<Vec<CachedDocument>, String> {
     let root = repo_root.join(OUTER_DOCS_CACHE_DIR);
     // Scanning the cache reads every directory of the snapshot tree, so the
     // walk runs off the async executor thread.
@@ -218,6 +218,7 @@ fn cache_unreadable(directory: &Path, error: &std::io::Error) -> String {
 /// Why one removal from the external documentation cache did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheError {
+    Busy,
     /// The requested path is not a clean logical path of the cache.
     InvalidPath(String),
     /// The requested path names no cached document or directory.
@@ -228,8 +229,9 @@ pub enum CacheError {
 
 impl CacheError {
     /// One-line cause of the failure.
-    pub fn reason(&self) -> &str {
+    fn reason(&self) -> &str {
         match self {
+            Self::Busy => "The external documentation cache cannot be modified while a turn or batch is running",
             Self::InvalidPath(reason) | Self::NotFound(reason) | Self::Failed(reason) => reason,
         }
     }
@@ -249,7 +251,7 @@ impl std::fmt::Display for CacheError {
 /// every directory the removal emptied is pruned afterwards, so a crash leaves
 /// either the complete subtree or none of it, and the inventory never reports a
 /// directory that no longer holds a document.
-pub(crate) fn remove_cache_entry(
+pub fn remove_cache_entry(
     repo_root: &Path,
     logical_path: &str,
 ) -> Result<CacheRemoval, CacheError> {
@@ -388,7 +390,7 @@ impl CacheRemoval {
 /// while the removal surface addresses logical paths. A removal of a directory
 /// therefore covers every document below it, and the resident layer is
 /// reconciled with exactly the rule the removal applied to the disk.
-pub(crate) fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
+pub fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
     let logical = removed.trim();
     if logical.is_empty() {
         return Vec::new();

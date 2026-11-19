@@ -90,7 +90,7 @@ impl LlmCapability {
     ///
     /// The order matches the enum declaration so iteration, prompt
     /// composition, and tests stay deterministic.
-    pub const ALL: &'static [LlmCapability] = &[
+    pub(crate) const ALL: &'static [LlmCapability] = &[
         Self::TextMessage,
         Self::EditReplace,
         Self::EditCreate,

@@ -109,11 +109,11 @@ impl ModelsConfig {
 
     /// Returns the alias registered for a model in the provider catalog.
     pub(crate) fn model_alias<'a>(
-        catalog: &'a [ModelCatalogEntry],
+        catalog: impl IntoIterator<Item = &'a ModelCatalogEntry>,
         model: &ModelRef,
     ) -> Option<&'a str> {
         catalog
-            .iter()
+            .into_iter()
             .find(|entry| &entry.model == model)
             .and_then(|entry| entry.alias.as_deref())
     }
@@ -413,7 +413,7 @@ impl ModelsConfig {
     /// Effort is read only from the base entry because the base entry is the model
     /// the role starts on; deeper ladder rungs may carry their own effort and are
     /// applied during escalation instead.
-    pub fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
+    pub(crate) fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
         self.base_entry(role).and_then(|entry| entry.effort)
     }
 

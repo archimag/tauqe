@@ -764,24 +764,14 @@ pub(crate) async fn apply_batch_cancel(
     Ok(())
 }
 
-/// Reports whether the key is the advertised `Shift+C` mass-clearing chord.
-///
-/// `Shift+C` is the canonical mass-clearing chord, deliberately uppercase so it
-/// never collides with the lowercase `c` copy verb. Both encodings reach it: a
-/// terminal may report the shifted letter as an uppercase code point, or as a
-/// lowercase code point carrying the `Shift` modifier.
-///
-/// A command modifier takes the chord away from this predicate entirely. The
-/// terminal owns `Ctrl+Shift+C` and `Alt+Shift+C` as its own copy chords, and
-/// they arrive as the same uppercase code point, so they must never reach the
-/// durable telemetry reset behind a read-only dialog (Conventions §4.4).
-fn is_mass_clear_chord(key: KeyEvent) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+/// Terminals encode a shifted letter as an uppercase character or with a Shift modifier.
+fn is_shifted_letter(key: KeyEvent, letter: char) -> bool {
+    if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
         return false;
     }
     match key.code {
-        KeyCode::Char('C') => true,
-        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::SHIFT),
+        KeyCode::Char(ch) if ch == letter.to_ascii_uppercase() => true,
+        KeyCode::Char(ch) if ch == letter => key.modifiers.contains(KeyModifiers::SHIFT),
         _ => false,
     }
 }
@@ -796,6 +786,61 @@ pub(crate) async fn handle_dialog_event(
     // Dispatch strictly through the canonical modal ordering so the surface that
     // renders is always the surface that receives keystrokes.
     match st.active_modal() {
+        Some(ActiveModal::ChatGptSignIn) => {
+            let Some(dialog) = st.modals.chatgpt.as_mut() else {
+                return Ok(Some(InputResult::Continue));
+            };
+            let action = match key.code {
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                    dialog.button = if dialog.button == crate::app::ConfirmDialogButton::Confirm {
+                        crate::app::ConfirmDialogButton::Cancel
+                    } else {
+                        crate::app::ConfirmDialogButton::Confirm
+                    };
+                    return Ok(Some(InputResult::Continue));
+                }
+                KeyCode::Esc => false,
+                KeyCode::Enter => dialog.button == crate::app::ConfirmDialogButton::Confirm,
+                KeyCode::Char('c' | 'C')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let url = dialog.prompt.authorization_url.clone();
+                    drop(st);
+                    let result = crate::clipboard::copy_to_clipboard_async(&url).await;
+                    let mut st = state.lock().await;
+                    if matches!(result, crate::clipboard::CopyResult::Failed) {
+                        st.notify_error(crate::i18n::active_t("dialog.chatgpt.copy_failed"));
+                    } else {
+                        st.notify_info(crate::i18n::active_t("dialog.chatgpt.copied"));
+                    }
+                    return Ok(Some(InputResult::Continue));
+                }
+                _ => return Ok(Some(InputResult::Continue)),
+            };
+            let id = dialog.prompt.id.clone();
+            let url = dialog.prompt.authorization_url.clone();
+            drop(st);
+            if action {
+                let opened = crate::input::mouse::launch_in_browser(&url).await;
+                let mut st = state.lock().await;
+                if let Some(dialog) = st.modals.chatgpt.as_mut().filter(|d| d.prompt.id == id) {
+                    dialog.browser_opened = Some(opened);
+                    if !opened {
+                        st.notify_error(crate::i18n::active_t("dialog.chatgpt.open_failed"));
+                    }
+                }
+            } else {
+                send_request(
+                    server_writer,
+                    methods::CHATGPT_SIGN_IN_CANCEL,
+                    serde_json::to_value(tauqe_protocol::config::ChatGptSignInId { id })?,
+                )
+                .await?;
+            }
+            return Ok(Some(InputResult::Continue));
+        }
         Some(ActiveModal::Squash) => {
             return squash::handle_squash_key(key, state, st, server_writer)
                 .await
@@ -1607,7 +1652,16 @@ pub(crate) async fn handle_dialog_event(
             );
             if close {
                 st.modals.usage_summary = None;
-            } else if is_mass_clear_chord(key) {
+            } else if is_shifted_letter(key, 'l') {
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::CHATGPT_SIGN_OUT,
+                    serde_json::Value::Null,
+                )
+                .await?;
+                return Ok(Some(InputResult::Continue));
+            } else if is_shifted_letter(key, 'c') {
                 // The reset is a daemon-owned mutation, so it is dispatched
                 // rather than patched locally. The cleared snapshot arrives
                 // through `model/usageTotals`, so the dialog re-renders the
@@ -1625,6 +1679,8 @@ pub(crate) async fn handle_dialog_event(
                     .await
                     .notify_success(crate::i18n::active_t("notify.usage_reset"));
                 return Ok(Some(InputResult::Continue));
+            } else if key.code == KeyCode::Tab && is_bare_press(key.modifiers) {
+                st.prefer_usage_tokens = !st.prefer_usage_tokens;
             } else if let Some(summary) = st.modals.usage_summary.as_mut() {
                 match key.code {
                     KeyCode::Down => {
@@ -2675,6 +2731,63 @@ mod tests {
             conn.written().is_empty(),
             "the dialog never talks to the server"
         );
+    }
+
+    #[tokio::test]
+    async fn sign_in_prompt_cancels_the_waiting_request_by_id() {
+        use tauqe_protocol::{events, Event};
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let mut reasoning = false;
+        crate::rpc::events::handle_event(Event{method:events::CHATGPT_SIGN_IN_PROMPT.into(),params:Some(serde_json::json!({"id":"17","model":"sample","authorization_url":"https://auth.openai.com/api/accounts/authorize?state=example"}))},&state,&mut reasoning).await;
+        assert_eq!(
+            state.lock().await.active_modal(),
+            Some(ActiveModal::ChatGptSignIn)
+        );
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        let rpc: tauqe_protocol::Request = serde_json::from_slice(conn.written()).unwrap();
+        assert_eq!(rpc.method, methods::CHATGPT_SIGN_IN_CANCEL);
+        assert_eq!(rpc.params.unwrap()["id"], "17");
+        for (id, visible) in [("16", true), ("17", false)] {
+            crate::rpc::events::handle_event(
+                Event {
+                    method: events::CHATGPT_SIGN_IN_CLOSED.into(),
+                    params: Some(serde_json::json!({"id":id})),
+                },
+                &state,
+                &mut reasoning,
+            )
+            .await;
+            assert_eq!(state.lock().await.modals.chatgpt.is_some(), visible);
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_summary_tab_toggles_footer_units_across_dialog_reopens() {
+        let mut st = crate::app::test_state();
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        handle_dialog_event(tab, &state, &mut conn).await.unwrap();
+        assert!(state.lock().await.prefer_usage_tokens);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_dialog_event(escape, &state, &mut conn)
+            .await
+            .unwrap();
+
+        state.lock().await.open_usage_summary();
+        assert!(state.lock().await.prefer_usage_tokens);
+        handle_dialog_event(tab, &state, &mut conn).await.unwrap();
+        assert!(!state.lock().await.prefer_usage_tokens);
+        assert!(conn.written().is_empty());
     }
 
     /// The footer advertises `Shift+C` as the telemetry reset chord, so that

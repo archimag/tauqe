@@ -49,12 +49,12 @@ This document specifies mandatory engineering and architectural conventions for 
 ## 2. Workspace Architecture and Crate Responsibilities
 
 The TAUQE workspace is decomposed into specialized crates with strict, unidirectional dependency boundaries. The enforced dependency graph is `tui -> protocol + tools`,
-`server -> protocol + core`, and `core -> tools`. Tools owns shared utilities,
+`server -> protocol + flow`, `flow -> core`, and `core -> tools`. Tools owns shared utilities,
 including the pure `tools::path_patterns` matcher used by the engine and TUI.
 Core has no dependency on protocol. The dependency gate enforces this boundary;
 server projects domain models explicitly without changing RPC or stored formats.
-Infrastructure remains inside core, behind application-owned ports. Tools owns
-technical inputs and results; core owns domain rules and execution; server owns
+Flow owns session state, scenario coordination, and application adapters. Tools owns
+technical inputs and results. Core owns domain rules and execution. Server owns
 RPC adaptation, transport, and logging setup. Do not add new engine-only contracts
 to protocol. Client-side computations belong to TUI, never to protocol.
 Code must preserve these boundaries:
@@ -77,7 +77,11 @@ Code must preserve these boundaries:
    - **Allowed:** Driving the substrate against Git, the file system, and toolchain processes, and calling provider HTTP endpoints. Exposing domain traits (`PromptProtocol`, `LlmProvider`, `ApplyPolicy`) and headless domain workflows.
    - **Strict Prohibitions:** Strictly headless; NO presentation or terminal UI dependencies (`ratatui`, `crossterm`). NO RPC transport server or socket listening code.
 
-4. **Protocol Crate Purity:**
+4. **`crates/flow` (Application Scenarios):**
+   - Owns the application session, admission, cancellation, document commands, interactive turns, and plan and review batches. Server calls the typed facade in `tauqe_flow::api`.
+   - Uses the domain types and execution loops in core. The server projects scenario events into protocol notifications.
+
+5. **Protocol Crate Purity:**
    - `crates/protocol` remains a lightweight leaf crate. It declares only
      `serde`, `serde_json`, and `schemars`, carries no workspace dependency, and
      pulls in no file-system, process, network, or async runtime crate.
@@ -97,16 +101,19 @@ boundary review. Core must never import protocol or hide a transport dependency 
 re-export, source inclusion, or a shared transport crate.
 
 
-The clean-boundary migration is complete for the audited workspace surface.
-Application owns repository queries/initialization, Git diff and squash-preview
-selection, document reads and mutations, refinement/replan preparation, and turn
-lifecycle policy. Server owns RPC parsing/error-code mapping, transport admission
-messages, typed event projection/publication, provider test injection, logging,
-and runtime signal/connection handling. Production server sources may not call
-stored-document engines, blocking Git primitives, model schemas, or domain
-normalizers directly. Architecture gates exclude test fixtures and the logging
-module's authorized filesystem work; they run with every server test suite.
+Server handlers decode the wire request, project typed input, invoke one
+`tauqe_flow::api::Application` scenario, and project its outcome. Flow owns admission,
+executing and supervising tasks, provider resolution, persistence, recovery,
+event ordering, and preparation of publication snapshots. Server owns wire
+compatibility, error-code mapping, transport pacing, event serialization, request
+logging, and process signal handling. A passive application observer publishes
+events and waits for transport readiness. It has no application state.
 
+Flow holds admission through terminal publication for launched work. Parameter
+decoding precedes admission, and scenario validation and preparation happen after
+admission. Read-only routes and permitted focus changes remain available during
+execution. The [RPC scenario inventory](docs/rpc-application-boundary.md) records
+the response and admission mode of every routed method.
 
 TUI's `projection` library owns client readiness/progress, tree lookup and
 normalization, optimistic status updates, Markdown rendering, review grouping,

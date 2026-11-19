@@ -4,7 +4,7 @@ pub(crate) trait Project: Sized {
     type Target;
     fn project(self) -> Self::Target;
 }
-use tauqe_core::models as domain;
+use tauqe_flow::api::types as domain;
 use tauqe_protocol as wire;
 impl Project for domain::ProviderKind {
     type Target = wire::ProviderKind;
@@ -12,6 +12,7 @@ impl Project for domain::ProviderKind {
         let value = self;
         match value {
             domain::ProviderKind::OpenRouter => wire::ProviderKind::OpenRouter,
+            domain::ProviderKind::OpenAI => wire::ProviderKind::OpenAI,
         }
     }
 }
@@ -21,6 +22,7 @@ impl Project for wire::ProviderKind {
         let value = self;
         match value {
             wire::ProviderKind::OpenRouter => domain::ProviderKind::OpenRouter,
+            wire::ProviderKind::OpenAI => domain::ProviderKind::OpenAI,
         }
     }
 }
@@ -286,179 +288,178 @@ impl Project for wire::ModelSelection {
         }
     }
 }
-use tauqe_core::{plan as domain_plan, review as domain_review};
 
-impl Project for domain_plan::PlanItemStatus {
+impl Project for domain::PlanItemStatus {
     type Target = wire::PlanItemStatus;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_plan::PlanItemStatus::Discussion => wire::PlanItemStatus::Discussion,
-            domain_plan::PlanItemStatus::Todo => wire::PlanItemStatus::Todo,
-            domain_plan::PlanItemStatus::InProgress => wire::PlanItemStatus::InProgress,
-            domain_plan::PlanItemStatus::Done => wire::PlanItemStatus::Done,
-            domain_plan::PlanItemStatus::Blocked => wire::PlanItemStatus::Blocked,
-            domain_plan::PlanItemStatus::Cancelled => wire::PlanItemStatus::Cancelled,
+            domain::PlanItemStatus::Discussion => wire::PlanItemStatus::Discussion,
+            domain::PlanItemStatus::Todo => wire::PlanItemStatus::Todo,
+            domain::PlanItemStatus::InProgress => wire::PlanItemStatus::InProgress,
+            domain::PlanItemStatus::Done => wire::PlanItemStatus::Done,
+            domain::PlanItemStatus::Blocked => wire::PlanItemStatus::Blocked,
+            domain::PlanItemStatus::Cancelled => wire::PlanItemStatus::Cancelled,
         }
     }
 }
 impl Project for wire::PlanItemStatus {
-    type Target = domain_plan::PlanItemStatus;
+    type Target = domain::PlanItemStatus;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::PlanItemStatus::Discussion => domain_plan::PlanItemStatus::Discussion,
-            wire::PlanItemStatus::Todo => domain_plan::PlanItemStatus::Todo,
-            wire::PlanItemStatus::InProgress => domain_plan::PlanItemStatus::InProgress,
-            wire::PlanItemStatus::Done => domain_plan::PlanItemStatus::Done,
-            wire::PlanItemStatus::Blocked => domain_plan::PlanItemStatus::Blocked,
-            wire::PlanItemStatus::Cancelled => domain_plan::PlanItemStatus::Cancelled,
+            wire::PlanItemStatus::Discussion => domain::PlanItemStatus::Discussion,
+            wire::PlanItemStatus::Todo => domain::PlanItemStatus::Todo,
+            wire::PlanItemStatus::InProgress => domain::PlanItemStatus::InProgress,
+            wire::PlanItemStatus::Done => domain::PlanItemStatus::Done,
+            wire::PlanItemStatus::Blocked => domain::PlanItemStatus::Blocked,
+            wire::PlanItemStatus::Cancelled => domain::PlanItemStatus::Cancelled,
         }
     }
 }
-impl Project for domain_plan::PlanRejectionKind {
+impl Project for domain::PlanRejectionKind {
     type Target = wire::PlanRejectionKind;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_plan::PlanRejectionKind::PayloadDefect => wire::PlanRejectionKind::PayloadDefect,
-            domain_plan::PlanRejectionKind::ModeForbidden => wire::PlanRejectionKind::ModeForbidden,
-            domain_plan::PlanRejectionKind::Abandoned => wire::PlanRejectionKind::Abandoned,
+            domain::PlanRejectionKind::PayloadDefect => wire::PlanRejectionKind::PayloadDefect,
+            domain::PlanRejectionKind::ModeForbidden => wire::PlanRejectionKind::ModeForbidden,
+            domain::PlanRejectionKind::Abandoned => wire::PlanRejectionKind::Abandoned,
         }
     }
 }
 impl Project for wire::PlanRejectionKind {
-    type Target = domain_plan::PlanRejectionKind;
+    type Target = domain::PlanRejectionKind;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::PlanRejectionKind::PayloadDefect => domain_plan::PlanRejectionKind::PayloadDefect,
-            wire::PlanRejectionKind::ModeForbidden => domain_plan::PlanRejectionKind::ModeForbidden,
-            wire::PlanRejectionKind::Abandoned => domain_plan::PlanRejectionKind::Abandoned,
+            wire::PlanRejectionKind::PayloadDefect => domain::PlanRejectionKind::PayloadDefect,
+            wire::PlanRejectionKind::ModeForbidden => domain::PlanRejectionKind::ModeForbidden,
+            wire::PlanRejectionKind::Abandoned => domain::PlanRejectionKind::Abandoned,
         }
     }
 }
-impl Project for domain_review::IssueType {
+impl Project for domain::IssueType {
     type Target = wire::IssueType;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::IssueType::Bug => wire::IssueType::Bug,
-            domain_review::IssueType::Security => wire::IssueType::Security,
-            domain_review::IssueType::Architecture => wire::IssueType::Architecture,
-            domain_review::IssueType::Performance => wire::IssueType::Performance,
-            domain_review::IssueType::Quality => wire::IssueType::Quality,
+            domain::IssueType::Bug => wire::IssueType::Bug,
+            domain::IssueType::Security => wire::IssueType::Security,
+            domain::IssueType::Architecture => wire::IssueType::Architecture,
+            domain::IssueType::Performance => wire::IssueType::Performance,
+            domain::IssueType::Quality => wire::IssueType::Quality,
         }
     }
 }
 impl Project for wire::IssueType {
-    type Target = domain_review::IssueType;
+    type Target = domain::IssueType;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::IssueType::Bug => domain_review::IssueType::Bug,
-            wire::IssueType::Security => domain_review::IssueType::Security,
-            wire::IssueType::Architecture => domain_review::IssueType::Architecture,
-            wire::IssueType::Performance => domain_review::IssueType::Performance,
-            wire::IssueType::Quality => domain_review::IssueType::Quality,
+            wire::IssueType::Bug => domain::IssueType::Bug,
+            wire::IssueType::Security => domain::IssueType::Security,
+            wire::IssueType::Architecture => domain::IssueType::Architecture,
+            wire::IssueType::Performance => domain::IssueType::Performance,
+            wire::IssueType::Quality => domain::IssueType::Quality,
         }
     }
 }
-impl Project for domain_review::IssueStatus {
+impl Project for domain::IssueStatus {
     type Target = wire::IssueStatus;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::IssueStatus::Discussion => wire::IssueStatus::Discussion,
-            domain_review::IssueStatus::Todo => wire::IssueStatus::Todo,
-            domain_review::IssueStatus::InProgress => wire::IssueStatus::InProgress,
-            domain_review::IssueStatus::Fixed => wire::IssueStatus::Fixed,
-            domain_review::IssueStatus::Skipped => wire::IssueStatus::Skipped,
-            domain_review::IssueStatus::Rejected => wire::IssueStatus::Rejected,
+            domain::IssueStatus::Discussion => wire::IssueStatus::Discussion,
+            domain::IssueStatus::Todo => wire::IssueStatus::Todo,
+            domain::IssueStatus::InProgress => wire::IssueStatus::InProgress,
+            domain::IssueStatus::Fixed => wire::IssueStatus::Fixed,
+            domain::IssueStatus::Skipped => wire::IssueStatus::Skipped,
+            domain::IssueStatus::Rejected => wire::IssueStatus::Rejected,
         }
     }
 }
 impl Project for wire::IssueStatus {
-    type Target = domain_review::IssueStatus;
+    type Target = domain::IssueStatus;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::IssueStatus::Discussion => domain_review::IssueStatus::Discussion,
-            wire::IssueStatus::Todo => domain_review::IssueStatus::Todo,
-            wire::IssueStatus::InProgress => domain_review::IssueStatus::InProgress,
-            wire::IssueStatus::Fixed => domain_review::IssueStatus::Fixed,
-            wire::IssueStatus::Skipped => domain_review::IssueStatus::Skipped,
-            wire::IssueStatus::Rejected => domain_review::IssueStatus::Rejected,
+            wire::IssueStatus::Discussion => domain::IssueStatus::Discussion,
+            wire::IssueStatus::Todo => domain::IssueStatus::Todo,
+            wire::IssueStatus::InProgress => domain::IssueStatus::InProgress,
+            wire::IssueStatus::Fixed => domain::IssueStatus::Fixed,
+            wire::IssueStatus::Skipped => domain::IssueStatus::Skipped,
+            wire::IssueStatus::Rejected => domain::IssueStatus::Rejected,
         }
     }
 }
-impl Project for domain_review::ReviewSeverity {
+impl Project for domain::ReviewSeverity {
     type Target = wire::ReviewSeverity;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::ReviewSeverity::Critical => wire::ReviewSeverity::Critical,
-            domain_review::ReviewSeverity::Warning => wire::ReviewSeverity::Warning,
-            domain_review::ReviewSeverity::Suggestion => wire::ReviewSeverity::Suggestion,
-            domain_review::ReviewSeverity::Info => wire::ReviewSeverity::Info,
+            domain::ReviewSeverity::Critical => wire::ReviewSeverity::Critical,
+            domain::ReviewSeverity::Warning => wire::ReviewSeverity::Warning,
+            domain::ReviewSeverity::Suggestion => wire::ReviewSeverity::Suggestion,
+            domain::ReviewSeverity::Info => wire::ReviewSeverity::Info,
         }
     }
 }
 impl Project for wire::ReviewSeverity {
-    type Target = domain_review::ReviewSeverity;
+    type Target = domain::ReviewSeverity;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::ReviewSeverity::Critical => domain_review::ReviewSeverity::Critical,
-            wire::ReviewSeverity::Warning => domain_review::ReviewSeverity::Warning,
-            wire::ReviewSeverity::Suggestion => domain_review::ReviewSeverity::Suggestion,
-            wire::ReviewSeverity::Info => domain_review::ReviewSeverity::Info,
+            wire::ReviewSeverity::Critical => domain::ReviewSeverity::Critical,
+            wire::ReviewSeverity::Warning => domain::ReviewSeverity::Warning,
+            wire::ReviewSeverity::Suggestion => domain::ReviewSeverity::Suggestion,
+            wire::ReviewSeverity::Info => domain::ReviewSeverity::Info,
         }
     }
 }
-impl Project for domain_review::ReviewGroupKind {
+impl Project for domain::ReviewGroupKind {
     type Target = wire::ReviewGroupKind;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::ReviewGroupKind::Simple => wire::ReviewGroupKind::Simple,
-            domain_review::ReviewGroupKind::Architectural => wire::ReviewGroupKind::Architectural,
+            domain::ReviewGroupKind::Simple => wire::ReviewGroupKind::Simple,
+            domain::ReviewGroupKind::Architectural => wire::ReviewGroupKind::Architectural,
         }
     }
 }
 impl Project for wire::ReviewGroupKind {
-    type Target = domain_review::ReviewGroupKind;
+    type Target = domain::ReviewGroupKind;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::ReviewGroupKind::Simple => domain_review::ReviewGroupKind::Simple,
-            wire::ReviewGroupKind::Architectural => domain_review::ReviewGroupKind::Architectural,
+            wire::ReviewGroupKind::Simple => domain::ReviewGroupKind::Simple,
+            wire::ReviewGroupKind::Architectural => domain::ReviewGroupKind::Architectural,
         }
     }
 }
-impl Project for domain_review::PostAnalysisMode {
+impl Project for domain::PostAnalysisMode {
     type Target = wire::PostAnalysisMode;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::PostAnalysisMode::Automatic => wire::PostAnalysisMode::Automatic,
-            domain_review::PostAnalysisMode::Manual => wire::PostAnalysisMode::Manual,
-            domain_review::PostAnalysisMode::None => wire::PostAnalysisMode::None,
+            domain::PostAnalysisMode::Automatic => wire::PostAnalysisMode::Automatic,
+            domain::PostAnalysisMode::Manual => wire::PostAnalysisMode::Manual,
+            domain::PostAnalysisMode::None => wire::PostAnalysisMode::None,
         }
     }
 }
 impl Project for wire::PostAnalysisMode {
-    type Target = domain_review::PostAnalysisMode;
+    type Target = domain::PostAnalysisMode;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::PostAnalysisMode::Automatic => domain_review::PostAnalysisMode::Automatic,
-            wire::PostAnalysisMode::Manual => domain_review::PostAnalysisMode::Manual,
-            wire::PostAnalysisMode::None => domain_review::PostAnalysisMode::None,
+            wire::PostAnalysisMode::Automatic => domain::PostAnalysisMode::Automatic,
+            wire::PostAnalysisMode::Manual => domain::PostAnalysisMode::Manual,
+            wire::PostAnalysisMode::None => domain::PostAnalysisMode::None,
         }
     }
 }
-impl Project for domain_plan::Plan {
+impl Project for domain::Plan {
     type Target = wire::Plan;
     fn project(self) -> Self::Target {
         let value = self;
@@ -474,10 +475,10 @@ impl Project for domain_plan::Plan {
     }
 }
 impl Project for wire::Plan {
-    type Target = domain_plan::Plan;
+    type Target = domain::Plan;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::Plan {
+        domain::Plan {
             id: value.id,
             title: value.title,
             description: value.description,
@@ -488,7 +489,7 @@ impl Project for wire::Plan {
         }
     }
 }
-impl Project for domain_plan::PlanSummary {
+impl Project for domain::PlanSummary {
     type Target = wire::PlanSummary;
     fn project(self) -> Self::Target {
         let value = self;
@@ -505,10 +506,10 @@ impl Project for domain_plan::PlanSummary {
     }
 }
 impl Project for wire::PlanSummary {
-    type Target = domain_plan::PlanSummary;
+    type Target = domain::PlanSummary;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::PlanSummary {
+        domain::PlanSummary {
             id: value.id,
             title: value.title,
             description: value.description,
@@ -520,7 +521,7 @@ impl Project for wire::PlanSummary {
         }
     }
 }
-impl Project for domain_plan::PlanItem {
+impl Project for domain::PlanItem {
     type Target = wire::PlanItem;
     fn project(self) -> Self::Target {
         let value = self;
@@ -541,10 +542,10 @@ impl Project for domain_plan::PlanItem {
     }
 }
 impl Project for wire::PlanItem {
-    type Target = domain_plan::PlanItem;
+    type Target = domain::PlanItem;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::PlanItem {
+        domain::PlanItem {
             id: value.id,
             title: value.title,
             details: value.details,
@@ -560,7 +561,7 @@ impl Project for wire::PlanItem {
         }
     }
 }
-impl Project for domain_plan::ConceptItem {
+impl Project for domain::ConceptItem {
     type Target = wire::ConceptItem;
     fn project(self) -> Self::Target {
         let value = self;
@@ -573,10 +574,10 @@ impl Project for domain_plan::ConceptItem {
     }
 }
 impl Project for wire::ConceptItem {
-    type Target = domain_plan::ConceptItem;
+    type Target = domain::ConceptItem;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::ConceptItem {
+        domain::ConceptItem {
             id: value.id,
             title: value.title,
             details: value.details,
@@ -584,7 +585,7 @@ impl Project for wire::ConceptItem {
         }
     }
 }
-impl Project for domain_plan::PlanImplementation {
+impl Project for domain::PlanImplementation {
     type Target = wire::PlanImplementation;
     fn project(self) -> Self::Target {
         let value = self;
@@ -596,17 +597,17 @@ impl Project for domain_plan::PlanImplementation {
     }
 }
 impl Project for wire::PlanImplementation {
-    type Target = domain_plan::PlanImplementation;
+    type Target = domain::PlanImplementation;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::PlanImplementation {
+        domain::PlanImplementation {
             items: value.items.into_iter().map(Project::project).collect(),
             architect: value.architect.map(Project::project),
             last_replanned_step: value.last_replanned_step,
         }
     }
 }
-impl Project for domain_plan::PlanRejection {
+impl Project for domain::PlanRejection {
     type Target = wire::PlanRejection;
     fn project(self) -> Self::Target {
         let value = self;
@@ -617,16 +618,16 @@ impl Project for domain_plan::PlanRejection {
     }
 }
 impl Project for wire::PlanRejection {
-    type Target = domain_plan::PlanRejection;
+    type Target = domain::PlanRejection;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_plan::PlanRejection {
+        domain::PlanRejection {
             kind: value.kind.project(),
             message: value.message,
         }
     }
 }
-impl Project for domain_review::ReviewIssue {
+impl Project for domain::ReviewIssue {
     type Target = wire::ReviewIssue;
     fn project(self) -> Self::Target {
         let value = self;
@@ -648,10 +649,10 @@ impl Project for domain_review::ReviewIssue {
     }
 }
 impl Project for wire::ReviewIssue {
-    type Target = domain_review::ReviewIssue;
+    type Target = domain::ReviewIssue;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewIssue {
+        domain::ReviewIssue {
             id: value.id,
             title: value.title,
             uuid: value.uuid,
@@ -668,7 +669,7 @@ impl Project for wire::ReviewIssue {
         }
     }
 }
-impl Project for domain_review::ReviewItem {
+impl Project for domain::ReviewItem {
     type Target = wire::ReviewItem;
     fn project(self) -> Self::Target {
         let value = self;
@@ -691,10 +692,10 @@ impl Project for domain_review::ReviewItem {
     }
 }
 impl Project for wire::ReviewItem {
-    type Target = domain_review::ReviewItem;
+    type Target = domain::ReviewItem;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewItem {
+        domain::ReviewItem {
             id: value.id,
             title: value.title,
             uuid: value.uuid,
@@ -712,7 +713,7 @@ impl Project for wire::ReviewItem {
         }
     }
 }
-impl Project for domain_review::ReviewGroup {
+impl Project for domain::ReviewGroup {
     type Target = wire::ReviewGroup;
     fn project(self) -> Self::Target {
         let value = self;
@@ -730,10 +731,10 @@ impl Project for domain_review::ReviewGroup {
     }
 }
 impl Project for wire::ReviewGroup {
-    type Target = domain_review::ReviewGroup;
+    type Target = domain::ReviewGroup;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewGroup {
+        domain::ReviewGroup {
             id: value.id,
             title: value.title,
             paths: value.paths,
@@ -746,7 +747,7 @@ impl Project for wire::ReviewGroup {
         }
     }
 }
-impl Project for domain_review::ArchitecturalIssueGroup {
+impl Project for domain::ArchitecturalIssueGroup {
     type Target = wire::ArchitecturalIssueGroup;
     fn project(self) -> Self::Target {
         let value = self;
@@ -760,10 +761,10 @@ impl Project for domain_review::ArchitecturalIssueGroup {
     }
 }
 impl Project for wire::ArchitecturalIssueGroup {
-    type Target = domain_review::ArchitecturalIssueGroup;
+    type Target = domain::ArchitecturalIssueGroup;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ArchitecturalIssueGroup {
+        domain::ArchitecturalIssueGroup {
             id: value.id,
             title: value.title,
             description: value.description,
@@ -772,7 +773,7 @@ impl Project for wire::ArchitecturalIssueGroup {
         }
     }
 }
-impl Project for domain_review::ReviewPostAnalysis {
+impl Project for domain::ReviewPostAnalysis {
     type Target = wire::ReviewPostAnalysis;
     fn project(self) -> Self::Target {
         let value = self;
@@ -789,10 +790,10 @@ impl Project for domain_review::ReviewPostAnalysis {
     }
 }
 impl Project for wire::ReviewPostAnalysis {
-    type Target = domain_review::ReviewPostAnalysis;
+    type Target = domain::ReviewPostAnalysis;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewPostAnalysis {
+        domain::ReviewPostAnalysis {
             created_at: value.created_at,
             summary: value.summary,
             independent_issues: value.independent_issues,
@@ -804,7 +805,7 @@ impl Project for wire::ReviewPostAnalysis {
         }
     }
 }
-impl Project for domain_review::ReviewLaunchConfig {
+impl Project for domain::ReviewLaunchConfig {
     type Target = wire::ReviewLaunchConfig;
     fn project(self) -> Self::Target {
         let value = self;
@@ -816,17 +817,17 @@ impl Project for domain_review::ReviewLaunchConfig {
     }
 }
 impl Project for wire::ReviewLaunchConfig {
-    type Target = domain_review::ReviewLaunchConfig;
+    type Target = domain::ReviewLaunchConfig;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewLaunchConfig {
+        domain::ReviewLaunchConfig {
             preset: value.preset,
             mode: value.mode.project(),
             groups: value.groups.into_iter().map(Project::project).collect(),
         }
     }
 }
-impl Project for domain_review::ReviewSession {
+impl Project for domain::ReviewSession {
     type Target = wire::ReviewSession;
     fn project(self) -> Self::Target {
         let value = self;
@@ -847,10 +848,10 @@ impl Project for domain_review::ReviewSession {
     }
 }
 impl Project for wire::ReviewSession {
-    type Target = domain_review::ReviewSession;
+    type Target = domain::ReviewSession;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewSession {
+        domain::ReviewSession {
             id: value.id,
             title: value.title,
             created_at: value.created_at,
@@ -866,7 +867,7 @@ impl Project for wire::ReviewSession {
         }
     }
 }
-impl Project for domain_review::ReviewSessionTarget {
+impl Project for domain::ReviewSessionTarget {
     type Target = wire::ReviewSessionTarget;
     fn project(self) -> Self::Target {
         let value = self;
@@ -876,15 +877,15 @@ impl Project for domain_review::ReviewSessionTarget {
     }
 }
 impl Project for wire::ReviewSessionTarget {
-    type Target = domain_review::ReviewSessionTarget;
+    type Target = domain::ReviewSessionTarget;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewSessionTarget {
+        domain::ReviewSessionTarget {
             review_id: value.review_id,
         }
     }
 }
-impl Project for domain_review::ReviewFindingTarget {
+impl Project for domain::ReviewFindingTarget {
     type Target = wire::ReviewFindingTarget;
     fn project(self) -> Self::Target {
         let value = self;
@@ -895,16 +896,16 @@ impl Project for domain_review::ReviewFindingTarget {
     }
 }
 impl Project for wire::ReviewFindingTarget {
-    type Target = domain_review::ReviewFindingTarget;
+    type Target = domain::ReviewFindingTarget;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewFindingTarget {
+        domain::ReviewFindingTarget {
             review_id: value.review_id,
             item_id: value.item_id,
         }
     }
 }
-impl Project for domain_review::ReviewFindingsTarget {
+impl Project for domain::ReviewFindingsTarget {
     type Target = wire::ReviewFindingsTarget;
     fn project(self) -> Self::Target {
         let value = self;
@@ -915,16 +916,16 @@ impl Project for domain_review::ReviewFindingsTarget {
     }
 }
 impl Project for wire::ReviewFindingsTarget {
-    type Target = domain_review::ReviewFindingsTarget;
+    type Target = domain::ReviewFindingsTarget;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewFindingsTarget {
+        domain::ReviewFindingsTarget {
             review_id: value.review_id,
             item_ids: value.item_ids,
         }
     }
 }
-impl Project for domain_review::ReviewGroupTarget {
+impl Project for domain::ReviewGroupTarget {
     type Target = wire::ReviewGroupTarget;
     fn project(self) -> Self::Target {
         let value = self;
@@ -935,178 +936,162 @@ impl Project for domain_review::ReviewGroupTarget {
     }
 }
 impl Project for wire::ReviewGroupTarget {
-    type Target = domain_review::ReviewGroupTarget;
+    type Target = domain::ReviewGroupTarget;
     fn project(self) -> Self::Target {
         let value = self;
-        domain_review::ReviewGroupTarget {
+        domain::ReviewGroupTarget {
             review_id: value.review_id,
             group_id: value.group_id,
         }
     }
 }
-impl Project for domain_review::ReviewExecuteTarget {
+impl Project for domain::ReviewExecuteTarget {
     type Target = wire::ReviewExecuteTarget;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_review::ReviewExecuteTarget::AllSessions => {
-                wire::ReviewExecuteTarget::AllSessions
-            }
-            domain_review::ReviewExecuteTarget::Session(target) => {
+            domain::ReviewExecuteTarget::AllSessions => wire::ReviewExecuteTarget::AllSessions,
+            domain::ReviewExecuteTarget::Session(target) => {
                 wire::ReviewExecuteTarget::Session(target.project())
             }
-            domain_review::ReviewExecuteTarget::Finding(target) => {
+            domain::ReviewExecuteTarget::Finding(target) => {
                 wire::ReviewExecuteTarget::Finding(target.project())
             }
-            domain_review::ReviewExecuteTarget::Findings(target) => {
+            domain::ReviewExecuteTarget::Findings(target) => {
                 wire::ReviewExecuteTarget::Findings(target.project())
             }
-            domain_review::ReviewExecuteTarget::Group(target) => {
+            domain::ReviewExecuteTarget::Group(target) => {
                 wire::ReviewExecuteTarget::Group(target.project())
             }
         }
     }
 }
 impl Project for wire::ReviewExecuteTarget {
-    type Target = domain_review::ReviewExecuteTarget;
+    type Target = domain::ReviewExecuteTarget;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            wire::ReviewExecuteTarget::AllSessions => {
-                domain_review::ReviewExecuteTarget::AllSessions
-            }
+            wire::ReviewExecuteTarget::AllSessions => domain::ReviewExecuteTarget::AllSessions,
             wire::ReviewExecuteTarget::Session(target) => {
-                domain_review::ReviewExecuteTarget::Session(target.project())
+                domain::ReviewExecuteTarget::Session(target.project())
             }
             wire::ReviewExecuteTarget::Finding(target) => {
-                domain_review::ReviewExecuteTarget::Finding(target.project())
+                domain::ReviewExecuteTarget::Finding(target.project())
             }
             wire::ReviewExecuteTarget::Findings(target) => {
-                domain_review::ReviewExecuteTarget::Findings(target.project())
+                domain::ReviewExecuteTarget::Findings(target.project())
             }
             wire::ReviewExecuteTarget::Group(target) => {
-                domain_review::ReviewExecuteTarget::Group(target.project())
+                domain::ReviewExecuteTarget::Group(target.project())
             }
         }
     }
 }
-impl Project for domain_plan::PlanSynthesisResult {
+impl Project for domain::PlanSynthesisResult {
     type Target = wire::PlanRefineResult;
     fn project(self) -> Self::Target {
         let value = self;
         match value {
-            domain_plan::PlanSynthesisResult::Success { plan, explanation } => {
+            domain::PlanSynthesisResult::Success { plan, explanation } => {
                 wire::PlanRefineResult::Success {
-                    plan: plan.project(),
+                    plan: Box::new(plan.project()),
                     explanation,
                 }
             }
-            domain_plan::PlanSynthesisResult::Blocked { reason } => {
+            domain::PlanSynthesisResult::Blocked { reason } => {
                 wire::PlanRefineResult::Blocked { reason }
             }
         }
     }
 }
 
-impl Project for tauqe_core::workflow::WorkflowKind {
+impl Project for domain::WorkflowKind {
     type Target = wire::WorkflowKind;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::workflow::WorkflowKind::Git => wire::WorkflowKind::Git,
-            tauqe_core::workflow::WorkflowKind::Naive => wire::WorkflowKind::Naive,
+            domain::WorkflowKind::Git => wire::WorkflowKind::Git,
+            domain::WorkflowKind::Naive => wire::WorkflowKind::Naive,
         }
     }
 }
 
 impl Project for wire::WorkflowKind {
-    type Target = tauqe_core::workflow::WorkflowKind;
+    type Target = domain::WorkflowKind;
     fn project(self) -> Self::Target {
         match self {
-            wire::WorkflowKind::Git => tauqe_core::workflow::WorkflowKind::Git,
-            wire::WorkflowKind::Naive => tauqe_core::workflow::WorkflowKind::Naive,
+            wire::WorkflowKind::Git => domain::WorkflowKind::Git,
+            wire::WorkflowKind::Naive => domain::WorkflowKind::Naive,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::EditProtocolKind {
+impl Project for domain::EditProtocolKind {
     type Target = wire::EditProtocolKind;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::workflow::EditProtocolKind::Structured => {
-                wire::EditProtocolKind::Structured
-            }
+            domain::EditProtocolKind::Structured => wire::EditProtocolKind::Structured,
         }
     }
 }
 
 impl Project for wire::EditProtocolKind {
-    type Target = tauqe_core::workflow::EditProtocolKind;
+    type Target = domain::EditProtocolKind;
     fn project(self) -> Self::Target {
         match self {
-            wire::EditProtocolKind::Structured => {
-                tauqe_core::workflow::EditProtocolKind::Structured
-            }
+            wire::EditProtocolKind::Structured => domain::EditProtocolKind::Structured,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::turn::TurnPhase {
+impl Project for domain::TurnPhase {
     type Target = wire::TurnPhase;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::workflow::turn::TurnPhase::Research => wire::TurnPhase::Research,
-            tauqe_core::workflow::turn::TurnPhase::Proposal => wire::TurnPhase::Proposal,
-            tauqe_core::workflow::turn::TurnPhase::Staging => wire::TurnPhase::Staging,
-            tauqe_core::workflow::turn::TurnPhase::Verification => wire::TurnPhase::Verification,
-            tauqe_core::workflow::turn::TurnPhase::Healing => wire::TurnPhase::Healing,
+            domain::TurnPhase::Research => wire::TurnPhase::Research,
+            domain::TurnPhase::Proposal => wire::TurnPhase::Proposal,
+            domain::TurnPhase::Staging => wire::TurnPhase::Staging,
+            domain::TurnPhase::Verification => wire::TurnPhase::Verification,
+            domain::TurnPhase::Healing => wire::TurnPhase::Healing,
         }
     }
 }
 
 impl Project for wire::TurnPhase {
-    type Target = tauqe_core::workflow::turn::TurnPhase;
+    type Target = domain::TurnPhase;
     fn project(self) -> Self::Target {
         match self {
-            wire::TurnPhase::Research => tauqe_core::workflow::turn::TurnPhase::Research,
-            wire::TurnPhase::Proposal => tauqe_core::workflow::turn::TurnPhase::Proposal,
-            wire::TurnPhase::Staging => tauqe_core::workflow::turn::TurnPhase::Staging,
-            wire::TurnPhase::Verification => tauqe_core::workflow::turn::TurnPhase::Verification,
-            wire::TurnPhase::Healing => tauqe_core::workflow::turn::TurnPhase::Healing,
+            wire::TurnPhase::Research => domain::TurnPhase::Research,
+            wire::TurnPhase::Proposal => domain::TurnPhase::Proposal,
+            wire::TurnPhase::Staging => domain::TurnPhase::Staging,
+            wire::TurnPhase::Verification => domain::TurnPhase::Verification,
+            wire::TurnPhase::Healing => domain::TurnPhase::Healing,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::turn::ReviewWorkPhase {
+impl Project for domain::ReviewWorkPhase {
     type Target = wire::ReviewWorkPhase;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::workflow::turn::ReviewWorkPhase::Audit => wire::ReviewWorkPhase::Audit,
-            tauqe_core::workflow::turn::ReviewWorkPhase::Decomposition => {
-                wire::ReviewWorkPhase::Decomposition
-            }
-            tauqe_core::workflow::turn::ReviewWorkPhase::PostAnalysis => {
-                wire::ReviewWorkPhase::PostAnalysis
-            }
+            domain::ReviewWorkPhase::Audit => wire::ReviewWorkPhase::Audit,
+            domain::ReviewWorkPhase::Decomposition => wire::ReviewWorkPhase::Decomposition,
+            domain::ReviewWorkPhase::PostAnalysis => wire::ReviewWorkPhase::PostAnalysis,
         }
     }
 }
 
 impl Project for wire::ReviewWorkPhase {
-    type Target = tauqe_core::workflow::turn::ReviewWorkPhase;
+    type Target = domain::ReviewWorkPhase;
     fn project(self) -> Self::Target {
         match self {
-            wire::ReviewWorkPhase::Audit => tauqe_core::workflow::turn::ReviewWorkPhase::Audit,
-            wire::ReviewWorkPhase::Decomposition => {
-                tauqe_core::workflow::turn::ReviewWorkPhase::Decomposition
-            }
-            wire::ReviewWorkPhase::PostAnalysis => {
-                tauqe_core::workflow::turn::ReviewWorkPhase::PostAnalysis
-            }
+            wire::ReviewWorkPhase::Audit => domain::ReviewWorkPhase::Audit,
+            wire::ReviewWorkPhase::Decomposition => domain::ReviewWorkPhase::Decomposition,
+            wire::ReviewWorkPhase::PostAnalysis => domain::ReviewWorkPhase::PostAnalysis,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::turn::ModelTurnPlanContext {
+impl Project for domain::ModelTurnPlanContext {
     type Target = wire::ModelTurnPlanContext;
     fn project(self) -> Self::Target {
         wire::ModelTurnPlanContext {
@@ -1118,9 +1103,9 @@ impl Project for tauqe_core::workflow::turn::ModelTurnPlanContext {
 }
 
 impl Project for wire::ModelTurnPlanContext {
-    type Target = tauqe_core::workflow::turn::ModelTurnPlanContext;
+    type Target = domain::ModelTurnPlanContext;
     fn project(self) -> Self::Target {
-        tauqe_core::workflow::turn::ModelTurnPlanContext {
+        domain::ModelTurnPlanContext {
             plan_id: self.plan_id,
             step_id: self.step_id,
             batch_step_ids: self.batch_step_ids,
@@ -1128,7 +1113,7 @@ impl Project for wire::ModelTurnPlanContext {
     }
 }
 
-impl Project for tauqe_core::workflow::turn::TurnWorkItem {
+impl Project for domain::TurnWorkItem {
     type Target = wire::TurnWorkItem;
     fn project(self) -> Self::Target {
         wire::TurnWorkItem {
@@ -1139,16 +1124,16 @@ impl Project for tauqe_core::workflow::turn::TurnWorkItem {
 }
 
 impl Project for wire::TurnWorkItem {
-    type Target = tauqe_core::workflow::turn::TurnWorkItem;
+    type Target = domain::TurnWorkItem;
     fn project(self) -> Self::Target {
-        tauqe_core::workflow::turn::TurnWorkItem {
+        domain::TurnWorkItem {
             id: self.id,
             title: self.title,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::turn::TurnWorkQueue {
+impl Project for domain::TurnWorkQueue {
     type Target = wire::TurnWorkQueue;
     fn project(self) -> Self::Target {
         wire::TurnWorkQueue {
@@ -1159,23 +1144,21 @@ impl Project for tauqe_core::workflow::turn::TurnWorkQueue {
 }
 
 impl Project for wire::TurnWorkQueue {
-    type Target = tauqe_core::workflow::turn::TurnWorkQueue;
+    type Target = domain::TurnWorkQueue;
     fn project(self) -> Self::Target {
-        tauqe_core::workflow::turn::TurnWorkQueue {
+        domain::TurnWorkQueue {
             items: self.items.into_iter().map(Project::project).collect(),
             active_index: self.active_index,
         }
     }
 }
 
-impl Project for tauqe_core::workflow::turn::TurnWorkContext {
+impl Project for domain::TurnWorkContext {
     type Target = wire::TurnWorkContext;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::workflow::turn::TurnWorkContext::Interactive => {
-                wire::TurnWorkContext::Interactive
-            }
-            tauqe_core::workflow::turn::TurnWorkContext::PlanStep {
+            domain::TurnWorkContext::Interactive => wire::TurnWorkContext::Interactive,
+            domain::TurnWorkContext::PlanStep {
                 plan_id,
                 plan_title,
                 queue,
@@ -1184,7 +1167,7 @@ impl Project for tauqe_core::workflow::turn::TurnWorkContext {
                 plan_title,
                 queue: queue.project(),
             },
-            tauqe_core::workflow::turn::TurnWorkContext::ReviewGroupStep {
+            domain::TurnWorkContext::ReviewGroupStep {
                 review_id,
                 review_title,
                 group_id,
@@ -1197,7 +1180,7 @@ impl Project for tauqe_core::workflow::turn::TurnWorkContext {
                 group_title,
                 queue: queue.project(),
             },
-            tauqe_core::workflow::turn::TurnWorkContext::ReviewStep {
+            domain::TurnWorkContext::ReviewStep {
                 review_id,
                 review_title,
                 queue,
@@ -1206,7 +1189,7 @@ impl Project for tauqe_core::workflow::turn::TurnWorkContext {
                 review_title,
                 queue: queue.project(),
             },
-            tauqe_core::workflow::turn::TurnWorkContext::ReviewPhase {
+            domain::TurnWorkContext::ReviewPhase {
                 review_id,
                 review_title,
                 phase,
@@ -1222,17 +1205,15 @@ impl Project for tauqe_core::workflow::turn::TurnWorkContext {
 }
 
 impl Project for wire::TurnWorkContext {
-    type Target = tauqe_core::workflow::turn::TurnWorkContext;
+    type Target = domain::TurnWorkContext;
     fn project(self) -> Self::Target {
         match self {
-            wire::TurnWorkContext::Interactive => {
-                tauqe_core::workflow::turn::TurnWorkContext::Interactive
-            }
+            wire::TurnWorkContext::Interactive => domain::TurnWorkContext::Interactive,
             wire::TurnWorkContext::PlanStep {
                 plan_id,
                 plan_title,
                 queue,
-            } => tauqe_core::workflow::turn::TurnWorkContext::PlanStep {
+            } => domain::TurnWorkContext::PlanStep {
                 plan_id,
                 plan_title,
                 queue: queue.project(),
@@ -1243,7 +1224,7 @@ impl Project for wire::TurnWorkContext {
                 group_id,
                 group_title,
                 queue,
-            } => tauqe_core::workflow::turn::TurnWorkContext::ReviewGroupStep {
+            } => domain::TurnWorkContext::ReviewGroupStep {
                 review_id,
                 review_title,
                 group_id,
@@ -1254,7 +1235,7 @@ impl Project for wire::TurnWorkContext {
                 review_id,
                 review_title,
                 queue,
-            } => tauqe_core::workflow::turn::TurnWorkContext::ReviewStep {
+            } => domain::TurnWorkContext::ReviewStep {
                 review_id,
                 review_title,
                 queue: queue.project(),
@@ -1264,7 +1245,7 @@ impl Project for wire::TurnWorkContext {
                 review_title,
                 phase,
                 queue,
-            } => tauqe_core::workflow::turn::TurnWorkContext::ReviewPhase {
+            } => domain::TurnWorkContext::ReviewPhase {
                 review_id,
                 review_title,
                 phase: phase.project(),
@@ -1274,141 +1255,133 @@ impl Project for wire::TurnWorkContext {
     }
 }
 
-impl Project for tauqe_core::edits::EditFileOp {
+impl Project for domain::EditFileOp {
     type Target = wire::EditFileOp;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::edits::EditFileOp::Replace => wire::EditFileOp::Replace,
-            tauqe_core::edits::EditFileOp::Create => wire::EditFileOp::Create,
-            tauqe_core::edits::EditFileOp::Delete => wire::EditFileOp::Delete,
-            tauqe_core::edits::EditFileOp::Move => wire::EditFileOp::Move,
-            tauqe_core::edits::EditFileOp::MoveDir => wire::EditFileOp::MoveDir,
-            tauqe_core::edits::EditFileOp::Overwrite => wire::EditFileOp::Overwrite,
+            domain::EditFileOp::Replace => wire::EditFileOp::Replace,
+            domain::EditFileOp::Create => wire::EditFileOp::Create,
+            domain::EditFileOp::Delete => wire::EditFileOp::Delete,
+            domain::EditFileOp::Move => wire::EditFileOp::Move,
+            domain::EditFileOp::MoveDir => wire::EditFileOp::MoveDir,
+            domain::EditFileOp::Overwrite => wire::EditFileOp::Overwrite,
         }
     }
 }
 
 impl Project for wire::EditFileOp {
-    type Target = tauqe_core::edits::EditFileOp;
+    type Target = domain::EditFileOp;
     fn project(self) -> Self::Target {
         match self {
-            wire::EditFileOp::Replace => tauqe_core::edits::EditFileOp::Replace,
-            wire::EditFileOp::Create => tauqe_core::edits::EditFileOp::Create,
-            wire::EditFileOp::Delete => tauqe_core::edits::EditFileOp::Delete,
-            wire::EditFileOp::Move => tauqe_core::edits::EditFileOp::Move,
-            wire::EditFileOp::MoveDir => tauqe_core::edits::EditFileOp::MoveDir,
-            wire::EditFileOp::Overwrite => tauqe_core::edits::EditFileOp::Overwrite,
+            wire::EditFileOp::Replace => domain::EditFileOp::Replace,
+            wire::EditFileOp::Create => domain::EditFileOp::Create,
+            wire::EditFileOp::Delete => domain::EditFileOp::Delete,
+            wire::EditFileOp::Move => domain::EditFileOp::Move,
+            wire::EditFileOp::MoveDir => domain::EditFileOp::MoveDir,
+            wire::EditFileOp::Overwrite => domain::EditFileOp::Overwrite,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditFileStatus {
+impl Project for domain::EditFileStatus {
     type Target = wire::EditFileStatus;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::edits::EditFileStatus::Ok => wire::EditFileStatus::Ok,
-            tauqe_core::edits::EditFileStatus::Error => wire::EditFileStatus::Error,
+            domain::EditFileStatus::Ok => wire::EditFileStatus::Ok,
+            domain::EditFileStatus::Error => wire::EditFileStatus::Error,
         }
     }
 }
 
 impl Project for wire::EditFileStatus {
-    type Target = tauqe_core::edits::EditFileStatus;
+    type Target = domain::EditFileStatus;
     fn project(self) -> Self::Target {
         match self {
-            wire::EditFileStatus::Ok => tauqe_core::edits::EditFileStatus::Ok,
-            wire::EditFileStatus::Error => tauqe_core::edits::EditFileStatus::Error,
+            wire::EditFileStatus::Ok => domain::EditFileStatus::Ok,
+            wire::EditFileStatus::Error => domain::EditFileStatus::Error,
         }
     }
 }
 
-impl Project for tauqe_core::edits::VerificationVerdict {
+impl Project for domain::VerificationVerdict {
     type Target = wire::VerificationVerdict;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::edits::VerificationVerdict::Passed => wire::VerificationVerdict::Passed,
-            tauqe_core::edits::VerificationVerdict::Failed => wire::VerificationVerdict::Failed,
-            tauqe_core::edits::VerificationVerdict::NotConfigured => {
-                wire::VerificationVerdict::NotConfigured
-            }
-            tauqe_core::edits::VerificationVerdict::Cancelled => {
-                wire::VerificationVerdict::Cancelled
-            }
+            domain::VerificationVerdict::Passed => wire::VerificationVerdict::Passed,
+            domain::VerificationVerdict::Failed => wire::VerificationVerdict::Failed,
+            domain::VerificationVerdict::NotConfigured => wire::VerificationVerdict::NotConfigured,
+            domain::VerificationVerdict::Cancelled => wire::VerificationVerdict::Cancelled,
         }
     }
 }
 
 impl Project for wire::VerificationVerdict {
-    type Target = tauqe_core::edits::VerificationVerdict;
+    type Target = domain::VerificationVerdict;
     fn project(self) -> Self::Target {
         match self {
-            wire::VerificationVerdict::Passed => tauqe_core::edits::VerificationVerdict::Passed,
-            wire::VerificationVerdict::Failed => tauqe_core::edits::VerificationVerdict::Failed,
-            wire::VerificationVerdict::NotConfigured => {
-                tauqe_core::edits::VerificationVerdict::NotConfigured
-            }
-            wire::VerificationVerdict::Cancelled => {
-                tauqe_core::edits::VerificationVerdict::Cancelled
-            }
+            wire::VerificationVerdict::Passed => domain::VerificationVerdict::Passed,
+            wire::VerificationVerdict::Failed => domain::VerificationVerdict::Failed,
+            wire::VerificationVerdict::NotConfigured => domain::VerificationVerdict::NotConfigured,
+            wire::VerificationVerdict::Cancelled => domain::VerificationVerdict::Cancelled,
         }
     }
 }
 
-impl Project for tauqe_core::context::ContextAccess {
+impl Project for domain::ContextAccess {
     type Target = wire::ContextAccess;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::context::ContextAccess::ReadOnly => wire::ContextAccess::ReadOnly,
-            tauqe_core::context::ContextAccess::Editable => wire::ContextAccess::Editable,
+            domain::ContextAccess::ReadOnly => wire::ContextAccess::ReadOnly,
+            domain::ContextAccess::Editable => wire::ContextAccess::Editable,
         }
     }
 }
 
 impl Project for wire::ContextAccess {
-    type Target = tauqe_core::context::ContextAccess;
+    type Target = domain::ContextAccess;
     fn project(self) -> Self::Target {
         match self {
-            wire::ContextAccess::ReadOnly => tauqe_core::context::ContextAccess::ReadOnly,
-            wire::ContextAccess::Editable => tauqe_core::context::ContextAccess::Editable,
+            wire::ContextAccess::ReadOnly => domain::ContextAccess::ReadOnly,
+            wire::ContextAccess::Editable => domain::ContextAccess::Editable,
         }
     }
 }
 
-impl Project for tauqe_core::llm::DocTopic {
+impl Project for domain::DocTopic {
     type Target = wire::DocTopic;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::llm::DocTopic::Overview => wire::DocTopic::Overview,
-            tauqe_core::llm::DocTopic::Context => wire::DocTopic::Context,
-            tauqe_core::llm::DocTopic::Workflow => wire::DocTopic::Workflow,
-            tauqe_core::llm::DocTopic::Git => wire::DocTopic::Git,
-            tauqe_core::llm::DocTopic::Interface => wire::DocTopic::Interface,
-            tauqe_core::llm::DocTopic::Review => wire::DocTopic::Review,
-            tauqe_core::llm::DocTopic::Plan => wire::DocTopic::Plan,
-            tauqe_core::llm::DocTopic::Config => wire::DocTopic::Config,
-            tauqe_core::llm::DocTopic::All => wire::DocTopic::All,
+            domain::DocTopic::Overview => wire::DocTopic::Overview,
+            domain::DocTopic::Context => wire::DocTopic::Context,
+            domain::DocTopic::Workflow => wire::DocTopic::Workflow,
+            domain::DocTopic::Git => wire::DocTopic::Git,
+            domain::DocTopic::Interface => wire::DocTopic::Interface,
+            domain::DocTopic::Review => wire::DocTopic::Review,
+            domain::DocTopic::Plan => wire::DocTopic::Plan,
+            domain::DocTopic::Config => wire::DocTopic::Config,
+            domain::DocTopic::All => wire::DocTopic::All,
         }
     }
 }
 
 impl Project for wire::DocTopic {
-    type Target = tauqe_core::llm::DocTopic;
+    type Target = domain::DocTopic;
     fn project(self) -> Self::Target {
         match self {
-            wire::DocTopic::Overview => tauqe_core::llm::DocTopic::Overview,
-            wire::DocTopic::Context => tauqe_core::llm::DocTopic::Context,
-            wire::DocTopic::Workflow => tauqe_core::llm::DocTopic::Workflow,
-            wire::DocTopic::Git => tauqe_core::llm::DocTopic::Git,
-            wire::DocTopic::Interface => tauqe_core::llm::DocTopic::Interface,
-            wire::DocTopic::Review => tauqe_core::llm::DocTopic::Review,
-            wire::DocTopic::Plan => tauqe_core::llm::DocTopic::Plan,
-            wire::DocTopic::Config => tauqe_core::llm::DocTopic::Config,
-            wire::DocTopic::All => tauqe_core::llm::DocTopic::All,
+            wire::DocTopic::Overview => domain::DocTopic::Overview,
+            wire::DocTopic::Context => domain::DocTopic::Context,
+            wire::DocTopic::Workflow => domain::DocTopic::Workflow,
+            wire::DocTopic::Git => domain::DocTopic::Git,
+            wire::DocTopic::Interface => domain::DocTopic::Interface,
+            wire::DocTopic::Review => domain::DocTopic::Review,
+            wire::DocTopic::Plan => domain::DocTopic::Plan,
+            wire::DocTopic::Config => domain::DocTopic::Config,
+            wire::DocTopic::All => domain::DocTopic::All,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditReplace {
+impl Project for domain::EditReplace {
     type Target = wire::EditReplace;
     fn project(self) -> Self::Target {
         wire::EditReplace {
@@ -1420,9 +1393,9 @@ impl Project for tauqe_core::edits::EditReplace {
 }
 
 impl Project for wire::EditReplace {
-    type Target = tauqe_core::edits::EditReplace;
+    type Target = domain::EditReplace;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditReplace {
+        domain::EditReplace {
             path: self.path,
             old_text: self.old_text,
             new_text: self.new_text,
@@ -1430,7 +1403,7 @@ impl Project for wire::EditReplace {
     }
 }
 
-impl Project for tauqe_core::edits::EditCreate {
+impl Project for domain::EditCreate {
     type Target = wire::EditCreate;
     fn project(self) -> Self::Target {
         wire::EditCreate {
@@ -1441,16 +1414,16 @@ impl Project for tauqe_core::edits::EditCreate {
 }
 
 impl Project for wire::EditCreate {
-    type Target = tauqe_core::edits::EditCreate;
+    type Target = domain::EditCreate;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditCreate {
+        domain::EditCreate {
             path: self.path,
             content: self.content,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditDelete {
+impl Project for domain::EditDelete {
     type Target = wire::EditDelete;
     fn project(self) -> Self::Target {
         wire::EditDelete { path: self.path }
@@ -1458,13 +1431,13 @@ impl Project for tauqe_core::edits::EditDelete {
 }
 
 impl Project for wire::EditDelete {
-    type Target = tauqe_core::edits::EditDelete;
+    type Target = domain::EditDelete;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditDelete { path: self.path }
+        domain::EditDelete { path: self.path }
     }
 }
 
-impl Project for tauqe_core::edits::EditMove {
+impl Project for domain::EditMove {
     type Target = wire::EditMove;
     fn project(self) -> Self::Target {
         wire::EditMove {
@@ -1475,16 +1448,16 @@ impl Project for tauqe_core::edits::EditMove {
 }
 
 impl Project for wire::EditMove {
-    type Target = tauqe_core::edits::EditMove;
+    type Target = domain::EditMove;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditMove {
+        domain::EditMove {
             from: self.from,
             to: self.to,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditMoveDir {
+impl Project for domain::EditMoveDir {
     type Target = wire::EditMoveDir;
     fn project(self) -> Self::Target {
         wire::EditMoveDir {
@@ -1495,16 +1468,16 @@ impl Project for tauqe_core::edits::EditMoveDir {
 }
 
 impl Project for wire::EditMoveDir {
-    type Target = tauqe_core::edits::EditMoveDir;
+    type Target = domain::EditMoveDir;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditMoveDir {
+        domain::EditMoveDir {
             from: self.from,
             to: self.to,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditOverwrite {
+impl Project for domain::EditOverwrite {
     type Target = wire::EditOverwrite;
     fn project(self) -> Self::Target {
         wire::EditOverwrite {
@@ -1515,16 +1488,16 @@ impl Project for tauqe_core::edits::EditOverwrite {
 }
 
 impl Project for wire::EditOverwrite {
-    type Target = tauqe_core::edits::EditOverwrite;
+    type Target = domain::EditOverwrite;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditOverwrite {
+        domain::EditOverwrite {
             path: self.path,
             content: self.content,
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditLineAnchor {
+impl Project for domain::EditLineAnchor {
     type Target = wire::EditLineAnchor;
     fn project(self) -> Self::Target {
         wire::EditLineAnchor {
@@ -1537,9 +1510,9 @@ impl Project for tauqe_core::edits::EditLineAnchor {
 }
 
 impl Project for wire::EditLineAnchor {
-    type Target = tauqe_core::edits::EditLineAnchor;
+    type Target = domain::EditLineAnchor;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditLineAnchor {
+        domain::EditLineAnchor {
             path: self.path,
             start: self.start,
             end: self.end,
@@ -1548,29 +1521,19 @@ impl Project for wire::EditLineAnchor {
     }
 }
 
-impl Project for tauqe_core::edits::EditOperation {
+impl Project for domain::EditOperation {
     type Target = wire::EditOperation;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::edits::EditOperation::Replace(value) => {
-                wire::EditOperation::Replace(value.project())
-            }
-            tauqe_core::edits::EditOperation::Create(value) => {
-                wire::EditOperation::Create(value.project())
-            }
-            tauqe_core::edits::EditOperation::Delete(value) => {
-                wire::EditOperation::Delete(value.project())
-            }
-            tauqe_core::edits::EditOperation::Move(value) => {
-                wire::EditOperation::Move(value.project())
-            }
-            tauqe_core::edits::EditOperation::MoveDir(value) => {
-                wire::EditOperation::MoveDir(value.project())
-            }
-            tauqe_core::edits::EditOperation::Overwrite(value) => {
+            domain::EditOperation::Replace(value) => wire::EditOperation::Replace(value.project()),
+            domain::EditOperation::Create(value) => wire::EditOperation::Create(value.project()),
+            domain::EditOperation::Delete(value) => wire::EditOperation::Delete(value.project()),
+            domain::EditOperation::Move(value) => wire::EditOperation::Move(value.project()),
+            domain::EditOperation::MoveDir(value) => wire::EditOperation::MoveDir(value.project()),
+            domain::EditOperation::Overwrite(value) => {
                 wire::EditOperation::Overwrite(value.project())
             }
-            tauqe_core::edits::EditOperation::LineAnchor(value) => {
+            domain::EditOperation::LineAnchor(value) => {
                 wire::EditOperation::LineAnchor(value.project())
             }
         }
@@ -1578,35 +1541,25 @@ impl Project for tauqe_core::edits::EditOperation {
 }
 
 impl Project for wire::EditOperation {
-    type Target = tauqe_core::edits::EditOperation;
+    type Target = domain::EditOperation;
     fn project(self) -> Self::Target {
         match self {
-            wire::EditOperation::Replace(value) => {
-                tauqe_core::edits::EditOperation::Replace(value.project())
-            }
-            wire::EditOperation::Create(value) => {
-                tauqe_core::edits::EditOperation::Create(value.project())
-            }
-            wire::EditOperation::Delete(value) => {
-                tauqe_core::edits::EditOperation::Delete(value.project())
-            }
-            wire::EditOperation::Move(value) => {
-                tauqe_core::edits::EditOperation::Move(value.project())
-            }
-            wire::EditOperation::MoveDir(value) => {
-                tauqe_core::edits::EditOperation::MoveDir(value.project())
-            }
+            wire::EditOperation::Replace(value) => domain::EditOperation::Replace(value.project()),
+            wire::EditOperation::Create(value) => domain::EditOperation::Create(value.project()),
+            wire::EditOperation::Delete(value) => domain::EditOperation::Delete(value.project()),
+            wire::EditOperation::Move(value) => domain::EditOperation::Move(value.project()),
+            wire::EditOperation::MoveDir(value) => domain::EditOperation::MoveDir(value.project()),
             wire::EditOperation::Overwrite(value) => {
-                tauqe_core::edits::EditOperation::Overwrite(value.project())
+                domain::EditOperation::Overwrite(value.project())
             }
             wire::EditOperation::LineAnchor(value) => {
-                tauqe_core::edits::EditOperation::LineAnchor(value.project())
+                domain::EditOperation::LineAnchor(value.project())
             }
         }
     }
 }
 
-impl Project for tauqe_core::edits::EditOutcome {
+impl Project for domain::EditOutcome {
     type Target = wire::EditOutcome;
     fn project(self) -> Self::Target {
         wire::EditOutcome {
@@ -1620,9 +1573,9 @@ impl Project for tauqe_core::edits::EditOutcome {
 }
 
 impl Project for wire::EditOutcome {
-    type Target = tauqe_core::edits::EditOutcome;
+    type Target = domain::EditOutcome;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::EditOutcome {
+        domain::EditOutcome {
             applied: self.applied,
             error: self.error,
             changed_files: self.changed_files,
@@ -1632,7 +1585,7 @@ impl Project for wire::EditOutcome {
     }
 }
 
-impl Project for tauqe_core::edits::StructuredChangeProposal {
+impl Project for domain::StructuredChangeProposal {
     type Target = wire::StructuredChangeProposal;
     fn project(self) -> Self::Target {
         wire::StructuredChangeProposal {
@@ -1649,9 +1602,9 @@ impl Project for tauqe_core::edits::StructuredChangeProposal {
 }
 
 impl Project for wire::StructuredChangeProposal {
-    type Target = tauqe_core::edits::StructuredChangeProposal;
+    type Target = domain::StructuredChangeProposal;
     fn project(self) -> Self::Target {
-        tauqe_core::edits::StructuredChangeProposal {
+        domain::StructuredChangeProposal {
             op: self.op,
             path: self.path,
             to: self.to,
@@ -1664,7 +1617,7 @@ impl Project for wire::StructuredChangeProposal {
     }
 }
 
-impl Project for tauqe_core::llm::StructuredOutcomeProposal {
+impl Project for domain::StructuredOutcomeProposal {
     type Target = wire::StructuredOutcomeProposal;
     fn project(self) -> Self::Target {
         wire::StructuredOutcomeProposal {
@@ -1677,9 +1630,9 @@ impl Project for tauqe_core::llm::StructuredOutcomeProposal {
 }
 
 impl Project for wire::StructuredOutcomeProposal {
-    type Target = tauqe_core::llm::StructuredOutcomeProposal;
+    type Target = domain::StructuredOutcomeProposal;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::StructuredOutcomeProposal {
+        domain::StructuredOutcomeProposal {
             status: self.status,
             commit_message: self.commit_message,
             message: self.message,
@@ -1688,7 +1641,7 @@ impl Project for wire::StructuredOutcomeProposal {
     }
 }
 
-impl Project for tauqe_core::llm::StructuredBlockedProposal {
+impl Project for domain::StructuredBlockedProposal {
     type Target = wire::StructuredBlockedProposal;
     fn project(self) -> Self::Target {
         wire::StructuredBlockedProposal {
@@ -1700,9 +1653,9 @@ impl Project for tauqe_core::llm::StructuredBlockedProposal {
 }
 
 impl Project for wire::StructuredBlockedProposal {
-    type Target = tauqe_core::llm::StructuredBlockedProposal;
+    type Target = domain::StructuredBlockedProposal;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::StructuredBlockedProposal {
+        domain::StructuredBlockedProposal {
             is_blocked: self.is_blocked,
             reason: self.reason,
             details: self.details,
@@ -1710,7 +1663,7 @@ impl Project for wire::StructuredBlockedProposal {
     }
 }
 
-impl Project for tauqe_core::llm::StructuredAbortProposal {
+impl Project for domain::StructuredAbortProposal {
     type Target = wire::StructuredAbortProposal;
     fn project(self) -> Self::Target {
         wire::StructuredAbortProposal {
@@ -1722,9 +1675,9 @@ impl Project for tauqe_core::llm::StructuredAbortProposal {
 }
 
 impl Project for wire::StructuredAbortProposal {
-    type Target = tauqe_core::llm::StructuredAbortProposal;
+    type Target = domain::StructuredAbortProposal;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::StructuredAbortProposal {
+        domain::StructuredAbortProposal {
             is_abort: self.is_abort,
             reason: self.reason,
             recommendation: self.recommendation,
@@ -1732,7 +1685,7 @@ impl Project for wire::StructuredAbortProposal {
     }
 }
 
-impl Project for tauqe_core::llm::discussion::RepoSearchRequest {
+impl Project for domain::RepoSearchRequest {
     type Target = wire::RepoSearchRequest;
     fn project(self) -> Self::Target {
         wire::RepoSearchRequest {
@@ -1743,16 +1696,16 @@ impl Project for tauqe_core::llm::discussion::RepoSearchRequest {
 }
 
 impl Project for wire::RepoSearchRequest {
-    type Target = tauqe_core::llm::discussion::RepoSearchRequest;
+    type Target = domain::RepoSearchRequest;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::discussion::RepoSearchRequest {
+        domain::RepoSearchRequest {
             path: self.path,
             regex: self.regex,
         }
     }
 }
 
-impl Project for tauqe_core::llm::discussion::DiscussionContextRequest {
+impl Project for domain::DiscussionContextRequest {
     type Target = wire::DiscussionContextRequest;
     fn project(self) -> Self::Target {
         wire::DiscussionContextRequest {
@@ -1763,16 +1716,16 @@ impl Project for tauqe_core::llm::discussion::DiscussionContextRequest {
 }
 
 impl Project for wire::DiscussionContextRequest {
-    type Target = tauqe_core::llm::discussion::DiscussionContextRequest;
+    type Target = domain::DiscussionContextRequest;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::discussion::DiscussionContextRequest {
+        domain::DiscussionContextRequest {
             path: self.path,
             access: self.access.project(),
         }
     }
 }
 
-impl Project for tauqe_core::llm::ModelResultProposal {
+impl Project for domain::ModelResultProposal {
     type Target = wire::ModelResultProposal;
     fn project(self) -> Self::Target {
         wire::ModelResultProposal {
@@ -1804,9 +1757,9 @@ impl Project for tauqe_core::llm::ModelResultProposal {
 }
 
 impl Project for wire::ModelResultProposal {
-    type Target = tauqe_core::llm::ModelResultProposal;
+    type Target = domain::ModelResultProposal;
     fn project(self) -> Self::Target {
-        tauqe_core::llm::ModelResultProposal {
+        domain::ModelResultProposal {
             message: self.message,
             scratchpad: self.scratchpad,
             context_drops: self.context_drops,
@@ -1834,17 +1787,13 @@ impl Project for wire::ModelResultProposal {
     }
 }
 
-impl Project for tauqe_core::discussion::DiscussionTarget {
+impl Project for domain::DiscussionTarget {
     type Target = wire::DiscussionTarget;
     fn project(self) -> Self::Target {
         match self {
-            tauqe_core::discussion::DiscussionTarget::Plan { id } => {
-                wire::DiscussionTarget::Plan { id }
-            }
-            tauqe_core::discussion::DiscussionTarget::Review { id } => {
-                wire::DiscussionTarget::Review { id }
-            }
-            tauqe_core::discussion::DiscussionTarget::ReviewGroup {
+            domain::DiscussionTarget::Plan { id } => wire::DiscussionTarget::Plan { id },
+            domain::DiscussionTarget::Review { id } => wire::DiscussionTarget::Review { id },
+            domain::DiscussionTarget::ReviewGroup {
                 session_id,
                 group_id,
             } => wire::DiscussionTarget::ReviewGroup {
@@ -1856,19 +1805,15 @@ impl Project for tauqe_core::discussion::DiscussionTarget {
 }
 
 impl Project for wire::DiscussionTarget {
-    type Target = tauqe_core::discussion::DiscussionTarget;
+    type Target = domain::DiscussionTarget;
     fn project(self) -> Self::Target {
         match self {
-            wire::DiscussionTarget::Plan { id } => {
-                tauqe_core::discussion::DiscussionTarget::Plan { id }
-            }
-            wire::DiscussionTarget::Review { id } => {
-                tauqe_core::discussion::DiscussionTarget::Review { id }
-            }
+            wire::DiscussionTarget::Plan { id } => domain::DiscussionTarget::Plan { id },
+            wire::DiscussionTarget::Review { id } => domain::DiscussionTarget::Review { id },
             wire::DiscussionTarget::ReviewGroup {
                 session_id,
                 group_id,
-            } => tauqe_core::discussion::DiscussionTarget::ReviewGroup {
+            } => domain::DiscussionTarget::ReviewGroup {
                 session_id,
                 group_id,
             },

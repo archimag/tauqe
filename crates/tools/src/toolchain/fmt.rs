@@ -31,10 +31,10 @@ use super::DEFAULT_PROJECT_TIMEOUT_SECS;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InMemoryFormatOutcome {
     /// Whether the declared command rewrote the content.
-    pub formatted: bool,
+    formatted: bool,
     /// Content to keep: the rewritten text on success, the authored text
     /// whenever the command failed, timed out, or was cancelled.
-    pub content: String,
+    pub(crate) content: String,
     /// Command line that was invoked.
     command: String,
     /// Whether the invocation was interrupted before it finished.

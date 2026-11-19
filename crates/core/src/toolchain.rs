@@ -273,7 +273,8 @@ async fn run_project_command(
 /// exports when the entry is omitted. A declaration always keeps precedence over
 /// the export of the same role, so a project can pin the filter in `tauqe.toml`
 /// or delegate it to its justfile without changing the bounded turn.
-pub(crate) async fn format_staged_content(
+#[cfg(test)]
+async fn format_staged_content(
     repo_root: &Path,
     content: &str,
     cancel_rx: Option<&watch::Receiver<bool>>,

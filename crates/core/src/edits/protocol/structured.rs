@@ -43,18 +43,6 @@ use super::utils::resolve_target_path_for_op;
 pub struct StructuredEditProtocol;
 
 impl StructuredEditProtocol {
-    /// Returns the edit schema of the interactive REPL capability surface.
-    ///
-    /// The default surface is intent-oriented, never transport-specific, so the
-    /// The default surface is the shared dialogue profile, never transport-specific, so the
-    #[cfg(test)]
-    fn schema(ctx: &PromptRenderContext<'_>) -> serde_json::Value {
-        Self::schema_for(
-            &crate::control::repl::dialogue_capability_expr(false, false),
-            ctx,
-        )
-    }
-
     /// Builds the edit schema for exactly the enabled capabilities.
     ///
     /// The registry composes the schema from the same capability modules that
@@ -127,24 +115,8 @@ impl StructuredEditProtocol {
         }
     }
 
-    /// Returns system prompt instructions for the structured-output protocol.
-    #[cfg(test)]
-    fn system_instructions(
-        &self,
-        editable_paths: &[String],
-        patch_strategy: PatchStrategy,
-    ) -> String {
-        self.system_instructions_for(
-            &crate::control::repl::dialogue_capability_expr(false, false),
-            editable_paths,
-            patch_strategy,
-            None,
-        )
-    }
-    /// The field reference is composed from the capability registry, so a
-    /// narrowed set never advertises a field for a disabled capability. The
-    /// project declaration reaches the same render context, so a surface that
-    /// advertises `custom_tools` publishes the commands the project declares.
+    /// A narrowed set never advertises a disabled capability. The project
+    /// declaration reaches the same render context for custom tools.
     pub(crate) fn system_instructions_for(
         &self,
         capabilities: &CapabilityTree,
@@ -184,6 +156,10 @@ impl StructuredEditProtocol {
         // profile, so the instructions and the declared schema describe the same
         // fields.
         let profile = StrategyProfile::of(patch_strategy);
+        if patch_strategy == PatchStrategy::ApplyPatch {
+            prompt.push_str("Use the current context version for each Update File, Move to source, and Delete File. Request any existing source that is missing from context before editing it. Use Add File only for a new destination.\n");
+            return prompt;
+        }
         prompt.push_str(profile.empty_field_guidance);
 
         prompt.push_str("Files inside <context> declare their status through a declarative `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. ");
@@ -191,22 +167,25 @@ impl StructuredEditProtocol {
         // the discovery capability is enabled: only a set that advertises
         // `context_requests` in the schema may be told to use it.
         if has_any_research(capabilities) {
-            prompt.push_str("A file absent from <context> is reached through `context_requests` or created with `op: 'create'`.\n\n");
+            prompt.push_str("A file absent from the current context is reached through `context_requests` or created with `op: 'create'`.\n\n");
         } else {
-            prompt
-                .push_str("A file absent from <context> must be created with `op: 'create'`.\n\n");
+            prompt.push_str(
+                "A file absent from the current context must be created with `op: 'create'`.\n\n",
+            );
         }
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Output MUST be valid JSON adhering to the specified schema.\n");
-        prompt.push_str("2. For 'replace', `path` MUST match a file present in <context>.\n");
+        prompt.push_str(
+            "2. For 'replace', `path` MUST match a file present in the current context.\n",
+        );
         prompt.push_str("3. ");
         prompt.push_str(profile.replace_invariant);
         let content_invariant = match patch_strategy {
             PatchStrategy::SearchReplace => {
                 "4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n"
             }
-            PatchStrategy::LineAnchor => {
+            PatchStrategy::LineAnchor | PatchStrategy::ApplyPatch => {
                 "4. For 'create', `content` must contain the complete file content from first to last line.\n"
             }
         };
@@ -798,9 +777,10 @@ mod tests {
 
     #[test]
     fn test_structured_schema_has_no_nullable_types() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         // Only the idle representation of the plan payload is nullable; every
         // edit field stays a concrete typed value.
         let changes = &schema["properties"]["changes"]["items"];
@@ -812,15 +792,21 @@ mod tests {
 
     #[test]
     fn test_structured_schema_and_instructions_include_overwrite() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         let ops = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
             .as_array()
             .unwrap();
         assert!(ops.iter().any(|op| op == "overwrite"));
 
-        let instr = StructuredEditProtocol.system_instructions(&[], PatchStrategy::SearchReplace);
+        let instr = StructuredEditProtocol.system_instructions_for(
+            &repl_expr(),
+            &[],
+            PatchStrategy::SearchReplace,
+            None,
+        );
         assert!(instr.contains("overwrite"));
     }
 
@@ -884,7 +870,12 @@ mod tests {
 
     #[test]
     fn test_structured_system_instructions_respect_the_capability_set() {
-        let full = StructuredEditProtocol.system_instructions(&[], PatchStrategy::SearchReplace);
+        let full = StructuredEditProtocol.system_instructions_for(
+            &repl_expr(),
+            &[],
+            PatchStrategy::SearchReplace,
+            None,
+        );
         assert!(full.contains("context_requests"));
         assert!(full.contains("overwrite"));
 
@@ -998,9 +989,10 @@ mod tests {
 
     #[test]
     fn test_anchored_schema_declares_range_fields_instead_of_echoed_text() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::LineAnchor,
-        )));
+        let schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::LineAnchor),
+        ));
         let items = &schema["properties"]["changes"]["items"];
         let properties = items["properties"].as_object().expect("properties object");
         for field in ["op", "path", "to", "start", "end", "content"] {
@@ -1028,8 +1020,8 @@ mod tests {
         let proto = StructuredEditProtocol;
         let paths = vec!["src/lib.rs".to_string()];
 
-        let instr = proto.system_instructions(&paths, PatchStrategy::SearchReplace);
-        assert!(!instr.contains("context_drops"));
+        let instr =
+            proto.system_instructions_for(&repl_expr(), &paths, PatchStrategy::SearchReplace, None);
         assert!(instr.contains("context_requests"));
     }
 
@@ -1115,9 +1107,10 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_control_fields() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1229,9 +1222,10 @@ mod tests {
     }
     #[test]
     fn test_structured_schema_declares_terminal_fields() {
-        let schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .expect("required array")
@@ -1246,9 +1240,10 @@ mod tests {
 
     #[test]
     fn test_structured_schema_reflects_the_capability_set() {
-        let full = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let full = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         let full_properties = full["properties"].as_object().expect("properties object");
         for field in [
             "message",
@@ -1352,14 +1347,58 @@ mod tests {
         ));
         assert!(review_schema["properties"].get("review_update").is_some());
 
-        let repl_schema = flattened_surface(&StructuredEditProtocol::schema(&render_context(
-            PatchStrategy::SearchReplace,
-        )));
+        let repl_schema = flattened_surface(&StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        ));
         assert!(repl_schema["properties"].get("review_update").is_none());
     }
     #[test]
+    fn edit_proposal_closes_custom_tool_arguments_per_command() {
+        let project: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "commands": {
+                "check": {"command": "just"},
+                "probe": {"command": "just", "parameters": [
+                    {"name": "target"}, {"name": "limit", "default": "10"}
+                ]},
+                "alias": {"command": "@probe"}
+            }
+        }))
+        .unwrap();
+        let ctx = render_context(PatchStrategy::SearchReplace).with_project(Some(&project));
+        let schema = StructuredEditProtocol::schema_for(&repl_expr(), &ctx);
+        let items =
+            &schema["properties"]["action"]["anyOf"][0]["properties"]["custom_tools"]["items"];
+        let variants = items["anyOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 3);
+        for variant in variants {
+            assert_eq!(variant["required"], serde_json::json!(["name", "args"]));
+            assert_eq!(variant["additionalProperties"], false);
+            let args = &variant["properties"]["args"];
+            assert_eq!(args["additionalProperties"], false);
+            if variant["properties"]["name"]["enum"][0] == "check" {
+                assert_eq!(args["properties"], serde_json::json!({}));
+                assert_eq!(args["required"], serde_json::json!([]));
+            } else {
+                assert_eq!(args["required"], serde_json::json!(["target", "limit"]));
+                assert_eq!(
+                    args["properties"]["target"]["type"],
+                    serde_json::json!(["string", "number", "boolean"])
+                );
+                assert_eq!(
+                    args["properties"]["limit"]["type"],
+                    serde_json::json!(["string", "number", "boolean", "null"])
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_surface_declares_the_operational_branches_as_one_exclusive_envelope() {
-        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
+        let schema = StructuredEditProtocol::schema_for(
+            &repl_expr(),
+            &render_context(PatchStrategy::SearchReplace),
+        );
         let branches = schema["properties"]["action"]["anyOf"]
             .as_array()
             .expect("an exclusive surface declares the branch envelope");

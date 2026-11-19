@@ -120,7 +120,7 @@ impl HistoryFileChange {
     }
 
     /// Builds a record for a path the turn modified with `op`.
-    pub fn operated(op: HistoryFileOperation, path: impl Into<String>) -> Self {
+    pub(crate) fn operated(op: HistoryFileOperation, path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             op: Some(op),
@@ -129,7 +129,7 @@ impl HistoryFileChange {
     }
 
     /// Builds a record for a move from `from` to `to`.
-    pub fn moved(from: impl Into<String>, to: impl Into<String>) -> Self {
+    pub(crate) fn moved(from: impl Into<String>, to: impl Into<String>) -> Self {
         Self {
             path: from.into(),
             op: Some(HistoryFileOperation::Move),
@@ -159,7 +159,7 @@ impl HistoryFileChange {
     /// from an annotated one, which is exactly why the format is retired; such a
     /// value decodes into the operation its prefix names. Anything unrecognized
     /// falls back to a plain record so a foreign entry never fails to load.
-    pub fn from_legacy_display(raw: &str) -> Self {
+    pub(crate) fn from_legacy_display(raw: &str) -> Self {
         if let Some(rest) = raw.strip_prefix(LEGACY_MOVE_PREFIX) {
             if let Some((from, to)) = rest.split_once(LEGACY_MOVE_ARROW) {
                 return Self::moved(from, to);

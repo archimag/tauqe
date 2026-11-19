@@ -9,6 +9,8 @@ use super::AppConfig;
 pub struct ProvidersConfig {
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
+    #[serde(default)]
+    pub openai: Option<OpenAiConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,13 +30,34 @@ pub struct OpenRouterConfig {
     pub models: Vec<ModelCatalogEntry>,
 }
 
-impl ProvidersConfig {
-    /// Models registered in the provider catalog, in declaration order.
-    pub(crate) fn catalog(&self) -> &[ModelCatalogEntry] {
-        match &self.openrouter {
-            Some(config) => &config.models,
-            None => &[],
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAiConfig {
+    #[serde(default, deserialize_with = "deserialize_openai_models")]
+    models: Vec<ModelCatalogEntry>,
+}
+
+fn deserialize_openai_models<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ModelCatalogEntry>, D::Error> {
+    struct Entry(ModelCatalogEntry);
+    impl<'de> Deserialize<'de> for Entry {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            ModelCatalogEntry::deserialize_in(de, Some(crate::models::ProviderKind::OpenAI))
+                .map(Self)
         }
+    }
+    Ok(Vec::<Entry>::deserialize(deserializer)?
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect())
+}
+
+impl ProvidersConfig {
+    pub(crate) fn catalog(&self) -> impl Iterator<Item = &ModelCatalogEntry> {
+        self.openrouter
+            .iter()
+            .flat_map(|config| &config.models)
+            .chain(self.openai.iter().flat_map(|config| &config.models))
     }
 }
 
@@ -162,8 +185,8 @@ pub fn read_credentials_file(path: &Path) -> Option<Credentials> {
     match std::fs::read_to_string(path) {
         Ok(content) => match toml::from_str::<Credentials>(&content) {
             Ok(creds) => Some(creds),
-            Err(err) => {
-                tracing::warn!("Failed to parse credentials file {:?}: {}", path, err);
+            Err(_) => {
+                tracing::warn!("Failed to parse credentials file {:?}", path);
                 None
             }
         },
@@ -174,78 +197,84 @@ pub fn read_credentials_file(path: &Path) -> Option<Credentials> {
     }
 }
 
-/// Writes `content` to `path`, creating the file with owner-only permissions
-/// before any bytes are written so the secret is never briefly world-readable.
-///
-/// The guarantee is absolute: a target that cannot enforce it refuses the write
-/// through the non-Unix definition below instead of persisting the secret with
-/// the platform's default permissions.
+/// Serializes edits across daemon processes and preserves unrelated TOML keys.
 #[cfg(unix)]
-fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
+pub(crate) fn update_credentials<T, E: From<std::io::Error>>(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T, E>,
+) -> Result<T, E> {
+    use std::io::{Error, ErrorKind, Write};
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::fs::PermissionsExt;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let mut file = std::fs::OpenOptions::new()
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == ErrorKind::NotFound => path.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
+        .open(target.with_added_extension("lock"))?;
+    lock.lock()?;
 
-    // Tighten permissions on a pre-existing file that an earlier version
-    // may have created with a looser mode.
-    let perms = std::fs::Permissions::from_mode(0o600);
-    let _ = std::fs::set_permissions(path, perms);
-
-    Ok(())
+    let mut document = match std::fs::read_to_string(&target) {
+        Ok(text) => text
+            .parse()
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid credentials TOML"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let result = edit(&mut document)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(document.to_string().as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(target).map_err(std::io::Error::from)?;
+    Ok(result)
 }
 
-/// Targets without a standard-library owner-only permission primitive.
-///
-/// `std` exposes file permissions only on Unix, so no dependency-free
-/// implementation of the guarantee exists for the other targets this crate
-/// builds for. A best-effort write under the platform's default permissions
-/// would silently break the guarantee on a whole platform class, so the write
-/// is refused and the caller reports the reason. The key stays usable through
-/// the `OPENROUTER_API_KEY` environment variable, which no file on disk
-/// carries.
 #[cfg(not(unix))]
-fn write_private_file(_path: &Path, _content: &str) -> std::io::Result<()> {
+pub(crate) fn update_credentials<T, E: From<std::io::Error>>(
+    _path: &Path,
+    _edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T, E>,
+) -> Result<T, E> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "Owner-only file permissions are enforced on Unix targets only, so \
-         the credentials file would take the platform's default permissions \
-         and the secret could be readable by other accounts. Set \
-         OPENROUTER_API_KEY in the environment instead.",
-    ))
+        "Owner-only credential files require Unix",
+    )
+    .into())
+}
+
+fn update_openrouter_key(path: &Path, key: &str, overwrite: bool) -> std::io::Result<()> {
+    update_credentials(path, |document| {
+        let section = document
+            .entry("openrouter")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let table = section.as_table_like_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected an openrouter credentials table",
+            )
+        })?;
+        if overwrite || !table.contains_key("api_key") {
+            table.insert("api_key", toml_edit::value(key));
+        }
+        Ok(())
+    })
 }
 
 pub fn write_credentials_file(path: &Path, api_key: &str) -> std::io::Result<()> {
-    let credentials = Credentials {
-        openrouter: Some(OpenRouterCredentials {
-            api_key: Some(api_key.trim().to_string()),
-        }),
-    };
-    let content = toml::to_string(&credentials)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    write_private_file(path, &content)
+    update_openrouter_key(path, api_key.trim(), true)
 }
 
 pub fn write_credentials_stub(path: &Path) -> std::io::Result<()> {
-    let content = r#"# Tauqe credentials
-# OpenRouter API key (get one at https://openrouter.ai/keys)
-[openrouter]
-api_key = "sk-or-v1-YOUR-KEY-HERE"
-"#;
-    write_private_file(path, content)
+    update_openrouter_key(path, "sk-or-v1-YOUR-KEY-HERE", false)
 }
 
 #[cfg(test)]
@@ -351,6 +380,34 @@ api_key = "sk-or-v1-secret-token"
         );
     }
 
+    #[test]
+    fn openai_catalog_resolves_bare_names_and_aliases() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[providers.openrouter]
+models = ["vendor/model"]
+[providers.openai]
+models = [{model="example", alias="Subscribed"}]
+[models]
+repl = ["Subscribed"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .resolve_role(crate::models::ModelRole::REPL)
+                .to_spec(),
+            "openai:example"
+        );
+        assert_eq!(
+            config.model_catalog().next().unwrap().model.to_spec(),
+            "openrouter:vendor/model"
+        );
+        assert!(
+            toml::from_str::<AppConfig>("[providers.openai]\nmodels=['openrouter:other']").is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_write_credentials_file_and_check() {
@@ -386,6 +443,20 @@ api_key = "sk-or-v1-secret-token"
             creds.openrouter.as_ref().and_then(|o| o.api_key.as_deref()),
             Some("sk-or-v1-YOUR-KEY-HERE")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updating_one_provider_preserves_other_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        std::fs::write(&path, "[openai]\nclient_id = 'existing'\n").unwrap();
+        write_credentials_file(&path, "updated").unwrap();
+        write_credentials_stub(&path).unwrap();
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(doc["openai"]["client_id"].as_str(), Some("existing"));
+        assert_eq!(doc["openrouter"]["api_key"].as_str(), Some("updated"));
     }
 
     #[cfg(unix)]
@@ -462,7 +533,7 @@ models = [
 ]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        let catalog = config.providers.catalog();
+        let catalog: Vec<_> = config.providers.catalog().collect();
 
         assert_eq!(catalog.len(), 2);
         assert_eq!(

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::ArchitectTier;
 
-use super::item::{PlanItem, PlanItemStatus};
 use super::node::PlanValidationError;
+use super::{PlanItem, PlanItemStatus};
 
 /// Canonical, shared comparison key for every plan and concept identifier.
 ///
@@ -135,7 +135,7 @@ impl StatusSummary {
 /// subtree statuses — and receive the same aggregation that
 /// [`compute_items_status`] produces for a tree, without building an
 /// intermediate `Vec`.
-pub(super) fn compute_direct_status<I>(statuses: I) -> PlanItemStatus
+fn compute_direct_status<I>(statuses: I) -> PlanItemStatus
 where
     I: IntoIterator<Item = PlanItemStatus>,
 {
@@ -284,35 +284,6 @@ impl PlanImplementation {
         count_leaf_stats(&self.items)
     }
 
-    /// Reports whether implementation work has already started or finished.
-    ///
-    /// The client uses this to choose the confirmation strength when it clears
-    /// the implementation horizon: a horizon whose leaves are all pending has no
-    /// progress recorded in Git commits yet, so a single confirmation suffices,
-    /// while any leaf that is `Done` or `InProgress` may already be captured by
-    /// a commit and therefore requires the strict two-tier confirmation.
-    ///
-    /// Only executable leaves are inspected. A container's status is derived
-    /// from its descendants, so it carries no independent progress and its
-    /// stored value is never trusted here; its children are still traversed.
-    /// The method is pure: no I/O, no mutation, and no allocation beyond the
-    /// recursion itself.
-    pub fn has_started_or_completed_steps(&self) -> bool {
-        fn walk(items: &[PlanItem]) -> bool {
-            items.iter().any(|item| {
-                if item.is_leaf() {
-                    matches!(
-                        item.status,
-                        PlanItemStatus::Done | PlanItemStatus::InProgress
-                    )
-                } else {
-                    walk(&item.children)
-                }
-            })
-        }
-        walk(&self.items)
-    }
-
     pub fn find_item(&self, item_id: &str) -> Option<&PlanItem> {
         fn walk<'a>(items: &'a [PlanItem], target: &str) -> Option<&'a PlanItem> {
             for item in items {
@@ -392,7 +363,7 @@ impl PlanImplementation {
     /// Only executable leaves carry provenance of their own: a container is never
     /// executed, so its provenance is cleared unconditionally, exactly as its file
     /// declarations are cleared by [`Self::normalize_leaf_files`].
-    pub fn normalize_lifecycle_provenance(&mut self) {
+    pub(crate) fn normalize_lifecycle_provenance(&mut self) {
         fn walk(items: &mut [PlanItem]) {
             for item in items.iter_mut() {
                 if item.children.is_empty() {

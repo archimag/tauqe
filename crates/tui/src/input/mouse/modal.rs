@@ -208,7 +208,8 @@ fn scroll_modal_surface(st: &mut AppState, modal: ActiveModal, mouse: MouseEvent
         // (Conventions §6). `DiffInspector` keeps its reading position to its own
         // chords, and `OuterDocsCacheRemove` is the pending decision that
         // outranks the tree it was raised from.
-        ActiveModal::ServerDisconnected
+        ActiveModal::ChatGptSignIn
+        | ActiveModal::ServerDisconnected
         | ActiveModal::ReviewTruncation
         | ActiveModal::Review
         | ActiveModal::ConfirmCancel
@@ -254,6 +255,32 @@ pub async fn handle_modal_click(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
     match st.active_modal() {
+        Some(ActiveModal::ChatGptSignIn) => {
+            if let Some(dialog) = st.modals.chatgpt.as_mut() {
+                let geom = geometry_of(
+                    term_rect,
+                    &crate::dialogs::render::confirm::chatgpt_params(dialog),
+                );
+                if rect_contains(geom.confirm_button, mouse.column, mouse.row) {
+                    dialog.button = crate::app::ConfirmDialogButton::Confirm;
+                } else if rect_contains(geom.cancel_button, mouse.column, mouse.row) {
+                    dialog.button = crate::app::ConfirmDialogButton::Cancel;
+                } else {
+                    return Ok(InputResult::Continue);
+                }
+                drop(st);
+                crate::dialogs::input::handle_dialog_event(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Enter,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    state,
+                    server_writer,
+                )
+                .await?;
+                return Ok(InputResult::Continue);
+            }
+        }
         Some(ActiveModal::ServerDisconnected) => {
             // Single source of truth: the renderer derives the quit button from
             // the same geometry, so clicks and the drawn button can never drift

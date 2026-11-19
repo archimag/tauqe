@@ -13,7 +13,7 @@ use crate::handlers::common::test_support::scratch_root;
 use crate::state::AppState;
 use crate::transport::{OutChannel, BACKLOG_HIGH_WATER};
 use tauqe_core::plan::PlanItemStatus;
-use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
+use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::review::{IssueStatus, ReviewItem, ReviewSession};
 use tokio::sync::{mpsc, watch};
@@ -207,7 +207,7 @@ async fn test_state_with_provider(
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
-    *state.provider_override.lock().await = Some(provider);
+    state.application.test_set_provider(provider).await;
     state
 }
 
@@ -307,21 +307,19 @@ impl LlmProvider for InterruptedAttemptProvider {
         tauqe_core::models::ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        _model: &str,
-        _messages: Vec<ChatMessage>,
-        _response_format: Option<ResponseFormat>,
+        _request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         _cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> tauqe_core::providers::ProviderResult {
         let attempt = self
             .attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if attempt == 0 {
             let _ = tx.send(StreamEvent::TextDelta(self.partial.clone())).await;
-            return Err(anyhow::anyhow!(
-                "OpenRouter stream read error: connection reset by peer"
+            return Err(tauqe_core::providers::ProviderError::Transient(
+                anyhow::anyhow!("OpenRouter stream read error: connection reset by peer"),
             ));
         }
         let _ = tx.send(StreamEvent::TextDelta(self.complete.clone())).await;

@@ -24,6 +24,31 @@ use crate::ui::header::truncate_to_width;
 
 use super::{render_modal_confirm, ConfirmModalParams, ModalTone};
 
+pub fn chatgpt_params(dialog: &crate::app::ChatGptDialog) -> ConfirmModalParams<'static> {
+    let message = if dialog.browser_opened == Some(true) {
+        "dialog.chatgpt.wait"
+    } else {
+        "dialog.chatgpt.question"
+    };
+    let mut body_lines = vec![
+        Line::raw(active_t(message).replace("{}", &dialog.prompt.model)),
+        Line::raw(active_t("dialog.chatgpt.copy")),
+    ];
+    if dialog.browser_opened == Some(false) {
+        body_lines.push(Line::raw(dialog.prompt.authorization_url.clone()));
+    }
+    ConfirmModalParams {
+        title: active_t("dialog.chatgpt.title"),
+        tone: ModalTone::Info,
+        body_lines,
+        confirm_label: active_t("dialog.chatgpt.continue"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: dialog.button,
+        destructive: false,
+        width: 72,
+    }
+}
+
 /// Presentation parameters for the interruption confirmation, shared by the
 /// renderer and mouse hit-testing.
 pub fn confirm_cancel_params(state: &AppState) -> ConfirmModalParams<'_> {

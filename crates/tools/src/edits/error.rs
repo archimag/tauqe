@@ -13,6 +13,12 @@ use thiserror::Error;
 /// [`EditError::ProtectedPath`] during staging.
 #[derive(Debug, Error)]
 pub enum EditError {
+    #[error("Invalid apply_patch document: {0}")]
+    InvalidPatch(String),
+
+    #[error("In file '{path}': patch context was not found uniquely: {context}")]
+    PatchContext { path: String, context: String },
+
     #[error("File '{0}' is not in context. Only files explicitly in context can be edited.")]
     NotInContext(String),
 

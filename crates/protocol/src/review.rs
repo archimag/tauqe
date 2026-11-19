@@ -33,7 +33,6 @@ pub use group::{
     ArchitecturalIssueGroup, PostAnalysisMode, ReviewGroup, ReviewGroupKind, ReviewLaunchConfig,
     ReviewPostAnalysis,
 };
-pub use group::{LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE};
 pub use item::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSeverity};
 pub use session::ReviewSession;
 

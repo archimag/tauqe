@@ -52,7 +52,7 @@ pub(crate) struct ReviewSummary {
     pub(crate) model: ModelRef,
     /// Actionable findings, excluding the terminal `Skipped` and `Rejected`
     /// outcomes (see [`ReviewSession::stats`]).
-    pub(crate) total_items: usize,
+    total_items: usize,
     /// Findings resolved as `Fixed`.
-    pub(crate) fixed_items: usize,
+    fixed_items: usize,
 }

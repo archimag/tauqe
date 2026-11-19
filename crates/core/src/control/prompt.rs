@@ -1,5 +1,6 @@
 //! Prompt assembly and model round execution for control loops.
 
+#[cfg(test)]
 use crate::context::ContextAccess;
 use crate::models::{ModelRef, ReasoningEffort};
 use crate::workflow::PatchStrategy;
@@ -8,13 +9,13 @@ use tokio::sync::mpsc;
 use super::context::LoopContext;
 use super::outcome::{ResponseEnvelope, SystemError};
 use crate::config::OuterDocEntry;
-use crate::context::ContextFileContent;
 use crate::control::cache::TurnInputCache;
 use crate::edits::StagedEditsState;
 use crate::history::HistorySnapshot;
 use crate::prompt::protocol::PromptProtocol;
 use crate::prompt::PromptAssembly;
 use crate::prompt::TurnBrief;
+use crate::providers::types::TurnRequestReason;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::research::journal::TurnResearchJournal;
 
@@ -37,7 +38,7 @@ pub struct PromptBuilder<'a> {
     pub(crate) outer_docs: Vec<OuterDocEntry>,
     pub(crate) project_config: Option<crate::config::project::ProjectConfig>,
     /// Introductory brief of the turn, owned by the loop that drives it.
-    pub(crate) turn_brief: Option<TurnBrief>,
+    turn_brief: Option<TurnBrief>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     turn_round_limit: Option<usize>,
 }
@@ -92,48 +93,55 @@ impl<'a> PromptBuilder<'a> {
         }
     }
 
-    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+    pub(crate) fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
         self
     }
 
-    pub fn with_prompt(mut self, prompt: Option<String>) -> Self {
+    pub(crate) fn with_prompt(mut self, prompt: Option<String>) -> Self {
         self.prompt = prompt;
         self
     }
 
-    pub fn with_history(mut self, history: Option<&'a HistorySnapshot>) -> Self {
+    pub(crate) fn with_history(mut self, history: Option<&'a HistorySnapshot>) -> Self {
         self.history = history;
         self
     }
 
-    pub fn with_repo_map_config(mut self, include_repo_map: bool, token_budget: usize) -> Self {
+    pub(crate) fn with_repo_map_config(
+        mut self,
+        include_repo_map: bool,
+        token_budget: usize,
+    ) -> Self {
         self.include_repo_map = include_repo_map;
         self.repomap_token_budget = token_budget;
         self
     }
 
-    pub fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
+    pub(crate) fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
         self.patch_strategy = patch_strategy;
         self
     }
 
-    pub fn with_workflow(mut self, workflow: impl Into<String>) -> Self {
+    pub(crate) fn with_workflow(mut self, workflow: impl Into<String>) -> Self {
         self.workflow = workflow.into();
         self
     }
 
-    pub fn with_outer_docs(mut self, outer_docs: Vec<OuterDocEntry>) -> Self {
+    pub(crate) fn with_outer_docs(mut self, outer_docs: Vec<OuterDocEntry>) -> Self {
         self.outer_docs = outer_docs;
         self
     }
 
-    pub fn with_turn_brief(mut self, turn_brief: Option<TurnBrief>) -> Self {
+    pub(crate) fn with_turn_brief(mut self, turn_brief: Option<TurnBrief>) -> Self {
         self.turn_brief = turn_brief;
         self
     }
 
-    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
+    pub(crate) fn with_reasoning_effort(
+        mut self,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
         self.reasoning_effort = reasoning_effort;
         self
     }
@@ -160,13 +168,8 @@ const MAX_EMPTY_STEP_RETRIES: usize = 2;
 /// Directive appended to the feedback when the turn reaches its final allowed round.
 const TURN_BUDGET_DIRECTIVE: &str = "\n\n<response_directive>\nThis is your final allowed round for this turn: the turn round budget is reaching its limit. Conclude the task now by stating your final conclusion in the 'answer' branch, delivering complete code changes in the 'edit' branch (with commit_message), or declaring a blocker in the 'blocked' branch. Do not issue further discovery requests.\n</response_directive>";
 
-/// Corrective suffix appended to the request after an empty round.
-///
-/// Silence is a transport-level non-answer rather than a conclusion, so a round
-/// that carries nothing actionable is asked again with an explicit result
-/// contract. The suffix extends the previous request, so the provider keeps
-/// matching the prompt prefix it has already cached and the task stays in view.
-const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edit, no research command, and no terminal signal, so nothing could be acted upon. Respond again with a concrete result: state the analysis or conclusion in the 'answer' branch, emit code changes in the 'edit' branch (with commit_message), or declare a blocker in the 'blocked' branch.";
+/// Feedback sent to the model after a round produces nothing actionable.
+const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply produced no actionable result. Provide a concrete result that conforms to the active response schema.";
 
 /// Message sequence a round sends to its provider.
 ///
@@ -177,7 +180,7 @@ const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried
 #[derive(Clone, Copy)]
 enum RoundAssembly<'a> {
     /// The shared round transcript of the turn.
-    Transcript,
+    Transcript { reason: Option<TurnRequestReason> },
     /// The contour reassembles its own request on every round.
     Rebuild {
         /// Diagnostic the contour carries into its next request.
@@ -188,18 +191,14 @@ enum RoundAssembly<'a> {
 /// Runs one round of a contour that replays the shared transcript of the turn.
 ///
 /// The first round of a turn seeds the transcript with the rendered prefix and the
-/// frozen task message. Every later round appends the answer it produced and the
-/// feedback of the round that follows, so the request of round `N + 1` is exactly the
-/// request of round `N` plus that pair: no token the provider already cached is
-/// rendered or moved again inside a phase. A phase boundary — recognized by a
-/// different capability tree or a context churn the change set marked —
-/// renders the prefix once more and keeps the task and the rounds already
-/// exchanged byte for byte.
+/// frozen task message. Later rounds append newly discovered original files.
+/// Each request has its own feedback and working file versions.
 pub(crate) async fn execute_round(
     ctx: &mut LoopContext<'_>,
     staged_state: Option<&StagedEditsState>,
+    reason: Option<TurnRequestReason>,
 ) -> Result<ResponseEnvelope, SystemError> {
-    execute_round_inner(ctx, RoundAssembly::Transcript, staged_state).await
+    execute_round_inner(ctx, RoundAssembly::Transcript { reason }, staged_state).await
 }
 
 /// Runs one round of a contour that assembles its own message sequence.
@@ -262,44 +261,31 @@ async fn execute_round_inner(
     .ok();
 
     let ctx_state = ctx.context_manager.get_state();
-    let mut context_files = ctx
+    let context_files = ctx
         .prompt_builder
         .input_cache
         .context_files(&root_buf, &ctx_state.items)
         .await
         .map_err(|e| SystemError::Other(e.to_string()))?;
 
-    if let Some(staged) = staged_state {
-        let staged_text = staged.staged_text_files();
-        let mut appended = Vec::new();
-        for (path, content) in &staged_text {
-            if let Some(file) = context_files.iter_mut().find(|file| &file.path == path) {
-                file.content = content.clone();
-            } else {
-                appended.push(ContextFileContent {
-                    path: path.clone(),
-                    access: ContextAccess::Editable,
-                    content: content.clone(),
-                    insertion_seq: 0,
-                });
-            }
-        }
-        appended.sort_by(|a, b| a.path.cmp(&b.path));
-        context_files.extend(appended);
-        context_files.retain(|file| !staged.deleted_paths.contains(&file.path));
-    }
-
+    let files = ctx.transcript().project_files(
+        context_files,
+        staged_state,
+        &root_buf,
+        ctx.prompt_builder.patch_strategy,
+    );
+    let super::transcript::RoundFiles {
+        originals,
+        current: context_files,
+        current_versions,
+    } = files;
     let context_paths: Vec<String> = context_files.iter().map(|f| f.path.clone()).collect();
 
     let (repo_map, repo_dirs) = if ctx.prompt_builder.include_repo_map {
         let map = ctx
             .prompt_builder
             .input_cache
-            .repo_map(
-                &root_buf,
-                &context_paths,
-                ctx.prompt_builder.repomap_token_budget,
-            )
+            .repo_map(&root_buf, ctx.prompt_builder.repomap_token_budget)
             .await;
         (map, None)
     } else {
@@ -335,7 +321,7 @@ async fn execute_round_inner(
     let mut assembly = PromptAssembly::new(
         repo_state,
         ctx_state.revision,
-        context_files.clone(),
+        originals,
         &ctx.prompt_builder.workflow,
         ctx.prompt_builder.protocol.kind(),
         history,
@@ -347,22 +333,18 @@ async fn execute_round_inner(
     .with_outer_docs(ctx.prompt_builder.outer_docs.clone());
 
     assembly.turn_brief = ctx.prompt_builder.turn_brief.clone();
-    // The scratchpad is never re-injected into the request a round sends: the
-    // model reads its own notes back from the assistant answers the transcript
-    // replays, so the head of the turn stays byte-stable inside a phase.
 
-    // The contour owns the capability tree of the round, so the protocol the
-    // round renders and decodes with is exactly the surface the loop declared.
+    // The protocol was constructed with the contour's capability tree. A round
+    // binds only the project declaration used by its schema and decoder.
     let scoped_protocol = ctx
         .prompt_builder
         .protocol
-        .with_capability_expr(ctx.capabilities.clone())
         .with_project(Some(project.clone()));
     let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
     let base_prompt = ctx.prompt_builder.prompt.as_deref().unwrap_or("");
     let rebuilt_user_prompt = match round_assembly {
-        RoundAssembly::Transcript => None,
+        RoundAssembly::Transcript { .. } => None,
         RoundAssembly::Rebuild { diagnostics } => Some(compose_rebuilt_user_prompt(
             &*ctx.journal,
             base_prompt,
@@ -377,15 +359,18 @@ async fn execute_round_inner(
     let transcript_handle = std::sync::Arc::clone(&ctx.transcript);
 
     let mut empty_attempts = 0usize;
+    let mut round_feedback = String::new();
     loop {
-        let spent = ctx
-            .rounds_spent
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(limit) = ctx.prompt_builder.turn_round_limit {
+        let spent = ctx.rounds_spent();
+        let max_rounds = ctx.prompt_builder.turn_round_limit;
+        if let Some(limit) = max_rounds {
             if spent >= limit {
-                return Err(SystemError::RoundBudgetExhausted);
+                return Err(SystemError::RoundBudgetExhausted {
+                    spent,
+                    last_answer: ctx.transcript().last_answer.clone(),
+                });
             }
-            if spent + 1 == limit && matches!(round_assembly, RoundAssembly::Transcript) {
+            if spent + 1 == limit && matches!(round_assembly, RoundAssembly::Transcript { .. }) {
                 let mut transcript = transcript_handle
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -395,10 +380,9 @@ async fn execute_round_inner(
             }
         }
 
-        // The sequence of the round is the sequence of its predecessor plus the pair
-        // the turn exchanged, so a transcript-driven round renders nothing of its own.
+        // Append original files to the stable prefix and render the current tail.
         let messages = match round_assembly {
-            RoundAssembly::Transcript => {
+            RoundAssembly::Transcript { .. } => {
                 let mut transcript = transcript_handle
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -414,13 +398,7 @@ async fn execute_round_inner(
                         ));
                     };
                     transcript.seed(prefix.to_vec(), task.clone(), &ctx.capabilities);
-                } else if !transcript.advertises(&ctx.capabilities) || transcript.prefix_is_stale()
-                {
-                    // A different capability tree or a marked context churn is
-                    // the phase boundary of the turn: the head is rendered once
-                    // more from the current assembly — relocated files carry
-                    // the anchors of their current bytes — while the task and
-                    // the rounds already exchanged keep their exact bytes.
+                } else if !transcript.advertises(&ctx.capabilities) {
                     let assembled = assembly.assemble_chat_messages_with_context_cache(
                         base_prompt,
                         protocol,
@@ -430,17 +408,36 @@ async fn execute_round_inner(
                         .split_last()
                         .map(|(_, prefix)| prefix.to_vec())
                         .unwrap_or_default();
-                    transcript.reseed_prefix(prefix);
+                    transcript.reseed_prefix(prefix, &ctx.capabilities);
                 }
+                transcript.append_discoveries(ctx.prompt_builder.patch_strategy);
                 if let Some(feedback) = transcript.take_pending_feedback() {
-                    transcript.push_feedback(feedback);
+                    if !round_feedback.is_empty() {
+                        round_feedback.push_str("\n\n");
+                    }
+                    round_feedback.push_str(&feedback);
                 }
-                transcript.messages()
+                let mut messages = transcript.messages();
+                let mut tail = round_feedback.clone();
+                if let Some(block) = &current_versions {
+                    if !tail.is_empty() {
+                        tail.push_str("\n\n");
+                    }
+                    tail.push_str(block);
+                }
+                if !tail.is_empty() {
+                    messages.push(crate::providers::ChatMessage::user(tail));
+                }
+                messages
             }
             RoundAssembly::Rebuild { .. } => {
                 let mut user_prompt = rebuilt_user_prompt.clone().unwrap_or_default();
                 if empty_attempts > 0 {
-                    user_prompt.push_str(&EMPTY_STEP_REMINDER.repeat(empty_attempts));
+                    user_prompt.push_str(EMPTY_STEP_REMINDER);
+                }
+                if let Some(block) = &current_versions {
+                    user_prompt.push_str("\n\n");
+                    user_prompt.push_str(block);
                 }
                 assembly.assemble_chat_messages_with_context_cache(
                     &user_prompt,
@@ -465,17 +462,34 @@ async fn execute_round_inner(
 
         let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(64);
         let event_sink = ctx.events.clone();
-        let mut stream_filter = protocol.create_stream_filter(
+        let mut stream_filter = protocol.create_stream_filter_with_strategy(
             context_paths.clone(),
             root_buf.clone(),
             staged_contents.clone(),
+            ctx.prompt_builder.patch_strategy,
         );
+
+        if let Some(staged) = staged_state {
+            let missing = staged
+                .deleted_paths
+                .iter()
+                .chain(
+                    staged
+                        .staged_files
+                        .keys()
+                        .filter(|path| !staged_contents.contains_key(*path)),
+                )
+                .cloned()
+                .collect();
+            stream_filter.exclude_disk_sources(missing);
+        }
 
         let forward = tokio::spawn(async move {
             let mut text = String::new();
             let mut stream_error: Option<String> = None;
             let mut cancelled = false;
             let mut completed = false;
+            let mut token_usage = None;
             while let Some(event) = llm_rx.recv().await {
                 match event {
                     StreamEvent::TextDelta(delta) => {
@@ -489,6 +503,7 @@ async fn execute_round_inner(
                     // streamed preview restart together with the new attempt.
                     StreamEvent::ResetStream => {
                         text.clear();
+                        token_usage = None;
                         stream_filter.reset();
                         event_sink.emit(StreamEvent::ResetStream);
                     }
@@ -504,24 +519,46 @@ async fn execute_round_inner(
                         completed = true;
                         event_sink.emit(StreamEvent::Done);
                     }
+                    StreamEvent::Usage(usage) => {
+                        token_usage = Some((usage.prompt_tokens, usage.cached_tokens));
+                        event_sink.emit(StreamEvent::Usage(usage));
+                    }
                     other => event_sink.emit(other),
                 }
             }
             for filtered in stream_filter.finish() {
                 event_sink.emit(filtered);
             }
-            (text, stream_error, cancelled, completed)
+            (text, stream_error, cancelled, completed, token_usage)
         });
 
+        ctx.check_cancelled()?;
+        let round = ctx
+            .rounds_spent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if let RoundAssembly::Transcript { reason } = round_assembly {
+            ctx.events.emit(StreamEvent::TurnRoundStarted {
+                round,
+                max_rounds,
+                reason: if empty_attempts == 0 {
+                    reason
+                } else {
+                    Some(TurnRequestReason::EmptyResponseRetry)
+                },
+            });
+        }
         let client_result = ctx
             .prompt_builder
             .provider
-            .stream_chat_with_session(
-                &ctx.prompt_builder.model.name,
-                messages,
-                response_format,
-                ctx.prompt_builder.reasoning_effort,
-                ctx.prompt_builder.session_id.as_deref(),
+            .stream(
+                crate::providers::LlmRequest {
+                    model: &ctx.prompt_builder.model.name,
+                    messages,
+                    response_format,
+                    reasoning_effort: ctx.prompt_builder.reasoning_effort,
+                    session_id: ctx.prompt_builder.session_id.as_deref(),
+                },
                 llm_tx,
                 ctx.cancel.receiver(),
             )
@@ -529,7 +566,7 @@ async fn execute_round_inner(
 
         client_result.map_err(|error| SystemError::Provider(error.to_string()))?;
 
-        let (assistant_text, stream_error, cancelled, completed) = forward
+        let (assistant_text, stream_error, cancelled, completed, token_usage) = forward
             .await
             .map_err(|error| SystemError::Other(format!("control stream task failed: {error}")))?;
 
@@ -547,10 +584,19 @@ async fn execute_round_inner(
             ));
         }
 
-        let commands = if assistant_text.trim().is_empty() {
-            Vec::new()
+        if let Some((prompt_tokens, cached_tokens)) = token_usage {
+            tracing::info!(round, model = %ctx.prompt_builder.model.name, prompt_tokens, ?cached_tokens,
+                "model request usage");
+        }
+        let has_answer = !assistant_text.trim().is_empty();
+        let commands = if has_answer {
+            protocol.decode_with_strategy(
+                &assistant_text,
+                &context_paths,
+                ctx.prompt_builder.patch_strategy,
+            )
         } else {
-            protocol.decode(&assistant_text, &context_paths)
+            Vec::new()
         };
 
         let protocol_errors: Vec<_> = commands
@@ -570,14 +616,11 @@ async fn execute_round_inner(
             );
         }
 
-        // The answer belongs to the transcript the moment it arrives: the round a
-        // contour requests next replays it even before that contour produced the
-        // feedback the round after it carries.
-        if matches!(round_assembly, RoundAssembly::Transcript) {
+        if has_answer && matches!(round_assembly, RoundAssembly::Transcript { .. }) {
             transcript_handle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_assistant(assistant_text.as_str());
+                .last_answer = Some(assistant_text.clone());
         }
 
         if !commands.is_empty() {
@@ -608,19 +651,18 @@ async fn execute_round_inner(
             )));
         }
         empty_attempts += 1;
-        let banner = format!(
-            "\n\n---\n**[Empty Response {}/{}]** The previous reply carried nothing actionable; asking for a concrete result...\n\n",
-            empty_attempts, MAX_EMPTY_STEP_RETRIES
-        );
-        ctx.events.emit(StreamEvent::TextDelta(banner));
 
         // The reminder is the feedback of the corrective round, so it travels through
         // the single feedback slot exactly as every other correction of the turn does.
-        if matches!(round_assembly, RoundAssembly::Transcript) {
+        if matches!(round_assembly, RoundAssembly::Transcript { .. }) {
             transcript_handle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .set_pending_feedback(EMPTY_STEP_REMINDER);
+                .set_pending_feedback(if empty_attempts == 1 {
+                    EMPTY_STEP_REMINDER
+                } else {
+                    ""
+                });
         }
     }
 }
@@ -638,14 +680,196 @@ mod tests {
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::research::journal::TurnResearchJournal;
 
+    struct ReconnectingProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ReconnectingProvider {
+        fn kind(&self) -> crate::models::ProviderKind {
+            crate::models::ProviderKind::OpenRouter
+        }
+
+        async fn stream(
+            &self,
+            request: crate::providers::LlmRequest<'_>,
+            tx: mpsc::Sender<StreamEvent>,
+            _: tokio::sync::watch::Receiver<bool>,
+        ) -> crate::providers::ProviderResult {
+            assert!(request
+                .messages
+                .iter()
+                .any(|msg| msg.content.contains(TURN_BUDGET_DIRECTIVE.trim())));
+            for event in [
+                StreamEvent::ReasoningDelta("initial attempt".into()),
+                StreamEvent::ResetStream,
+                StreamEvent::ReasoningDelta("retried attempt".into()),
+                StreamEvent::TextDelta("answer".into()),
+                StreamEvent::Done,
+            ] {
+                tx.send(event).await.unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn only_admitted_calls_publish_rounds_before_provider_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ContextManager::new(dir.path().to_path_buf());
+        let mut journal = TurnResearchJournal::default();
+        let provider = ReconnectingProvider;
+        let model = ModelRef::openrouter("mock/model");
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
+        let cancel = CancellationToken::new();
+        let (events, mut rx) = EventSink::channel();
+        let mut cache = TurnInputCache::default();
+        let builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
+        let mut policy = DirectApplyPolicy::new();
+        let mut ctx = LoopContext::new(
+            &cancel,
+            &events,
+            dir.path(),
+            &mut context,
+            &mut journal,
+            &mut policy,
+            CapabilityTree::from_leaves([LlmCapability::TextMessage]),
+            builder,
+        );
+        ctx.set_turn_round_limit(Some(1));
+        assert!(ctx
+            .request_round()
+            .await
+            .unwrap()
+            .has(LlmCapability::TextMessage));
+        assert!(matches!(
+            ctx.request_round().await,
+            Err(SystemError::RoundBudgetExhausted { .. })
+        ));
+        assert_eq!(ctx.rounds_spent(), 1);
+
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::TurnRoundStarted { .. }
+                        | StreamEvent::ReasoningDelta(_)
+                        | StreamEvent::ResetStream
+                )
+            })
+            .collect();
+        assert!(matches!(
+            observed.as_slice(),
+            [
+                StreamEvent::TurnRoundStarted {
+                    round: 1,
+                    max_rounds: Some(1),
+                    reason: None,
+                },
+                StreamEvent::ReasoningDelta(_),
+                StreamEvent::ResetStream,
+                StreamEvent::ReasoningDelta(_),
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_responses_spend_calls_without_adding_assistant_messages_or_banners() {
+        for (assembly, limit) in [
+            (RoundAssembly::Transcript { reason: None }, Some(3)),
+            (RoundAssembly::Transcript { reason: None }, Some(1)),
+            (RoundAssembly::Rebuild { diagnostics: None }, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut context = ContextManager::new(dir.path().to_path_buf());
+            let mut journal = TurnResearchJournal::default();
+            let provider = MockLlmProvider::scripted([
+                MockResponse::text(" \n\t"),
+                MockResponse::text(""),
+                MockResponse::text("answer"),
+            ]);
+            let model = ModelRef::openrouter("mock/model");
+            let protocol =
+                JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
+            let cancel = CancellationToken::new();
+            let (events, mut rx) = EventSink::channel();
+            let mut cache = TurnInputCache::default();
+            let builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache)
+                .with_prompt(Some("Return a result".into()));
+            let mut policy = DirectApplyPolicy::new();
+            let mut ctx = LoopContext::new(
+                &cancel,
+                &events,
+                dir.path(),
+                &mut context,
+                &mut journal,
+                &mut policy,
+                CapabilityTree::from_leaves([LlmCapability::TextMessage]),
+                builder,
+            );
+            ctx.set_turn_round_limit(limit);
+
+            let result = execute_round_inner(&mut ctx, assembly, None).await;
+            let requests = provider.requests();
+            let mut rounds = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    StreamEvent::TurnRoundStarted {
+                        round,
+                        max_rounds,
+                        reason,
+                    } => rounds.push((round, max_rounds, reason)),
+                    StreamEvent::TextDelta(text) => assert!(!text.contains("[Empty Response")),
+                    _ => {}
+                }
+            }
+
+            if limit == Some(1) {
+                assert!(matches!(
+                    result,
+                    Err(SystemError::RoundBudgetExhausted { .. })
+                ));
+                assert_eq!(ctx.rounds_spent(), 1);
+                assert_eq!(requests.len(), 1);
+                assert_eq!(rounds, [(1, limit, None)]);
+            } else {
+                assert!(result.unwrap().has(LlmCapability::TextMessage));
+                assert_eq!(ctx.rounds_spent(), 3);
+                assert_eq!(requests.len(), 3);
+                if limit.is_some() {
+                    for pair in requests.windows(2) {
+                        assert!(pair[1].messages.starts_with(&requests[0].messages));
+                        assert_eq!(pair[1].response_format, pair[0].response_format);
+                    }
+                    let retry = Some(TurnRequestReason::EmptyResponseRetry);
+                    assert_eq!(
+                        rounds,
+                        [(1, limit, None), (2, limit, retry), (3, limit, retry)]
+                    );
+                } else {
+                    assert!(rounds.is_empty(), "Architect progress stays separate");
+                }
+                for request in &requests[1..] {
+                    let feedback = request.messages.last().unwrap();
+                    assert_eq!(feedback.role, "user");
+                    assert_eq!(
+                        feedback.content.matches(EMPTY_STEP_REMINDER.trim()).count(),
+                        1
+                    );
+                }
+            }
+            for request in requests {
+                assert!(!request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "assistant"));
+            }
+        }
+    }
+
     /// A round appends its own pair and never rewrites the head of the turn.
     ///
-    /// The transcript is the only channel the working memory travels through: the
-    /// head a turn seeds is reproduced byte for byte by every later round, and the
-    /// note the model wrote reaches the next round inside the assistant answer
-    /// that produced it.
     #[tokio::test]
-    async fn a_round_keeps_the_seeded_head_and_replays_its_own_scratchpad_answer() {
+    async fn a_round_keeps_the_seeded_head_without_replaying_the_answer() {
         let dir = tempfile::tempdir().expect("scratch directory");
         let mut context = ContextManager::new(dir.path().to_path_buf());
         let mut journal = TurnResearchJournal::default();
@@ -656,11 +880,11 @@ mod tests {
             MockResponse::text("The helper already defines the answer."),
         ]);
         let model = ModelRef::openrouter("mock/model");
-        let protocol = JsonPromptProtocol::edits();
         let capabilities = CapabilityTree::from_leaves([LlmCapability::TextMessage]);
+        let protocol = JsonPromptProtocol::new(capabilities.clone());
         let cancel = CancellationToken::new();
         let events = EventSink::noop();
-        let mut cache = crate::control::cache::TurnInputCache::default();
+        let mut cache = TurnInputCache::default();
         let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
         let mut policy = DirectApplyPolicy::new();
         let mut ctx = LoopContext::new(
@@ -674,7 +898,7 @@ mod tests {
             prompt_builder,
         );
 
-        let first = execute_round(&mut ctx, None).await.expect("first round");
+        let first = ctx.request_round().await.expect("first round");
         assert!(first.has(LlmCapability::TextMessage));
 
         let seeded = ctx.transcript().messages();
@@ -687,28 +911,12 @@ mod tests {
 
         ctx.request_round().await.expect("second round");
         let extended = ctx.transcript().messages();
-        assert_eq!(
-            &extended[..seeded.len()],
-            &seeded[..],
-            "a round appends its pair and never rewrites a message before it"
-        );
-        // The note the model wrote travels back through its own answer, which the
-        // transcript replays unchanged.
-        assert!(extended.iter().any(|message| {
-            message.role == "assistant"
-                && message
-                    .content
-                    .contains("- Hypothesis: helper defines ANSWER")
-        }));
+        assert_eq!(extended, seeded);
+        assert_eq!(provider.requests()[1].messages, seeded);
     }
 
-    /// A context churn the change set marked reseeds the prefix: the rewritten
-    /// file renders again from the bytes now on disk, and the relocation
-    /// moves it to the tail of its layer, so the repair or healing round
-    /// addresses fresh material instead of the rendering the turn opened
-    /// with.
     #[tokio::test]
-    async fn a_context_churn_reseeds_the_prefix_with_fresh_bytes_at_the_tail() {
+    async fn changed_bytes_travel_after_the_frozen_context() {
         let dir = tempfile::tempdir().expect("scratch directory");
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("a.rs"), "original a\n").unwrap();
@@ -726,12 +934,16 @@ mod tests {
         let provider = MockLlmProvider::scripted(vec![
             MockResponse::text("first answer"),
             MockResponse::text("second answer"),
+            MockResponse::text("restored"),
+            MockResponse::text("rebuilt"),
+            MockResponse::text("next turn"),
         ]);
         let model = ModelRef::openrouter("mock/model");
-        let protocol = JsonPromptProtocol::edits();
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         let cancel = CancellationToken::new();
         let events = EventSink::noop();
-        let mut cache = crate::control::cache::TurnInputCache::default();
+        let mut cache = TurnInputCache::default();
         let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
         let mut policy = DirectApplyPolicy::new();
         let mut ctx = LoopContext::new(
@@ -745,7 +957,7 @@ mod tests {
             prompt_builder,
         );
 
-        let first = execute_round(&mut ctx, None).await.expect("first round");
+        let first = ctx.request_round().await.expect("first round");
         assert!(first.has(LlmCapability::TextMessage));
         let seeded = ctx.transcript().messages();
 
@@ -766,14 +978,8 @@ mod tests {
             .expect("the neighbor is placed");
         assert!(a_open < b_open, "the opening round renders a.rs first");
 
-        // The turn rewrote the file and marked the churn the staging loop
-        // marks: the relocation moves the rewritten path to the tail of its
-        // layer and the epoch stales the rendered prefix.
         std::fs::write(root.join("a.rs"), "rewritten a\n").unwrap();
-        ctx.note_context_churn(&["a.rs".to_string()], &[]);
-        assert!(ctx.transcript().prefix_is_stale());
-
-        let second = execute_round(&mut ctx, None).await.expect("second round");
+        let second = ctx.request_round().await.expect("second round");
         assert!(second.has(LlmCapability::TextMessage));
 
         let second_requests = provider.requests();
@@ -782,35 +988,84 @@ mod tests {
             .iter()
             .find(|message| message.content.starts_with("<context>"))
             .expect("the reseeded round renders the context block again");
-        assert!(
-            second_context.content.contains("rewritten a"),
-            "the reseeded prefix renders the bytes now on disk"
-        );
-        assert!(
-            !second_context.content.contains("original a"),
-            "the stale rendering is gone"
-        );
-        let a_reseed = second_context
-            .content
-            .find(r#"path="a.rs""#)
-            .expect("the element is placed");
-        let b_reseed = second_context
-            .content
-            .find(r#"path="b.rs""#)
-            .expect("the neighbor is placed");
-        assert!(
-            b_reseed < a_reseed,
-            "the relocation renders the rewritten file after its untouched neighbor"
-        );
+        assert_eq!(first_context, second_context);
+        assert!(second_requests[1]
+            .messages
+            .starts_with(&first_requests[0].messages));
+        let latest = &second_requests[1].messages.last().unwrap().content;
+        assert!(latest.contains("<current_versions>"));
+        assert!(latest.contains("rewritten a"));
+        assert!(!latest.contains("b.rs"));
 
-        // The task and the round already exchanged keep their exact bytes; the
-        // answer of the second round appends behind them as the new tail.
-        let extended = ctx.transcript().messages();
-        assert_eq!(extended.len(), seeded.len() + 1);
-        assert_eq!(
-            extended[seeded.len() - 1].content,
-            "first answer",
-            "the exchanged round keeps its bytes across the reseed"
+        assert_eq!(ctx.transcript().messages(), seeded);
+
+        ctx.context_manager
+            .add_file("b.rs", ContextAccess::Editable)
+            .unwrap();
+        let mut staged = StagedEditsState::default();
+        staged
+            .staged_files
+            .insert("a.rs".into(), b"original a\n".to_vec());
+        execute_round(&mut ctx, Some(&staged), None).await.unwrap();
+        let restored = provider.requests().pop().unwrap();
+        assert!(restored.messages.contains(first_context));
+        assert!(restored.messages.starts_with(&seeded));
+        assert!(!restored
+            .messages
+            .iter()
+            .any(|message| message.content.contains("rewritten a")));
+
+        assert!(restored
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains(r#"<access path="b.rs" value="editable" />"#));
+        assert_eq!(restored.response_format, second_requests[1].response_format);
+
+        staged.deleted_paths.insert("a.rs".into());
+        staged.staged_files.clear();
+        staged
+            .staged_files
+            .insert("moved.rs".into(), b"original a\n".to_vec());
+        execute_round_inner(
+            &mut ctx,
+            RoundAssembly::Rebuild { diagnostics: None },
+            Some(&staged),
+        )
+        .await
+        .unwrap();
+        let rebuilt = provider.requests().pop().unwrap();
+        assert!(rebuilt.messages.contains(first_context));
+        let tail = &rebuilt.messages.last().unwrap().content;
+        assert!(tail.contains(r#"<deleted path="a.rs" />"#));
+        assert!(tail.contains(r#"<file path="moved.rs" access="editable">"#));
+        assert!(!tail.contains("rewritten a"));
+
+        drop(ctx);
+        let builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
+        let mut next = LoopContext::new(
+            &cancel,
+            &events,
+            dir.path(),
+            &mut context,
+            &mut journal,
+            &mut policy,
+            CapabilityTree::from_leaves([LlmCapability::TextMessage]),
+            builder,
         );
+        next.request_round().await.unwrap();
+        let request = provider.requests().pop().unwrap();
+        let baseline = request
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("<context>"))
+            .unwrap();
+        assert!(baseline.content.contains("rewritten a"));
+        assert!(!baseline.content.contains("original a"));
+        assert!(!request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<current_versions>\n")));
     }
 }

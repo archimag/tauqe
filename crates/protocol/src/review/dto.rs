@@ -255,23 +255,6 @@ pub enum ReviewExecuteTarget {
     Group(ReviewGroupTarget),
 }
 
-impl ReviewExecuteTarget {
-    /// Session the target addresses, or `None` for the cross-session run.
-    ///
-    /// Only [`Self::AllSessions`] names no session, so a consumer that needs
-    /// the session identifier reads it here instead of matching every variant
-    /// on its own.
-    pub fn review_id(&self) -> Option<&str> {
-        match self {
-            Self::AllSessions => None,
-            Self::Session(target) => Some(&target.review_id),
-            Self::Finding(target) => Some(&target.review_id),
-            Self::Findings(target) => Some(&target.review_id),
-            Self::Group(target) => Some(&target.review_id),
-        }
-    }
-}
-
 /// Whole-session target: the implicit queue of one stored session.
 ///
 /// The payload refuses a field it does not declare, so a request that still

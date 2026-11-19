@@ -27,6 +27,7 @@ pub const EDIT_FILE_RETRYING: &str = "edit/fileRetrying";
 pub const EDIT_FINISHED: &str = "edit/finished";
 
 pub const TURN_PHASE: &str = "turn/phase";
+pub const TURN_ROUND_STARTED: &str = "turn/roundStarted";
 pub const TURN_REPOMAP: &str = "turn/repoMap";
 pub const TOOLCHAIN_STARTED: &str = "toolchain/started";
 pub const TOOLCHAIN_FINISHED: &str = "toolchain/finished";
@@ -54,3 +55,7 @@ pub const PLAN_LIST_CHANGED: &str = "plan/listChanged";
 pub const PLAN_BATCH_FINISHED: &str = "plan/batchFinished";
 
 pub const DISCUSSION_FOCUS_CHANGED: &str = "discussion/focusChanged";
+
+pub const CHATGPT_SIGN_IN_PROMPT: &str = "credentials/chatgptSignInPrompt";
+
+pub const CHATGPT_SIGN_IN_CLOSED: &str = "credentials/chatgptSignInClosed";

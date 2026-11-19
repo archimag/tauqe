@@ -1,0 +1,28 @@
+[package]
+name = "tauqe-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-support = ["tauqe-core/test-support"]
+
+[dependencies]
+tauqe-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tauqe-flow = { path = ".", features = ["test-support"] }
+tauqe-tools.workspace = true
+tempfile.workspace = true
+toml.workspace = true

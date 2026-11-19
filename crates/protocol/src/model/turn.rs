@@ -581,6 +581,30 @@ pub struct TurnPhaseEvent {
     pub detail: Option<String>,
 }
 
+/// Reason for a corrective provider call, scoped to that admitted round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRequestReason {
+    PatchRepair,
+    PostHookRepair,
+    VerificationRepair,
+    EmptyResponseRetry,
+}
+
+/// An admitted provider call in a bounded turn, independent of phase attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoundStartedEvent {
+    pub operation_id: String,
+    /// One-based number of the call that has just started.
+    pub round: usize,
+    /// Total call budget, when the turn has a limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<usize>,
+    /// Corrective work requested of the model; absent for ordinary calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<TurnRequestReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoMapInfoEvent {
     pub operation_id: String,

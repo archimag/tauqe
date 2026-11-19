@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::edits::EditOperation;
-use crate::edits::EditProposal;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
@@ -60,10 +59,7 @@ impl GitTransactionPolicy {
 
     /// Creates a policy that reports an open transaction through `guard` and
     /// observes the turn's cancellation signal while capturing and committing.
-    pub(crate) fn with_guard_and_cancel(
-        guard: Arc<AtomicBool>,
-        cancel: watch::Receiver<bool>,
-    ) -> Self {
+    pub fn with_guard_and_cancel(guard: Arc<AtomicBool>, cancel: watch::Receiver<bool>) -> Self {
         Self {
             checkpoint: None,
             guard: Some(guard),
@@ -122,12 +118,12 @@ impl ApplyPolicy for GitTransactionPolicy {
         .await
     }
 
-    async fn apply_temporary(
+    async fn apply_temporary_batches(
         &mut self,
         repo_root: &Path,
         project: &ProjectConfig,
         context_manager: &mut ContextManager,
-        proposal: &EditProposal,
+        batches: &[&[EditOperation]],
     ) -> anyhow::Result<Vec<String>> {
         // Capture the pre-edit checkpoint exactly once. The verification-healing
         // loop calls this method repeatedly; recreating the checkpoint on every
@@ -149,7 +145,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         self.publish_transaction_state();
 
         let changed_files =
-            apply_edit_proposal_with_config(repo_root, project, context_manager, proposal).await?;
+            apply_edit_proposal_with_config(repo_root, project, context_manager, batches).await?;
 
         if !changed_files.is_empty() {
             let root = repo_root.to_path_buf();
@@ -265,10 +261,10 @@ mod tests {
         let mut cm = editable_context(root);
 
         let edits = replace_edit();
-        let application = crate::api::Application::default();
+        let active = Arc::new(AtomicBool::new(false));
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = application.git_transaction_policy(cancel_rx);
-        assert!(!application.transaction_is_active());
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(active.clone(), cancel_rx);
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         let staged = policy
             .staging(root, &project(), &cm, &edits, None, None)
             .await;
@@ -282,7 +278,7 @@ mod tests {
             .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
-        assert!(application.transaction_is_active());
+        assert!(active.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
@@ -291,7 +287,7 @@ mod tests {
             .await
             .unwrap();
         assert!(commit.is_some());
-        assert!(!application.transaction_is_active());
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
     }
 
@@ -303,10 +299,10 @@ mod tests {
         let mut cm = editable_context(root);
 
         let edits = replace_edit();
-        let application = crate::api::Application::default();
+        let active = Arc::new(AtomicBool::new(false));
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = application.git_transaction_policy(cancel_rx);
-        assert!(!application.transaction_is_active());
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(active.clone(), cancel_rx);
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
@@ -315,12 +311,12 @@ mod tests {
             .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
-        assert!(application.transaction_is_active());
+        assert!(active.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
         assert!(policy.rollback(root).await.unwrap());
-        assert!(!application.transaction_is_active());
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
     }
 

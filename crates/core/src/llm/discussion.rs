@@ -7,8 +7,8 @@ fn default_context_access() -> ContextAccess {
 }
 use crate::context::lexical_path::strip_surrounding_markup;
 use crate::edits::normalize_repo_path;
-pub use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
-use crate::review::ReviewUpdateProposal;
+mod plan;
+mod review;
 use normalize::{
     deserialize_context_access, deserialize_context_requests, deserialize_dir_list_requests,
     deserialize_repo_map_paths,
@@ -16,11 +16,13 @@ use normalize::{
 pub(crate) use normalize::{
     deserialize_null_as_default, deserialize_repo_path_list, deserialize_repo_search_requests,
 };
+pub use plan::{DiscussionPlanAction, DiscussionPlanUpdate};
+pub use review::{ReviewDecisionStatus, ReviewUpdateProposal};
 
-pub mod normalize;
-pub mod schema;
+pub(crate) mod normalize;
+pub(crate) mod schema;
 
-pub use normalize::normalize_repo_map_path;
+pub(crate) use normalize::normalize_repo_map_path;
 /// Declarative repository search request emitted during a research or discussion turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSearchRequest {
@@ -29,7 +31,7 @@ pub struct RepoSearchRequest {
 }
 
 impl RepoSearchRequest {
-    pub fn new(path: impl Into<String>, regex: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, regex: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             regex: regex.into(),
@@ -62,13 +64,13 @@ impl RepoSearchRequest {
 /// shallow and never floods the context budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirListRequest {
-    pub path: String,
+    pub(crate) path: String,
     #[serde(default)]
-    pub recursive: bool,
+    pub(crate) recursive: bool,
 }
 
 impl DirListRequest {
-    pub fn new(path: impl Into<String>, recursive: bool) -> Self {
+    pub(crate) fn new(path: impl Into<String>, recursive: bool) -> Self {
         Self {
             path: path.into(),
             recursive,
@@ -85,7 +87,7 @@ impl DirListRequest {
     /// never address a location outside the repository; such a path yields
     /// `None` and the request is dropped instead of being allowed to escape.
     /// The `recursive` flag is preserved.
-    pub fn normalized(self) -> Option<Self> {
+    pub(crate) fn normalized(self) -> Option<Self> {
         normalize_repo_map_path(&self.path).map(|path| Self {
             path,
             recursive: self.recursive,
@@ -167,9 +169,9 @@ fn strip_access_prefix<'a>(spec: &'a str, prefix: &str) -> Option<&'a str> {
 /// to ensure immediate streaming output to TUI clients while supporting strict structured validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DiscussionResponse {
-    pub message: String,
+    pub(crate) message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_update: Option<DiscussionPlanUpdate>,
+    pub(crate) plan_update: Option<DiscussionPlanUpdate>,
     /// Decision recorded for one finding of the discussed review session.
     ///
     /// The dialogue is where an engineer actually decides what a finding is
@@ -182,33 +184,33 @@ pub struct DiscussionResponse {
     /// the ordinary finding workflow and owns the transition to `fixed`. Null
     /// when the turn recorded no decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_update: Option<ReviewUpdateProposal>,
+    pub(crate) review_update: Option<ReviewUpdateProposal>,
     #[serde(
         default,
         deserialize_with = "deserialize_context_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub context_requests: Vec<DiscussionContextRequest>,
+    pub(crate) context_requests: Vec<DiscussionContextRequest>,
     #[serde(
         default,
         deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub repo_searches: Vec<RepoSearchRequest>,
+    pub(crate) repo_searches: Vec<RepoSearchRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo_dirs: Option<bool>,
+    pub(crate) repo_dirs: Option<bool>,
     #[serde(
         default,
         deserialize_with = "deserialize_repo_map_paths",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub repo_maps: Vec<String>,
+    pub(crate) repo_maps: Vec<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_dir_list_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub dir_lists: Vec<DirListRequest>,
+    pub(crate) dir_lists: Vec<DirListRequest>,
     /// Decode diagnosis of a `plan_update` payload the DTO could not honor.
     ///
     /// The structured stream filter rebuilds this response from a partially
@@ -218,11 +220,11 @@ pub struct DiscussionResponse {
     /// it. It is a harness-side diagnostic rather than a model-authored field, so
     /// it stays out of the strict wire schema and is omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_update_error: Option<String>,
+    pub(crate) plan_update_error: Option<String>,
 }
 
 impl DiscussionResponse {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             plan_update: None,
@@ -236,7 +238,7 @@ impl DiscussionResponse {
         }
     }
 
-    pub fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
+    pub(crate) fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
         self.repo_maps = paths
             .iter()
             .filter_map(|path| normalize_repo_map_path(path))

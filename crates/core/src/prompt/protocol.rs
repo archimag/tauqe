@@ -53,25 +53,13 @@ pub trait PromptProtocol: Send + Sync {
     fn supports(&self, capability: LlmCapability) -> bool {
         self.capability_expr().contains(capability)
     }
-
-    /// Returns a variant of this protocol that advertises exactly `expr`.
-    ///
-    /// Every concrete protocol implements this, so a caller narrows a turn to a
-    /// capability tree without branching on the concrete protocol type.
-    fn with_capability_expr(&self, expr: CapabilityTree) -> Box<dyn PromptProtocol>;
-
     /// Returns a variant of this protocol bound to the project declaration.
     ///
     /// The declaration decides whether the composed schema advertises the
     /// commands of `[project.commands]` as typed custom tools and whether the
-    /// decoder accepts one, so a contour hands the active declaration to its
-    /// protocol before it renders the instructions of a round or decodes the
-    /// answer. A protocol whose surface does not depend on the declaration
-    /// answers with the surface it already carries.
-    fn with_project(&self, _project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
-        self.with_capability_expr(self.capability_expr())
-    }
-
+    /// decoder accepts one. Binding the project does not change the capability
+    /// tree the protocol received at construction.
+    fn with_project(&self, project: Option<ProjectConfig>) -> Box<dyn PromptProtocol>;
     /// Decodes raw model output into normalized core commands.
     ///
     /// `context_paths` lists the files an edit may address this turn: every file
@@ -84,20 +72,24 @@ pub trait PromptProtocol: Send + Sync {
     /// Only commands corresponding to advertised capabilities are produced.
     fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand>;
 
+    /// Decodes using the same edit strategy that produced the request schema.
+    fn decode_with_strategy(
+        &self,
+        raw_text: &str,
+        context_paths: &[String],
+        _strategy: PatchStrategy,
+    ) -> Vec<LlmCommand> {
+        self.decode(raw_text, context_paths)
+    }
+
     /// Renders protocol-specific instructions appended to the system prompt.
     ///
     /// The active protocol renders its own guidance directly, so prompt assembly
     /// never reconstructs a protocol from its name and never renders mode
     /// instructions of its own.
     ///
-    /// An implementor renders the instructions of the wire surface its narrowed
-    /// capability set selects: the edit reference when a file-edit capability is
-    /// enabled, and the read-only discussion schema otherwise. The narrowed
-    /// capability tree is the single typed input carrying that decision — the
-    /// caller narrows the surface and hands it to
-    /// [`PromptProtocol::with_capability_expr`] before calling — so no parallel
-    /// regime channel exists on this trait and a second source of truth cannot
-    /// appear.
+    /// The protocol renders the instructions of the capability tree it received
+    /// when constructed; callers do not replace that tree during prompt assembly.
     ///
     /// `has_eager_repo_map` reports whether the prompt already carries the
     /// rendered repository symbol map, so the guidance never advertises an
@@ -138,6 +130,16 @@ pub trait PromptProtocol: Send + Sync {
     ///
     /// Each protocol constructs its own filter, so no protocol is ever
     /// reconstructed from its [`PromptProtocol::name`] string.
+    fn create_stream_filter_with_strategy(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+        _strategy: PatchStrategy,
+    ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
+        self.create_stream_filter(editable_paths, repo_root, staged_contents)
+    }
+
     fn create_stream_filter(
         &self,
         editable_paths: Vec<String>,
@@ -182,12 +184,9 @@ mod tests {
             String::new()
         }
 
-        fn with_capability_expr(&self, _expr: CapabilityTree) -> Box<dyn PromptProtocol> {
-            // The fixture advertises a fixed capability tree; narrowing is
-            // exercised by the concrete protocols.
+        fn with_project(&self, _project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
             Box::new(TextOnlyProtocol)
         }
-
         fn create_stream_filter(
             &self,
             editable_paths: Vec<String>,

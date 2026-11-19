@@ -10,12 +10,13 @@ use tokio::sync::{mpsc, watch};
 
 use super::outcome::{ResponseEnvelope, SystemError};
 use super::prompt::PromptBuilder;
+pub use super::transcript::TurnTranscript;
 use crate::context::ContextManager;
 use crate::edits::StagedEditsState;
 #[cfg(test)]
 use crate::history::HistorySnapshot;
 use crate::prompt::TurnBrief;
-use crate::providers::types::{ChatMessage, StreamEvent};
+use crate::providers::types::{StreamEvent, TurnRequestReason};
 use crate::workflow::policy::ApplyPolicy;
 use crate::workflow::research::journal::TurnResearchJournal;
 
@@ -126,7 +127,7 @@ impl EventSink {
     }
 
     /// Convenience helper to emit textual response deltas.
-    pub(crate) fn emit_text_delta(&self, text: impl Into<String>) {
+    pub fn emit_text_delta(&self, text: impl Into<String>) {
         self.emit(StreamEvent::TextDelta(text.into()));
     }
 
@@ -134,193 +135,6 @@ impl EventSink {
     #[cfg(test)]
     fn emit_reasoning_delta(&self, text: impl Into<String>) {
         self.emit(StreamEvent::ReasoningDelta(text.into()));
-    }
-}
-
-/// Round transcript of one bounded turn.
-///
-/// The transcript freezes the byte-stable head of the turn and lets every later
-/// round append to what the model has already seen instead of rebuilding the
-/// whole message sequence. It is shared through [`LoopContext`], so a round a
-/// reborrowed child context appends stays visible to the context it came from.
-///
-/// The prefix is frozen inside a phase, not for the whole turn: a change set
-/// that churned the context — the files it converged on and the files the
-/// substrate refused — marks the churn epoch, and the next round reseeds the
-/// head once from the current context, so the model reads the bytes it is
-/// about to change instead of the rendering the turn opened with.
-#[derive(Debug)]
-pub struct TurnTranscript {
-    /// System head of the turn, rendered when the transcript is seeded.
-    prefix: Vec<ChatMessage>,
-    /// Task message of the turn, frozen for the whole turn.
-    task: ChatMessage,
-    /// Assistant and user message pairs of the rounds already exchanged.
-    rounds: Vec<ChatMessage>,
-    /// Feedback the next round appends as its user message.
-    pending_feedback: Option<String>,
-    /// Serialized capability tree the prefix was seeded with.
-    seed_signature: Option<String>,
-    /// Churn epoch the rendered prefix was stamped with.
-    ///
-    /// Seeding and reseeding stamp the epoch the context had reached, so the
-    /// prefix is stale exactly when the context churned after it was
-    /// rendered.
-    seed_churn: u64,
-    /// Churn epoch the context has reached.
-    ///
-    /// A change set that rewrote context files marks the churn, and the next
-    /// round reseeds the prefix so the model reads the bytes it is about to
-    /// address instead of the bytes the turn opened with.
-    context_churn: u64,
-}
-
-impl Default for TurnTranscript {
-    fn default() -> Self {
-        Self {
-            prefix: Vec::new(),
-            task: ChatMessage::user(String::new()),
-            rounds: Vec::new(),
-            pending_feedback: None,
-            seed_signature: None,
-            seed_churn: 0,
-            context_churn: 0,
-        }
-    }
-}
-
-impl TurnTranscript {
-    /// Seeds the transcript with the rendered head of the turn and its task message.
-    /// Seeds the transcript with the rendered head of the turn and its task message.
-    ///
-    /// The first round of a turn seeds a snapshot of the assembly it was built from,
-    /// so the prefix and the task message stay frozen for every round that follows.
-    pub(crate) fn seed(
-        &mut self,
-        prefix: Vec<ChatMessage>,
-        task: ChatMessage,
-        capabilities: &CapabilityTree,
-    ) {
-        self.prefix = prefix;
-        self.task = task;
-        self.seed_signature = Some(serde_json::to_string(capabilities).unwrap_or_default());
-        self.seed_churn = self.context_churn;
-    }
-
-    /// Replaces the rendered head of the turn and keeps the task and every round.
-    ///
-    /// A phase transition re-renders the capabilities the turn advertises, so the
-    /// prefix changes while the material already exchanged stays byte-for-byte
-    /// identical.
-    pub(crate) fn reseed_prefix(&mut self, prefix: Vec<ChatMessage>) {
-        self.prefix = prefix;
-        self.seed_churn = self.context_churn;
-    }
-
-    /// Appends one round: the assistant message and the feedback of the next request.
-    ///
-    /// A round adds exactly two messages to the transcript and never rewrites a
-    /// message an earlier round produced.
-    #[cfg(test)]
-    fn append_round(&mut self, assistant: impl Into<String>, user_feedback: impl Into<String>) {
-        self.rounds.push(ChatMessage::assistant(assistant));
-        self.rounds.push(ChatMessage::user(user_feedback));
-    }
-    /// Assembles the message sequence of the next round.
-    ///
-    /// The sequence is the prefix, the frozen task message, and every round already
-    /// exchanged, so round `N + 1` sends exactly the messages of round `N` plus the
-    /// pair the last round appended. A transcript that has not been seeded carries
-    /// no message at all.
-    pub(crate) fn messages(&self) -> Vec<ChatMessage> {
-        if !self.is_seeded() {
-            return Vec::new();
-        }
-        let mut messages = Vec::with_capacity(self.prefix.len() + 1 + self.rounds.len());
-        messages.extend(self.prefix.iter().cloned());
-        messages.push(self.task.clone());
-        messages.extend(self.rounds.iter().cloned());
-        messages
-    }
-
-    /// Reports whether the transcript has been seeded with a prefix and a task.
-    pub(crate) fn is_seeded(&self) -> bool {
-        self.seed_signature.is_some()
-    }
-
-    /// Reports whether the transcript advertises exactly this capability tree.
-    ///
-    /// A different tree is the phase boundary of the turn: the head the turn renders
-    /// is rewritten once, while the task message and the rounds already exchanged keep
-    /// their exact bytes.
-    pub(crate) fn advertises(&self, capabilities: &CapabilityTree) -> bool {
-        let signature = serde_json::to_string(capabilities).unwrap_or_default();
-        self.seed_signature.as_deref() == Some(signature.as_str())
-    }
-
-    /// Reports whether the context churned after the prefix was rendered.
-    ///
-    /// A change set that rewrote context files — the members it converged on
-    /// and the members the substrate refused — marks the churn, and the round
-    /// that follows reseeds the prefix once so the model addresses the bytes
-    /// the change set produced instead of the rendering the turn opened
-    /// with.
-    pub(crate) fn prefix_is_stale(&self) -> bool {
-        self.context_churn != self.seed_churn
-    }
-
-    /// Marks the context as churned by the change set the turn just staged.
-    ///
-    /// The mark carries no payload of its own: relocating the named paths
-    /// already moved the entries, and the next round that renders a request
-    /// compares the epochs and reseeds the prefix once.
-    fn mark_context_churn(&mut self) {
-        self.context_churn += 1;
-    }
-
-    /// Appends the answer of the round that just finished.
-    ///
-    /// The answer is recorded as soon as it arrives, before the feedback of the round
-    /// that follows exists, so a round a later contour requests replays it in order. A
-    /// blank answer carries nothing the model can read back and is not recorded.
-    pub(crate) fn push_assistant(&mut self, answer: impl Into<String>) {
-        let answer = answer.into();
-        if answer.trim().is_empty() {
-            return;
-        }
-        self.rounds.push(ChatMessage::assistant(answer));
-    }
-
-    /// Appends the feedback the next round carries as its user message.
-    ///
-    /// The slot [`Self::set_pending_feedback`] fills travels here exactly once, so the
-    /// sequence of a round is always its predecessor plus the pair it exchanged.
-    pub(crate) fn push_feedback(&mut self, feedback: impl Into<String>) {
-        let feedback = feedback.into();
-        if feedback.trim().is_empty() {
-            return;
-        }
-        self.rounds.push(ChatMessage::user(feedback));
-    }
-
-    /// Takes the feedback the next round appends as its user message.
-    pub(crate) fn take_pending_feedback(&mut self) -> Option<String> {
-        self.pending_feedback.take()
-    }
-
-    /// Records the feedback the next round appends as its user message.
-    ///
-    /// The slot is written by every producer of an additional round — the
-    /// research journal, verification healing, patch retry, and the empty-round
-    /// reminder — and taken exactly once by the round that appends the pair, so
-    /// feedback never reaches the provider twice. Blank feedback carries no
-    /// knowledge and leaves the slot untouched.
-    pub(crate) fn set_pending_feedback(&mut self, feedback: impl Into<String>) {
-        let feedback = feedback.into();
-        if feedback.trim().is_empty() {
-            return;
-        }
-        self.pending_feedback = Some(feedback);
     }
 }
 
@@ -439,13 +253,8 @@ impl<'a> LoopContext<'a> {
 
     /// Opens a research round in the journal of the turn.
     ///
-    /// The boundary narrows what the round reports to the records that follow
-    /// it, and the patch strategy of the turn travels with the boundary, so the
-    /// files a round delivers render with the very anchors the context block
-    /// carries.
+    /// The boundary narrows feedback to the findings of this round.
     pub(crate) fn begin_research_round(&mut self) {
-        let patch_strategy = self.prompt_builder.patch_strategy;
-        self.journal.set_patch_strategy(patch_strategy);
         let next_index = self.journal.round_index() + 1;
         self.journal.begin_round(next_index);
     }
@@ -464,39 +273,6 @@ impl<'a> LoopContext<'a> {
         self.transcript().set_pending_feedback(feedback);
     }
 
-    /// Marks the context as churned by the change set the turn just staged.
-    ///
-    /// The change set is the churn of the working set the model must read
-    /// next: the members that converged relocate to the tail of their context
-    /// layers first, the members the substrate refused follow them, and the
-    /// relocation re-issues their arrival watermarks so the next assembly
-    /// renders the hot group behind the last recorded turn. The churn mark
-    /// also stales the rendered prefix, so the round that follows reseeds it
-    /// and the model addresses the bytes it is about to change instead of the
-    /// bytes the turn opened with.
-    ///
-    /// The mark is recorded whenever a path was named, even when no context
-    /// layer holds it: a change set that creates a file outside the context
-    /// still changes what the repair round must see, and the reseed the mark
-    /// triggers costs no provider round of its own.
-    pub(crate) fn note_context_churn(&mut self, converged: &[String], refused: &[String]) {
-        let named: Vec<String> = converged.iter().chain(refused).cloned().collect();
-        if named.is_empty() {
-            return;
-        }
-        if self.context_manager.move_files_to_tail(&named) {
-            self.events.emit(StreamEvent::ContextChanged(
-                self.context_manager.get_state(),
-            ));
-        }
-        self.transcript().mark_context_churn();
-    }
-
-    /// Marks the context as churned so the transcript prefix is reseeded.
-    pub(crate) fn mark_context_churn(&mut self) {
-        self.transcript().mark_context_churn();
-    }
-
     /// Sets the history snapshot on the underlying prompt builder.
     #[cfg(test)]
     pub(crate) fn set_history(&mut self, history: Option<&'a HistorySnapshot>) -> &mut Self {
@@ -505,7 +281,7 @@ impl<'a> LoopContext<'a> {
     }
     /// Requests a standard model round without repair diagnostics.
     pub(crate) async fn request_round(&mut self) -> Result<ResponseEnvelope, SystemError> {
-        super::prompt::execute_round(self, None).await
+        super::prompt::execute_round(self, None, None).await
     }
 
     /// Requests a verification healing round with compiler/linter error report.
@@ -516,9 +292,10 @@ impl<'a> LoopContext<'a> {
     pub(crate) async fn request_healing(
         &mut self,
         healing_prompt: &str,
+        reason: TurnRequestReason,
     ) -> Result<ResponseEnvelope, SystemError> {
         self.transcript().set_pending_feedback(healing_prompt);
-        super::prompt::execute_round(self, None).await
+        super::prompt::execute_round(self, None, Some(reason)).await
     }
 
     /// Requests an in-memory patch retry round with virtual staging failure report.
@@ -532,7 +309,7 @@ impl<'a> LoopContext<'a> {
         staged_state: Option<&StagedEditsState>,
     ) -> Result<ResponseEnvelope, SystemError> {
         self.transcript().set_pending_feedback(repair_prompt);
-        super::prompt::execute_round(self, staged_state).await
+        super::prompt::execute_round(self, staged_state, Some(TurnRequestReason::PatchRepair)).await
     }
 
     /// Checks whether cancellation was requested, returning [`SystemError::Cancelled`] if so.
@@ -599,7 +376,8 @@ mod tests {
         let mut journal = TurnResearchJournal::default();
         let provider = MockLlmProvider::new();
         let model = ModelRef::openrouter("mock/model");
-        let protocol = JsonPromptProtocol::default();
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         let cancel = CancellationToken::new();
         let sink = EventSink::noop();
         let base_caps = CapabilityTree::set([CapabilityTree::leaf(LlmCapability::TextMessage)]);
@@ -679,39 +457,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_turn_transcript_appends_exactly_one_round() {
-        let mut transcript = seeded_transcript();
-        let seeded = transcript.messages();
-
-        transcript.append_round("first answer", "search results");
-
-        let mut expected = seeded;
-        expected.push(ChatMessage::assistant("first answer"));
-        expected.push(ChatMessage::user("search results"));
-        assert_eq!(transcript.messages(), expected);
+    fn discover(transcript: &mut TurnTranscript, path: &str) {
+        transcript.remember_files(&[crate::context::ContextFileContent {
+            path: path.into(),
+            content: "discovered".into(),
+            access: crate::context::ContextAccess::ReadOnly,
+            insertion_seq: 0,
+        }]);
+        transcript.append_discoveries(crate::workflow::PatchStrategy::ApplyPatch);
     }
 
     #[test]
-    fn test_turn_transcript_reseed_replaces_prefix_only() {
+    fn discovered_files_are_delivered_once_across_reseeding() {
         let mut transcript = seeded_transcript();
-        transcript.append_round("first answer", "search results");
+        discover(&mut transcript, "helper.rs");
+        discover(&mut transcript, "helper.rs");
+        let messages = transcript.messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[2].content.contains("helper.rs"));
 
-        transcript.reseed_prefix(vec![
-            ChatMessage::system("contract"),
-            ChatMessage::user("context"),
-        ]);
-
-        assert_eq!(
-            transcript.messages(),
-            vec![
-                ChatMessage::system("contract"),
-                ChatMessage::user("context"),
-                sample_task_message(),
-                ChatMessage::assistant("first answer"),
-                ChatMessage::user("search results"),
-            ]
+        let prefix = vec![ChatMessage::system("new contract"), messages[2].clone()];
+        transcript.reseed_prefix(
+            prefix.clone(),
+            &CapabilityTree::from_leaves([LlmCapability::EditReplace]),
         );
+        discover(&mut transcript, "helper.rs");
+        let mut expected = prefix;
+        expected.push(sample_task_message());
+        assert_eq!(transcript.messages(), expected);
     }
 
     #[test]
@@ -721,7 +494,8 @@ mod tests {
         let mut journal = TurnResearchJournal::default();
         let provider = MockLlmProvider::new();
         let model = ModelRef::openrouter("mock/model");
-        let protocol = JsonPromptProtocol::default();
+        let protocol =
+            JsonPromptProtocol::new(CapabilityTree::from_leaves([LlmCapability::TextMessage]));
         let cancel = CancellationToken::new();
         let sink = EventSink::noop();
         let mut cache = crate::control::cache::TurnInputCache::default();
@@ -745,102 +519,13 @@ mod tests {
                 sample_task_message(),
                 &child.capabilities,
             );
-            child
-                .transcript()
-                .append_round("child answer", "child feedback");
+            discover(&mut child.transcript(), "child.rs");
         }
 
         let transcript = ctx.transcript();
         assert!(transcript.is_seeded());
         let messages = transcript.messages();
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[2], ChatMessage::assistant("child answer"));
-        assert_eq!(messages[3], ChatMessage::user("child feedback"));
-    }
-
-    #[test]
-    fn a_context_churn_marks_the_rendered_prefix_stale_until_reseeded() {
-        let mut transcript = seeded_transcript();
-        assert!(!transcript.prefix_is_stale());
-
-        transcript.mark_context_churn();
-        assert!(transcript.prefix_is_stale());
-
-        // The reseed stamps the epoch the context reached, so the prefix the
-        // next round sends is current again.
-        transcript.reseed_prefix(vec![ChatMessage::system("contract, revised")]);
-        assert!(!transcript.prefix_is_stale());
-    }
-
-    #[test]
-    fn a_churn_before_the_first_seed_is_absorbed_by_the_seed() {
-        let mut transcript = TurnTranscript::default();
-        transcript.mark_context_churn();
-        assert!(!transcript.is_seeded());
-
-        transcript.seed(
-            vec![ChatMessage::system("contract")],
-            sample_task_message(),
-            &CapabilityTree::from_leaves([LlmCapability::EditReplace]),
-        );
-        assert!(!transcript.prefix_is_stale());
-    }
-
-    #[test]
-    fn note_context_churn_relocates_the_named_files_in_the_given_order() {
-        let dir = tempfile::tempdir().expect("scratch directory");
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
-
-        let mut context = ContextManager::new(root);
-        context
-            .add_file("b.rs", crate::context::ContextAccess::ReadOnly)
-            .unwrap();
-        context
-            .add_file("a.rs", crate::context::ContextAccess::Editable)
-            .unwrap();
-
-        let mut journal = TurnResearchJournal::default();
-        let provider = MockLlmProvider::new();
-        let model = ModelRef::openrouter("mock/model");
-        let protocol = JsonPromptProtocol::default();
-        let cancel = CancellationToken::new();
-        let sink = EventSink::noop();
-        let mut cache = crate::control::cache::TurnInputCache::default();
-        let prompt_builder = PromptBuilder::new(&provider, &model, &protocol, &mut cache);
-        let mut policy = crate::workflow::policy::DirectApplyPolicy::new();
-        let mut ctx = LoopContext::new(
-            &cancel,
-            &sink,
-            dir.path(),
-            &mut context,
-            &mut journal,
-            &mut policy,
-            CapabilityTree::from_leaves([LlmCapability::TextMessage]),
-            prompt_builder,
-        );
-
-        // The transcript seeds a prefix first, so the churn that follows is
-        // observable as staleness instead of being absorbed by the seed.
-        ctx.transcript().seed(
-            vec![ChatMessage::system("contract")],
-            sample_task_message(),
-            &ctx.capabilities,
-        );
-        assert!(!ctx.transcript().prefix_is_stale());
-
-        // `a.rs` converged and `b.rs` was refused: both relocate, the
-        // converged member ahead of the refused one.
-        ctx.note_context_churn(&["a.rs".to_string()], &["b.rs".to_string()]);
-        assert!(ctx.transcript().prefix_is_stale());
-        let state = ctx.context_manager.get_state();
-        let paths: Vec<&str> = state.items.iter().map(|item| item.path.as_str()).collect();
-        assert_eq!(paths, vec!["a.rs", "b.rs"]);
-
-        // A churn that names no path marks nothing.
-        let churn_epoch = ctx.transcript().context_churn;
-        ctx.note_context_churn(&[], &[]);
-        assert_eq!(ctx.transcript().context_churn, churn_epoch);
+        assert_eq!(messages.len(), 3);
+        assert!(messages[2].content.contains("child.rs"));
     }
 }

@@ -4,11 +4,17 @@ mod item;
 mod node;
 mod render;
 mod review;
-pub use implementation::{compute_items_status, PlanImplementationProjection, PlanScopeEvaluation};
-pub use item::{PlanItemProjection, PlanStatusProjection};
-pub use node::{PlanProjection, PlanValidationError};
+pub use implementation::{PlanImplementationProjection, PlanScopeEvaluation};
+pub use item::PlanItemProjection;
+#[cfg(test)]
+pub(crate) use item::PlanStatusProjection;
+#[cfg(test)]
+pub(crate) use node::PlanProjection;
+pub use node::PlanValidationError;
 pub use render::PlanRendering;
-pub use review::{ReviewGroupProjection, ReviewProjection, ReviewStatusProjection};
+pub use review::ReviewProjection;
+#[cfg(test)]
+pub(crate) use review::{ReviewGroupProjection, ReviewStatusProjection};
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]

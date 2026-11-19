@@ -20,6 +20,13 @@ use super::{
     SelectionDialogState, SquashDialogState, StatusDialogState, UsageSummaryState,
 };
 
+#[derive(Debug, Clone)]
+pub struct ChatGptDialog {
+    pub prompt: tauqe_protocol::config::ChatGptSignInPrompt,
+    pub button: super::ConfirmDialogButton,
+    pub browser_opened: Option<bool>,
+}
+
 /// State of the overlay surfaces that own the keyboard while they are open.
 ///
 /// Every overlay [`ActiveModal`] ranks keeps its fields here instead of
@@ -28,6 +35,7 @@ use super::{
 /// keeps are declared in one subsystem (Conventions §7).
 #[derive(Debug, Clone, Default)]
 pub struct ModalState {
+    pub chatgpt: Option<ChatGptDialog>,
     /// Fatal transport failure banner: the daemon stopped answering, so the
     /// interface stays read-only until the developer quits.
     pub server_disconnected: Option<String>,
@@ -203,6 +211,8 @@ pub struct ModalState {
 pub enum ActiveModal {
     /// Fatal transport state; blocks every other surface.
     ServerDisconnected,
+    ConfirmQuit,
+    ChatGptSignIn,
     Squash,
     /// Consent to launch a review whose audited window the configured budgets
     /// truncate. It outranks the launch dialog it returns to, so a pending
@@ -210,7 +220,6 @@ pub enum ActiveModal {
     ReviewTruncation,
     Review,
     ConfirmCancel,
-    ConfirmQuit,
     BatchCancel,
     ClearAuto,
     ClearUser,
@@ -350,11 +359,12 @@ mod tests {
 
         let expected = [
             ActiveModal::ServerDisconnected,
+            ActiveModal::ConfirmQuit,
+            ActiveModal::ChatGptSignIn,
             ActiveModal::Squash,
             ActiveModal::ReviewTruncation,
             ActiveModal::Review,
             ActiveModal::ConfirmCancel,
-            ActiveModal::ConfirmQuit,
             ActiveModal::BatchCancel,
             ActiveModal::ClearAuto,
             ActiveModal::ClearUser,

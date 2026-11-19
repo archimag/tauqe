@@ -1,167 +1,34 @@
-//! RPC publication for core-owned grouped review execution.
-use super::common::{emit, publish_review};
+//! Wire coverage for grouped reviews.
+#![cfg(test)]
 use crate::state::{AppState, OperationGuard};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use tauqe_core::api::{GroupAuditObserver, ReviewObserver, UsageTotalsSnapshot};
 use tauqe_core::providers::StreamEvent;
-use tauqe_core::review::stream::ReviewStreamUpdate;
 use tauqe_core::review::{ReviewGroup, ReviewSession};
-#[cfg(test)]
 use tauqe_core::workflow::batch::BatchReport;
-use tauqe_protocol::{
-    events, ModelUsageEvent, ReviewGroupFinishedEvent, ReviewGroupStartedEvent,
-    ReviewReasoningDeltaEvent,
-};
+use tauqe_protocol::events;
 use tokio::sync::watch;
 
-pub(super) struct Observer {
-    state: Arc<AppState>,
-    root: PathBuf,
-    id: String,
-}
-#[async_trait]
-impl ReviewObserver for Observer {
-    async fn pace(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
-        self.state.out.pace_event(event, cancel).await;
-    }
-    fn publish(&self, update: ReviewStreamUpdate) {
-        if let ReviewStreamUpdate::Reasoning(delta) = update {
-            emit(
-                &self.state.out,
-                events::REVIEW_REASONING_DELTA,
-                serde_json::to_value(ReviewReasoningDeltaEvent {
-                    operation_id: self.id.clone(),
-                    delta,
-                })
-                .ok(),
-            );
-        }
-    }
-    fn publish_usage_totals(&self, id: &str, snapshot: &UsageTotalsSnapshot) {
-        crate::usage::publish_snapshot(&self.state.out, id, snapshot);
-    }
-    fn publish_usage(&self, snapshot: &UsageTotalsSnapshot) {
-        emit(
-            &self.state.out,
-            events::MODEL_USAGE,
-            serde_json::to_value(ModelUsageEvent {
-                operation_id: self.id.clone(),
-                usage: crate::usage::wire_usage(&snapshot.prev.to_usage_info()),
-                session_total_cost: snapshot.session.cost,
-                current_cost: Some(snapshot.prev.cost),
-            })
-            .ok(),
-        );
-    }
-}
-#[async_trait]
-impl GroupAuditObserver for Observer {
-    fn group_started(&self, group: &ReviewGroup, files_count: usize, estimated_tokens: usize) {
-        emit(
-            &self.state.out,
-            events::REVIEW_GROUP_STARTED,
-            serde_json::to_value(ReviewGroupStartedEvent {
-                operation_id: self.id.clone(),
-                group_id: group.id.clone(),
-                group_title: group.title.clone(),
-                files_count,
-                estimated_tokens,
-            })
-            .ok(),
-        );
-    }
-    fn group_finished(&self, group: &ReviewGroup, findings_count: usize, error: Option<String>) {
-        emit(
-            &self.state.out,
-            events::REVIEW_GROUP_FINISHED,
-            serde_json::to_value(ReviewGroupFinishedEvent {
-                operation_id: self.id.clone(),
-                group_id: group.id.clone(),
-                findings_count,
-                success: error.is_none(),
-                error,
-            })
-            .ok(),
-        );
-    }
-    async fn publish_review(&self, id: &str) {
-        publish_review(&self.state, &self.root, id).await;
-    }
-}
-
-pub(super) fn observer(state: &Arc<AppState>, root: &Path, id: &str) -> Arc<Observer> {
-    Arc::new(Observer {
-        state: Arc::clone(state),
-        root: root.into(),
-        id: id.into(),
-    })
-}
-#[async_trait]
-impl tauqe_core::api::PresetReviewObserver for Observer {
-    async fn reviewer(
-        &self,
-        resolved: &tauqe_core::api::ResolvedReviewSynthesis,
-    ) -> Result<Arc<dyn tauqe_core::providers::LlmProvider>, String> {
-        #[cfg(test)]
-        if let Some(provider) = self.state.provider_override.lock().await.clone() {
-            return Ok(provider);
-        }
-        resolved.provider().map_err(|error| error.to_string())
-    }
-    async fn post_analysis(
-        &self,
-        session: &ReviewSession,
-        operation: &OperationGuard,
-    ) -> Result<ReviewSession, String> {
-        super::analysis::run_review_post_analysis(
-            &self.state,
-            &self.root,
-            session,
-            None,
-            operation,
-            true,
-        )
-        .await
-        .map_err(|error| error.message)
-    }
-}
-#[cfg(test)]
 pub(crate) async fn run_group_audits(
     state: &Arc<AppState>,
     root: &Path,
     session: &ReviewSession,
     operation: Arc<OperationGuard>,
 ) -> Result<BatchReport, String> {
-    let resolved = state
-        .application
-        .resolve_review_synthesis(Some(&tauqe_core::models::ModelSelection::Specific(
-            session.model.clone(),
-        )))
-        .await;
-    #[cfg(test)]
-    let provider = match state.provider_override.lock().await.clone() {
-        Some(provider) => provider,
-        None => resolved.provider().map_err(|e| e.to_string())?,
-    };
-    #[cfg(not(test))]
-    let provider = resolved.provider().map_err(|e| e.to_string())?;
-    let observer = Arc::new(Observer {
-        state: Arc::clone(state),
-        root: root.into(),
-        id: format!("op-{}", operation.id()),
+    let observer = Arc::new(crate::publication::Publisher {
+        out: state.out.clone(),
     });
-    tauqe_core::api::run_group_audits(
-        &state.application,
-        root,
-        session,
-        operation,
-        provider,
-        observer,
-        crate::reap::task_exit_deadline(),
-    )
-    .await
+    state
+        .application
+        .test_run_group_audits(
+            root,
+            session,
+            operation,
+            observer,
+            crate::reap::task_exit_deadline(),
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -172,7 +39,7 @@ mod tests {
         await_published, stall_outbound_transport, RecordingSink,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tauqe_core::providers::{ChatMessage, LlmProvider};
+    use tauqe_core::providers::LlmProvider;
     use tauqe_core::review::ReviewStorage;
     use tokio::sync::mpsc;
 
@@ -180,7 +47,7 @@ mod tests {
     use tauqe_core::config::AppConfig;
     use tauqe_core::models::{ModelRef, ProviderKind};
     use tauqe_core::providers::mock::MockResponse;
-    use tauqe_core::providers::{MockLlmProvider, ResponseFormat};
+    use tauqe_core::providers::MockLlmProvider;
     use tauqe_core::workflow::batch::BatchStop;
 
     /// Scratch repository, its daemon state, and the published event stream.
@@ -321,14 +188,12 @@ mod tests {
             ProviderKind::OpenRouter
         }
 
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _model: &str,
-            _messages: Vec<ChatMessage>,
-            _response_format: Option<ResponseFormat>,
+            _request: tauqe_core::providers::LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
             _cancel_rx: watch::Receiver<bool>,
-        ) -> anyhow::Result<()> {
+        ) -> tauqe_core::providers::ProviderResult {
             let call = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
             if call >= self.cancel_on_call {
                 // The developer interrupted the audit while this group was in
@@ -359,7 +224,7 @@ mod tests {
             MockResponse::text(""),
             MockResponse::text(findings_payload("Beta cloning")),
         ]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let operation = Arc::new(fixture.state.try_begin_operation().unwrap());
         let report = run_group_audits(&fixture.state, &fixture.root, &session, operation)
@@ -423,7 +288,7 @@ mod tests {
             cancel_on_call: 2,
             calls: AtomicUsize::new(0),
         });
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let operation = Arc::new(fixture.state.try_begin_operation().unwrap());
         let report = run_group_audits(&fixture.state, &fixture.root, &session, operation)
@@ -469,7 +334,7 @@ mod tests {
             MockResponse::text(findings_payload("Alpha cloning")),
             MockResponse::text(findings_payload("Beta cloning")),
         ]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let operation = Arc::new(fixture.state.try_begin_operation().unwrap());
         let report = run_group_audits(&fixture.state, &fixture.root, &session, operation)
@@ -517,7 +382,7 @@ mod tests {
         let response = MockResponse::text(findings_payload("Alpha cloning"))
             .with_reasoning("Inspecting the audited slice");
         let provider = Arc::new(MockLlmProvider::scripted([response]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         let operation = Arc::new(fixture.state.try_begin_operation().unwrap());
         let report = run_group_audits(&fixture.state, &fixture.root, &session, operation)
@@ -551,7 +416,7 @@ mod tests {
         let response = MockResponse::text(findings_payload("Alpha cloning"))
             .with_reasoning("Inspecting the audited slice");
         let provider = Arc::new(MockLlmProvider::scripted([response]));
-        *fixture.state.provider_override.lock().await = Some(provider);
+        fixture.state.application.test_set_provider(provider).await;
 
         // The client keeps its pipe open but stopped reading its stream.
         stall_outbound_transport(&fixture.state);

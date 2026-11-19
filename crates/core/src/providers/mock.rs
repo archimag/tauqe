@@ -9,8 +9,8 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use super::{LlmRequest, ModelUsageInfo, ProviderResult};
 use crate::models::ProviderKind;
-use crate::providers::ModelUsageInfo;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
 
@@ -105,7 +105,8 @@ impl MockLlmProvider {
     }
 
     /// Number of responses still waiting to be replayed.
-    pub fn remaining(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> usize {
         self.with_state(|state| state.scripts.len())
     }
 
@@ -131,43 +132,21 @@ impl MockLlmProvider {
         self.with_state(|state| state.scripts.pop_front())
     }
 
-    fn record(
-        &self,
-        model: &str,
-        messages: &[ChatMessage],
-        response_format: Option<&ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
-    ) {
-        self.with_state(|state| {
-            state.requests.push(MockRequest {
-                model: model.to_string(),
-                messages: messages.to_vec(),
-                response_format: response_format.cloned(),
-                reasoning_effort,
-                session_id: session_id.map(str::to_string),
-            });
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: &watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        self.record(
-            model,
-            &messages,
-            response_format.as_ref(),
-            reasoning_effort,
-            session_id,
-        );
+        self.with_state(|state| {
+            state.requests.push(MockRequest {
+                model: request.model.to_owned(),
+                messages: request.messages,
+                response_format: request.response_format,
+                reasoning_effort: request.reasoning_effort,
+                session_id: request.session_id.map(str::to_owned),
+            });
+        });
 
         let cancelled = *cancel_rx.borrow();
         if cancelled {
@@ -216,64 +195,20 @@ impl MockLlmProvider {
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
     fn kind(&self) -> ProviderKind {
-        // A test double reuses the sole wire provider kind; the mock never
+        // A test double defaults to the OpenRouter provider kind and never
         // performs any network I/O.
         ProviderKind::OpenRouter
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
+        request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.replay(model, messages, response_format, None, None, tx, &cancel_rx)
+    ) -> ProviderResult {
+        self.replay(request, tx, &cancel_rx)
             .await
-    }
-
-    async fn stream_chat_with_effort(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.replay(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            None,
-            tx,
-            &cancel_rx,
-        )
-        .await
-    }
-
-    async fn stream_chat_with_session(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        response_format: Option<ResponseFormat>,
-        reasoning_effort: Option<ReasoningEffort>,
-        session_id: Option<&str>,
-        tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
-        self.replay(
-            model,
-            messages,
-            response_format,
-            reasoning_effort,
-            session_id,
-            tx,
-            &cancel_rx,
-        )
-        .await
+            .map_err(crate::providers::ProviderError::Request)
     }
 }
 
@@ -291,7 +226,7 @@ mod tests {
             }
             events
         };
-        let stream = provider.stream_chat("test-model", messages, None, tx, cancel_rx);
+        let stream = provider.stream(LlmRequest::new("test-model", messages), tx, cancel_rx);
         let (result, events) = tokio::join!(stream, collect);
         result.expect("mock stream should succeed");
         events
@@ -345,7 +280,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(true);
 
         let result = provider
-            .stream_chat("test-model", Vec::new(), None, tx, cancel_rx)
+            .stream(LlmRequest::new("test-model", Vec::new()), tx, cancel_rx)
             .await;
         assert!(result.is_ok());
 
@@ -377,12 +312,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let stream = provider.stream_chat_with_session(
-            "test-model",
-            Vec::new(),
-            None,
-            None,
-            Some("tauqe-repl-abc"),
+        let stream = provider.stream(
+            LlmRequest {
+                session_id: Some("tauqe-repl-abc"),
+                ..LlmRequest::new("test-model", Vec::new())
+            },
             tx,
             cancel_rx,
         );
@@ -400,11 +334,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let stream = provider.stream_chat_with_effort(
-            "test-model",
-            Vec::new(),
-            None,
-            Some(ReasoningEffort::XHigh),
+        let stream = provider.stream(
+            LlmRequest {
+                reasoning_effort: Some(ReasoningEffort::XHigh),
+                ..LlmRequest::new("test-model", Vec::new())
+            },
             tx,
             cancel_rx,
         );

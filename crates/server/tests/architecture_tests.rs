@@ -28,7 +28,8 @@ fn workspace_dependencies_follow_module_boundaries() {
         ("tauqe-protocol", &[]),
         ("tauqe-tools", &[]),
         ("tauqe-core", &["tauqe-tools"]),
-        ("tauqe-server", &["tauqe-core", "tauqe-protocol"]),
+        ("tauqe-flow", &["tauqe-core"]),
+        ("tauqe-server", &["tauqe-flow", "tauqe-protocol"]),
         ("tauqe-tui", &["tauqe-tools", "tauqe-protocol"]),
     ];
     let workspace_names: BTreeSet<_> = packages
@@ -44,13 +45,13 @@ fn workspace_dependencies_follow_module_boundaries() {
         let package = packages.iter().find(|p| p["name"] == name).unwrap();
         for dependency in package["dependencies"].as_array().unwrap() {
             let dependency_name = dependency["name"].as_str().unwrap();
-            // The core test-support feature is enabled by a self dev-dependency.
+            // The test-support feature is enabled by a self dev-dependency.
             if dependency_name == name && dependency["kind"] == "dev" {
                 continue;
             }
-            // Composition-root tests compare the real client projection with core.
-            if name == "tauqe-server"
-                && dependency_name == "tauqe-tui"
+            // Server tests compare client and engine projections. Flow tests create Git fixtures.
+            if ((name == "tauqe-server" && ["tauqe-tui", "tauqe-core"].contains(&dependency_name))
+                || (name == "tauqe-flow" && dependency_name == "tauqe-tools"))
                 && dependency["kind"] == "dev"
             {
                 continue;
@@ -61,11 +62,11 @@ fn workspace_dependencies_follow_module_boundaries() {
                     "forbidden dependency: {name} -> {dependency_name}"
                 );
             }
-            if name == "tauqe-core" {
+            if matches!(name, "tauqe-core" | "tauqe-flow") {
                 assert!(
                     !["ratatui", "crossterm", "axum", "tonic", "jsonrpsee"]
                         .contains(&dependency_name),
-                    "core must remain headless and transport-free: {dependency_name}"
+                    "{name} must remain headless and transport-free: {dependency_name}"
                 );
             }
             if name == "tauqe-protocol" {
@@ -99,38 +100,38 @@ fn assert_protocol_free(paths: &[&str]) {
             );
         }
     }
-    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src");
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     for path in paths {
-        inspect(&core.join(path));
+        inspect(&crates.join(path));
     }
 }
 #[test]
 fn history_models_do_not_depend_on_protocol() {
     assert_protocol_free(&[
-        "history.rs",
-        "history",
-        "application/history.rs",
-        "application/history_operation.rs",
+        "core/src/history.rs",
+        "core/src/history",
+        "flow/src/application/history.rs",
+        "flow/src/application/history_operation.rs",
     ]);
 }
 #[test]
 fn context_models_do_not_depend_on_protocol() {
     assert_protocol_free(&[
-        "context.rs",
-        "context",
-        "application/context.rs",
-        "application/context_operation.rs",
+        "core/src/context.rs",
+        "core/src/context",
+        "flow/src/application/context.rs",
+        "flow/src/application/context_operation.rs",
     ]);
 }
 
 #[test]
 fn model_configuration_does_not_depend_on_protocol() {
     assert_protocol_free(&[
-        "models.rs",
-        "models",
-        "config/models.rs",
-        "config/models",
-        "config/providers.rs",
+        "core/src/models.rs",
+        "core/src/models",
+        "core/src/config/models.rs",
+        "core/src/config/models",
+        "core/src/config/providers.rs",
     ]);
 }
 #[test]
@@ -143,21 +144,21 @@ fn protocol_does_not_resolve_generation_attempt_budgets() {
 #[test]
 fn plan_and_review_documents_and_storage_do_not_depend_on_protocol() {
     assert_protocol_free(&[
-        "plan.rs",
-        "plan/model",
-        "plan/storage.rs",
-        "plan/storage",
-        "review.rs",
-        "review/model",
-        "review/storage.rs",
-        "review/storage",
-        "review/analysis.rs",
-        "review/analysis",
-        "config/review.rs",
-        "application/plan_horizon.rs",
-        "application/plan_two_phase.rs",
-        "application/review_analysis.rs",
-        "application/review_synthesis_completion.rs",
+        "core/src/plan.rs",
+        "core/src/plan/model",
+        "core/src/plan/storage.rs",
+        "core/src/plan/storage",
+        "core/src/review.rs",
+        "core/src/review/model",
+        "core/src/review/storage.rs",
+        "core/src/review/storage",
+        "core/src/review/analysis.rs",
+        "core/src/review/analysis",
+        "core/src/config/review.rs",
+        "flow/src/application/plan_horizon.rs",
+        "flow/src/application/plan_two_phase.rs",
+        "flow/src/application/review_analysis.rs",
+        "flow/src/application/review_synthesis_completion.rs",
     ]);
 }
 
@@ -172,23 +173,23 @@ fn protocol_does_not_own_model_only_analysis_or_durable_provenance_rules() {
 #[test]
 fn execution_identity_and_queue_entry_points_do_not_depend_on_protocol() {
     assert_protocol_free(&[
-        "workflow/kind.rs",
-        "workflow/turn.rs",
-        "workflow/implementation.rs",
-        "workflow/implementation/scope.rs",
-        "application/configuration.rs",
-        "application/turn_setup.rs",
-        "application/implementation.rs",
-        "application/implementation_step.rs",
-        "application/review_batch.rs",
-        "control/refine.rs",
-        "edits/protocol.rs",
+        "core/src/workflow/kind.rs",
+        "core/src/workflow/turn.rs",
+        "core/src/workflow/implementation.rs",
+        "core/src/workflow/implementation/scope.rs",
+        "flow/src/application/configuration.rs",
+        "flow/src/application/turn_setup.rs",
+        "flow/src/application/implementation.rs",
+        "flow/src/application/implementation_step.rs",
+        "flow/src/application/review_batch.rs",
+        "core/src/control/refine.rs",
+        "core/src/edits/protocol.rs",
     ]);
 }
 
 #[test]
-fn all_core_sources_are_independent_of_protocol() {
-    assert_protocol_free(&[""]);
+fn core_and_flow_sources_are_independent_of_protocol() {
+    assert_protocol_free(&["core/src", "flow/src"]);
 }
 
 #[test]
@@ -225,84 +226,6 @@ fn protocol_does_not_export_retired_model_only_payloads() {
     }
 }
 #[test]
-fn model_ask_adapter_does_not_load_or_render_domain_documents() {
-    let adapter = include_str!("../src/handlers/model/prompt.rs");
-    for name in [
-        "PlanStorage",
-        "ReviewStorage",
-        "format_plan_discussion_prompt",
-        "format_review_discussion_prompt",
-        "effective_groups",
-        "parse::<u32>",
-    ] {
-        assert!(
-            !adapter.contains(name),
-            "model ask policy remains in server: {name}"
-        );
-    }
-}
-
-#[test]
-fn turn_adapter_does_not_classify_step_artifacts_or_select_changed_documents() {
-    let adapter = include_str!("../src/handlers/model/turn.rs");
-    for policy in [
-        ".executed_steps",
-        ".commit_error",
-        "PlanStorage",
-        "ReviewStorage",
-        "load_review_session",
-        "review_decisions_applied",
-    ] {
-        assert!(
-            !adapter.contains(policy),
-            "turn completion policy remains in server: {policy}"
-        );
-    }
-}
-
-#[test]
-fn turn_adapter_does_not_assemble_engine_execution_or_read_git_state() {
-    let adapter = include_str!("../src/handlers/model/turn.rs");
-    for engine_detail in [
-        "run_repl_execution",
-        "run_step_execution",
-        "ReplExecutionConfig",
-        "StepExecutionConfig",
-        "apply_policy(",
-        "context_snapshot()",
-        "JsonPromptProtocol",
-        "start_interactive_task",
-        "run_step_task",
-        "get_repository_state",
-    ] {
-        assert!(
-            !adapter.contains(engine_detail),
-            "execution assembly remains in server: {engine_detail}"
-        );
-    }
-}
-
-#[test]
-fn turn_adapter_delegates_interactive_history_cleanup_and_failure_priority() {
-    let adapter = include_str!("../src/handlers/model/turn.rs");
-    for policy in [
-        "persist_interactive_interruption",
-        "persist_interactive_completion",
-        "classify_interactive_completion",
-        "merge_turn_context",
-        "interactive_plan_updates(",
-        "interactive_review_updates(",
-        "is_cancelled ||",
-        "cancel_rx.borrow()",
-    ] {
-        assert!(
-            !adapter.contains(policy),
-            "interactive finalization policy remains in server: {policy}"
-        );
-    }
-}
-
-#[test]
 fn server_production_sources_use_application_ports_for_domain_io_and_mutations() {
     fn inspect(path: &Path) {
         if path.is_dir() {
@@ -322,6 +245,9 @@ fn server_production_sources_use_application_ports_for_domain_io_and_mutations()
             return;
         }
         let source = std::fs::read_to_string(path).unwrap();
+        if source.lines().any(|line| line.trim() == "#![cfg(test)]") {
+            return;
+        }
         let production = source
             .split("#[cfg(test)]\nmod tests")
             .next()
@@ -349,6 +275,35 @@ fn server_production_sources_use_application_ports_for_domain_io_and_mutations()
             "find_duplicate_item_ids(",
             "effective_groups(",
             ".is_leaf()",
+            "ServerImplementationHost",
+            "create_provider(",
+            ".begin_configuration_change(",
+            ".begin_context_change(",
+            ".begin_history_change(",
+            ".documents_at(",
+            ".prepare_implementation_step(",
+            ".prepare_implementation_refinement(",
+            ".run_architect_contour(",
+            ".classify_step_edit_completion(",
+            "start_model_turn(",
+            "PreparedTurn",
+            "build_model_ask_prompt(",
+            ".start_interactive_execution(",
+            ".finalize_interactive_turn(",
+            ".prepare_step_execution(",
+            ".execute_prepared_step(",
+            ".run_step_loop(",
+            ".prepare_plan_execution(",
+            ".prepare_plan_queue(",
+            ".execute_plan_queue(",
+            ".prepare_review_batch(",
+            ".execute_review_post_analysis(",
+            ".prepare_review_synthesis_request(",
+            ".execute_review_synthesis(",
+            "async fn run_member(",
+            "async fn critic_provider(",
+            "async fn post_analysis(",
+            "async fn reviewer(",
         ] {
             assert!(
                 !code.contains(forbidden),
@@ -358,6 +313,74 @@ fn server_production_sources_use_application_ports_for_domain_io_and_mutations()
         }
     }
     inspect(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+}
+
+#[test]
+fn rpc_projections_only_import_the_application_facade() {
+    for source in [
+        include_str!("../src/contracts.rs"),
+        include_str!("../src/publication.rs"),
+        include_str!("../src/discussion.rs"),
+    ] {
+        for dependency in source.split("tauqe_flow::").skip(1) {
+            assert!(
+                dependency.starts_with("api::") || dependency.starts_with("api as "),
+                "RPC projection bypasses the application facade: {}",
+                dependency.lines().next().unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn application_publication_has_no_workflow_access() {
+    let publication = include_str!("../src/publication.rs");
+    for forbidden in [
+        "AppState",
+        "Application::",
+        ".application",
+        "tokio::spawn",
+        ".flush().await",
+    ] {
+        assert!(
+            !publication.contains(forbidden),
+            "publication has workflow access: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn every_routed_method_has_an_application_scenario_and_admission_record() {
+    let dispatch = include_str!("../src/handlers.rs");
+    let routes = dispatch
+        .lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix("methods::")
+                .and_then(|line| line.split_once(" =>"))
+                .map(|(name, _)| name)
+        })
+        .collect::<BTreeSet<_>>();
+    let mapped = include_str!("../../../docs/rpc-application-boundary.md")
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .map(|line| {
+            let columns: Vec<_> = line.split('|').collect();
+            assert_eq!(columns.len(), 5, "{line}");
+            assert!(!columns[1].trim().is_empty(), "{line}");
+            assert!(
+                matches!(columns[2].trim(), "Immediate" | "Synchronous" | "Launch"),
+                "{line}"
+            );
+            assert!(
+                matches!(columns[3].trim(), "Exclusive" | "Observe" | "Open"),
+                "{line}"
+            );
+            columns[0].trim_end().trim_end_matches('`')
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mapped.len(), routes.len());
+    assert_eq!(mapped.into_iter().collect::<BTreeSet<_>>(), routes);
 }
 
 #[test]

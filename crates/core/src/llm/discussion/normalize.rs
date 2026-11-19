@@ -35,7 +35,7 @@ where
 /// can never address a location outside the repository; such a path yields
 /// `None` and the request is dropped. This is the crate's single shared
 /// normalizer for these paths, so every wire boundary applies the same rules.
-pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
+pub(crate) fn normalize_repo_map_path(raw: &str) -> Option<String> {
     normalize_repo_map_path_checked(raw).ok()
 }
 
@@ -72,7 +72,7 @@ fn normalize_repo_map_path_checked(raw: &str) -> Result<String, String> {
 /// engine, because a typed command field cannot silently drop itself. This is a
 /// first line of defence only: the engine still confines every path against the
 /// repository root.
-pub fn deserialize_repo_map_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub(crate) fn deserialize_repo_map_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

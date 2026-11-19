@@ -32,11 +32,16 @@ pub use storage::SessionStorage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMutation {
     /// A new interaction record was appended to the end of the session.
-    Appended { item: HistoryItem },
+    Appended {
+        item: HistoryItem,
+        estimated_tokens: u64,
+    },
     /// The summarized prefix was replaced by `summary`, preserving `tail_ids`.
     Compacted {
         summary: HistoryItem,
         tail_ids: Vec<u64>,
+        total_count: usize,
+        estimated_tokens: u64,
     },
     /// A record was rolled back: its turn failed or was cancelled before the
     /// result reached the model context.
@@ -70,12 +75,12 @@ impl HistorySnapshot {
     }
 
     /// Frozen records, in recording order.
-    pub(crate) fn entries(&self) -> &[HistoryEntry] {
+    pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
 
     /// Reports whether the snapshot carries no record at all.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
@@ -89,7 +94,7 @@ impl HistorySnapshot {
 /// A record that cannot be serialized is skipped with a diagnostic instead of
 /// failing the whole block: the records around it still describe the session.
 #[cfg(test)]
-pub(crate) fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
+fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
@@ -262,7 +267,10 @@ impl HistoryManager {
             let id = entry.id().unwrap_or(self.current_max_id);
             let mut item = Self::entry_to_history_item(id, entry);
             item.status = status;
-            (listener.0)(HistoryMutation::Appended { item });
+            (listener.0)(HistoryMutation::Appended {
+                item,
+                estimated_tokens: self.estimated_tokens(),
+            });
         }
     }
 
@@ -424,7 +432,7 @@ impl HistoryManager {
     /// block the live history would produce at that moment byte for byte.
     /// Returns an empty string if there are no history entries.
     #[cfg(test)]
-    pub(crate) fn format_history_tag(&self) -> Result<String> {
+    fn format_history_tag(&self) -> Result<String> {
         let entries = self.get_entries()?;
         Ok(render_history_block(&entries).unwrap_or_default())
     }
@@ -464,7 +472,12 @@ impl HistoryManager {
             if let Some(summary_entry) = compacted.first() {
                 let id = summary_entry.id().unwrap_or(1);
                 let summary = Self::entry_to_history_item(id, summary_entry);
-                (listener.0)(HistoryMutation::Compacted { summary, tail_ids });
+                (listener.0)(HistoryMutation::Compacted {
+                    summary,
+                    tail_ids,
+                    total_count: compacted.len(),
+                    estimated_tokens: self.estimated_tokens(),
+                });
             }
         }
         Ok(())
@@ -626,7 +639,7 @@ mod tests {
         // The prompt reaches the chronicle the moment the turn starts, so the
         // developer sees the running task before any result exists.
         match &mutations[0] {
-            HistoryMutation::Appended { item } => {
+            HistoryMutation::Appended { item, .. } => {
                 assert_eq!(item.id, id);
                 assert_eq!(item.status, HistoryEntryStatus::Active);
                 assert_eq!(item.text, "Refactor the parser");
@@ -847,7 +860,9 @@ mod tests {
             assert!(matches!(mutation, HistoryMutation::Appended { .. }));
         }
         match &mutations[8] {
-            HistoryMutation::Compacted { summary, tail_ids } => {
+            HistoryMutation::Compacted {
+                summary, tail_ids, ..
+            } => {
                 assert_eq!(summary.kind, HistoryKind::System);
                 assert_eq!(summary.text, "Earlier tasks summarized.");
                 assert_eq!(tail_ids, &expected_tail_ids);

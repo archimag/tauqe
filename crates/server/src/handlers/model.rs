@@ -1,12 +1,8 @@
 //! Model turn subsystem facade.
 //!
-//! Discussion prompt construction lives in [`prompt`] and the bounded turn
-//! itself — provider resolution, protocol selection, streaming relay, and usage
-//! accounting — lives in [`turn`]. This module exposes the RPC surface and the
-//! turn primitives shared by the plan, review, architect, and locale handlers.
+//! Projects model commands and application events onto the wire.
 
-mod prompt;
-pub(crate) mod turn;
+use crate::publication;
 
 #[cfg(test)]
 mod tests;
@@ -16,14 +12,11 @@ use std::sync::Arc;
 
 use tauqe_protocol::model::{CancelMode, ModelCancelParams};
 use tauqe_protocol::{
-    events, DiscussionClearFocusResult, DiscussionGetFocusResult, DiscussionSetFocusParams,
-    DiscussionSetFocusResult, Event, ModelAskParams, Request, Response,
+    DiscussionClearFocusResult, DiscussionGetFocusResult, DiscussionSetFocusParams,
+    DiscussionSetFocusResult, ModelAskParams, Request, Response,
 };
 
 use crate::state::AppState;
-
-pub use turn::start_model_turn;
-pub(crate) use turn::unwind_grace;
 
 pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
     let params: ModelAskParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -37,46 +30,40 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    let resolved = match prompt::build_model_ask_prompt(state, params).await {
-        Ok(resolved) => resolved,
-        Err(err) => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(err),
-            };
-        }
+    use tauqe_flow::api::{AskError, DiscussionPromptError, ModelAskInput};
+    let input = match params {
+        ModelAskParams::Prompt { text } => ModelAskInput::Prompt { text },
+        ModelAskParams::Discussion(request) => ModelAskInput::Discussion {
+            target: request.target.project(),
+            focused_items: request.focused_items,
+            comment: request.comment,
+        },
     };
-
-    match start_model_turn(state, resolved.prompt, resolved.focus, None, None).await {
-        Ok(op_id) => Response {
-            id: req.id,
-            result: Some(serde_json::json!({ "operation_id": op_id })),
-            error: None,
-        },
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        },
+    let observer = Arc::new(publication::Publisher {
+        out: state.out.clone(),
+    });
+    match state.application.ask(input, observer).await {
+        Ok(started) => Response::ok_typed(
+            req.id,
+            &serde_json::json!({
+                "operation_id": started.operation_id,
+            }),
+        ),
+        Err(error) => {
+            use tauqe_protocol::errors::*;
+            let code = match &error {
+                AskError::Busy => OPERATION_IN_PROGRESS,
+                AskError::Provider(_) => NO_API_KEY,
+                AskError::Prompt(DiscussionPromptError::InvalidInput) => INVALID_PARAMS,
+                AskError::Prompt(DiscussionPromptError::NotFound(_)) => NOT_FOUND,
+                AskError::Prompt(DiscussionPromptError::Storage(_)) => INTERNAL_ERROR,
+            };
+            Response::err(req.id, code, error.to_string())
+        }
     }
 }
 
 pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Response {
-    // The mutation replaces the shared model selection and rotates the dialogue
-    // session — the very state `config/set` protects by claiming the slot — so
-    // the identical state change is guarded with the identical strength.
-    // Sampling the slot once would let a turn register between the check and the
-    // write and then run against a selection it never resolved.
-    let operation = match crate::handlers::begin_configuration_change(
-        &req.id,
-        state,
-        "Cannot change model while an operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
     let params: tauqe_protocol::ModelSelectParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -89,8 +76,22 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
             }
         };
 
-    let change = match operation.select_model(params.selection.project()).await {
-        Ok(change) => change,
+    let observer = publication::Publisher {
+        out: state.out.clone(),
+    };
+    let view = match state
+        .application
+        .change_model(params.selection.project(), &observer)
+        .await
+    {
+        Ok(view) => view,
+        Err(tauqe_flow::api::SettingsError::Busy) => {
+            return Response::err(
+                req.id,
+                tauqe_protocol::errors::OPERATION_IN_PROGRESS,
+                "Cannot change model while an operation is in progress",
+            )
+        }
         Err(error) => {
             return Response::err(
                 req.id,
@@ -99,44 +100,27 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
             )
         }
     };
-    let selection = change.snapshot.selection;
-    let effective_model = change.snapshot.config.resolve_model(&selection);
-    let roles = crate::handlers::config::effective_roles_summary(&change.snapshot.config);
-
-    state.out.send_event(&Event {
-        method: events::MODEL_CHANGED.to_string(),
-        params: serde_json::to_value(tauqe_protocol::ModelChangedEvent {
-            selection: selection.clone().project(),
-            effective_model: effective_model.clone().project(),
-            roles: Some(roles.clone()),
-        })
-        .ok(),
-    });
-
     Response::ok_typed(
         req.id,
         &tauqe_protocol::ModelSelectResult {
-            selection: selection.project(),
-            effective_model: effective_model.project(),
-            roles: Some(roles),
+            selection: view.selection.project(),
+            effective_model: view.model.project(),
+            roles: Some(view.roles.project()),
         },
     )
 }
 
 pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Response {
-    let guard = state.application.configuration().await;
-    let selection = guard.selection.clone();
-    let effective_model = guard.config.resolve_model(&selection);
-    let available_models = guard.config.available_models();
-    let roles = crate::handlers::config::effective_roles_summary(&guard.config);
+    let view = state.application.configuration_view().await;
 
     Response::ok_typed(
         req.id,
         &tauqe_protocol::ModelCurrentResult {
-            selection: selection.project(),
-            effective_model: effective_model.project(),
-            roles: Some(roles),
-            available_models: available_models
+            selection: view.selection.project(),
+            effective_model: view.model.project(),
+            roles: Some(view.roles.project()),
+            available_models: view
+                .available_models
                 .into_iter()
                 .map(crate::contracts::Project::project)
                 .collect(),
@@ -158,16 +142,17 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
 /// registers afterwards contributes its own completed window on top of the
 /// cleared floor instead of resurrecting a cleared record.
 pub async fn handle_usage_reset(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
-        &req.id,
-        state,
-        "Cannot reset usage while a model operation is in progress",
-    ) {
-        return resp;
+    let observer = Arc::new(publication::Publisher {
+        out: state.out.clone(),
+    });
+    match state.application.reset_project_usage(observer).await {
+        Ok(snapshot) => Response::ok_typed(req.id, &crate::usage::wire_snapshot(&snapshot)),
+        Err(_) => Response::err(
+            req.id,
+            tauqe_protocol::errors::OPERATION_IN_PROGRESS,
+            "Cannot reset usage while a model operation is in progress",
+        ),
     }
-
-    let snapshot = state.reset_lifetime_usage().await;
-    Response::ok_typed(req.id, &crate::usage::wire_snapshot(&snapshot))
 }
 
 /// Sets the active discussion focus anchor and broadcasts the change.
@@ -183,19 +168,37 @@ pub async fn handle_discussion_set_focus(req: Request, state: &Arc<AppState>) ->
                 );
             }
         };
-    let focus = state.set_discussion_focus(params.focus).await;
+    let focus = state
+        .application
+        .set_focus(
+            params.focus.project(),
+            &publication::Publisher {
+                out: state.out.clone(),
+            },
+        )
+        .await
+        .project();
     Response::ok_typed(req.id, &DiscussionSetFocusResult { focus })
 }
 
 /// Returns the active discussion focus anchor.
 pub async fn handle_discussion_get_focus(req: Request, state: &Arc<AppState>) -> Response {
-    let focus = state.discussion_focus().await;
+    let focus = state.application.discussion_focus().await.project();
     Response::ok_typed(req.id, &DiscussionGetFocusResult { focus })
 }
 
 /// Clears the active discussion focus anchor, returning the resulting focus.
 pub async fn handle_discussion_clear_focus(req: Request, state: &Arc<AppState>) -> Response {
-    let focus = state.clear_discussion_focus().await;
+    let focus = state
+        .application
+        .set_focus(
+            tauqe_flow::api::DiscussionFocus::None,
+            &publication::Publisher {
+                out: state.out.clone(),
+            },
+        )
+        .await
+        .project();
     Response::ok_typed(req.id, &DiscussionClearFocusResult { focus })
 }
 
@@ -220,52 +223,37 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
         None => ModelCancelParams::default(),
     };
 
-    // A soft stop is advisory: the batch supervisor finishes the current member
-    // (its turn, compiler verification, and Git commit) and then stops before
-    // launching the next one. The operation stays registered so its cancel and
-    // soft-stop channels remain live until the batch unwinds on its own.
-    if params.mode == Some(CancelMode::Soft) {
-        state.soft_stop_active_operation();
-        return Response {
-            id: req.id,
-            result: Some(serde_json::json!({ "cancelled": true })),
-            error: None,
-        };
-    }
+    cancel(req.id, state, params.mode)
+}
 
-    // A hard stop signals cancellation but keeps the operation slot registered:
-    // the cancelled workflow keeps mutating state (rolling back its git
-    // transaction, releasing the session lock) until it observes the cancel
-    // signal and drops its guard. Clearing the slot immediately would let a
-    // client start `git/undo`, `config/set`, or a new turn against a half-unwound
-    // turn. A watchdog force-aborts a stalled task after the grace period.
-    state.hard_cancel_active_operation();
-    Response {
-        id: req.id,
-        result: Some(serde_json::json!({ "cancelled": true })),
-        error: None,
-    }
+pub(super) fn cancel(
+    id: tauqe_protocol::RequestId,
+    state: &AppState,
+    mode: Option<CancelMode>,
+) -> Response {
+    use tauqe_flow::api::CancellationMode;
+    let mode = match mode {
+        Some(CancelMode::Soft) => CancellationMode::Soft,
+        _ => CancellationMode::Hard,
+    };
+    state
+        .application
+        .cancel(mode, crate::reap::task_exit_deadline());
+    Response::ok(id, serde_json::json!({"cancelled": true}))
 }
 
 pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> Response {
-    let operation = match crate::handlers::begin_history_change(
-        &req.id,
-        state,
-        "Cannot clear history while a model operation is in progress",
-    ) {
-        Ok(operation) => operation,
-        Err(response) => return *response,
+    let observer = publication::Publisher {
+        out: state.out.clone(),
     };
-    let outcome = operation.clear().await;
-    if let Some(error) = outcome.persistence_error {
-        tracing::warn!(error = %error, "Failed to clear the interaction history");
-    }
-    state.publish_focus_update(outcome.focus_update);
-    Response {
-        id: req.id,
-        result: Some(serde_json::json!({ "cleared": true })),
-        error: None,
+    match state.application.clear_dialogue_history(&observer).await {
+        Ok(()) => Response::ok(req.id, serde_json::json!({"cleared": true})),
+        Err(_) => Response::err(
+            req.id,
+            tauqe_protocol::errors::OPERATION_IN_PROGRESS,
+            "Cannot clear history while a model operation is in progress",
+        ),
     }
 }
 
-mod result;
+pub(crate) mod result;

@@ -75,6 +75,7 @@ fn main() {
 
     let mut has_tui = false;
     let mut has_server = false;
+    let mut has_flow = false;
     let mut has_core = false;
     let mut has_tools = false;
     let mut has_protocol = false;
@@ -100,6 +101,12 @@ fn main() {
             } else if !path.ends_with(".md") {
                 unknown = true;
             }
+        } else if path.starts_with("crates/flow/") {
+            if is_rs || is_cargo_toml {
+                has_flow = true;
+            } else if !path.ends_with(".md") {
+                unknown = true;
+            }
         } else if path.starts_with("crates/core/") {
             if is_rs || is_cargo_toml {
                 has_core = true;
@@ -118,8 +125,11 @@ fn main() {
             } else if !path.ends_with(".md") {
                 unknown = true;
             }
+        } else if path.starts_with("docs/src/") && path.ends_with(".md") {
+            // The core embeds book chapters in the executable documentation.
+            has_core = true;
         } else if path.ends_with(".md") {
-            // Markdown files no longer trigger checks
+            // Standalone Markdown does not trigger Cargo.
         } else if is_rs {
             has_other_rs = true;
         } else {
@@ -141,27 +151,19 @@ fn main() {
     let mut cargo_args: Vec<String> = Vec::new();
     let run_cargo: bool;
 
-    if changed.is_empty() || unknown || has_protocol || has_root || has_other_rs {
+    // Every workspace member depends on tools directly or transitively.
+    if changed.is_empty() || unknown || has_protocol || has_tools || has_root || has_other_rs {
         run_cargo = true;
         cargo_args.push("--workspace".to_string());
     } else {
-        if has_tools {
-            cargo_args.extend([
-                "-p".to_string(),
-                "tauqe-tools".to_string(),
-                "-p".to_string(),
-                "tauqe-core".to_string(),
-                "-p".to_string(),
-                "tauqe-server".to_string(),
-            ]);
-        } else if has_core {
-            cargo_args.extend([
-                "-p".to_string(),
-                "tauqe-core".to_string(),
-                "-p".to_string(),
-                "tauqe-server".to_string(),
-            ]);
-        } else if has_server {
+        if has_core {
+            cargo_args.extend(["-p".to_string(), "tauqe-core".to_string()]);
+        }
+        if has_core || has_flow {
+            cargo_args.extend(["-p".to_string(), "tauqe-flow".to_string()]);
+        }
+        // Server integration tests exercise the TUI library's projections.
+        if has_core || has_flow || has_server || has_tui {
             cargo_args.extend(["-p".to_string(), "tauqe-server".to_string()]);
         }
 
@@ -188,22 +190,26 @@ fn main() {
     );
 
     if run_cargo {
-        let mut check_args = vec!["check".to_string()];
-        check_args.extend(cargo_args.iter().cloned());
-        check_args.push("--all-targets".to_string());
-        run_step("`cargo check`", "cargo", &check_args);
-
+        // Clippy checks the same targets and denies warnings; a separate check
+        // would repeat compilation work before running the gate.
         let mut clippy_args = vec!["clippy".to_string()];
         clippy_args.extend(cargo_args.iter().cloned());
-        clippy_args.extend(["--all-targets", "--", "-D", "warnings"].map(String::from));
-        run_step("`cargo clippy`", "cargo", &clippy_args);
+        run_step("`just clippy`", "just", &clippy_args);
 
-        // The task runner owns the test invocation. Its `test` recipe decides
-        // which runner executes the suite, how failures are reported, and that
-        // the doctest pass follows, so the script never re-derives that policy.
-        let mut test_args = vec!["test".to_string()];
+        let mut test_args = vec!["test-binaries".to_string()];
         test_args.extend(cargo_args.iter().cloned());
-        run_step("`just test`", "just", &test_args);
+        run_step("`just test-binaries`", "just", &test_args);
+
+        let mut doc_args = vec!["test-doc".to_string()];
+        if cargo_args.iter().any(|arg| arg == "--workspace") {
+            run_step("`just test-doc`", "just", &doc_args);
+        } else if has_core || has_flow {
+            doc_args.extend(["-p".to_string(), "tauqe-flow".to_string()]);
+            if has_core {
+                doc_args.extend(["-p".to_string(), "tauqe-core".to_string()]);
+            }
+            run_step("`just test-doc`", "just", &doc_args);
+        }
     }
 
     exit(0);

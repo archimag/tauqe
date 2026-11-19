@@ -25,10 +25,20 @@ models = [
   { model = "meta/muse-spark-1.3-contributor", alias = "Muse Spark"}
 ]
 
+[providers.openai]
+models = [
+  { model = "gpt-6-sol", alias = "GPT Sol" },
+  { model = "gpt-6-astra", alias = "GPT Astra" },
+  { model = "gpt-6-terra", alias = "GPT Terra" },
+  { model = "gpt-6-luna", alias = "GPT Luna" },
+]
+
 [models]
 scribe = "Claude Haiku"
 
 repl = [
+  "GPT Sol",
+  { model = "GPT Astra", effort = "medium" },
   "DeepSeek Flash",
   "GLM",
   "Gemini Flash",
@@ -36,13 +46,15 @@ repl = [
 ]
 
 coder = [
-  { model = "DeepSeek Flash", attempts = 2 },
+  "GPT Sol",
+  { model = "DeepSeek Flash", level_up = false },
   { model = "Gemini Flash", level_up = false },
   { model = "Claude Sonnet", level_up = false }
 ]
 
 architect = [
   "GLM",
+  { model = "GPT Astra",  level_up = false },
   { model = "Gemini Flash", level_up = false }
 ]
 

@@ -1,362 +1,237 @@
 use crate::contracts::Project;
-use std::path::PathBuf;
+use crate::publication::Publisher;
+use crate::state::AppState;
 use std::sync::Arc;
-
-use tauqe_core::config::AppConfig;
-use tauqe_core::models::ModelSelection;
-use tauqe_core::workflow::WorkflowFactory;
+use tauqe_flow::api::{
+    ConfigurationCommand, ConfigurationError, ConfigurationFileError, ConfigurationPatch,
+    ConfigurationView, SettingsError,
+};
 use tauqe_protocol::{
-    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, Event,
-    Request, Response, ReviewPresetSummary, SystemStatusResult,
+    errors, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind, Request,
+    Response, ReviewPresetSummary, SystemStatusResult,
 };
 
-use crate::state::AppState;
-
-/// Projects the core's resolved model-role configuration into the RPC contract.
-pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> tauqe_protocol::ModelRolesSummary {
-    cfg.effective_roles_summary().project()
-}
-
-/// Projects the declared review presets into the compact snapshot a client
-/// renders its review launcher from.
-///
-/// Groups, paths, and local prompts stay on the server, because they are applied
-/// when a session is launched. A project that declares no preset adds no field
-/// to the wire, so the client reads the snapshot as absent.
-fn review_preset_summaries(cfg: &AppConfig) -> Option<Vec<ReviewPresetSummary>> {
-    let summaries: Vec<ReviewPresetSummary> = cfg
-        .review
-        .presets
-        .iter()
+pub(crate) fn config_state(view: ConfigurationView) -> ConfigState {
+    let presets: Vec<_> = view
+        .review_presets
+        .into_iter()
         .map(|preset| ReviewPresetSummary {
-            name: preset.name.clone(),
-            title: preset.title.clone(),
+            name: preset.name,
+            title: preset.title,
         })
         .collect();
-    if summaries.is_empty() {
-        None
-    } else {
-        Some(summaries)
-    }
-}
-
-pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
-    let sel = selection
-        .cloned()
-        .unwrap_or_else(|| cfg.default_selection());
-    let effective = cfg.resolve_model(&sel);
-    let roles = effective_roles_summary(cfg);
     ConfigState {
-        workflow: cfg.repl.workflow.project(),
+        workflow: view.workflow.project(),
         edit_protocol: EditProtocolKind::Structured,
-        model: effective.project(),
-        selection: Some(sel.project()),
-        roles: Some(roles),
-        history_model: Some(cfg.history_model().project()),
-        available_workflows: WorkflowFactory::available_workflows()
+        model: view.model.project(),
+        selection: Some(view.selection.project()),
+        roles: Some(view.roles.project()),
+        history_model: Some(view.history_model.project()),
+        available_workflows: view
+            .available_workflows
             .into_iter()
             .map(Project::project)
             .collect(),
         available_edit_protocols: Vec::new(),
-        available_models: cfg
-            .available_models()
+        available_models: view
+            .available_models
             .into_iter()
-            .map(crate::contracts::Project::project)
+            .map(Project::project)
             .collect(),
-        review_presets: review_preset_summaries(cfg),
+        review_presets: (!presets.is_empty()).then_some(presets),
     }
 }
 
-/// Resolves the repository-bound configuration directory from the single
-/// authoritative repository root held by [`AppState`], instead of re-deriving it
-/// from the process CWD. Returns `None` when no repository is available yet.
-async fn resolved_repo_root(state: &Arc<AppState>) -> Option<PathBuf> {
-    let root = state.repo_root().await;
-    if root.as_os_str().is_empty() {
-        None
-    } else {
-        Some(root)
-    }
-}
-
-/// Converts a completed application status to the existing RPC shape.
-fn system_status_dto(status: tauqe_core::api::SystemStatus) -> SystemStatusResult {
-    let cfg = &status.configuration.config;
-    let selection = status.configuration.selection;
+fn system_status_dto(status: tauqe_flow::api::SystemStatus) -> SystemStatusResult {
+    let config = status.configuration;
     SystemStatusResult {
         has_git: status.has_git,
+        has_api_key: status.has_api_key,
         has_config: status.locations.config.is_some(),
+        ready: status.ready,
         config_path: status
             .locations
             .config
-            .map(|path| path.to_string_lossy().to_string()),
+            .map(|path| path.to_string_lossy().into_owned()),
         default_config_path: status
             .locations
             .default_config
             .to_string_lossy()
-            .to_string(),
-        has_api_key: status.has_api_key,
+            .into_owned(),
         credentials_path: status
             .locations
             .credentials
-            .map(|path| path.to_string_lossy().to_string()),
+            .map(|path| path.to_string_lossy().into_owned()),
         default_credentials_path: status
             .locations
             .default_credentials
             .to_string_lossy()
-            .to_string(),
-        ready: status.ready,
-        model: cfg.resolve_model(&selection).project(),
-        selection: Some(selection.project()),
-        roles: Some(effective_roles_summary(cfg)),
-        history_model: Some(cfg.history_model().project()),
-        available_models: cfg
-            .available_models()
+            .into_owned(),
+        model: config.model.project(),
+        selection: Some(config.selection.project()),
+        roles: Some(config.roles.project()),
+        history_model: Some(config.history_model.project()),
+        available_models: config
+            .available_models
             .into_iter()
-            .map(crate::contracts::Project::project)
+            .map(Project::project)
             .collect(),
-        config_error: cfg.config_error.clone(),
+        config_error: config.config_error,
     }
 }
 
 pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
-    let guard = state.application.configuration().await;
-    let result = config_state(&guard.config, Some(&guard.selection));
-    Response::ok_typed(req.id, &result)
+    Response::ok_typed(
+        req.id,
+        &config_state(state.application.configuration_view().await),
+    )
 }
 
 pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response {
-    // The mutation replaces the shared configuration and model selection, so
-    // the slot is claimed: a turn registering right after a plain check would
-    // observe a configuration swapped underneath its running batch.
-    let operation = match super::begin_configuration_change(
-        &req.id,
-        state,
-        "Cannot change workflow or model while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
+    let Some(params) = req
+        .params
+        .and_then(|p| serde_json::from_value::<ConfigSetParams>(p).ok())
+    else {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Missing or invalid parameters",
+        );
     };
-
-    let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-        Some(p) => p,
-        None => {
-            return Response::err(
-                req.id,
-                errors::INVALID_PARAMS,
-                "Missing or invalid parameters",
-            );
-        }
+    let observer = Publisher {
+        out: state.out.clone(),
     };
-
-    let root = resolved_repo_root(state).await;
-    let change = match operation
-        .update_project_configuration(
-            root.as_deref(),
-            tauqe_core::api::ConfigurationPatch {
-                selection: params.selection.map(crate::contracts::Project::project),
-                model: params.model.map(crate::contracts::Project::project),
-                history_model: params.history_model.map(crate::contracts::Project::project),
-                workflow: params.workflow.map(Project::project),
-            },
-        )
-        .await
-    {
-        Ok(change) => change,
+    let patch = ConfigurationPatch {
+        selection: params.selection.map(Project::project),
+        model: params.model.map(Project::project),
+        history_model: params.history_model.map(Project::project),
+        workflow: params.workflow.map(Project::project),
+    };
+    match state.application.configure(patch, &observer).await {
+        Ok(view) => Response::ok_typed(req.id, &config_state(view)),
+        Err(SettingsError::Busy) => Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot change workflow or model while a model operation is in progress",
+        ),
         Err(error) => {
             let code = match &error {
-                tauqe_core::api::ConfigurationError::UnknownModel { .. }
-                | tauqe_core::api::ConfigurationError::UnknownHistoryModel { .. } => {
-                    errors::INVALID_MODEL
-                }
-                tauqe_core::api::ConfigurationError::ModuleRead(_)
-                | tauqe_core::api::ConfigurationError::ModuleConflict { .. } => {
-                    errors::MODULE_CONFLICT
-                }
+                SettingsError::Configuration(
+                    ConfigurationError::UnknownModel { .. }
+                    | ConfigurationError::UnknownHistoryModel { .. },
+                ) => errors::INVALID_MODEL,
+                _ => errors::MODULE_CONFLICT,
             };
-            return Response::err(req.id, code, error.to_string());
+            Response::err(req.id, code, error.to_string())
         }
-    };
-    let updated_state = config_state(&change.snapshot.config, Some(&change.snapshot.selection));
-
-    state.out.send_event(&Event {
-        method: events::CONFIG_CHANGED.to_string(),
-        params: serde_json::to_value(&updated_state).ok(),
-    });
-
-    Response::ok_typed(req.id, &updated_state)
+    }
 }
 
 pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_root = resolved_repo_root(state).await;
-    let repo_opt = repo_root.as_deref();
-
-    let status = system_status_dto(state.application.system_status(repo_opt).await);
-
-    Response::ok_typed(req.id, &status)
+    Response::ok_typed(req.id, &system_status_dto(state.application.status().await))
 }
 
 pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Response {
-    // The reload replaces the shared configuration for every later turn, so the
-    // slot is claimed for the whole reload instead of sampled once.
-    let operation = match super::begin_configuration_change(
-        &req.id,
+    change_files(
+        req,
         state,
+        ConfigurationCommand::Reload,
         "Cannot reload configuration while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    let repo_root = resolved_repo_root(state).await;
-    let repo_opt = repo_root.as_deref();
-
-    let snapshot = operation.reload_configuration(repo_opt).await;
-    let updated_state = config_state(&snapshot.config, Some(&snapshot.selection));
-
-    state.out.send_event(&Event {
-        method: events::CONFIG_CHANGED.to_string(),
-        params: serde_json::to_value(&updated_state).ok(),
-    });
-
-    let status = system_status_dto(state.application.system_status(repo_opt).await);
-
-    Response::ok_typed(req.id, &status)
+        errors::INTERNAL_ERROR,
+    )
+    .await
 }
 
 pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Response {
-    // Creating the file is followed by the same full rebind a reload performs,
-    // so the slot is claimed for both halves of the operation.
-    let operation = match super::begin_configuration_change(
-        &req.id,
+    change_files(
+        req,
         state,
+        ConfigurationCommand::Create,
         "Cannot create configuration while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    let repo_root = resolved_repo_root(state).await;
-    let repo_opt = repo_root.as_deref();
-
-    let result = match operation.create_configuration(repo_opt).await {
-        Ok(result) => result,
-        Err(error) => {
-            let code = match &error {
-                tauqe_core::api::ConfigurationFileError::ModuleConflict(_) => {
-                    errors::MODULE_CONFLICT
-                }
-                _ => errors::CONFIG_CREATE_FAILED,
-            };
-            return Response::err(req.id, code, error.to_string());
-        }
-    };
-    let updated_state = config_state(&result.snapshot.config, Some(&result.snapshot.selection));
-
-    state.out.send_event(&Event {
-        method: events::CONFIG_CHANGED.to_string(),
-        params: serde_json::to_value(&updated_state).ok(),
-    });
-
-    let status = system_status_dto(
-        state
-            .application
-            .system_status_after_write(repo_opt, &result)
-            .await,
-    );
-
-    Response::ok_typed(req.id, &status)
+        errors::CONFIG_CREATE_FAILED,
+    )
+    .await
 }
 
-pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Response {
-    // Saving credentials reloads the configuration that every later turn reads,
-    // so the slot is claimed for the write and the reload together.
-    let operation = match super::begin_configuration_change(
-        &req.id,
+pub async fn handle_credentials_save(mut req: Request, state: &Arc<AppState>) -> Response {
+    let Some(params) = req
+        .params
+        .take()
+        .and_then(|p| serde_json::from_value::<CredentialsSaveParams>(p).ok())
+    else {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Missing or invalid parameters",
+        );
+    };
+    change_files(
+        req,
         state,
+        ConfigurationCommand::SaveCredentials(params.api_key),
         "Cannot save credentials while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    let repo_root = resolved_repo_root(state).await;
-    let repo_opt = repo_root.as_deref();
-
-    let params: CredentialsSaveParams =
-        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-            Some(p) => p,
-            None => {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_PARAMS,
-                    "Missing or invalid parameters",
-                );
-            }
-        };
-
-    let result = match operation.save_credentials(repo_opt, params.api_key).await {
-        Ok(result) => result,
-        Err(error) => {
-            let code = match &error {
-                tauqe_core::api::ConfigurationFileError::InvalidKey => errors::INVALID_KEY,
-                _ => errors::CREDENTIALS_SAVE_FAILED,
-            };
-            return Response::err(req.id, code, error.to_string());
-        }
-    };
-    let updated_state = config_state(&result.snapshot.config, Some(&result.snapshot.selection));
-
-    state.out.send_event(&Event {
-        method: events::CONFIG_CHANGED.to_string(),
-        params: serde_json::to_value(&updated_state).ok(),
-    });
-
-    let status = system_status_dto(
-        state
-            .application
-            .system_status_after_write(repo_opt, &result)
-            .await,
-    );
-
-    Response::ok_typed(req.id, &status)
+        errors::CREDENTIALS_SAVE_FAILED,
+    )
+    .await
 }
 
 pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>) -> Response {
-    // The stub replaces a file the configuration loader reads, so the slot is
-    // claimed for the write instead of being observed once before it.
-    let operation = match super::begin_configuration_change(
-        &req.id,
+    change_files(
+        req,
         state,
+        ConfigurationCommand::CreateCredentialsStub,
         "Cannot create a credentials stub while a model operation is in progress",
-    ) {
-        Ok(guard) => guard,
-        Err(resp) => return *resp,
-    };
-
-    let repo_root = resolved_repo_root(state).await;
-    let repo_opt = repo_root.as_deref();
-
-    let result = match operation.create_credentials_stub(repo_opt).await {
-        Ok(result) => result,
-        Err(error) => {
-            return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, error.to_string())
-        }
-    };
-
-    let status = system_status_dto(
-        state
-            .application
-            .system_status_after_write(repo_opt, &result)
-            .await,
-    );
-
-    Response::ok_typed(req.id, &status)
+        errors::CREDENTIALS_STUB_FAILED,
+    )
+    .await
 }
 
+async fn change_files(
+    req: Request,
+    state: &AppState,
+    command: ConfigurationCommand,
+    busy: &'static str,
+    failure: &'static str,
+) -> Response {
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
+    match state
+        .application
+        .change_configuration_files(command, &observer)
+        .await
+    {
+        Ok(status) => Response::ok_typed(req.id, &system_status_dto(status)),
+        Err(SettingsError::Busy) => Response::err(req.id, errors::OPERATION_IN_PROGRESS, busy),
+        Err(error) => {
+            let code = match &error {
+                SettingsError::File(ConfigurationFileError::InvalidKey) => errors::INVALID_KEY,
+                SettingsError::File(ConfigurationFileError::ModuleConflict(_)) => {
+                    errors::MODULE_CONFLICT
+                }
+                _ => failure,
+            };
+            Response::err(req.id, code, error.to_string())
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tauqe_core::{config::AppConfig, models::ModelSelection};
+
+    fn view(config: &AppConfig) -> ConfigurationView {
+        tauqe_flow::api::ConfigurationSnapshot {
+            config: config.clone(),
+            selection: config.default_selection(),
+        }
+        .view()
+    }
+
+    fn effective_roles_summary(config: &AppConfig) -> tauqe_protocol::ModelRolesSummary {
+        view(config).roles.project()
+    }
     use crate::handlers::common::test_support::scratch_root;
     use tauqe_core::models::ModelRef;
     use tauqe_core::models::{ModelCatalogEntry, ModelRole};
@@ -377,7 +252,7 @@ mod tests {
             ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
         ]);
 
-        let st = config_state(&cfg, None);
+        let st = config_state(view(&cfg));
         assert_eq!(
             st.history_model,
             Some(ModelRef::openrouter("anthropic/claude-3.5-haiku").project())
@@ -462,7 +337,7 @@ mod tests {
             },
         ];
 
-        let st = config_state(&cfg, None);
+        let st = config_state(view(&cfg));
         let presets = st
             .review_presets
             .expect("declared presets must reach the snapshot");
@@ -474,7 +349,7 @@ mod tests {
 
         // A project that declares no preset ships no snapshot field at all, so
         // the client reads the launcher as absent rather than as an empty list.
-        let empty = config_state(&AppConfig::default(), None);
+        let empty = config_state(view(&AppConfig::default()));
         assert!(empty.review_presets.is_none());
     }
 
@@ -553,9 +428,9 @@ mod tests {
     fn status_projection_preserves_paths_and_application_readiness() {
         let config = AppConfig::default();
         let selection = config.default_selection();
-        let status = system_status_dto(tauqe_core::api::SystemStatus {
-            configuration: tauqe_core::api::ConfigurationSnapshot { config, selection },
-            locations: tauqe_core::api::ConfigurationLocations {
+        let status = system_status_dto(tauqe_flow::api::SystemStatus {
+            configuration: tauqe_flow::api::ConfigurationSnapshot { config, selection }.view(),
+            locations: tauqe_flow::api::ConfigurationLocations {
                 config: Some(PathBuf::from("/resolved/tauqe.toml")),
                 credentials: Some(PathBuf::from("/resolved/credentials.toml")),
                 default_config: PathBuf::from("/default/tauqe.toml"),

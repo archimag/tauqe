@@ -42,7 +42,8 @@ pub use turn::{
     ModelResultProposal, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
     RepoMapInfoEvent, ReviewWorkPhase, StructuredAbortProposal, StructuredBlockedProposal,
     StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
-    TurnPhaseEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue,
+    TurnPhaseEvent, TurnRequestReason, TurnRoundStartedEvent, TurnWorkContext, TurnWorkItem,
+    TurnWorkQueue,
 };
 pub use usage::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,

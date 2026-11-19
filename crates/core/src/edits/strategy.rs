@@ -77,6 +77,7 @@ impl StrategyProfile {
         match strategy {
             PatchStrategy::SearchReplace => &SEARCH_REPLACE,
             PatchStrategy::LineAnchor => &LINE_ANCHOR,
+            PatchStrategy::ApplyPatch => &APPLY_PATCH,
         }
     }
 
@@ -114,11 +115,11 @@ static SEARCH_REPLACE_FIELDS: &[ReplacedLineField] = &[
 static LINE_ANCHOR_FIELDS: &[ReplacedLineField] = &[
     ReplacedLineField {
         name: "start",
-        description: "Opaque anchor of the first replaced line, copied verbatim from <context> (required for 'replace', empty string otherwise)",
+        description: "Opaque anchor of the first replaced line, copied verbatim from the current file version (required for 'replace', empty string otherwise)",
     },
     ReplacedLineField {
         name: "end",
-        description: "Opaque anchor of the last replaced line, copied verbatim from <context> (required for 'replace', empty string otherwise)",
+        description: "Opaque anchor of the last replaced line, copied verbatim from the current file version (required for 'replace', empty string otherwise)",
     },
 ];
 
@@ -132,7 +133,19 @@ static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
     no_match_hint: "Search block not found (0 matches). Verify exact line content, indentation, and context.",
     no_range_hint: SEARCH_REPLACE_NO_RANGE_HINT,
     ambiguous_match_hint: search_replace_ambiguous_match_hint,
-    retry_instruction: "Re-read the <context> block and copy the exact text of the lines you replace, including indentation and whitespace, so the pattern matches exactly one location.",
+    retry_instruction: "Re-read the current file version and copy the exact text of the lines you replace, including indentation and whitespace, so the pattern matches exactly one location.",
+};
+
+static APPLY_PATCH: StrategyProfile = StrategyProfile {
+    replaced_line_fields: &[],
+    content_description: "",
+    structured_instruction: "- `patch`: one Codex patch delimited by `*** Begin Patch` and `*** End Patch`. Use repository-relative paths in `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` sections. Add-file lines start with `+`. Updates use `@@` or `@@ context` followed by lines prefixed with a space for context, `-` for removal, and `+` for insertion. An update may put `*** Move to: destination` immediately after its header. Use enough exact context to identify each hunk uniquely.",
+    empty_field_guidance: "",
+    replace_invariant: "",
+    no_match_hint: "Copy the exact current context around the hunk.",
+    no_range_hint: "Include a context hunk for each replacement.",
+    ambiguous_match_hint: |_| "Include enough exact context to match once.".to_string(),
+    retry_instruction: "Submit a complete corrected patch against the current file versions. The refused patch was not applied.",
 };
 
 /// Profile of the opaque line-anchor strategy.
@@ -141,11 +154,11 @@ static LINE_ANCHOR: StrategyProfile = StrategyProfile {
     content_description: "Complete replacement of the addressed line range for 'replace' (the replaced lines are never echoed back), complete file content for 'create', empty string otherwise",
     structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'move_dir') plus `path`, `to`, `start`, `end`, and `content`. A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line, `start` for the first replaced line and `end` for the last one, and carries the complete replacement of that range in `content`; both anchors must be copied character for character, and the replaced lines are never echoed back. 'create' carries the whole file in `content`, 'move' names its destination in `to`, and both leave `start` and `end` empty. A 'move_dir' entry names the source directory in `path` and the destination in `to`, moves the whole subtree, and leaves `start`, `end`, and `content` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.",
     empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `start`/`end` for 'create', `start`/`end`/`content` for 'delete', `content` for 'move' and 'move_dir', and `to` for every operation except 'move' and 'move_dir').\n\n",
-    replace_invariant: "For 'replace', `start` and `end` MUST be anchors rendered in <context> for that same file, the named range MUST NOT overlap another entry, and `content` replaces exactly the addressed lines.\n",
-    no_match_hint: "The change set addressed no line of the file. Copy the anchor of the first and of the last replaced line from the <context> block of that same file.",
+    replace_invariant: "For 'replace', `start` and `end` MUST be anchors rendered in the current version of that same file, the named range MUST NOT overlap another entry, and `content` replaces exactly the addressed lines.\n",
+    no_match_hint: "The change set addressed no line of the file. Copy the anchor of the first and of the last replaced line from the current version of that same file.",
     no_range_hint: LINE_ANCHOR_NO_RANGE_HINT,
     ambiguous_match_hint: line_anchor_ambiguous_match_hint,
-    retry_instruction: "Re-read the <context> block and copy the `start` and `end` anchors character for character: an anchor names a line only in the file it was rendered for, and the ranges of one change set must not overlap.",
+    retry_instruction: "Re-read the current file version and copy the `start` and `end` anchors character for character: an anchor names a line only in the file it was rendered for, and the ranges of one change set must not overlap.",
 };
 
 /// Explanation of a change set that addresses no replaced line, in the
@@ -155,7 +168,7 @@ const SEARCH_REPLACE_NO_RANGE_HINT: &str =
 
 /// Explanation of a change set that addresses no replaced line, in the
 /// line-anchor dialect.
-const LINE_ANCHOR_NO_RANGE_HINT: &str = "The change set addressed no line range. Copy the `start` and `end` anchors of the lines you replace from the <context> block of that same file, or replace the whole file by naming its first and its last line with `start` and `end` when most of the content changes.";
+const LINE_ANCHOR_NO_RANGE_HINT: &str = "The change set addressed no line range. Copy the `start` and `end` anchors of the lines you replace from the current version of that same file, or replace the whole file by naming its first and its last line with `start` and `end` when most of the content changes.";
 
 /// Suffix of the search/replace explanation of an ambiguous match.
 const SEARCH_REPLACE_AMBIGUOUS_SUFFIX: &str =

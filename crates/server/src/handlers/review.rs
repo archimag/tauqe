@@ -1,26 +1,7 @@
-//! Review handler facade.
-//!
-//! The review subsystem is decomposed into focused submodules: shared helpers
-//! (`common`), session CRUD (`storage_ops`), the deterministic audit-window
-//! projection every launch consumes (`window`), primary audit synthesis
-//! (`synthesis`), cross-group post-analysis (`analysis`), the grouped preset
-//! launch (`groups`), the read-only projection a client resolves consent against
-//! (`preview`), and the batch supervisor (`batch`). Every RPC handler keeps its
-//! public name and signature so the dispatcher stays unchanged, and the
-//! lifecycle and concurrency invariants — parallel-mutation rejection,
-//! cancellation handling, and the status gate that refuses a finished, rejected,
-//! or untriaged finding — are preserved across the split.
-//!
-//! Review execution itself is not implemented here. Every step turn, every
-//! Architect wave, every ladder rung, and every durable finding transition
-//! belongs to the engine's unified implementation pipeline
-//! (`tauqe_core::workflow::implementation`), which the batch supervisor drives
-//! through `ServerImplementationHost`. A review run and a plan run therefore
-//! share one implementation instead of keeping two parallel runtimes.
+//! RPC handlers for review commands.
 
 mod analysis;
 mod batch;
-mod common;
 mod groups;
 mod preview;
 mod storage_ops;
@@ -38,7 +19,6 @@ pub use synthesis::{handle_review_cancel, handle_review_start};
 // The implementation host publishes a review session before it starts the model
 // turn of a review scope, so the refreshed lifecycle reaches the client before
 // the turn streams.
-pub(crate) use common::publish_review;
 // The integration tests import the batch supervisor and the shared context
 // helpers directly from their submodules, so no test-only re-exports are
 // needed here.

@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::implementation::{id_key, PlanImplementation};
-use super::item::{ConceptItem, PlanItem, PlanItemStatus};
+use super::{ConceptItem, PlanItem, PlanItemStatus};
 
 /// Structured validation errors representing plan integrity violations.
 ///
@@ -179,7 +179,7 @@ impl Plan {
         PlanStats { total, completed }
     }
 
-    pub fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem> {
+    pub(crate) fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem> {
         fn walk<'a>(items: &'a [ConceptItem], target: &str) -> Option<&'a ConceptItem> {
             for item in items {
                 if id_key(&item.id) == target {
@@ -201,7 +201,7 @@ impl Plan {
     /// `concept_refs` entry against that tree, and appends the structural
     /// report of [`PlanImplementation::validate_structure`], so a caller
     /// receives one composed list of errors.
-    pub fn validate(&self) -> Result<(), Vec<PlanValidationError>> {
+    pub(crate) fn validate(&self) -> Result<(), Vec<PlanValidationError>> {
         let mut errors = Vec::new();
 
         // 1. Validate concept tree IDs

@@ -14,6 +14,7 @@
 
 pub mod cache;
 pub mod context;
+pub mod execution;
 pub mod history;
 pub mod outcome;
 pub mod plan;
@@ -21,6 +22,7 @@ pub mod prompt;
 pub mod refine;
 pub mod repl;
 pub mod step;
+mod transcript;
 pub mod turn;
 
 pub use context::{CancellationToken, EventSink, LoopContext};
@@ -28,5 +30,7 @@ pub use history::compact_history_if_needed_with_budget;
 pub use outcome::{FailureReport, LoopResult, LoopSuccess, ResponseEnvelope, SystemError};
 pub use plan::{PlanStepArtifact, PlanStepLoopConfig};
 pub use prompt::PromptBuilder;
-pub use repl::{repl_capabilities, run_repl_loop, ReplArtifact, ReplLoopConfig};
+pub use repl::{repl_capabilities, ReplArtifact};
+#[cfg(test)]
+pub(crate) use repl::{run_repl_loop, ReplLoopConfig};
 pub use turn::{run_turn_loop, ResearchLoopConfig, TurnArtifact, TurnLoopConfig};

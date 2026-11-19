@@ -190,20 +190,23 @@ file is simply absent from the change set instead of aborting it. Responsibility
 split accordingly — model-generated code may only target tracked paths, while a
 declared external generator may produce ignored output without failing the turn.
 
-### 2.5 Addressing a range: echoed text or anchors
+### 2.5 Edit strategies
 
-A change set has to say *which* lines it replaces. Two strategies exist, and the
+A change set has to say *which* lines it replaces. Three strategies exist, and the
 project declares one of them in `[repl] patch_strategy`:
 
 | Strategy | A range is addressed by | Cost of one range |
 | --- | --- | --- |
+| `apply_patch` (default) | file sections and context hunks | changed lines plus context |
 | `search_replace` | the replaced lines, echoed verbatim and matched exactly | every replaced line is paid for twice: once in the prompt, once in the proposal |
 | `line_anchor` | the opaque anchors rendered beside the first and last replaced line | two four-symbol tokens, however much text the range holds |
 
-The strategy is orthogonal to the transport. Whether the model speaks marker-tagged
-XML or Structured Output JSON, the same two strategies are available: the transport
-decides the encoding of a change, the strategy decides the fields that address its
-range.
+Structured JSON carries a single `patch` string for `apply_patch`. The document
+starts with `*** Begin Patch` and ends with `*** End Patch`. It supports Add File,
+Update File with `@@` hunks and optional Move to, and Delete File. The engine
+stages it atomically in memory, then passes the accepted changes through the
+usual formatting, verification, and transaction. The two array-based strategies
+remain available through explicit configuration.
 
 A directory move names two directories and no lines, so it addresses no replaced
 range at all: both strategies accept it, and neither expects a range or a payload

@@ -78,7 +78,7 @@ pub struct StepFailure {
 
 impl StepFailure {
     /// Creates a domain failure: confine the current step and continue.
-    pub fn domain(reason: impl Into<String>) -> Self {
+    pub(crate) fn domain(reason: impl Into<String>) -> Self {
         Self {
             kind: StepFailureKind::Domain,
             reason: reason.into(),

@@ -105,20 +105,6 @@ pub struct OuterDocsTrustRefusal {
     /// Ready-to-paste declaration that would authorize the source, when one exists.
     remedy: Option<String>,
 }
-/// Content of one file a research round delivered to the context.
-///
-/// The pair of a path and its bytes is the unit a `<file>` element renders, so
-/// the journal renders the material the context block already holds and the
-/// element it emits carries the same anchors and the same `access` attribute.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddedFileContent {
-    path: String,
-    /// Effective access the file resolved to after the round.
-    access: ContextAccess,
-    /// Bytes of the file as the context renders them.
-    content: String,
-}
-
 /// Outcome of applying context requests to ContextManager.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextApplicationOutcome {
@@ -300,34 +286,6 @@ fn reconcile_research_context(
     outcome
 }
 
-/// Reads the contents of the files one application delivered to the context.
-///
-/// The context manager resolves every path the way the context block does, so a
-/// repository file and an external document whose snapshot lives in the cache
-/// are read alike: a document is admitted under its logical path while a request
-/// still holds the cache path it was materialized to, and both spellings resolve
-/// to the same file.
-fn read_added_file_contents(
-    context_manager: &ContextManager,
-    added: &[String],
-) -> Vec<AddedFileContent> {
-    context_manager
-        .read_context_files()
-        .into_iter()
-        .filter(|file| {
-            added.iter().any(|requested| {
-                requested.as_str() == file.path.as_str()
-                    || outer_docs::logical_path(requested.as_str()) == Some(file.path.as_str())
-            })
-        })
-        .map(|file| AddedFileContent {
-            path: file.path,
-            access: file.access,
-            content: file.content,
-        })
-        .collect()
-}
-
 /// Reports whether a requested repository path may enter the context.
 ///
 /// A tracked file is always admissible. A harness-owned sandbox path is
@@ -410,12 +368,6 @@ pub struct ResearchRoundOutcome {
     pub(crate) limit_exceeded: Option<ContextLimitExceeded>,
     /// Files that widened the effective context this round.
     pub(crate) added_files: Vec<String>,
-    /// Contents of the files that widened the context this round.
-    ///
-    /// The journal renders them as `<file>` elements, so the feedback of the
-    /// round that requested them carries the bytes it delivered instead of a
-    /// path the model would have to request again.
-    added_file_contents: Vec<AddedFileContent>,
     /// Requested files that do not exist in the repository.
     pub(crate) missing_files: Vec<String>,
     /// Requested files whose current access already satisfied the request.
@@ -631,12 +583,6 @@ impl ResearchCapabilityHandler for ContextRequestHandler {
             round.available_files,
             round.token_budget,
         );
-        // The delivered bytes travel with the round outcome, so the feedback of
-        // this round renders the files it just handed over instead of a path the
-        // model would have to request again.
-        if !applied.added.is_empty() {
-            outcome.added_file_contents = read_added_file_contents(context_manager, &applied.added);
-        }
         outcome.added_files.extend(applied.added);
         outcome.missing_files.extend(applied.missing);
         outcome

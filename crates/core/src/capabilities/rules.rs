@@ -56,7 +56,7 @@ pub fn render_contract_rules(rules: &[ContractRule]) -> String {
 }
 
 pub struct ContractContext<'a> {
-    render: PromptRenderContext<'a>,
+    pub(super) render: PromptRenderContext<'a>,
     has_eager_repo_map: bool,
     /// Typed kind of the contour that drives the turn.
     ///
@@ -243,7 +243,7 @@ pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Op
             Some(ContractRule::new(
                 "Project Custom Tools",
                 format!(
-                    "The project declares a closed allowlist of commands in `[project.commands]`: you invoke a command strictly by the name it declares, an argument is one literal value that carries no shell syntax, a parameter is supplied by its declared name and keeps its declared default when left out, and anything the declaration does not name is rejected instead of reaching a process. When no declared command covers the required operation, report a semantic blocker instead of improvising one. The commands this project makes available:{tools}"
+                    "The project declares a closed allowlist of commands in `[project.commands]`: you invoke a command strictly by the name it declares, an argument is one literal value that carries no shell syntax, a parameter is supplied by its declared name and keeps its declared default when set to null, and anything the declaration does not name is rejected instead of reaching a process. When no declared command covers the required operation, report a semantic blocker instead of improvising one. The commands this project makes available:{tools}"
                 ),
             ))
         }

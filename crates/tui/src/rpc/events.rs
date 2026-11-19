@@ -134,9 +134,8 @@ fn compose_plan_notice(detail_key: &str, details: &str) -> String {
 
 /// Resolves the localized label of one bounded-turn phase.
 ///
-/// The footer pipeline and the last-resort diagnostic name a phase through the
-/// same catalog entries, so a diagnostic spells the phase exactly like the
-/// footer displays it (c-1).
+/// The footer and the last-resort diagnostic use the phase catalog to name
+/// the declared work (c-1).
 fn phase_label(phase: tauqe_protocol::TurnPhase) -> String {
     active_t(match phase {
         tauqe_protocol::TurnPhase::Research => "phase.research",
@@ -166,6 +165,51 @@ fn edit_desync_reason(phase: Option<tauqe_protocol::TurnPhase>) -> String {
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
+        events::MODEL_FINISHED | events::MODEL_CANCELLED | events::MODEL_ERROR => {
+            // Batch members settle their round counter without settling the queue.
+            let current = ev
+                .params
+                .as_ref()
+                .and_then(|params| params.get("operation_id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| st.model.operation_id.as_deref() == Some(id));
+            if !st.model.is_batch || current {
+                st.model.clear_round_progress();
+            }
+        }
+        _ => {}
+    }
+    match ev.method.as_str() {
+        events::CHATGPT_SIGN_IN_PROMPT => {
+            if let Some(prompt) = ev.params.and_then(|v| {
+                serde_json::from_value::<tauqe_protocol::config::ChatGptSignInPrompt>(v).ok()
+            }) {
+                if prompt
+                    .authorization_url
+                    .starts_with("https://auth.openai.com/api/accounts/authorize?")
+                {
+                    st.modals.chatgpt = Some(crate::app::ChatGptDialog {
+                        prompt,
+                        button: crate::app::ConfirmDialogButton::Confirm,
+                        browser_opened: None,
+                    });
+                }
+            }
+        }
+        events::CHATGPT_SIGN_IN_CLOSED => {
+            if let Some(done) = ev.params.and_then(|v| {
+                serde_json::from_value::<tauqe_protocol::config::ChatGptSignInId>(v).ok()
+            }) {
+                if st
+                    .modals
+                    .chatgpt
+                    .as_ref()
+                    .is_some_and(|d| d.prompt.id == done.id)
+                {
+                    st.modals.chatgpt = None;
+                }
+            }
+        }
         events::GIT_STATE_CHANGED => {
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("repository") {
@@ -400,12 +444,39 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
         }
+        events::TURN_ROUND_STARTED => {
+            if let Some(data) = ev.params.and_then(|params| {
+                serde_json::from_value::<tauqe_protocol::TurnRoundStartedEvent>(params).ok()
+            }) {
+                if st.model.is_busy()
+                    && st.model.operation_id.as_deref() == Some(data.operation_id.as_str())
+                {
+                    st.model.start_answer_round(data.round);
+                    st.model.turn_round = Some(data.round);
+                    st.model.turn_max_rounds = data.max_rounds;
+                    st.model.turn_phase = None;
+                    st.model.turn_phase_detail = None;
+                    st.model.turn_request_reason = data.reason;
+                    st.model.status = TurnStatus::Awaiting;
+                    if matches!(
+                        data.reason,
+                        Some(
+                            tauqe_protocol::model::TurnRequestReason::PostHookRepair
+                                | tauqe_protocol::model::TurnRequestReason::VerificationRepair
+                        )
+                    ) {
+                        mark_files_awaiting_healing(&mut st.model);
+                    }
+                }
+            }
+        }
         events::TURN_PHASE => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::TurnPhaseEvent>(params) {
+                    st.model.turn_request_reason = None;
                     st.model.turn_phase = Some(data.phase);
-                    st.model.turn_round = data.round;
-                    st.model.turn_max_rounds = data.max_rounds;
+                    // Legacy phase coordinates can describe a local attempt, not
+                    // the number of admitted model calls in the turn.
                     st.model.turn_phase_detail = data.detail;
                     st.model.status = match data.phase {
                         tauqe_protocol::TurnPhase::Research => TurnStatus::Research,
@@ -550,23 +621,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_STREAM_RESET => {
             if let Some(params) = ev.params {
                 if serde_json::from_value::<tauqe_protocol::ModelStreamResetEvent>(params).is_ok() {
-                    // The connection broke after partial delivery: every
-                    // fragment streamed so far belongs to the aborted attempt,
-                    // so the view drops them before the retry replays the
-                    // answer from its very beginning instead of stitching two
-                    // attempts together (c-3).
+                    // A reconnect replays the current round, not earlier replies.
                     *is_reasoning = false;
-                    st.model.text.clear();
-                    st.model.markdown_lines.clear();
-                    st.model.code_blocks.clear();
-                    // The hyperlinks were painted from the answer being
-                    // dropped, and the edit cycle of the withdrawn attempt is
-                    // void as well: its streamed files, its activity flag, its
-                    // settled outcome with the reason, and its rendered diffs
-                    // are released before the next rung opens its own cycle on
-                    // a clean slate instead of inheriting a rejected badge
-                    // (c-1).
-                    st.model.links.clear();
+                    st.model.reset_answer_stream();
                     st.model.reasoning.clear();
                     st.model.discard_edit_cycle();
                 }
@@ -1258,8 +1315,7 @@ fn settle_batch_turn(st: &mut AppState, summary: &BatchFinishSummary) {
     model.toolchain = None;
     model.retrying = None;
     model.turn_phase = None;
-    model.turn_round = None;
-    model.turn_max_rounds = None;
+    model.clear_round_progress();
     model.turn_phase_detail = None;
     model.end_in_flight_usage();
     // A queue never settles into a bare `Error`: the reason reported by the
@@ -3752,6 +3808,167 @@ mod tests {
                 .unwrap(),
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn round_progress_tracks_the_current_batch_member_across_reconnect() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let started = |id: &str| Event {
+            method: events::MODEL_STARTED.into(),
+            params: Some(serde_json::json!({
+                "operation_id": id, "model": {"provider": "openrouter", "name": "coder"},
+                "is_batch": true
+            })),
+        };
+        let round = |id: &str, number: usize, limit: Option<usize>, reason| Event {
+            method: events::TURN_ROUND_STARTED.into(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::TurnRoundStartedEvent {
+                    operation_id: id.into(),
+                    round: number,
+                    max_rounds: limit,
+                    reason,
+                })
+                .unwrap(),
+            ),
+        };
+        handle_event(started("op-stream"), &state, &mut is_reasoning).await;
+        handle_event(
+            round(
+                "op-stream",
+                2,
+                Some(5),
+                Some(tauqe_protocol::model::TurnRequestReason::EmptyResponseRetry),
+            ),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(stream_reset_event(), &state, &mut is_reasoning).await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.model.turn_round, Some(2));
+            assert_eq!(guard.model.turn_max_rounds, Some(5));
+            assert_eq!(guard.model.status, TurnStatus::Awaiting);
+            assert_eq!(
+                guard.model.turn_request_reason,
+                Some(tauqe_protocol::model::TurnRequestReason::EmptyResponseRetry)
+            );
+        }
+        handle_event(
+            turn_phase_event(tauqe_protocol::TurnPhase::Staging),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.model.turn_round, Some(2));
+            assert_eq!(guard.model.status, TurnStatus::Staging);
+            assert_eq!(guard.model.turn_request_reason, None);
+        }
+
+        handle_event(started("op-next"), &state, &mut is_reasoning).await;
+        handle_event(
+            round("op-stream", 3, Some(5), None),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.model.turn_round, None);
+            assert_eq!(guard.model.turn_max_rounds, None);
+        }
+        handle_event(round("op-next", 1, None, None), &state, &mut is_reasoning).await;
+        assert_eq!(state.lock().await.model.turn_round, Some(1));
+        handle_event(
+            Event {
+                method: events::MODEL_FINISHED.into(),
+                params: Some(serde_json::json!({"operation_id": "op-next", "full_text": ""})),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let guard = state.lock().await;
+        assert_eq!(guard.model.turn_round, None);
+        assert!(
+            guard.model.is_busy(),
+            "only the supervisor settles the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_repair_opens_a_new_answer_section_and_reconnect_keeps_it() {
+        let mut app = crate::app::test_state();
+        app.model.operation_id = Some("op-stream".into());
+        app.model.status = TurnStatus::Awaiting;
+        let state = Arc::new(Mutex::new(app));
+        let mut is_reasoning = false;
+        let round = |number, reason| Event {
+            method: events::TURN_ROUND_STARTED.into(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::TurnRoundStartedEvent {
+                    operation_id: "op-stream".into(),
+                    round: number,
+                    max_rounds: Some(5),
+                    reason,
+                })
+                .unwrap(),
+            ),
+        };
+        let text = |delta: &str| Event {
+            method: events::MODEL_TEXT_DELTA.into(),
+            params: Some(
+                serde_json::to_value(ModelDeltaEvent {
+                    operation_id: "op-stream".into(),
+                    delta: delta.into(),
+                })
+                .unwrap(),
+            ),
+        };
+        handle_event(round(1, None), &state, &mut is_reasoning).await;
+        handle_event(text("First proposal"), &state, &mut is_reasoning).await;
+        handle_event(
+            round(
+                2,
+                Some(tauqe_protocol::model::TurnRequestReason::PatchRepair),
+            ),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(text("Partial repair"), &state, &mut is_reasoning).await;
+        handle_event(stream_reset_event(), &state, &mut is_reasoning).await;
+        handle_event(text("Corrected proposal"), &state, &mut is_reasoning).await;
+
+        let mut guard = state.lock().await;
+        guard.model.render_markdown_now();
+        let rows: Vec<String> = guard
+            .model
+            .markdown_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .filter(|row: &String| !row.trim().is_empty())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                active_t("footer.round").replacen("{}", "1", 1),
+                "First proposal".to_string(),
+                active_t("footer.round").replacen("{}", "2", 1),
+                "Corrected proposal".to_string(),
+            ]
+        );
+        assert_eq!(guard.model.text, "First proposalCorrected proposal");
+        assert_eq!(guard.model.turn_round, Some(2));
     }
 
     fn model_finished_event() -> Event {
