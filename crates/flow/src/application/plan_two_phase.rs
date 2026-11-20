@@ -1,35 +1,31 @@
 //! Headless draft, independent critique, reconciliation, and persistence.
 use crate::api::{ApplicationEvent, ApplicationObserver};
 use crate::application::architect::publish_architect_started;
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::{
-    abort_and_reap_with_deadline, await_with_deadline, Application, Awaited, OperationGuard,
+use crate::api::{Application, OperationGuard};
+use crate::application::infrastructure::execution::{
+    PlanExecutionEnvironment, StructuredExecution,
 };
+use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
 use crate::application::plan_horizon::{
-    collect_plan_context_files, PlanHorizonContour, PlanHorizonError, PlanHorizonFailure,
+    collect_plan_context_files, ArchitectScope, PlanHorizonContour, PlanHorizonError,
+    PlanHorizonFailure,
 };
-use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
+use tauqe_core::control::structured::StructuredError;
 use tauqe_core::models::{ArchitectTier, ModelSelection};
+use tauqe_core::plan::prompt::critique::plan_critique_contract;
 use tauqe_core::plan::prompt::{
-    build_plan_critique_prompt, build_plan_critique_system_prompt,
-    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
-    build_plan_reconciliation_prompt, parse_plan_critique_output, plan_critique_response_schema,
-    plan_critique_response_schema_definition, resolve_architect_tier, PlanCritiqueOutput,
+    build_plan_critique_prompt, build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
+    build_plan_reconciliation_prompt, resolve_architect_tier, PlanCritiqueOutput,
     PlanRefinementOutput,
 };
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::plan::{find_duplicate_item_ids, prompt::format_architect_tier};
 use tauqe_core::plan::{Plan, PlanItem, PlanSynthesisResult};
-use tauqe_core::providers::{
-    format_session_id, ChatMessage, JsonSchemaDefinition, LlmProvider, ResponseFormat, StreamEvent,
-    SESSION_PREFIX_ARCHITECT,
-};
-use tauqe_core::workflow::WorkflowOptions;
-use tokio::sync::mpsc;
+use tauqe_core::providers::{ChatMessage, StreamEvent};
 /// Longest plan title the pipeline derives from developer directives.
 const DERIVED_TITLE_MAX_CHARS: usize = 120;
 
@@ -338,47 +334,26 @@ async fn execute_two_phase_plan_synthesis(
         operation_title,
     } = request;
     let repo_root = state.application.repository_root().await;
+    let environment =
+        PlanExecutionEnvironment::new(state.application.configuration().await, operation);
 
-    let (config, planner_tier, planner_options, models, critic_tier, critic_session) = {
-        let cfg = state.application.configuration().await.config.clone();
+    let (planner_tier, critic_tier) = {
+        let cfg = environment.config();
         // A directed modification is not a replanning wave around a blocked step,
         // so the drafting beat starts from the base rung or from the explicit
         // developer selection, never from an escalated position.
         let (planner_tier, _) = resolve_architect_tier(
-            &cfg,
+            cfg,
             plan.implementation.architect.as_ref(),
             planner_model.as_ref(),
             None,
             plan.implementation.last_replanned_step.as_deref(),
         );
-        let mut planner_options = WorkflowOptions::from_app_config(&cfg);
-        // One synthesis is one isolated design dialogue, so its cache is keyed by
-        // the plan and never by the interactive REPL session.
-        planner_options.session_id = Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id));
         let critic_tier = critic_model
             .as_ref()
             .filter(|_| !skip_critique)
             .map(|selection| cfg.models.resolve_selection_architect_tier(selection));
-        // A promoted critic addresses a backend node warmed by that very model,
-        // so the critique session never shares an identifier across ladder rungs.
-        let critic_session = critic_tier.as_ref().and_then(|tier| {
-            planner_options.session_id.as_ref().map(|session| {
-                let index = cfg
-                    .models
-                    .architect_tier_index(Some(tier))
-                    .unwrap_or_default();
-                format_session_id(session, &format!("critique{index}"))
-            })
-        });
-        let models = cfg.models.clone();
-        (
-            cfg,
-            planner_tier,
-            planner_options,
-            models,
-            critic_tier,
-            critic_session,
-        )
+        (planner_tier, critic_tier)
     };
 
     tracing::info!(
@@ -408,11 +383,11 @@ async fn execute_two_phase_plan_synthesis(
     let mut horizon = match run_planner_wave(
         state,
         operation,
+        &environment,
         compose_draft_task(&plan, directives.as_deref()),
         draft_header,
-        planner_options.clone(),
-        models.clone(),
         planner_tier.clone(),
+        ArchitectScope::Plan(plan.id.clone()),
         BUDGET_HINT,
     )
     .await
@@ -435,12 +410,12 @@ async fn execute_two_phase_plan_synthesis(
         match run_critique_wave(
             state,
             operation,
-            &config,
+            &environment,
             &plan,
             &horizon.output,
             directives.as_deref(),
             critic_tier,
-            critic_session,
+            &ArchitectScope::Plan(plan.id.clone()),
         )
         .await
         {
@@ -456,6 +431,7 @@ async fn execute_two_phase_plan_synthesis(
                     match run_planner_wave(
                         state,
                         operation,
+                        &environment,
                         compose_reconciliation_task(
                             &plan,
                             &horizon.output,
@@ -463,9 +439,8 @@ async fn execute_two_phase_plan_synthesis(
                             directives.as_deref(),
                         ),
                         header,
-                        planner_options,
-                        models,
                         planner_tier.clone(),
+                        ArchitectScope::Plan(plan.id.clone()),
                         BUDGET_HINT,
                     )
                     .await
@@ -640,11 +615,11 @@ async fn execute_two_phase_plan_synthesis(
 async fn run_planner_wave(
     state: &Runtime,
     operation: &OperationGuard,
+    environment: &PlanExecutionEnvironment,
     task: String,
     intro_header: String,
-    options: WorkflowOptions,
-    models: ModelsConfig,
     tier: ArchitectTier,
+    scope: ArchitectScope,
     budget_hint: &str,
 ) -> Result<PlannerWave, WaveFailure> {
     let op_id = format!("op-{}", crate::api::next_operation_id());
@@ -655,14 +630,14 @@ async fn run_planner_wave(
     let context_snapshot = state.application.context_for_turn().await;
     let (result, summary) = state
         .application
-        .run_architect_contour(
+        .run_architect_contour_with_environment(
             operation,
+            environment,
             PlanHorizonContour {
                 operation_id: op_id.clone(),
                 task,
                 context: context_snapshot,
-                options,
-                models_config: models,
+                scope,
                 tier,
                 intro_header,
                 budget_hint: budget_hint.to_string(),
@@ -727,19 +702,18 @@ async fn run_planner_wave(
 async fn run_critique_wave(
     state: &Runtime,
     operation: &OperationGuard,
-    config: &AppConfig,
+    environment: &PlanExecutionEnvironment,
     plan: &Plan,
     draft: &PlanRefinementOutput,
     directives: Option<&str>,
     tier: &ArchitectTier,
-    session_id: Option<String>,
+    scope: &ArchitectScope,
 ) -> Result<PlanCritiqueOutput, WaveFailure> {
-    let provider = match state
-        .application
-        .resolve_provider(tier.model.provider, config)
+    let execution = match environment
+        .for_structured(&state.application, operation, tier, scope)
         .await
     {
-        Ok(provider) => provider,
+        Ok(execution) => execution,
         Err(error) => return Err(WaveFailure::Failed(error.to_string())),
     };
 
@@ -748,7 +722,7 @@ async fn run_critique_wave(
     tracing::info!(plan_id = %plan.id, model = %tier.model, "independent plan critique started");
 
     match run_critique_rounds(
-        state, operation, provider, plan, draft, directives, tier, session_id, &op_id,
+        state, operation, &execution, plan, draft, directives, tier, &op_id,
     )
     .await
     {
@@ -791,19 +765,17 @@ async fn run_critique_wave(
 async fn run_critique_rounds(
     state: &Runtime,
     operation: &OperationGuard,
-    provider: Arc<dyn LlmProvider>,
+    execution: &StructuredExecution,
     plan: &Plan,
     draft: &PlanRefinementOutput,
     directives: Option<&str>,
     tier: &ArchitectTier,
-    session_id: Option<String>,
     op_id: &str,
 ) -> Result<PlanCritiqueOutput, CritiqueFailure> {
     let budget = tier.attempts().max(1) as usize;
-    let mut messages = vec![
-        ChatMessage::system(build_plan_critique_system_prompt()),
-        ChatMessage::user(build_plan_critique_prompt(plan, draft, directives)),
-    ];
+    let mut messages = vec![ChatMessage::user(build_plan_critique_prompt(
+        plan, draft, directives,
+    ))];
     let mut last_error = String::new();
 
     for attempt in 1..=budget {
@@ -817,21 +789,10 @@ async fn run_critique_rounds(
             }),
         );
 
-        let raw = collect_structured_round(
-            state,
-            operation,
-            Arc::clone(&provider),
-            tier,
-            messages.clone(),
-            session_id.clone(),
-            op_id,
-        )
-        .await?;
-
-        match parse_plan_critique_output(&raw) {
+        match collect_structured_round(state, operation, execution, messages.clone(), op_id).await {
             Ok(critique) => return Ok(critique),
-            Err(err) => {
-                last_error = err.to_string();
+            Err(CritiqueFailure::Unreadable(err)) => {
+                last_error = err;
                 tracing::warn!(
                     plan_id = %plan.id,
                     attempt = attempt,
@@ -841,6 +802,7 @@ async fn run_critique_rounds(
                 );
                 messages.push(ChatMessage::user(critique_healing_directive(&last_error)));
             }
+            Err(other) => return Err(other),
         }
     }
 
@@ -849,7 +811,7 @@ async fn run_critique_rounds(
     )))
 }
 
-/// Collects the raw text of one structured provider round.
+/// Collects the typed payload of one structured provider round.
 ///
 /// The critique is not streamed to the client, so the round only accumulates the
 /// payload it will decode; a voided attempt drops the payload it had already
@@ -857,12 +819,10 @@ async fn run_critique_rounds(
 async fn collect_structured_round(
     state: &Runtime,
     operation: &OperationGuard,
-    provider: Arc<dyn LlmProvider>,
-    tier: &ArchitectTier,
+    execution: &StructuredExecution,
     messages: Vec<ChatMessage>,
-    session_id: Option<String>,
     op_id: &str,
-) -> Result<String, CritiqueFailure> {
+) -> Result<PlanCritiqueOutput, CritiqueFailure> {
     let publisher = state.observer.clone();
     let usage = state
         .application
@@ -870,85 +830,48 @@ async fn collect_structured_round(
             publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
         })
         .await;
-    let (tx, mut rx) = mpsc::channel(64);
-    let cancel_rx = operation.cancel_receiver();
-    let stream_cancel = cancel_rx.clone();
-    let model_name = tier.model.name.clone();
-    let effort = tier.effort;
-    let response_format = critique_response_format();
-    let task = tokio::spawn(async move {
-        provider
-            .stream(
-                tauqe_core::providers::LlmRequest {
-                    model: &model_name,
-                    messages,
-                    response_format: Some(response_format),
-                    reasoning_effort: effort,
-                    session_id: session_id.as_deref(),
-                },
-                tx,
-                stream_cancel,
-            )
-            .await
-    });
-    // The round is reachable only through the operation slot, so a hard cancel
-    // and the shutdown drain abort a provider that ignores the signal.
-    operation.set_abort_handle(task.abort_handle());
-
-    let mut raw = String::new();
-    let mut stream_error: Option<String> = None;
-    let mut cancelled = false;
-    while let Some(event) = rx.recv().await {
-        match event {
-            StreamEvent::TextDelta(delta) => raw.push_str(&delta),
-            StreamEvent::Usage(reported) => usage.observe(&reported).await,
-            StreamEvent::ResetStream => raw.clear(),
-            StreamEvent::Cancelled => {
-                cancelled = true;
-                break;
+    let completion = structured_task::run(
+        &state.application,
+        operation,
+        execution,
+        plan_critique_contract(),
+        messages,
+        op_id,
+        state.exit_deadline,
+        |event| {
+            let usage = &usage;
+            async move {
+                if let StreamEvent::Usage(reported) = event {
+                    usage.observe(&reported).await;
+                }
             }
-            StreamEvent::Error(message) => {
-                stream_error = Some(message);
-                break;
-            }
-            _ => {}
-        }
-    }
-    operation.clear_abort_handle();
-
-    // Both terminal rejections reap the streamed round through the shared bounded
-    // task-exit confirmation (`crate::api::abort_and_reap_with_deadline`, governed by the
-    // task-exit deadline), so an abandoned provider call cannot outlive the critique
-    // and a task that never reaches a suspension point cannot park it.
-    if *cancel_rx.borrow() || cancelled {
-        let _ =
-            abort_and_reap_with_deadline(op_id, "plan-critique-stream", state.exit_deadline, task)
-                .await;
-        usage.flush().await;
-        return Err(CritiqueFailure::Cancelled);
-    }
-    if let Some(message) = stream_error {
-        let _ =
-            abort_and_reap_with_deadline(op_id, "plan-critique-stream", state.exit_deadline, task)
-                .await;
-        usage.flush().await;
-        return Err(CritiqueFailure::Failed(message));
-    }
-    // A completed round is awaited through the shared bounded task-exit
-    // confirmation (`crate::api::await_with_deadline`, governed by the task-exit
-    // deadline): a task that stops yielding after its last event becomes a typed
-    // stream failure carrying the recorded expiry diagnostic instead of parking the
-    // critique forever.
-    let completion =
-        await_with_deadline(op_id, "plan-critique-stream", state.exit_deadline, task).await;
+        },
+    )
+    .await;
     usage.flush().await;
     match completion {
-        Awaited::Joined(Ok(Ok(()))) => Ok(raw),
-        Awaited::Joined(Ok(Err(err))) => Err(CritiqueFailure::Failed(err.to_string())),
-        Awaited::Joined(Err(join_error)) => Err(CritiqueFailure::Failed(format!(
+        Ok(output) => Ok(output),
+        Err(StructuredTaskError::Cancelled) => Err(CritiqueFailure::Cancelled),
+        Err(StructuredTaskError::Request(
+            error @ (StructuredError::Empty | StructuredError::Incomplete),
+        )) => Err(CritiqueFailure::Unreadable(error.to_string())),
+        Err(StructuredTaskError::Request(StructuredError::Decode(err))) => {
+            Err(CritiqueFailure::Unreadable(err))
+        }
+        Err(StructuredTaskError::Request(StructuredError::Cancelled)) => {
+            Err(CritiqueFailure::Cancelled)
+        }
+        Err(
+            StructuredTaskError::Request(StructuredError::Failed(err))
+            | StructuredTaskError::Stream(err),
+        ) => Err(CritiqueFailure::Failed(err)),
+        Err(StructuredTaskError::ForeignOperation) => Err(CritiqueFailure::Failed(
+            "The independent critique requires an active operation for this session".into(),
+        )),
+        Err(StructuredTaskError::Task(join_error)) => Err(CritiqueFailure::Failed(format!(
             "The independent critique task terminated unexpectedly: {join_error}"
         ))),
-        Awaited::Orphaned => {
+        Err(StructuredTaskError::Orphaned) => {
             let message = format!(
                 "The independent critique task did not stop within the {} ms task-exit deadline",
                 state.exit_deadline.as_millis()
@@ -1066,35 +989,6 @@ fn critique_healing_directive(error: &str) -> String {
     format!(
         "<response_directive>\nYour previous reply did not satisfy the response schema ({error}). Regenerate the whole payload strictly according to the specified JSON schema: `verdict`, `summary`, and `findings` are required, the verdict accepts only `approved` and `changes_required`, and every finding requires `category`, `target`, and `detail`.\n</response_directive>"
     )
-}
-
-/// Projects the declarative critique definition into a provider response format.
-fn critique_response_format() -> ResponseFormat {
-    let definition = plan_critique_response_schema_definition();
-    let name = definition
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("plan_critique")
-        .to_string();
-    let description = definition
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let strict = definition
-        .get("strict")
-        .and_then(serde_json::Value::as_bool);
-    let schema = definition
-        .get("schema")
-        .cloned()
-        .unwrap_or_else(plan_critique_response_schema);
-    ResponseFormat::JsonSchema {
-        json_schema: JsonSchemaDefinition {
-            name,
-            description,
-            schema: Cow::Owned(schema),
-            strict,
-        },
-    }
 }
 
 /// Captures the prompt and the context paths a synthesis actually observed.

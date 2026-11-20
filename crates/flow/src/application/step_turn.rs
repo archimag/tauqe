@@ -1,12 +1,9 @@
-use crate::api::{next_operation_id, Application, OperationGuard};
-use crate::api::{ApplicationEvent, ApplicationObserver};
-use crate::application::ask::observe_edit_event;
-use crate::application::edit_cycle::{EditCycle, EditTermination};
+use crate::api::{Application, ApplicationObserver, OperationGuard};
+use crate::application::infrastructure::step_run::StepRunPublication;
 use crate::application::step_dispatch::{StepLoopBody, StepLoopReport};
+use crate::application::turn_execution::SingleStepRequest;
 use std::sync::Arc;
-use tauqe_core::control::context::EventSink;
 use tauqe_core::models::ReasoningEffort;
-use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::turn::TurnWorkContext;
 
 /// Options of one step-endpoint execution through the control loops.
@@ -21,6 +18,9 @@ pub struct StepLoopOptions {
     pub session_id: Option<String>,
     /// Registration of the batch that owns the run.
     pub operation: Arc<OperationGuard>,
+    /// Frozen technical environment shared across a plan run, if present.
+    pub(crate) execution:
+        Option<crate::application::infrastructure::execution::PlanExecutionEnvironment>,
     /// Plan coordinates published with `model/started`.
     pub plan_context: Option<tauqe_core::workflow::turn::ModelTurnPlanContext>,
     /// Work the run executes, published with `model/started`.
@@ -39,137 +39,59 @@ impl Application {
         let StepLoopOptions {
             selection,
             reasoning_effort,
-            marker,
+            marker: _marker,
             session_id,
             operation,
+            execution,
             plan_context,
             work_context,
             body,
         } = options;
 
-        let resolved = self
-            .resolve_turn_model(selection, reasoning_effort, crate::api::TurnMode::Step)
-            .await;
-        let provider = match self.resolve_turn_provider(&resolved).await {
-            Ok(provider) => provider,
-            Err(error) => return StepLoopReport::Failed(error.to_string()),
+        let session_label = session_id.clone();
+        let prepared = match body {
+            StepLoopBody::Single(task) => {
+                let context = self.context_for_turn().await;
+                match self
+                    .prepare_single_step(
+                        &operation,
+                        SingleStepRequest {
+                            selection,
+                            execution,
+                            reasoning_effort,
+                            session_id,
+                            capabilities: tauqe_core::control::turn::turn_capability_expr(),
+                            history: None,
+                            task,
+                            context,
+                        },
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => return StepLoopReport::Failed(error),
+                }
+            }
         };
-        let crate::api::ResolvedTurnModel {
-            config,
-            selection,
-            model,
-            role,
-            effort,
-            alias,
-        } = resolved;
-        let op_id = format!("op-{}", next_operation_id());
-        tracing::info!(
-            operation_id = %op_id,
-            model = %model,
-            role = ?role,
-            effort = ?effort,
-            work = work_kind(work_context.as_ref()),
-            session = session_id.as_deref().unwrap_or("none"),
-            "step run started"
-        );
-        observer.publish(
-            &op_id,
-            ApplicationEvent::Started {
-                model: model.clone(),
-                role,
-                alias,
-                effort,
+        let resolved = &prepared.execution.model;
+        self.run_prepared_step(
+            StepRunPublication {
+                model: resolved.model.clone(),
+                role: resolved.role,
+                effort: resolved.effort,
+                alias: resolved.alias.clone(),
                 plan_context,
                 work_context,
-                is_batch: true,
+                session_label,
             },
-        );
-
-        let execution = match self
-            .prepare_step_execution(
-                &operation,
-                crate::api::StepExecutionRequest {
-                    provider,
-                    model,
-                    config,
-                    selection,
-                    reasoning_effort: effort,
-                    marker,
-                    session_id,
-                    body,
-                },
-            )
-            .await
-        {
-            Ok(execution) => execution,
-            Err(error) => return StepLoopReport::Failed(error.to_string()),
-        };
-        let (sink, mut event_rx) = EventSink::channel();
-        let edit_observer = observer.clone();
-        let edit_id = op_id.clone();
-        let edit_cycle = Arc::new(EditCycle::new(move |event| {
-            edit_observer.publish(&edit_id, ApplicationEvent::Edit(event));
-        }));
-        let relay = {
-            let relay_op = op_id.clone();
-            let relay_observer = observer.clone();
-            let usage_observer = observer.clone();
-            let usage_guard = self
-                .begin_usage(&op_id, move |id, snapshot| {
-                    usage_observer.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()));
-                })
-                .await;
-            let relay_edit_cycle = Arc::clone(&edit_cycle);
-            tokio::spawn(async move {
-                let mut assistant_text = String::new();
-                while let Some(event) = event_rx.recv().await {
-                    match &event {
-                        StreamEvent::TextDelta(delta) => assistant_text.push_str(delta),
-                        StreamEvent::ResetStream => assistant_text.clear(),
-                        StreamEvent::Usage(report) => usage_guard.observe(report).await,
-                        _ => {}
-                    }
-                    observe_edit_event(&relay_edit_cycle, &event);
-                    relay_observer.publish(&relay_op, ApplicationEvent::Stream(event));
-                }
-                (assistant_text, usage_guard)
-            })
-        };
-
-        // Core owns task supervision, recovery, and merging the returned context.
-        let report = self
-            .execute_prepared_step(&operation, &op_id, execution, sink.clone())
-            .await;
-        drop(sink);
-        let telemetry = relay.await;
-        let completion = crate::api::classify_step_edit_completion(&report);
-        let termination = match completion.disposition {
-            crate::api::StepEditDisposition::Completed => EditTermination::Answered,
-            crate::api::StepEditDisposition::Refused => EditTermination::StagingRefused,
-            crate::api::StepEditDisposition::Cancelled => EditTermination::Cancelled,
-            crate::api::StepEditDisposition::Failed => EditTermination::ProtocolFailure,
-        };
-        edit_cycle.close_outcome(termination, completion.outcome);
-        match telemetry {
-            Ok((assistant_text, usage_guard)) => {
-                observer.publish(&op_id, ApplicationEvent::Finished(assistant_text));
-                usage_guard.flush().await;
-            }
-            Err(error) => {
-                tracing::warn!(operation_id = %op_id, %error, "Step telemetry relay terminated unexpectedly")
-            }
-        }
-        observer.publish(&op_id, ApplicationEvent::Usage(self.usage_snapshot().await));
-        report
-    }
-}
-fn work_kind(work_context: Option<&TurnWorkContext>) -> &'static str {
-    match work_context {
-        None => "none",
-        Some(TurnWorkContext::Interactive) => "interactive",
-        Some(TurnWorkContext::PlanStep { .. }) => "plan_step",
-        Some(TurnWorkContext::ReviewGroupStep { .. }) => "review_group_step",
-        Some(TurnWorkContext::ReviewStep { .. }) => "review_step",
-        Some(TurnWorkContext::ReviewPhase { .. }) => "review_phase",
+            observer,
+            |op_id, sink| async move {
+                // run_step_task remains the sole owner of task supervision,
+                // recovery, and adoption of the returned context.
+                self.execute_prepared_single_step(&operation, &op_id, prepared, sink.clone())
+                    .await
+            },
+        )
+        .await
     }
 }

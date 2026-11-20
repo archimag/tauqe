@@ -1,13 +1,16 @@
 //! Model resolution, provider construction, and runtime policy of a turn.
 
 use crate::api::Application;
+#[cfg(test)]
+use crate::application::infrastructure::execution::ExecutionEnvironment;
+#[cfg(test)]
 use std::sync::Arc;
 use tauqe_core::config::AppConfig;
 use tauqe_core::models::{ModelRef, ModelRole, ModelSelection, ReasoningEffort};
-use tauqe_core::providers::{format_session_id, LlmProvider, SESSION_PREFIX_REPL};
-use tauqe_core::workflow::policy::{ApplyPolicy, DirectApplyPolicy};
-use tauqe_core::workflow::WorkflowKind;
-use tokio::sync::watch;
+#[cfg(test)]
+use tauqe_core::providers::LlmProvider;
+#[cfg(test)]
+use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REPL};
 
 #[derive(Clone, Copy)]
 pub enum TurnMode {
@@ -28,59 +31,41 @@ pub struct ResolvedTurnModel {
 #[error("{0}")]
 pub struct TurnProviderError(String);
 
+impl TurnProviderError {
+    pub(crate) fn new(message: String) -> Self {
+        Self(message)
+    }
+
+    pub(crate) fn foreign_operation() -> Self {
+        Self("Execution requires an active operation for this session".into())
+    }
+}
+
 impl Application {
+    #[cfg(test)]
     pub(crate) async fn resolve_turn_provider(
         &self,
         model: &ResolvedTurnModel,
     ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
-        self.resolve_provider(model.model.provider, &model.config)
-            .await
+        ExecutionEnvironment::new(crate::application::configuration::ConfigurationSnapshot {
+            config: model.config.clone(),
+            selection: model.selection.clone(),
+        })
+        .provider(self, model.model.provider)
+        .await
     }
 
-    pub(crate) async fn resolve_provider(
-        &self,
-        kind: tauqe_core::models::ProviderKind,
-        config: &AppConfig,
-    ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(provider) = self.scripted_provider().await {
-            return Ok(provider);
-        }
-        tauqe_core::providers::create_provider_with_login(kind, config, self.chatgpt_login.clone())
-            .map(Arc::from)
-            .map_err(|error| TurnProviderError(error.to_string()))
-    }
-
+    #[cfg(test)]
     pub(crate) async fn resolve_turn_model(
         &self,
         selection: Option<ModelSelection>,
         effort: Option<ReasoningEffort>,
         mode: TurnMode,
     ) -> ResolvedTurnModel {
-        let snapshot = self.configuration().await;
-        let config = snapshot.config;
-        let selection = selection.unwrap_or(snapshot.selection);
-        let model = config.resolve_model(&selection);
-        let role = match &selection {
-            ModelSelection::Role(role) => Some(*role),
-            ModelSelection::Specific(_) | ModelSelection::Tier { .. } => None,
-        };
-        let effort_role = match mode {
-            TurnMode::Interactive => role.unwrap_or(ModelRole::REPL),
-            TurnMode::Step => ModelRole::Coder,
-        };
-        let effort = effort.or_else(|| config.resolve_selection_effort(effort_role, &selection));
-        let alias = config.model_alias(&model).map(str::to_string);
-        ResolvedTurnModel {
-            config,
-            selection,
-            model,
-            role,
-            effort,
-            alias,
-        }
+        ExecutionEnvironment::new(self.configuration().await).resolve_model(selection, effort, mode)
     }
 
+    #[cfg(test)]
     pub(crate) async fn turn_session(
         &self,
         mode: TurnMode,
@@ -95,17 +80,6 @@ impl Application {
                 &self.session_uuid().await,
             )),
             TurnMode::Step => None,
-        }
-    }
-
-    pub(crate) fn apply_policy(
-        &self,
-        workflow: WorkflowKind,
-        cancel: watch::Receiver<bool>,
-    ) -> Box<dyn ApplyPolicy> {
-        match workflow {
-            WorkflowKind::Naive => Box::new(DirectApplyPolicy::new()),
-            WorkflowKind::Git => Box::new(self.git_transaction_policy(cancel)),
         }
     }
 }

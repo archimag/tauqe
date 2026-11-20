@@ -1,395 +1,57 @@
 # Terminal UI Conventions
 
-This document specifies mandatory architectural and UX invariants for the Tauqe Terminal User Interface (`crates/tui`).
-
----
-
-## 1. Layout Semantics: Header vs Footer
-
-1. **Header is for Actions:**
-   - The top header is reserved conceptually for navigation, mode switching, and direct user actions.
-   - Dynamic session telemetry and background status feedback belong in the footer, not in the header.
-
-2. **Footer is for Indicators:**
-   - The bottom footer is reserved conceptually for operational telemetry, indicators, and status feedback.
-   - Navigation controls and interactive workflow triggers belong in the header or dedicated view panes, not in the footer.
-   - Show the engine's declared current action, not a fixed sequence of past or future phases. A new admitted request replaces deterministic activity and may carry a localized, typed reason. Use model status when no deterministic action is declared. The next deterministic activity replaces the request reason without changing the round counter.
-   - The overall turn round counts admitted provider calls. Legacy phase-event counters can describe local attempts and must not populate overall turn progress.
-
----
-
-## 2. Tab Hierarchy and History Invariant
-
-- **History is always the last tab:**
-  - The History tab represents the chronological session audit log and must remain the final tab in the navigation order.
-  - Any newly introduced view modes or tabs must be positioned before the History tab.
-
----
-
-## 3. Single Source of Truth for Keyboard Commands and Clean Views
-
-1. **Typed Command Specifications (`CommandSpec`):**
-   - Every keyboard binding is declared exactly once, as an executable command specification in `crates/tui/src/command.rs`: an abstract [`KeyChord`], a typed action, a [`CommandCategory`], and a help description.
-   - The input dispatcher that intercepts keys and the Help generator that documents them read the same structures, so the keys the developer sees in Help can never drift from the keys the application actually intercepts.
-   - Scattered string descriptions and hardcoded key checks in handlers are forbidden. A view owns a static [`CommandMap`] of its specifications and derives both input resolution and Help rendering from it.
-   - Maps are grouped by scope: `GLOBAL_COMMAND_MAP` (application-wide), `EDITOR_COMMAND_MAP` (the shared text editor), per-view maps, and the shared `DIALOG_COMMAND_MAP` for modal dialogs.
-
-2. **Semantic Key Chords (`KeyChord`):**
-   - An abstract chord names intent independently of the physical keyboard, so one specification describes the developer's actual modifiers.
-   - `Primary` (`C-`) and `Meta` (`M-`) are the two symmetric command modifiers, resolved dynamically through `InputConfig::is_primary(...)` / `InputConfig::is_meta(...)`. Hardcoding `KeyModifiers::CONTROL` or `KeyModifiers::ALT` in a view is forbidden.
-   - `PrimaryOrMeta` binds a chord reachable on either command modifier, so a terminal without a dedicated Meta key still reaches the action.
-   - `Bare` names a single alphanumeric or navigation key without command modifiers. Bare chords are active only in structural navigation and are unconditionally blocked while a text editor is capturing keystrokes, so the unconditional character insertion invariant (§5) always holds.
-   - `Shift` names an explicit `Shift` combination (`Shift+Tab`, `Shift+C`, `Shift+X`) used for reverse motion, destructive actions, and batch operations, deliberately separated from typed characters and command modifiers.
-   - `Ctrl` and `Alt` name raw physical chords whose key must never be remapped (the `C-g` keyboard-quit and the `Ctrl+C` cancel chord).
-   - Chord display is projected through the configured modifiers, so Help and dialog footers always name the real keys instead of the abstract notation.
-   - The zero F-keys invariant (§5) holds across every map: `KeyCode::F(...)` is never bound.
-
-3. **Prohibition of Action Hint Bars in Primary Views:**
-   - Primary view modes (REPL, Context, Review, Plans, History) must **never** render persistent keyboard command toolbars, shortcut hint banners ("Actions: Tab Fold, x Check..."), or bottom action bars.
-   - The standardized Help modal (`Ctrl+H` / `Alt+H`, or `?` in navigation views) is the single authoritative mechanism for discovering view commands.
-   - Bottom status areas are reserved strictly for operational telemetry, entity metadata, and progress indicators.
-   - Keybinding hints are permissible only inside temporary, contextual modal dialogs (confirmations, selection popups) where immediate contextual guidance is required.
-
-4. **Three-Tier Cognitive Classification of Help Commands:**
-   - The Help modal derives its contents strictly from the command maps without manual duplication, and ranks commands by cognitive importance through the [`CommandCategory`] model:
-     1. **Essential** — costly operations that spend tokens or touch Git (sending and cancelling turns, executing a step or batch, squashing commits).
-     2. **Interface** — presentation, navigation, and view state (switching views, tree navigation, folding, focus toggling).
-     3. **Helpers** — auxiliary operations that do not mutate interface state (copying to the clipboard, filtering, recentering).
-   - Categories keep their canonical order (Essential → Interface → Helpers) and any empty category is omitted. Arbitrary or chronological insertion is forbidden: each command belongs to the tier matching its daily cognitive weight, not the order in which it was implemented.
-
-5. **Decoupled Three-Tab Help Subsystem (Global, Current Mode, Text Editor):**
-   - The Help modal presents three dedicated tabs — Global Shortcuts, Current Mode Shortcuts, and Text Editor Help — completely separating application-wide navigation from view-specific workflows and the shared text editor vocabulary.
-   - Global shortcuts are derived from `GLOBAL_COMMAND_MAP`; active view shortcuts are derived from the mode's typed `CommandMap` (categorized into Essential, Interface, Helpers); and Readline/Emacs text editor bindings are derived from `EDITOR_COMMAND_MAP`.
-   - Separating Global and Current Mode ensures neither surface overflows the screen or buries mode-specific commands under application-wide shortcuts.
-
-6. **Unified Dialog Footers from the Local Command Map:**
-   - Modal footer hints are not hand-laid per dialog. They are generated by the reusable modal component from the shared `DIALOG_COMMAND_MAP`, with the configured `C-` / `M-` labels applied automatically.
-   - The footer therefore advertises exactly the chords the dialogs intercept, deduplicated and grouped (focus / activate / fast select / dismiss), and stays consistent across every modal.
-   - The hint is rendered as a docked, `palette.overlay`-filled help panel below the action bar (see §6.4), with its chords, verbs, and separators styled through semantic text roles.
-
----
-
-## 4. Hierarchical Tree Navigation, Org-Mode Paradigm, and Semantic Key Matrix
-
-1. **Hierarchical Tree Structures (Plans, Review):**
-   - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
-   - **Visibility Cycling:** Support clear local folding on items (`Tab` or `Space`) and global folding (`a`) to toggle between dense overview (all collapsed) and expanded states.
-   - **Orthogonal Status and Execution:** Task lifecycle statuses (`TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`, consciously chosen via modal dialog `t`) are strictly separated from execution (`x`).
-   - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
-   - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review, Context, History), prioritize simple direct keys (`n`/`p`, `↑`/`↓`, `x` for execute, `r` for refine, `c` for copy, `t` for the status dialog) rather than multi-key chord sequences.
-
-2. **Case Invariant: Lowercase Acts on the Selection, Uppercase Acts on Everything:**
-   - The letter case of a structural command encodes the scale of its effect. This rule is mandatory in every navigation view (Plans, Review, Context, History).
-   - A lowercase letter applies one verb to the single item under the cursor: `x` executes the selected step or finding, `r` refines the selected item, `c` copies the selected item.
-   - The uppercase (`Shift`) counterpart applies the same verb to every applicable item: `X` executes every ready step or open finding, `R` refines every item awaiting decomposition.
-   - The scale is chosen before the letter. A verb never acquires a letter whose sibling already carries the opposite scale, and a batch command is never bound to a lowercase key.
-
-3. **`x` / `X` Are Reserved for Constructive Execution:**
-   - `x` executes the selected target and `X` executes the batch of every applicable target. The reservation holds in the REPL viewport, Plans, and Review alike.
-   - Binding `x` to deletion, cancellation, dismissal, or any other destructive effect is forbidden: a keystroke pressed while disproving a step must never destroy it.
-   - Removing a single entity is bound to `Delete` and always opens a confirmation dialog whose default focus is `Cancel` (§5.4).
-
-4. **Clipboard Is Isolated from Destructive Clearing (`c` / `y`):**
-   - In navigation views, lowercase `c` and `y` exclusively place content, a path, or item text into the clipboard (copy / yank). They never clear, delete, or reset state.
-   - Clearing a whole collection — the auto context layer, the user context layer, the session history, or a stored list — requires the `Shift+C` chord plus an interactive modal confirmation that defaults to `Cancel` (§5.4).
-   - `Shift+C` is deliberately uppercase-only, because removing one entity is `Delete` and a single clear has no safe meaning. A view that needs both a copy and a clear keeps `c` for copy and `Shift+C` for the mass clear, never the reverse.
-
-5. **`N` Creates, `r` / `R` Decompose (New Entity versus Refine Invariant):**
-   - Creating a new analysis entity is separated from decomposing an existing one, so the two verbs never compete for a letter. Starting a new Review session over the current context is bound to `N`.
-    - `r` and `R` are reserved for the Architect in Plans and Review: lowercase `r` decomposes the selected item (refining the plan horizon or turning a finding into an implementation plan), and `R` runs the Architect over every item that requires decomposition.
-   - Refresh therefore never claims `r`; it uses the canonical `g` (§4.6).
-
-6. **Navigation Minimum and Canonical Refresh (`g`):**
-   - Every structural navigation view implements the same symmetric movement set: `n` / `p` (and `↑` / `↓`) for the next and previous row, `Home`, `M-<`, or `C-Home` for the first row, `End`, `M->`, or `C-End` for the last row, `PgUp` / `PgDn` for paged scrolling, and `C-n` / `C-p` for the accordion walk. The shared text editor honors the same boundary chords (`M-<` / `M->`, `C-Home` / `C-End`) for the beginning and the end of the buffer.
-   - Requesting a lightweight state refresh from the daemon — no LLM call and no bounded turn — is bound to `g` in the Plans, Review, and Context tabs, following the Magit/Dired convention.
-   - `g` is a cheap, non-destructive helper, so it needs no confirmation dialog.
-
-7. **Unified Batch Execution (`X`):**
-   - A batch launch always reuses the single `BatchExecution` supervisor instead of a per-mode loop. The queue is assembled from every unfinished leaf step of the ready plans, the confirmation dialog states the total scope of work, one progress view tracks the run, and interruption is governed by the three-way `BatchCancel` dialog (§6.3).
-
-8. **Strictly Increasing Indentation Derived from Depth (All Hierarchical Views):**
-   - **Strictly Increasing Indent:** Every nested object renders strictly deeper than its visual parent. The indent step is fixed at 2 columns and accumulates with nesting depth, so a child row never shares its leading indent with the parent row. Rendering a child at the indent of its parent is forbidden.
-   - **A Node Body Is Never Deeper Than Its Children:** A node's own detail block — description, target files, read-only contracts, recommendations, and notes — renders at the level of its children, exactly one indent step deeper than the node's summary row, and never deeper. Otherwise the children read as if they sit above the parent's own body, which inverts the hierarchy.
-   - **Indent Is Computed, Never Written:** Leading indentation is derived from the numeric nesting depth through a single helper owned by the view. Literal whitespace runs inside a renderer are forbidden, so a parent row, its body, and its children can never drift apart and every hierarchical view shares one scale.
-   - **The Hierarchy Is Covered by a Regression Test:** Every hierarchical view carries a regression test asserting that a child's leading indent is strictly greater than its parent's, and that a node body is never indented deeper than its children. The test guards the invariant against a future return to a flat render.
-
----
-
-## 5. Unified Emacs & Magit Paradigm: Direct Structural Navigation vs Readline Editing
-
-1. **Two Distinct Interaction Modes:**
-   - **Magit / Org-Mode Structural Navigation (Non-Input Contexts):**
-     In all views, dialogs, and panels where a text buffer is NOT actively receiving text (Plans, Review, History, Context file list, dialog button toggling):
-     - Canonical navigation uses simple, direct keys: `n` (*next*) and `p` (*previous*), following the Magit/Dired standard. Arrows `↑`/`↓` are preserved as secondary aliases.
-     - Actions use direct bare keys: `x` / `X` for single versus batch execution, `r` / `R` for single versus batch Architect decomposition, `N` for a new review session, `g` for refresh, `t` for the status dialog, `c` / `y` for copy, `Shift+C` for mass clearing, `Tab` / `Space` for local folding, `a` for fold-all, plus `Delete`, `Enter`, `Esc`, `q` to return/bury the buffer, and `?` for help (§4.2–§4.7).
-     - Modifier chords are never required for basic browsing, folding, or status toggling.
-     - Never intercept these single keys when a text editor becomes active.
-   - **Emacs-Style Commands with Zero Modal Ambiguity (Text-Input Contexts):**
-     In all views and dialogs where a text input editor is active (REPL prompt input, Squash message editor, file adding, modal text fields):
-     - **Unconditional Character Insertion:** Every printable character typed without a command modifier MUST be unconditionally inserted into the text buffer. Intercepting bare alphanumeric keys (such as `u`, `s`, `c`, `y`, `[`, `]`, or `Space`) when the prompt buffer is empty is strictly forbidden.
-     - All functional commands and actions within text input contexts MUST require an explicit command modifier.
-   - **One Declared Capture Boundary Governs Typing, the Quit Guard, and Paste:** The text-capturing surfaces are declared exactly once, as the typed capture-site resolver owned by the application state, and the keyboard dispatch gate, the quit-loss guard, and the paste router all derive their answer from that single declaration, so an editor that captures text is inserted into by typing, protected against a silent exit, and reached by a pasted payload without being listed anywhere a second time.
-
-2. **Symmetric Abstract Command Modifiers (`C-` and `M-`):**
-   - Commands in text input contexts are formulated conceptually with two independent Emacs-style chords: the primary modifier `C-<key>` and the meta modifier `M-<key>`.
-   - `C-` is the abstract Primary Command Modifier, configured in `$XDG_CONFIG_HOME/tauqe/tui.toml` under `[input] primary_modifier = "ctrl"` (default) or `"alt"`. `M-` is the abstract Meta Command Modifier, configured under `[input] meta_modifier = "alt"` (default) or `"ctrl"`.
-   - The two modifiers are independent and symmetric, so either chord can be remapped and a terminal that lacks a dedicated Meta key still reaches every action.
-   - The codebase must never hardcode raw `KeyModifiers::CONTROL` or `KeyModifiers::ALT` checks for input-level actions; it must resolve them through `InputConfig::is_primary(...)` and `InputConfig::is_meta(...)`.
-   - The AltGr / compose chord (`Ctrl+Alt`) belongs to neither modifier, so typing composed characters or `AltGr` digits never triggers an application command.
-   - Standard bindings:
-     - `C-Enter` — send prompt / confirm message editor;
-     - `C-S` / `M-S` — open squash commits dialog;
-     - `C-W` — kill word backward;
-     - `M-B`, `M-F` — move word backward / forward;
-     - `C-A`, `C-E`, `C-K`, `C-U`, `C-Y`, `C-D`, `C-B`, `C-F` — standard line editing and yank;
-     - `C-P`, `C-N` — move cursor line up / down in the shared text editor; inside a modal dialog the same symmetric pair is the vertical field walk between input fields and rows (§6.2), so the vertical axis never relies on `Tab`;
-     - `M-P`, `M-N` — navigate prompt history backward / forward;
-     - `C-T` — toggle file diff folding;
-     - `C-Space` / `Shift+Tab` — switch REPL focus between the prompt and the Viewport;
-     - `C-J` — insert newline;
-     - `C-1` … `C-5` / `M-1` … `M-5` — switch tabs;
-     - `C-M` / `M-M` — model selection picker;
-     - `C-C` — cancel generation;
-     - `C-G` — keyboard-quit (Emacs `keyboard-quit`): the canonical abort chord, normalized globally to `Esc` before any handler runs, so it aborts the active operation, dismisses the top-most modal, returns from an auxiliary view, or detaches the active discussion focus exactly as `Esc` would;
-     - `C-L` — recenter the active item or viewport (Emacs `recenter-top-bottom`);
-     - `C-R` — toggle reasoning block;
-     - `C-O` — reload configuration;
-     - `C-H` / `M-H` — open the contextual Help dialog;
-     - `M-T` — open the color theme selector;
-     - `C-[` / `C-]` — navigate response file diffs;
-
-3. **Zero F-Keys Invariant and Universal Fallbacks:**
-   - The TUI must never bind `KeyCode::F(...)` (`F1`..`F12`). Function keys are intercepted unpredictably by window managers, terminal multiplexers, and laptop firmware, some are reserved by the terminal itself, and 60% and compact keyboards omit the row entirely. Every action must be reachable through a bare key, `C-`, `M-`, or a dedicated navigation key.
-   - Universal navigation keys (dedicated arrows, `Home`/`End`, `PgUp`/`PgDn`) remain active across all terminal types, regardless of keyboard protocol capabilities.
-   - `Alt+Enter` and `Ctrl+J` serve as universal fallbacks for newline insertion in legacy terminals lacking `Shift+Enter`.
-
-4. **Explicit Confirmation for Destructive and Long-Running Actions:**
-   - Any modal dialog that initiates a destructive action (such as delete plan, clear history, or cancel generation) or a long-running, autonomous execution workflow (such as executing a plan step, plan batch, or review finding batch) MUST feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
-   - Pressing `Enter` or `Esc` defaults to safe cancellation.
-   - Quick confirmation is permitted via direct `y` or `Y` keypress.
-   - A destructive action must verify that a valid target exists before prompting the user, emitting an informative notification otherwise.
-
-5. **Canonical Keyboard-Quit (`C-g`):**
-   - `C-g` (ASCII BEL, `0x07`) is the universal abort chord inherited from Emacs. It is normalized once, before any view or modal handler runs, to `Esc`, so every surface reacts identically without a per-handler binding.
-   - The chord must never be implemented by installing a `SIGINT` handler. Normalizing the key event keeps the process free of signal handling and preserves the terminal's standard `Ctrl+C` behavior.
-   - Because `C-g` resolves to `Esc`, its effect is always `Esc`'s effect in the active context: interrupt a running generation, dismiss the top-most modal, return from an auxiliary view, or detach the active discussion focus. It never clears history; history clearing is the dedicated `Shift+C` binding inside the History view.
-
----
-
-## 6. Modal Dialog Architecture & Interaction Standard
-
-1. **Three-Tier Dialog Structure (Header, Body, Actions):**
-   - Every modal dialog must follow a consistent three-tier layout:
-     - **Header / Title:** Border title (`Block::bordered().title(...)`) indicating operation context and status (e.g. ` Confirm Cancellation `, ` Select Model `, ` Squash AI Commits (Applying...) `).
-     - **Body:** Central functional area (formatted text/alert for confirmations, virtual scrollable list for selectors, or structured input/diff pane).
-     - **Actions Footer:** Dedicated bottom action bar presenting explicit action buttons (`[ Confirm ]`, `[ Cancel ]`, etc.). It is always separated from the body by a blank row (see §6.7), never by a rule drawn through the middle of the card.
-     - **Docked Help Panel:** Immediately below the action bar, a non-interactive hint strip docked to the bottom border and rendered as a `palette.overlay`-filled row (see §6.4). It is chrome, not a fourth content tier.
-
-2. **Standardized Command Navigation:**
-   - **Focus Cycling:** `Tab` and `Shift+Tab` cycle focus between actionable controls (buttons or fields).
-   - **Vertical Field Walk:** `C-n` and `C-p` are the universal vertical movement of a dialog. They step to the next and the previous input field, and inside a field that owns several rows (the review launcher's Target Paths) they walk those rows and leave the section only at its boundary. The chords reach the dialog before its single-line fields, while a multiline editor keeps them for cursor line movement, so vertical motion never depends on the surrounding control.
-   - **`Tab` as Contextual Completion:** `Tab` accepts the highlighted candidate while a completion menu (the directory prefixes of the active path row) is open, and falls through to the shared focus move only when no candidate is offered. `Shift+Tab` always keeps the reverse focus move.
-   - **Multi-Row Input Fields:** `C-j` opens the next row of a multi-row field, and only while the active row already carries usable input, so one press never chains empty rows. `Backspace` on an empty row closes it and returns the cursor to the previous row.
-   - **Horizontal Button Stepping:** `←` / `→` move focus between adjacent buttons in action bars.
-   - **Execution & Safe Defaults:** `Enter` or `Space` activates the currently focused button. For destructive actions as well as long-running, autonomous execution tasks (plan execution, review finding batch execution), safe cancellation (`Cancel`) must always receive default focus.
-   - **Fast Accelerators in Confirmation Modals:** Direct `y` / `Y` confirms immediately; `n` / `N` or `Esc` cancels and closes immediately, regardless of button focus.
-   - **Dismissal:** `Esc` or `q` unconditionally cancels and dismisses dialogs (except where a text input editor is actively capturing keystrokes).
-   - **List Navigation in Selection Dialogs:** When the body contains a selectable list (e.g., model picker), items are navigated using standard keys (`n`/`p`, `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`), preserving current item selection when focus shifts to action buttons.
-
-3. **Batch Cancellation Dialog (Three-Way Stop):**
-   - When a running batch (plan or review execution) receives a cancellation request, the modal presents three explicit actions instead of a binary confirm: `Continue`, `Soft Stop`, and `Hard Stop`. A stop is thereby a deliberate choice rather than an accidental dismissal.
-   - `Soft Stop` lets the current member finish its bounded turn, compiler verification, and Git commit before the queue halts; `Hard Stop` aborts the current member immediately. `Continue` keeps the queue running and holds the safe default focus, so an accidental keypress never discards committed work.
-   - Direct accelerators `c` (Continue), `s` (Soft Stop), and `h` (Hard Stop) select an action without moving focus; `Tab`, `←`/`→`, `Enter`/`Space`, and `Esc` follow the standard dialog navigation rules above.
-   - While a soft stop is pending, the footer indicates it (e.g. `[Stopping after current step]`), so the developer can distinguish a graceful drain still in progress from an immediate abort (see §1).
-
-4. **Docked Help Panel and Layering Invariant:**
-   - The hint text of a modal dialog is never a loose caption hanging in the gap between the buttons and the border. It forms a **docked help panel**: a full-width strip filled with `palette.overlay` and docked to the bottom inner row of the dialog, immediately above the bottom border.
-   - Docking the hint to its own filled row separates persistent chrome from the interactive action bar and visually closes the dialog card, so the eye reads the buttons as controls and the strip as guidance. A transparent or unstyled hint row is forbidden (see §8).
-   - The panel is non-interactive: it never receives focus, is never hit-tested for activation, and exposes no selectable controls. Its text is generated from the shared `DIALOG_COMMAND_MAP` (§3.6), never hand-authored per dialog.
-
-5. **Semantic Typography for Hint Chords:**
-   - Hint text is not a flat string; it is assembled from structured `Span`s so every token carries its own semantic role:
-     - key chords render in `palette.text_primary` (emphasized);
-     - action verbs render in `palette.text_secondary`;
-     - separator glyphs (`/` and `•`) recede into `palette.text_muted`.
-   - This semantic contrast keeps the keys scannable and legible on any terminal or color profile and honors the absolute prohibition of raw colors (§8). Hints are projected through the configured `C-` / `M-` modifiers before styling, so the styled tokens always name the real keys.
-
-6. **Mouse Hit-Testing Synchronization Invariant:**
-   - Every geometry helper that reports clickable button rectangles (for example `modal_action_buttons`) must compute its coordinates from the exact same `Layout` formula the render path uses. Shifting the action bar, or inserting the docked help panel below it, must therefore never desynchronize the click targets from the drawn buttons.
-   - Rendering and hit-testing share a single geometry source of truth, so the confirm/cancel buttons that are drawn are always the buttons that are clickable.
-
-7. **Mandatory Vertical Breathing Room (Dialog Air):**
-   - A modal dialog is never a dense block of text pressed against its own borders, title, or buttons. The card reserves three fixed spacers, and every band of the card is separated from its neighbour by them.
-   - **Top Inset:** exactly one empty row between the top border (its title included) and the first rendered line of the body. The body never collides with the border title.
-   - **Inter-Section Spacer:** exactly one empty row between logical blocks inside the body (a summary and an item list, a heading and its details, two stacked forms). It belongs to the body renderer, which knows where its own sections begin and end.
-   - **Pre-Action Spacer:** exactly one empty row between the body and the interactive action bar, followed by the button row and the docked hint row. It belongs to the shared frame, not to the body renderer.
-   - The shared frame therefore expresses a fixed vertical formula: top inset, flexible body, pre-action spacer, button row, docked hint row. A dialog cannot opt out of the top inset or the pre-action spacer.
-   - A body renderer draws strictly inside its own area. Painting into the top inset, the pre-action spacer, the button row, or the hint strip is a layout defect, and reclaiming space by deleting a spacer is forbidden.
-   - Because all three spacers are part of the shared formula, they are also part of the hit-testing helper (§6.6): spacing and click geometry are corrected in one place and cannot drift apart.
-   - Rationale: a dense dialog forces the eye to re-parse where reading ends and acting begins, and on a short terminal the buttons visually merge with the text above them. One empty row is the cheapest possible separation and keeps high information density legible.
-
-8. **Mandatory Horizontal Margin (Dialog Frame Inset):**
-   - Text pressed against a vertical border reads as clipped: the border glyph merges with the first character of every line and the card loses its frame.
-   - Every modal card keeps its content off the left and right borders by one column of inner horizontal padding on each side. The body, the action bar, and the docked help panel share that same padding, so text, buttons, and hints start on one left margin.
-   - Content is laid out strictly inside the padded column. Renderers never draw on the border column, and they never compensate for a narrow card by shrinking the padding below one column.
-   - The padding is part of the same shared geometry as the vertical spacers (§6.6, §6.7), so mouse hit-testing and rendering stay aligned when the card is resized.
-   - Rationale: one column of margin is the smallest possible inset that visually separates content from chrome, and it keeps the border readable on every terminal width.
-
----
-
-## 7. REPL Focus Model (Prompt vs Viewport)
-
-1. **Two Focus Targets:**
-  - The REPL tab has two focus targets: the prompt editor (default) and the Viewport (model response and file diffs).
-  - `C-Space` and `Shift+Tab` switch focus between them. `Esc` in the Viewport returns focus to the prompt.
-  - Reason: arrow keys and `C-P` / `C-N` have different meanings in the editor (cursor navigation) and in the response (file selection, scrolling). Separate focus removes this conflict without adding bare-letter shortcuts.
-
-2. **Viewport Navigation:**
-  - `C-N` / `C-P` and `↓` / `↑` move the reading position. Inside an expanded file they scroll its diff body line by line and cross into the next or previous file only at the boundaries of that file's block — the next file opens at its summary row, the previous one at its last diff line — so a long patch is never interrupted mid-read.
-  - A collapsed file is crossed in one keystroke, the explicit `C-[` / `C-]` chords switch files directly, and with no files at all the same keys scroll the response.
-  - `Tab` and `C-T` fold or unfold the selected diff. `Enter` on the selected file, and the bare `v` chord, open the fullscreen diff inspector instead: `n` / `p` walk the audited files, `j` / `k` and `↑` / `↓` scroll the isolated diff line by line, `PgUp` / `PgDn` page it, and `Esc` returns to the exact reading position the audit was opened from.
-  - `PgUp`, `PgDn`, `Home`, and `End` scroll the response.
-   - Apart from the single bare `v` inspector chord, bare letters and `Space` are never Viewport commands. This keeps the unconditional character insertion rule from §5: every other bare letter falls through to the prompt and is inserted there.
-
-3. **Automatic Return to the Prompt:**
-  - Any key that types text or edits the prompt moves focus back to the prompt and is applied there. No keystroke is lost.
-  - Sending a prompt also returns focus to the prompt.
-
-4. **Focus Indicator:**
-  - While the Viewport has focus, the prompt border is dimmed and titled `[VIEWPORT]`.
-
----
-
-## 8. Semantic Design System and Absolute Prohibition of Raw Colors
-
-1. **Single Source of Truth for Visual Styling (`ThemeEngine` & `ThemePalette`):**
-   - All presentation rendering across primary views, modal dialogs, popup overlays, text editors, and global chrome must resolve colors and styles exclusively through `crate::theme::engine::current_engine()` (or a passed `&ThemeEngine`) and the semantic `ThemePalette` tokens.
-   - UI components must never hardcode concrete terminal colors, construct ad-hoc ANSI styles, or invent local color constants.
-
-2. **Absolute Prohibition of Raw Colors:**
-   - Direct usage of raw `ratatui::style::Color` variants (e.g. `Color::Black`, `Color::White`, `Color::Red`, `Color::Green`, `Color::Yellow`, `Color::Blue`, `Color::Magenta`, `Color::Cyan`, `Color::Gray`, `Color::DarkGray`, `Color::Light*`, `Color::Rgb(...)`, `Color::Indexed(...)`) or unstyled/default-filled blocks in presentation code is **strictly forbidden**.
-   - The sole allowed color constructor in UI code is projection through `engine.color(role)`, `engine.fg(role)`, and `engine.bg(role)`.
-
-3. **Mandatory Surface and Background Layering:**
-   - Visual hierarchy must be maintained strictly through palette layer roles:
-     - `canvas` — root workspace/window background;
-     - `surface` — modal dialog cards, popups, and bordered containers;
-     - `overlay` — floating dropdowns, selection rows, and contextual menus;
-     - `code_bg` — inline and block code surfaces.
-   - Leaving modal dialogs, popups, or confirmation overlays with transparent, unstyled, or default terminal backgrounds (`Color::Reset` or unstyled blocks) is strictly prohibited. Every modal container MUST explicitly fill its background using `palette.surface` (or `palette.overlay`) so underlying content is visually occluded across all color depths.
-
-4. **Semantic Role Mapping:**
-   - **Text:** `text_primary` for headings and high-priority content, `text_secondary` for descriptive labels and secondary values, `text_muted` for subtle hints, borders, and inactive separators, `text_inverse` for text rendered over accented backgrounds (active buttons, badges).
-   - **Borders & Chrome:** `border` for standard container dividers; `ModalTone` (`Info`, `Warning`, `Dangerous`, `Accent`) for semantic dialog border accents.
-   - **Action Controls:** `button_bg` and `button_fg` for resting buttons, `button_active_bg` and `text_inverse` for focused/active buttons, `status_error` and `text_inverse` for dangerous/destructive action buttons.
-   - **Status & Indicators:** `status_info`, `status_success`, `status_warning`, `status_error` for notifications, telemetry, and lifecycle badges.
-   - **Diffs & Patches:** `diff_added`, `diff_removed`, `diff_context` for unified diffs and file reviews.
-
-5. **Projection Transparency:**
-   - View code must never attempt manual ANSI downsampling, 16-color degradation branching, or separate light/dark logic branches.
-   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), guaranteeing legibility and WCAG contrast in all terminal environments.
-
----
-
-## 9. Zero-Hardcode User-Facing Text Invariant (100% Localized Presentation)
-
-1. **Single Source of Localized Text (`i18n.t` and `active_t`):**
-   - Every user-facing string rendered by the TUI (tab titles, modal dialog titles and bodies, button labels, key descriptions in `CommandSpec`, bounded-turn lifecycle badges, status messages, notifications `notify_*`, confirmation alerts) must be resolved dynamically through `i18n.t("key")` (or the process-global snapshot `active_t("key")`).
-   - Hardcoding raw user-facing string literals in `Span::raw("...")`, `Line::from("...")`, `Paragraph::new("...")`, or `Button::new("...")` is strictly prohibited and classified as an architectural defect.
-
-2. **Canonical Catalog as Embedded SSOT (`canonical_catalog`):**
-   - Every user-facing text key must be declared in `crates/tui/src/i18n/catalog.rs` inside `canonical_catalog()`.
-   - Each entry defines:
-     - `key` — stable dot-notated identifier (`category.item`);
-     - `english` — authoritative English source text;
-     - `context` — semantic usage description for the LLM translation engine (e.g. "confirmation button in modal dialog", "help description for cancelling current turn");
-     - `max_width` — explicit physical terminal column budget (`Some(N)`) for buttons, badges, tabs, and columns; or `None` (unbounded) for documentation, command descriptions, and multi-line explanations.
-
-3. **Budgeted vs Unbounded Text Geometry:**
-   - Elements constrained by fixed grid layouts (`Constraint::Length`) must specify a realistic `max_width` budget to prevent terminal grid overflow.
-   - Elements rendered within scrollable or wrapping views (Help dialog, command lists, multi-line explanations) must use `max_width = None` so translations remain natural and uncompromised.
-
-4. **Allowed Non-Localized Exceptions (Technical Artifacts):**
-   - Raw string literals are permissible exclusively for:
-     - LLM generation output and streaming response payloads (markdown, code blocks, diff hunks);
-     - File system paths, Git commit hashes, branch names, and repository metadata;
-     - Model and provider identifiers (e.g. `anthropic/claude-3.7-sonnet`);
-     - Technical chrome and non-verbal syntax separators (`/`, `•`, ` : `, `[+]`, `[-]`, `...`, borders);
-     - Key chord notation rendered by `KeyChord::display()` (e.g. `C-`, `M-`, `Tab`).
-
----
-
-## 10. Declarative Hit-Testing Registry (Single Source of Truth for Pointer Regions)
-
-1. **Components Declare Their Own Interactive Geometry:**
-   - Every interactive visual element registers the rectangle it has just drawn together with a typed `UiAction` by calling `HitRegistry::register` while the frame is being drawn.
-   - Adding, moving, resizing, or removing an interactive element therefore touches only the component that draws it. The pointer routing never changes because a new clickable region appears.
-   - Keeping a per-widget coordinate struct (the `*ClickAreas` family) beside a renderer, and matching it inside the pointer handler, is forbidden. The drawn geometry and the clickable geometry would become two independent sources of truth that drift apart on the first layout change, and the click that looks correct on screen would silently land elsewhere.
-
-2. **The Dispatcher Knows No Widgets:**
-   - `crates/tui/src/input/mouse.rs` resolves a pointer coordinate with a single spatial lookup in the flat registry of the current frame and forwards the found `UiAction` to one dispatcher match.
-   - The dispatcher maps an action to a state transition. It never contains a widget name, a field of a view struct, or a coordinate computation, so it holds no knowledge of where anything is drawn.
-   - A component that introduces a new action touches its own renderer and the dispatcher match, never the pointer routing itself. Inline geometry checks inside the pointer handler are an architectural defect.
-
-3. **Frame-Scoped Lifecycle and Absence of Phantom Clicks:**
-   - The registry lives strictly inside one frame: `render_ui` clears it before the components declare the new regions, and only what was actually drawn in this frame is registered.
-   - A hidden, collapsed, or covered surface registers nothing, so it physically cannot receive a click. A modal drawn over a view wins over the regions it covers, because resolution consults the regions in reverse draw order and an active modal takes the click before the registry is consulted.
-   - Because hit-testing and rendering read the same declaration, they cannot desynchronize (§6.6). The dialog vertical air and horizontal margin (§6.7, §6.8) are part of that same declaration, so spacing is corrected in one place.
-
-4. **Mandatory Regression Coverage:**
-   - Registry resolution (top-most region wins, edges exclusive, empty space resolves to nothing, a cleared registry drops every region) and the dispatcher transitions are covered by unit tests in `crates/tui/src/ui.rs` and `crates/tui/src/input/mouse.rs`.
-   - A change that reintroduces a widget-specific coordinate check inside the pointer handler, or lets a covered surface keep a clickable region, must break these tests rather than pass silently.
-
----
-
-## 11. Memory Bounds of the Presentation Layer
-
-1. **The Interface Never Retains Unbounded Growth:**
-   - A long session, a deeply expanded tree, or a large audit log must never translate into a presentation structure that grows with the session. Every cache, retained list, and reading buffer the interface owns carries a declared ceiling.
-2. **Markdown Body Cache Ceiling (`MAX_CACHED_BODIES`):**
-   - Rendered Markdown bodies are held by the single cache in `crates/tui/src/markdown/cache.rs`, capped at `MAX_CACHED_BODIES = 128` bodies.
-   - Every lookup stamps the body it returns, a cache hit and a freshly rendered body alike, with the current value of a monotonic cache clock (`CachedBody::last_used`). A hit therefore refreshes the stamp, and a body read again becomes the most recently used one.
-   - When a new body would exceed the ceiling, the body with the smallest `last_used` is evicted through a linear search over the retained entries. Room is made before the new body enters, so the body the current call asks for is never the victim of its own insertion.
-   - A view that drops an item from the window it can draw releases that item's body explicitly through `MarkdownBodyCache::evict`. Releasing a key that holds no body is a neutral no-op.
-3. **Retained History Window (`HISTORY_RETAINED_ITEMS`):**
-   - The History view mirrors a journal that grows for the whole session, while the
-     presentation layer owns a bounded amount of memory. The view retains the newest
-     `HISTORY_RETAINED_ITEMS = 200` records and drops the oldest prefix when a live append
-     crosses that ceiling.
-   - The dropped block is measured through the same layout the viewport uses — the item
-     bodies honour the fold state and the records are separated by dividers — so the scroll
-     offset and the selected index are compensated by the height and the count of what left
-     above them. The fold state and the cached body of a dropped record are released with
-     it, together with the copy flash that targeted it.
-   - Dropping a record from the view never drops it from the store. The view reports that
-     older records are available (`has_more`), so the top of the list reads them back
-     through the existing paging request. Replacing the list (`apply_page`) and
-     restructuring it (`apply_compaction`) are not trimmed: an explicit older-page fetch may
-     widen the window until the next live record arrives.
-4. **Rendering Metrics Keep Their Meaning:**
-   - The ceiling and the explicit release change no measurement: `render_count` counts real renders only, so a hit, an eviction, and a no-op release leave it flat and the regression tests still prove that navigation never re-parses a body.
-5. **Rationale (Why):**
-   - An unbounded body cache turns every node a session ever expanded into permanently retained memory, and that cost stays invisible until the process is already large. A hard ceiling with an explicit release path bounds the memory by construction and keeps the release decision in the view that knows which items left its window.
-   - The history window follows the same argument one level up: a session that appends a record per prompt and per answer would otherwise keep every rendered row of the whole run in memory. Bounding the view while compensating the reading position keeps a long session both legible and cheap.
-
-## Client Projections over Wire DTOs
-
-`projection` is the pure client library shared by the TUI binary and parity
-tests. Its extension traits operate directly on `tauqe_protocol` DTOs; widgets
-import the traits where they render or optimistically update document state.
-Keep readiness, progress, derived statuses, leaf normalization, tree lookup,
-Markdown rendering, review group fallback, and picker cycles here. Protocol
-must not implement these computations or export their local evaluation types.
-
-These projections predict presentation and interaction only. They perform no
-I/O and never enforce or authorize persisted transitions. Core owns durable
-validation, scheduling, and completed-step immutability. Integration tests in
-server compare the real projection library against core, without adding a core
-dependency to TUI or a runtime TUI dependency to server. Wire encoding tests stay
-in protocol; client behavior tests live beside the projections.
-
-
-Shared utility matching uses `tauqe_tools::path_patterns` in context filters and
-review pattern previews. TUI depends on protocol for wire data and tools for
-utilities, and never on core. Client previews use the same matcher implementation
-as engine enforcement; they must not introduce a private copy of its rules.
+These conventions express reviewable interaction and presentation principles.
+Specific key bindings, geometry constants, and current widget inventories
+belong to command definitions, code, and tests.
+
+## Interaction and discoverability
+
+- Keep action and navigation affordances in the header or the relevant view;
+  keep status, progress, and background telemetry in the footer. Report the
+  operation actually underway, not an assumed future phase.
+- Derive keyboard dispatch and Help from the same typed command declarations.
+  Display configured modifiers, not hardcoded physical shortcuts. Reserve
+  persistent view space for content; contextual shortcut hints belong in
+  dialogs and Help rather than a permanent action bar.
+- Structural navigation may use direct letter keys. When an editor captures
+  text, every unmodified printable character inserts text instead of firing
+  a navigation command. Typing, paste routing, and loss-of-work protection
+  must agree on which surface owns the input.
+- Every action must be reachable without function keys. Keep basic movement
+  and dismissal consistent across views; do not make a destructive operation
+  share an execution or copy shortcut.
+- Make the scale of an action visible: a selected-item command must not
+  silently become a batch command. Keep execution separate from status
+  editing and from destructive clearing.
+
+## Safe and legible controls
+
+- Destructive actions and long-running autonomous launches require an explicit
+  confirmation with a safe default. Check that the action has a valid target
+  before offering to confirm it. Distinguish continuing, finishing the current
+  batch member, and immediately cancelling when those choices are available.
+- Give dialogs a recognizable title, readable content, explicit actions, and
+  contextual guidance. Separate content from borders and controls; keep
+  rendering and pointer hit-testing derived from the same geometry. Covered
+  or hidden controls must not remain clickable.
+- In hierarchical views, indent children more than parents and keep the
+  parent's details visually attached to it. Support local and global folding
+  without sacrificing a dense collapsed overview.
+- Preserve the reader's position across folds, scrolling, stream resets,
+  and bounded-window eviction. An interaction should not lose a keystroke or
+  move the user away from the material they are reviewing without intent.
+
+## Presentation and state
+
+- Render through semantic theme roles rather than raw terminal colors.
+  Opaque overlays must occlude underlying content, and focus, danger, and
+  status must remain distinguishable across supported color depths.
+- Resolve user-facing interface text through the localization catalog, with
+  width budgets for constrained controls. Paths, hashes, code, and model
+  output remain technical data rather than translated UI copy.
+- Bound retained presentation caches and windows. Discarding an off-screen
+  rendering must not discard the underlying durable record.
+- Treat client projections and previews as presentation aids, not authority
+  for persisted state. Reuse shared matching rules rather than implementing
+  a subtly different UI-only version; the server and application validate
+  any durable transition.

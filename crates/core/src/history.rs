@@ -14,6 +14,7 @@ use tauqe_tools::tokens::estimate_tokens_from_bytes;
 
 use self::entry::record_bytes;
 
+pub use compaction::build_compaction_request;
 pub(crate) use compaction::{
     build_compacted_history, partition_head_tail, DEFAULT_HISTORY_BUDGET_TOKENS,
     DEFAULT_TAIL_TURNS_COUNT,

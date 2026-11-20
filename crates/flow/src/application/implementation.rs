@@ -4,6 +4,8 @@ use crate::api::{Application, OuterDocsPreload, OuterDocsRefusal};
 use std::path::Path;
 use tauqe_core::config::AppConfig;
 use tauqe_core::outer_docs::OuterDocsRegistry;
+use tauqe_core::plan::storage::PlanStorage;
+use tauqe_core::review::storage::ReviewStorage;
 use tauqe_core::workflow::implementation::{ExecutionScope, ImplementationFrame, StepFailure};
 use tauqe_core::workflow::turn::TurnWorkQueue;
 use tokio::sync::watch;
@@ -59,12 +61,52 @@ async fn resolve_frame(
 ) -> Result<ImplementationFrame, StepFailure> {
     let scope = scope.clone();
     let root = repo_root.to_path_buf();
-    match tauqe_core::blocking::run_blocking_async(move || scope.resolve(&root)).await {
+    match tauqe_core::blocking::run_blocking_async(move || resolve_frame_sync(&scope, &root)).await
+    {
         Ok(resolved) => resolved,
         Err(reason) => Err(StepFailure::infrastructure(format!(
             "The implementation frame could not be resolved: blocking task failed: {reason}"
         ))),
     }
+}
+
+/// Reads the authoritative document while already on a blocking worker.
+pub(crate) fn resolve_frame_sync(
+    scope: &ExecutionScope,
+    root: &Path,
+) -> Result<ImplementationFrame, StepFailure> {
+    match scope {
+        ExecutionScope::Plan { plan_id, step_id } => {
+            let plan = PlanStorage::load_plan(root, plan_id)
+                .map_err(|err| StepFailure::infrastructure(err.to_string()))?
+                .ok_or_else(|| {
+                    StepFailure::infrastructure(format!("Plan '{}' not found", plan_id))
+                })?;
+            Ok(ImplementationFrame::from_plan(plan, step_id.as_deref()))
+        }
+        ExecutionScope::ReviewGroup {
+            review_id,
+            group_id,
+        } => {
+            let session = load_review(root, review_id)?;
+            ImplementationFrame::from_group(&session, group_id)
+        }
+        ExecutionScope::ReviewFinding { review_id, item_id } => {
+            let session = load_review(root, review_id)?;
+            ImplementationFrame::from_finding(&session, *item_id)
+        }
+    }
+}
+
+fn load_review(
+    root: &Path,
+    review_id: &str,
+) -> Result<tauqe_core::review::ReviewSession, StepFailure> {
+    ReviewStorage::load_review(root, review_id)
+        .map_err(|err| StepFailure::infrastructure(err.to_string()))?
+        .ok_or_else(|| {
+            StepFailure::infrastructure(format!("Review session '{}' not found", review_id))
+        })
 }
 
 /// Resolves the external documents the active step of the run declares.

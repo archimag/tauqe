@@ -1,15 +1,19 @@
 //! Single-audit execution and completion behind transport publication ports.
 
 use crate::api::{
-    Application, OperationGuard, PreparedReviewSynthesisRequest, ProviderTaskError, ReviewObserver,
+    Application, OperationGuard, PreparedReviewSynthesisRequest, ReviewObserver,
     ReviewSynthesisCompletionError, ReviewSynthesisPersistenceError, ReviewSynthesisStream,
     UsageTotalsSnapshot,
 };
+use crate::application::infrastructure::execution::StructuredExecution;
+use crate::application::infrastructure::structured_task;
+use crate::application::review_synthesis_request::ReviewSynthesisRequestError;
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::providers::LlmProvider;
+use tauqe_core::providers::StreamEvent;
+use tauqe_core::review::parser::single_review_contract;
 use tauqe_core::review::stream::ReviewStreamUpdate;
 use tauqe_core::review::ReviewSession;
 
@@ -37,7 +41,7 @@ pub struct ReviewSynthesisResult {
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewSynthesisExecutionError {
     #[error(transparent)]
-    Task(#[from] ProviderTaskError),
+    Task(#[from] ReviewSynthesisRequestError),
     #[error(transparent)]
     Completion(#[from] ReviewSynthesisCompletionError),
     #[error(transparent)]
@@ -60,12 +64,12 @@ impl Application {
         operation: &OperationGuard,
         root: &Path,
         prepared: PreparedReviewSynthesisRequest,
-        provider: Arc<dyn LlmProvider>,
+        execution: &StructuredExecution,
         observer: Arc<dyn ReviewSynthesisObserver>,
         config: ReviewSynthesisExecutionConfig,
     ) -> Result<ReviewSynthesisResult, ReviewSynthesisExecutionError> {
         if !self.owns_operation(operation) {
-            return Err(ProviderTaskError.into());
+            return Err(ReviewSynthesisRequestError.into());
         }
         let publisher = Arc::clone(&observer);
         let usage = self
@@ -73,34 +77,42 @@ impl Application {
                 publisher.publish_usage_totals(id, snapshot);
             })
             .await;
-        let mut cancel = operation.cancel_receiver();
-        let mut task = self.start_review_synthesis(operation, &prepared, provider)?;
-        let mut response = ReviewSynthesisStream::default();
-        while let Some(event) = task.next_event().await {
-            observer.pace(&event, &mut cancel).await;
-            match response.observe(event) {
-                ReviewStreamUpdate::Usage(report) => usage.observe(&report).await,
-                ReviewStreamUpdate::Finished => break,
-                ReviewStreamUpdate::Ignored => {}
-                update => observer.publish(update),
-            }
-        }
-        task.clear_abort_handle();
+        let cancel = operation.cancel_receiver();
+        let (metadata, messages) = prepared.into_parts();
+        let result = structured_task::run(
+            self,
+            operation,
+            execution,
+            single_review_contract(),
+            messages,
+            &config.operation_id,
+            config.exit_deadline,
+            |event| {
+                let usage = &usage;
+                let observer = &observer;
+                let mut pacing_cancel = cancel.clone();
+                async move {
+                    observer.pace(&event, &mut pacing_cancel).await;
+                    match event {
+                        StreamEvent::Usage(report) => usage.observe(&report).await,
+                        StreamEvent::TextDelta(delta) => {
+                            observer.publish(ReviewStreamUpdate::Content(delta))
+                        }
+                        StreamEvent::ReasoningDelta(delta) => {
+                            observer.publish(ReviewStreamUpdate::Reasoning(delta))
+                        }
+                        StreamEvent::ResetStream => observer.publish(ReviewStreamUpdate::Reset),
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await;
         usage.flush().await;
         let snapshot = self.usage_snapshot().await;
         observer.publish_usage(&snapshot);
         let cancelled = *cancel.borrow();
-        let session = match response.finish(prepared.into_metadata(), cancelled) {
-            Ok(session) => session,
-            Err(error) => {
-                if error.requires_abort() {
-                    let _ = task
-                        .abort_and_reap(&config.operation_id, config.exit_deadline)
-                        .await;
-                }
-                return Err(error.into());
-            }
-        };
+        let session = ReviewSynthesisStream::finish(result, metadata, cancelled)?;
         self.persist_review_synthesis(operation, root, &session, || async {
             let list = self.documents_at(root).review_list().await.ok();
             observer.publish_saved(&session, list).await;
@@ -116,10 +128,13 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+    use crate::application::plan_horizon::ArchitectScope;
     use std::sync::Mutex;
-    use tauqe_core::config::AppConfig;
+    use tauqe_core::config::{AppConfig, ModelsConfig};
     use tauqe_core::context::ContextAccess;
     use tauqe_core::context::ContextFileContent;
+    use tauqe_core::models::{ModelEntry, ModelRef, ModelRole, ModelSelection, ProviderKind};
     use tauqe_core::providers::{mock::MockResponse, MockLlmProvider, ModelUsageInfo, StreamEvent};
     use tauqe_core::review::ReviewStorage;
 
@@ -183,7 +198,20 @@ mod tests {
     }
     fn application(root: &Path) -> Application {
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        Application::for_repository(AppConfig::default(), root.to_path_buf(), sender)
+        Application::for_repository(
+            AppConfig {
+                models: ModelsConfig {
+                    reviewer: Some(vec![ModelEntry::new(
+                        ModelRef::openrouter("test/reviewer"),
+                        None,
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            root.to_path_buf(),
+            sender,
+        )
     }
     fn observer(app: &Application, root: &Path, cancel_on_usage: bool) -> Arc<Observer> {
         Arc::new(Observer {
@@ -232,6 +260,18 @@ mod tests {
         })
     }
 
+    async fn execution(app: &Application, operation: &OperationGuard) -> StructuredExecution {
+        PlanExecutionEnvironment::new(app.configuration().await, operation)
+            .for_reviewer_structured(
+                app,
+                operation,
+                &ModelSelection::Role(ModelRole::Reviewer),
+                &ArchitectScope::Review("audit".into()),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn headless_execution_keeps_accounting_publication_and_history_order() {
         let root = tempfile::tempdir().unwrap();
@@ -239,18 +279,27 @@ mod tests {
         let operation = app.try_begin_operation().unwrap();
         let prepared = prepare(&app, &operation).await;
         let observer = observer(&app, root.path(), false);
+        let provider = Arc::new(MockLlmProvider::scripted([response()]));
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
+        let execution = execution(&app, &operation).await;
         let result = app
             .execute_review_synthesis(
                 &operation,
                 root.path(),
                 prepared,
-                Arc::new(MockLlmProvider::scripted([response()])),
+                &execution,
                 observer.clone(),
                 config(),
             )
             .await
             .unwrap();
         assert_eq!(result.session.description.as_deref(), Some("One boundary"));
+        let request = provider.last_request().unwrap();
+        assert_eq!(request.session_id.as_deref(), Some("tauqe-review-audit"));
+        assert!(
+            matches!(request.response_format, Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema }) if json_schema.strict == Some(true))
+        );
         assert_eq!(result.usage.operations, 1);
         assert_eq!(result.usage.prev.total_tokens, 17);
         assert_eq!(result.usage.session.cost, 0.25);
@@ -276,12 +325,18 @@ mod tests {
         let operation = app.try_begin_operation().unwrap();
         let prepared = prepare(&app, &operation).await;
         let observer = observer(&app, root.path(), true);
+        app.test_set_provider_for(
+            ProviderKind::OpenRouter,
+            Arc::new(MockLlmProvider::scripted([response()])),
+        )
+        .await;
+        let execution = execution(&app, &operation).await;
         let error = app
             .execute_review_synthesis(
                 &operation,
                 root.path(),
                 prepared,
-                Arc::new(MockLlmProvider::scripted([response()])),
+                &execution,
                 observer.clone(),
                 config(),
             )
@@ -316,12 +371,18 @@ mod tests {
             let operation = app.try_begin_operation().unwrap();
             let prepared = prepare(&app, &operation).await;
             let observer = observer(&app, root.path(), false);
+            app.test_set_provider_for(
+                ProviderKind::OpenRouter,
+                Arc::new(MockLlmProvider::scripted([script])),
+            )
+            .await;
+            let execution = execution(&app, &operation).await;
             let error = app
                 .execute_review_synthesis(
                     &operation,
                     root.path(),
                     prepared,
-                    Arc::new(MockLlmProvider::scripted([script])),
+                    &execution,
                     observer.clone(),
                     config(),
                 )
@@ -358,12 +419,15 @@ mod tests {
         let foreign = other.try_begin_operation().unwrap();
         let observer = observer(&app, root.path(), false);
         let provider = Arc::new(MockLlmProvider::scripted([response()]));
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
+        let execution = execution(&app, &operation).await;
         let result = app
             .execute_review_synthesis(
                 &foreign,
                 root.path(),
                 prepared,
-                provider.clone(),
+                &execution,
                 observer.clone(),
                 config(),
             )

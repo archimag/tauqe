@@ -25,7 +25,7 @@ fn escape_list(items: &[String]) -> String {
 /// `commit_message`, `blocked`, `context_requests`), while the tagged contour
 /// names its control tags bound to `marker`. A structured turn emits no command
 /// tag, so the marker it carries is never used.
-pub(crate) fn format_plan_step_execution_prompt(
+pub fn format_plan_step_execution_prompt(
     plan: &Plan,
     step_id: &str,
     _protocol: EditProtocolKind,
@@ -176,7 +176,7 @@ pub(crate) fn format_plan_step_execution_prompt(
 /// feedback, then explicitly demands strict adherence to the active protocol on
 /// the next turn, and re-attaches the full target step task execution prompt so
 /// the model retains the complete architectural context, plan details, and target files.
-pub(crate) fn format_plan_step_retry_prompt(
+pub fn format_plan_step_retry_prompt(
     task_prompt: &str,
     assistant_text: &str,
     error: Option<&str>,

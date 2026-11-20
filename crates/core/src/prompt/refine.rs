@@ -334,9 +334,8 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         _repo_root: std::path::PathBuf,
         _staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn EditStreamFilter> {
-        Box::new(DiscussionStreamFilter::with_target_field(
-            "explanation".to_string(),
-        ))
+        // The synthesis contract owns a root explanation, not a branch field.
+        Box::new(DiscussionStreamFilter::with_target_field("explanation"))
     }
 }
 
@@ -580,6 +579,29 @@ mod tests {
             })
             .collect();
         assert_eq!(streamed, "Decomposed");
+    }
+
+    #[test]
+    fn test_only_root_explanation_is_previewed() {
+        let protocol = PlanRefinePromptProtocol::default();
+        let mut filter = protocol.create_stream_filter(
+            vec![],
+            std::path::PathBuf::from("/tmp"),
+            std::collections::HashMap::new(),
+        );
+        let events = filter.push_chunk(
+            r#"{"metadata":{"explanation":"hidden"},"items":[{"explanation":"also hidden"}],"explanation":"Visible"}"#,
+        );
+        assert_eq!(
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    crate::providers::StreamEvent::TextDelta(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "Visible"
+        );
     }
     /// A round that reports a host-environment impossibility instead of a horizon.
     const ABORTED: &str = r#"{

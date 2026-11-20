@@ -2,7 +2,7 @@
 
 use crate::edits::stream::json::JsonFieldStreamFilter;
 use crate::models::ModelRef;
-use crate::review::parser::{parse_review_findings, parse_review_output, ReviewFindingsOutput};
+use crate::review::parser::{decode_single_review, ReviewFindingsOutput, SingleReviewOutput};
 use crate::review::uuid::generate_uuid_v7;
 use crate::review::{ReviewIssue, ReviewItem, ReviewSession};
 
@@ -56,49 +56,47 @@ impl ReviewSynthesisResponse {
         if raw_buffer.trim().is_empty() {
             return Err(EmptyReviewResponse);
         }
-        let (parsed_title, summary, issues) = match self.filter.finish() {
-            Ok(output) => {
-                let trimmed = output.summary.trim();
-                let summary = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-                let title = output.title.trim();
-                let title = if title.is_empty() {
-                    None
-                } else {
-                    Some(title.to_string())
-                };
-                (title, summary, parse_review_findings(&raw_buffer))
-            }
-            Err(_) => parse_review_output(&raw_buffer),
-        };
-        let title = parsed_title
-            .or_else(|| {
-                metadata
-                    .user_prompt
-                    .as_deref()
-                    .and_then(|prompt| prompt.lines().next())
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(|line| line.chars().take(60).collect::<String>())
-            })
-            .unwrap_or_else(|| format!("Review {}", metadata.created_at));
-        Ok(ReviewSession {
-            id: metadata.id,
-            title,
-            created_at: metadata.created_at,
-            model: metadata.model,
-            description: summary.or_else(|| metadata.user_prompt.clone()),
-            user_prompt: metadata.user_prompt,
-            target_files: metadata.target_files,
-            items: with_finding_identities(issues),
-            raw_markdown: raw_buffer,
-            groups: Vec::new(),
-            post_analysis: None,
-            launch_config: None,
+        self.filter.finish().ok();
+        let decoded = decode_single_review(&raw_buffer).map_err(|_| EmptyReviewResponse)?;
+        Ok(materialize_review(metadata, decoded))
+    }
+}
+
+/// Project a decoded audit into a session without interpreting provider JSON.
+pub fn materialize_review(
+    metadata: ReviewSynthesisMetadata,
+    decoded: SingleReviewOutput,
+) -> ReviewSession {
+    let SingleReviewOutput {
+        raw_markdown,
+        title: parsed_title,
+        summary,
+        issues,
+    } = decoded;
+    let title = parsed_title
+        .or_else(|| {
+            metadata
+                .user_prompt
+                .as_deref()
+                .and_then(|prompt| prompt.lines().next())
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.chars().take(60).collect::<String>())
         })
+        .unwrap_or_else(|| format!("Review {}", metadata.created_at));
+    ReviewSession {
+        id: metadata.id,
+        title,
+        created_at: metadata.created_at,
+        model: metadata.model,
+        description: summary.or_else(|| metadata.user_prompt.clone()),
+        user_prompt: metadata.user_prompt,
+        target_files: metadata.target_files,
+        items: with_finding_identities(issues),
+        raw_markdown,
+        groups: Vec::new(),
+        post_analysis: None,
+        launch_config: None,
     }
 }
 
@@ -259,5 +257,14 @@ mod tests {
         response.push_chunk(" \n ");
         let error = response.finish(metadata(None)).unwrap_err();
         assert_eq!(error.to_string(), "Model returned an empty review");
+    }
+
+    #[test]
+    fn decoded_audit_materializes_without_losing_provider_bytes() {
+        let raw = " \n```json\n{\"title\":\"Audit\",\"summary\":\"OK\",\"findings\":[]}\n``` \n";
+        let review = materialize_review(metadata(None), decode_single_review(raw).unwrap());
+        assert_eq!(review.raw_markdown, raw);
+        assert_eq!(review.title, "Audit");
+        assert_eq!(review.description.as_deref(), Some("OK"));
     }
 }

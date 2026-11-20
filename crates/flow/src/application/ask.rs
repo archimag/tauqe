@@ -3,9 +3,10 @@ use crate::api::{
     next_operation_id, Application, ApplicationEvent, ApplicationObserver, DiscussionPromptError,
     InteractiveExecutionRequest, InteractiveFinalizationInput, InteractiveFinalizationObserver,
     InteractiveFinalizationOutcome, InteractiveFinalizationUpdate, InteractiveStreamState,
-    ModelAskInput, OperationGuard, TurnMode,
+    ModelAskInput, OperationGuard,
 };
 use crate::application::edit_cycle::{EditCycle, EditTermination};
+use crate::application::infrastructure::execution::{DialogueExecution, ExecutionFactory};
 use crate::application::turn_setup::TurnProviderError;
 use std::sync::Arc;
 use tauqe_core::edits::EditOutcome;
@@ -57,54 +58,51 @@ impl Application {
         if let Some(update) = prepared.focus_update {
             update.publish(&operation_id, observer.as_ref());
         }
-        let resolved = self
-            .resolve_turn_model(None, None, TurnMode::Interactive)
-            .await;
-        let provider = self.resolve_turn_provider(&resolved).await?;
+        let factory = ExecutionFactory::bind(self, &operation).await?;
+        let dialogue = factory.for_dialogue().await?;
+        let resolved = &dialogue.model;
+        let model = resolved.model.clone();
+        let role = resolved.role;
+        let alias = resolved.alias.clone();
+        let effort = resolved.effort;
+        let compaction = factory.compaction_environment();
         let application = self.clone();
         let id = operation_id.clone();
         tokio::spawn(async move {
-            if let Err(error) = application
-                .compact_history(&operation, &resolved.config, operation.cancel_receiver())
-                .await
-            {
+            if let Err(error) = application.compact_history(&operation, &compaction).await {
                 tracing::warn!(%error, "session history is unavailable for compaction");
             }
-            let session_id = application.turn_session(TurnMode::Interactive, None).await;
             if *operation.cancel_receiver().borrow() {
                 observer.publish(&id, ApplicationEvent::Stream(StreamEvent::Cancelled));
                 return;
             }
             let request = InteractiveExecutionRequest {
-                provider,
-                model: resolved.model.clone(),
-                config: resolved.config,
                 capabilities: tauqe_core::control::repl_capabilities(prepared.focus.as_ref()),
                 prompt: prepared.prompt,
                 focus: prepared.focus,
-                session_id,
-                reasoning_effort: resolved.effort,
             };
             tracing::info!(
                 operation_id = %id,
-                model = %resolved.model,
-                role = ?resolved.role,
-                effort = ?resolved.effort,
+                model = %model,
+                role = ?role,
+                effort = ?effort,
                 "Model turn started"
             );
             observer.publish(
                 &id,
                 ApplicationEvent::Started {
-                    model: resolved.model,
-                    role: resolved.role,
-                    alias: resolved.alias,
-                    effort: resolved.effort,
+                    model,
+                    role,
+                    alias,
+                    effort,
                     plan_context: None,
                     work_context: Some(TurnWorkContext::Interactive),
                     is_batch: false,
                 },
             );
-            application.run_ask(operation, request, observer, id).await;
+            application
+                .run_ask(operation, request, dialogue, observer, id)
+                .await;
         });
         Ok(AskStarted { operation_id })
     }
@@ -113,13 +111,14 @@ impl Application {
         &self,
         operation: Arc<OperationGuard>,
         request: InteractiveExecutionRequest,
+        dialogue: DialogueExecution,
         observer: Arc<dyn ApplicationObserver>,
         id: String,
     ) {
         let focus = request.focus.clone();
-        let model = request.model.clone();
+        let model = dialogue.model.model.clone();
         let execution = match self
-            .start_interactive_execution(operation.clone(), request)
+            .start_interactive_execution(operation.clone(), request, dialogue)
             .await
         {
             Ok(execution) => execution,

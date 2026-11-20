@@ -648,17 +648,10 @@ mod tests {
         }
     }
 
-    /// A stream whose task never yields after its last event is abandoned at the
-    /// shared task-exit deadline: the request still resolves, the response carries
-    /// the recorded expiry diagnostic, and the operation slot is released.
-    ///
-    /// This is the completed-stream hazard of the locale handler — the task itself
-    /// is still running, so the handler can neither classify its result nor wait for
-    /// it without a bound. The journal record of the expiry is emitted by the shared
-    /// primitive, which its own suite covers; here the diagnostic is asserted where
-    /// the handler carries it to the client.
+    /// Closing the provider's event channel without Done is not a clean completion:
+    /// even after the provider returns, the locale must not fall back to English.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn abandons_a_wedged_stream_task_at_the_task_exit_deadline() {
+    async fn refuses_a_stream_that_closes_without_done() {
         // The parked task occupies a worker of its own, so the runtime keeps enough
         // threads for the handler and for the bounded confirmation to run.
         let deadline = std::time::Duration::from_millis(50);
@@ -688,11 +681,11 @@ mod tests {
 
         let err = response
             .error
-            .expect("the abandoned stream must not succeed");
+            .expect("a stream without Done must not fall back to English");
         assert_eq!(err.code, errors::MODEL_ERROR);
         assert!(
-            err.message.contains("50 ms task-exit deadline"),
-            "the response must carry the expiry diagnostic: {}",
+            err.message.contains("closed without Done"),
+            "the response must report incomplete output: {}",
             err.message
         );
         assert!(
@@ -701,11 +694,11 @@ mod tests {
         );
         assert!(
             state.usage_snapshot().await.cur.is_none(),
-            "the abandoned stream still closes its usage window"
+            "the incomplete stream still closes its usage window"
         );
         assert!(
-            !exited.load(Ordering::SeqCst),
-            "the abandoned task provably never exited before the response"
+            exited.load(Ordering::SeqCst),
+            "the provider must finish before its missing Done is classified"
         );
 
         // The handle was released deliberately and no second kill is attempted: the

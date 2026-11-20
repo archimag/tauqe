@@ -224,6 +224,7 @@ pub struct DiscussionResponse {
 }
 
 impl DiscussionResponse {
+    #[cfg(test)]
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -238,6 +239,7 @@ impl DiscussionResponse {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
         self.repo_maps = paths
             .iter()

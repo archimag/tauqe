@@ -13,9 +13,6 @@ use super::prompt::PromptBuilder;
 pub use super::transcript::TurnTranscript;
 use crate::context::ContextManager;
 use crate::edits::StagedEditsState;
-#[cfg(test)]
-use crate::history::HistorySnapshot;
-use crate::prompt::TurnBrief;
 use crate::providers::types::{StreamEvent, TurnRequestReason};
 use crate::workflow::policy::ApplyPolicy;
 use crate::workflow::research::journal::TurnResearchJournal;
@@ -120,7 +117,7 @@ impl EventSink {
     }
 
     /// Emits a single domain stream event.
-    pub(crate) fn emit(&self, event: StreamEvent) {
+    pub fn emit(&self, event: StreamEvent) {
         if let Some(ref sender) = self.sender {
             let _ = sender.send(event);
         }
@@ -162,6 +159,17 @@ pub struct LoopContext<'a> {
 }
 
 impl<'a> LoopContext<'a> {
+    /// Binds a temporary context to the transcript and call budget of its unit.
+    pub(super) fn with_unit_state(
+        mut self,
+        transcript: Arc<Mutex<TurnTranscript>>,
+        rounds_spent: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.transcript = transcript;
+        self.rounds_spent = rounds_spent;
+        self
+    }
+
     /// Creates a new execution context.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -193,6 +201,7 @@ impl<'a> LoopContext<'a> {
         &'b mut self,
         capabilities: CapabilityTree,
     ) -> LoopContext<'b> {
+        // The next request binds this grant to every protocol projection.
         LoopContext {
             cancel: self.cancel,
             events: self.events,
@@ -242,15 +251,6 @@ impl<'a> LoopContext<'a> {
         self
     }
 
-    /// Sets the introductory brief of the turn on the underlying prompt builder.
-    ///
-    /// The brief belongs to the loop that drives the turn, so the contour and the
-    /// opening text travel as typed values instead of a rendering flag.
-    pub(crate) fn set_turn_brief(&mut self, brief: Option<TurnBrief>) -> &mut Self {
-        self.prompt_builder.set_turn_brief(brief);
-        self
-    }
-
     /// Opens a research round in the journal of the turn.
     ///
     /// The boundary narrows feedback to the findings of this round.
@@ -273,12 +273,6 @@ impl<'a> LoopContext<'a> {
         self.transcript().set_pending_feedback(feedback);
     }
 
-    /// Sets the history snapshot on the underlying prompt builder.
-    #[cfg(test)]
-    pub(crate) fn set_history(&mut self, history: Option<&'a HistorySnapshot>) -> &mut Self {
-        self.prompt_builder.set_history(history);
-        self
-    }
     /// Requests a standard model round without repair diagnostics.
     pub(crate) async fn request_round(&mut self) -> Result<ResponseEnvelope, SystemError> {
         super::prompt::execute_round(self, None, None).await
@@ -426,6 +420,7 @@ mod tests {
             vec![ChatMessage::system("contract")],
             sample_task_message(),
             &CapabilityTree::from_leaves([LlmCapability::EditReplace]),
+            None,
         );
         transcript
     }
@@ -444,6 +439,7 @@ mod tests {
             ],
             sample_task_message(),
             &CapabilityTree::from_leaves([LlmCapability::EditReplace]),
+            None,
         );
 
         assert!(transcript.is_seeded());
@@ -480,6 +476,7 @@ mod tests {
         transcript.reseed_prefix(
             prefix.clone(),
             &CapabilityTree::from_leaves([LlmCapability::EditReplace]),
+            None,
         );
         discover(&mut transcript, "helper.rs");
         let mut expected = prefix;
@@ -518,6 +515,7 @@ mod tests {
                 vec![ChatMessage::system("contract")],
                 sample_task_message(),
                 &child.capabilities,
+                None,
             );
             discover(&mut child.transcript(), "child.rs");
         }

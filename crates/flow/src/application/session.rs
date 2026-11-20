@@ -1,5 +1,7 @@
 //! Shared state and lifecycle of one application session.
 
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -36,7 +38,9 @@ struct Session {
     operations: Arc<super::operation::OperationRegistry>,
     focus: Mutex<DiscussionFocus>,
     #[cfg(any(test, feature = "test-support"))]
-    provider_override: Mutex<Option<Arc<dyn tauqe_core::providers::LlmProvider>>>,
+    provider_override: Mutex<
+        HashMap<tauqe_core::models::ProviderKind, Arc<dyn tauqe_core::providers::LlmProvider>>,
+    >,
 }
 
 impl Application {
@@ -55,14 +59,33 @@ impl Application {
     }
     #[cfg(any(test, feature = "test-support"))]
     pub async fn test_set_provider(&self, provider: Arc<dyn tauqe_core::providers::LlmProvider>) {
-        *self.session.provider_override.lock().await = Some(provider);
+        self.test_set_provider_for(provider.kind(), provider).await;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_set_provider_for(
+        &self,
+        kind: tauqe_core::models::ProviderKind,
+        provider: Arc<dyn tauqe_core::providers::LlmProvider>,
+    ) {
+        self.session
+            .provider_override
+            .lock()
+            .await
+            .insert(kind, provider);
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn scripted_provider(
         &self,
+        kind: tauqe_core::models::ProviderKind,
     ) -> Option<Arc<dyn tauqe_core::providers::LlmProvider>> {
-        self.session.provider_override.lock().await.clone()
+        self.session
+            .provider_override
+            .lock()
+            .await
+            .get(&kind)
+            .cloned()
     }
 
     pub async fn discussion_focus(&self) -> DiscussionFocus {

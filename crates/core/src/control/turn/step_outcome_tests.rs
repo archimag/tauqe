@@ -204,3 +204,25 @@ fn exhaustion_and_undeclared_divergence_are_domain_failures() {
         ))
     );
 }
+
+#[test]
+fn technical_result_exposes_decoded_commands_and_rounds_without_raw_text() {
+    let result = success(
+        Some(VerificationVerdict::NotConfigured),
+        &[committed()],
+        None,
+    );
+    let LoopResult::Success(success) = result else {
+        panic!("expected success");
+    };
+    assert_eq!(success.value.rounds_spent, 1);
+    assert_eq!(success.value.commit_hash.as_deref(), Some("commit-id"));
+    assert_eq!(
+        success.value.verification,
+        Some(VerificationVerdict::NotConfigured)
+    );
+    assert!(matches!(
+        success.response.commands(),
+        [LlmCommand::CommitMessage(_)]
+    ));
+}

@@ -25,7 +25,7 @@ const SESSION_ID_MAX_LEN: usize = 256;
 /// Interactive REPL dialogue: one session per client session.
 pub const SESSION_PREFIX_REPL: &str = "tauqe-repl";
 /// Plan execution: one session for every step and retry of a plan.
-pub(crate) const SESSION_PREFIX_PLAN: &str = "tauqe-plan";
+pub const SESSION_PREFIX_PLAN: &str = "tauqe-plan";
 /// Architect plan horizon synthesis.
 pub const SESSION_PREFIX_ARCHITECT: &str = "tauqe-architect";
 /// Review audit: findings, refinement, and group decomposition.

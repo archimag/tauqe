@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crate::capabilities::{compose_contract_rules, ContractContext, PromptRenderContext};
 use crate::context::ContextFileContent;
+use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::history::HistorySnapshot;
@@ -58,7 +59,7 @@ impl TurnBrief {
     }
 
     /// Builds the brief of one isolated step.
-    pub(crate) fn step() -> Self {
+    pub fn step() -> Self {
         Self {
             contour: ContourKind::Step,
             intro: STEP_INTRO.to_string(),
@@ -195,6 +196,17 @@ pub(crate) fn history_compaction_response_format() -> ResponseFormat {
     }
 }
 
+/// Read-only Scribe contract: an empty summary leaves the journal unchanged.
+pub fn history_compaction_contract() -> StructuredContract<Option<String>> {
+    StructuredContract {
+        instructions: "You are an expert software engineering assistant. Your task is to summarize past development session history concisely and accurately.".into(),
+        format: history_compaction_response_format(),
+        decode: |raw| Ok(parse_compaction_summary(raw)),
+        visibility: StructuredVisibility::Silent,
+        require_done: true,
+    }
+}
+
 pub(crate) fn parse_compaction_summary(raw: &str) -> Option<String> {
     extract_json_string_field(raw, "summary")
 }
@@ -222,6 +234,18 @@ pub fn squash_commit_response_format() -> ResponseFormat {
             schema: Cow::Owned(squash_commit_response_schema()),
             strict: Some(true),
         },
+    }
+}
+
+/// A completed squash response can carry no usable message. The scenario owns
+/// the fallback; request failures and incomplete streams remain errors.
+pub fn squash_commit_contract() -> crate::control::structured::StructuredContract<Option<String>> {
+    StructuredContract {
+        instructions: "You are an expert developer assistant. Return the requested squash commit message as a JSON object with a commit_message string.".into(),
+        format: squash_commit_response_format(),
+        decode: |raw| Ok(parse_squash_commit_message(raw)),
+        visibility: StructuredVisibility::Silent,
+        require_done: true,
     }
 }
 
@@ -1902,6 +1926,36 @@ mod tests {
             parse_squash_commit_message(fenced).as_deref(),
             Some("feat: добавить функцию")
         );
+    }
+
+    #[test]
+    fn squash_contract_extracts_an_optional_message_from_the_existing_format() {
+        let contract = squash_commit_contract();
+        assert_eq!(
+            (contract.decode)(r#"{"commit_message":"  feat: add x  "}"#).unwrap(),
+            Some("feat: add x".into())
+        );
+        assert_eq!(
+            (contract.decode)(r#"{"commit_message":"  "}"#).unwrap(),
+            None
+        );
+        assert_eq!((contract.decode)("{}").unwrap(), None);
+        assert!(contract.require_done);
+        assert!(matches!(contract.visibility, StructuredVisibility::Silent));
+        assert_eq!(contract.format, squash_commit_response_format());
+    }
+
+    #[test]
+    fn compaction_contract_requires_done_and_extracts_only_a_nonempty_summary() {
+        let contract = history_compaction_contract();
+        assert!(contract.require_done);
+        assert!(matches!(contract.visibility, StructuredVisibility::Silent));
+        assert_eq!(contract.format, history_compaction_response_format());
+        assert_eq!(
+            (contract.decode)(r#"{"summary":"  Earlier tasks verified.  "}"#).unwrap(),
+            Some("Earlier tasks verified.".into())
+        );
+        assert_eq!((contract.decode)(r#"{"summary":"  "}"#).unwrap(), None);
     }
 
     /// Returns the `Core System Contract` section of a rendered prompt.

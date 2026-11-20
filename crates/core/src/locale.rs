@@ -14,6 +14,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use crate::control::structured::{StructuredContract, StructuredVisibility};
 use serde::Deserialize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -124,6 +125,18 @@ pub fn locale_response_format() -> ResponseFormat {
             schema: Cow::Owned(locale_response_schema()),
             strict: Some(true),
         },
+    }
+}
+
+/// The translation payload is private; only a completed request may fall back
+/// to English when its output contains no usable entries.
+pub fn locale_translation_contract() -> StructuredContract<BTreeMap<String, String>> {
+    StructuredContract {
+        instructions: build_locale_system_prompt(),
+        format: locale_response_format(),
+        decode: |raw| Ok(parse_locale_output(raw)),
+        visibility: StructuredVisibility::Silent,
+        require_done: true,
     }
 }
 
@@ -391,6 +404,19 @@ mod tests {
         let item = &schema["properties"]["translations"]["items"];
         assert_eq!(item["required"], serde_json::json!(["key", "translation"]));
         assert_eq!(item["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn translation_contract_is_silent_and_requires_completion() {
+        let contract = locale_translation_contract();
+        assert!(contract.require_done);
+        assert!(matches!(contract.visibility, StructuredVisibility::Silent));
+        assert_eq!(contract.format, locale_response_format());
+        assert!((contract.decode)("not json").unwrap().is_empty());
+        assert_eq!(
+            (contract.decode)(r#"{"translations":[{"key":"a","translation":"Да"}]}"#).unwrap()["a"],
+            "Да"
+        );
     }
 
     #[test]

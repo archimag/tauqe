@@ -97,13 +97,13 @@ impl ModelEntry {
     /// attempt instead of the coder default. Every consumer reads the value
     /// through this accessor, so the adaptive default has one authoritative
     /// statement instead of a repeated number.
-    pub(crate) fn attempts(&self) -> u32 {
+    pub fn attempts(&self) -> u32 {
         resolve_attempts(self.attempts, self.level_up, DEFAULT_CODER_ATTEMPTS)
     }
 
     /// Renders the entry as the canonical model specification, with the
     /// configured reasoning depth appended when one is set.
-    pub(crate) fn display_label(&self) -> String {
+    pub fn display_label(&self) -> String {
         match self.effort {
             Some(effort) => format!("{} [{}]", self.model.to_spec(), effort),
             None => self.model.to_spec(),

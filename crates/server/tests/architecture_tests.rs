@@ -115,6 +115,31 @@ fn history_models_do_not_depend_on_protocol() {
     ]);
 }
 #[test]
+fn core_history_does_not_run_or_schedule_compaction_models() {
+    let sources = [
+        include_str!("../../core/src/history.rs"),
+        include_str!("../../core/src/history/compaction.rs"),
+        include_str!("../../core/src/control/history.rs"),
+    ];
+    for source in sources {
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "LlmProvider",
+            "structured::execute",
+            "history_compaction_contract",
+            "compact_history_if_needed_with_budget",
+            "if !history_manager.needs_compaction",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "core history schedules a Scribe call: {forbidden}"
+            );
+        }
+    }
+    let control = include_str!("../../core/src/control.rs");
+    assert!(!control.contains("pub use history::compact_history_if_needed_with_budget"));
+}
+#[test]
 fn context_models_do_not_depend_on_protocol() {
     assert_protocol_free(&[
         "core/src/context.rs",
@@ -190,6 +215,123 @@ fn execution_identity_and_queue_entry_points_do_not_depend_on_protocol() {
 #[test]
 fn core_and_flow_sources_are_independent_of_protocol() {
     assert_protocol_free(&["core/src", "flow/src"]);
+}
+
+#[test]
+fn review_scenarios_do_not_construct_or_stream_provider_requests() {
+    let application = Path::new(env!("CARGO_MANIFEST_DIR")).join("../flow/src/application");
+    for entry in std::fs::read_dir(application).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("review_") || path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["LlmRequest", ".stream(", "LlmProvider"] {
+            assert!(
+                !production.contains(forbidden),
+                "review scenario {} bypasses structured execution: {forbidden}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Exclude test modules and comments without treating incidental prose as a call site.
+fn production_code(source: &str) -> String {
+    source
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap()
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn scenarios_do_not_wire_provider_requests() {
+    let application = Path::new(env!("CARGO_MANIFEST_DIR")).join("../flow/src/application");
+    for name in [
+        "ask.rs",
+        "architect.rs",
+        "plan_two_phase.rs",
+        "plan_horizon.rs",
+        "implementation_host.rs",
+        "implementation_pipeline.rs",
+        "review_batch.rs",
+        "review_commands.rs",
+        "review_groups.rs",
+        "review_synthesis_execution.rs",
+        "review_analysis_execution.rs",
+        "review_sequence.rs",
+        "locale_generation.rs",
+        "git_squash.rs",
+        "history_compaction.rs",
+        "interactive_dialogue.rs",
+    ] {
+        let code = production_code(&std::fs::read_to_string(application.join(name)).unwrap());
+        for forbidden in [
+            ".stream(",
+            "LlmRequest",
+            "PromptProtocol",
+            "ApplyPolicy",
+            "LlmProvider",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "scenario {name} bypasses execution infrastructure: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn core_provider_calls_use_the_shared_request_mechanism() {
+    fn inspect(path: &Path) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                inspect(&entry.unwrap().path());
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let code = production_code(&std::fs::read_to_string(path).unwrap());
+            assert!(
+                !code.contains(".stream("),
+                "core bypasses shared request execution: {}",
+                path.display()
+            );
+        }
+    }
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src");
+    // Provider implementations (including the retry decorator) implement their
+    // own transport. Only the shared request module may invoke it from core.
+    for entry in std::fs::read_dir(&core).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name == "providers" || name == "providers.rs")
+        {
+            continue;
+        }
+        if path.file_name().is_some_and(|name| name == "control") {
+            for child in std::fs::read_dir(path).unwrap() {
+                let child = child.unwrap().path();
+                if child.file_name().is_some_and(|name| name == "request.rs") {
+                    continue;
+                }
+                inspect(&child);
+            }
+        } else {
+            inspect(&path);
+        }
+    }
+    assert!(
+        production_code(include_str!("../../core/src/control/request.rs"))
+            .contains("provider.stream(")
+    );
 }
 
 #[test]

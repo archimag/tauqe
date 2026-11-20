@@ -123,7 +123,7 @@ fn render_compaction_source(entries: &[HistoryEntry]) -> String {
 /// The task names the attempts explicitly, because they are the part of a long
 /// turn a summary must not flatten: a later turn needs to know what was already
 /// verified and what was already corrected before it continues.
-pub(crate) fn build_compaction_request(entries: &[HistoryEntry]) -> String {
+pub fn build_compaction_request(entries: &[HistoryEntry]) -> String {
     format!(
         "Summarize the following interaction history into a concise, structured summary capturing the completed tasks, key code changes, and context:\n\n```text\n{}\n```\nA turn record may carry the intermediate rounds it ran before its final answer as `[Round N]` lines together with the feedback each round received. State per turn what the rounds verified and what they corrected, so the attempts survive the summary. Respond with a single JSON object matching the enforced schema, placing the summary text in the `summary` field. Do not wrap the JSON in markdown code fences.",
         render_compaction_source(entries),

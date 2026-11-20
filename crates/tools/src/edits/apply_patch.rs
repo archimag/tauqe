@@ -27,7 +27,7 @@ enum Section {
 
 #[derive(Debug)]
 struct Hunk {
-    anchor: Option<String>,
+    header_context: Option<String>,
     lines: Vec<(char, String)>,
 }
 
@@ -172,12 +172,17 @@ fn parse(patch: &str) -> Result<Vec<Section>, EditError> {
     while i < lines.len() && lines[i] != "*** End Patch" {
         let header = lines[i];
         i += 1;
+        let section_error = |path: &str, line, reason| EditError::InvalidPatchSection {
+            path: path.to_owned(),
+            line,
+            reason,
+        };
         if let Some(path) = header.strip_prefix("*** Add File: ") {
             let mut body = String::new();
             while i < lines.len() && !lines[i].starts_with("*** ") {
-                let line = lines[i].strip_prefix('+').ok_or_else(|| {
-                    EditError::InvalidPatch(format!("expected added line at {}", i + 1))
-                })?;
+                let line = lines[i]
+                    .strip_prefix('+')
+                    .ok_or_else(|| section_error(path, i + 1, "expected a line starting with +"))?;
                 body.push_str(line);
                 body.push('\n');
                 i += 1;
@@ -186,6 +191,7 @@ fn parse(patch: &str) -> Result<Vec<Section>, EditError> {
         } else if let Some(path) = header.strip_prefix("*** Delete File: ") {
             sections.push(Section::Delete(path.to_string()));
         } else if let Some(path) = header.strip_prefix("*** Update File: ") {
+            let section_line = i;
             let destination = if i < lines.len() && lines[i].starts_with("*** Move to: ") {
                 let to = lines[i]["*** Move to: ".len()..].to_string();
                 i += 1;
@@ -195,23 +201,18 @@ fn parse(patch: &str) -> Result<Vec<Section>, EditError> {
             };
             let mut hunks = Vec::new();
             while i < lines.len() && !lines[i].starts_with("*** ") {
+                let hunk_line = i + 1;
                 let marker = lines[i];
                 if !marker.starts_with("@@") {
-                    return Err(EditError::InvalidPatch(format!(
-                        "expected @@ at line {}",
-                        i + 1
-                    )));
+                    return Err(section_error(path, hunk_line, "expected @@"));
                 }
-                let anchor = marker.strip_prefix("@@ ").map(str::to_string);
-                if marker != "@@" && anchor.is_none() {
-                    return Err(EditError::InvalidPatch(format!(
-                        "invalid hunk at line {}",
-                        i + 1
-                    )));
+                let header_context = marker.strip_prefix("@@ ").map(str::to_string);
+                if marker != "@@" && header_context.is_none() {
+                    return Err(section_error(path, hunk_line, "invalid hunk header"));
                 }
                 i += 1;
                 let mut hunk = Hunk {
-                    anchor,
+                    header_context,
                     lines: Vec::new(),
                 };
                 while i < lines.len()
@@ -224,16 +225,18 @@ fn parse(patch: &str) -> Result<Vec<Section>, EditError> {
                         .next()
                         .map(|kind| (kind, &line[kind.len_utf8()..]))
                     else {
-                        return Err(EditError::InvalidPatch(format!(
-                            "invalid hunk line {}",
-                            i + 1
-                        )));
+                        return Err(section_error(
+                            path,
+                            i + 1,
+                            "expected a line starting with space, +, or -",
+                        ));
                     };
                     if !matches!(kind, ' ' | '+' | '-') {
-                        return Err(EditError::InvalidPatch(format!(
-                            "invalid hunk line {}",
-                            i + 1
-                        )));
+                        return Err(section_error(
+                            path,
+                            i + 1,
+                            "expected a line starting with space, +, or -",
+                        ));
                     }
                     hunk.lines.push((kind, text.to_string()));
                     i += 1;
@@ -241,13 +244,29 @@ fn parse(patch: &str) -> Result<Vec<Section>, EditError> {
                 if i < lines.len() && lines[i] == "*** End of File" {
                     i += 1;
                 }
-                if hunk.lines.is_empty() || !hunk.lines.iter().any(|(kind, _)| *kind != ' ') {
-                    return Err(EditError::InvalidPatch("empty or unchanged hunk".into()));
+                if hunk.lines.is_empty() && hunk.header_context.is_none() {
+                    return Err(section_error(
+                        path,
+                        hunk_line,
+                        "remove this context-only hunk or include a + or - line",
+                    ));
                 }
                 hunks.push(hunk);
             }
             if hunks.is_empty() && destination.is_none() {
-                return Err(EditError::InvalidPatch("update requires a hunk".into()));
+                return Err(section_error(path, section_line, "update requires a hunk"));
+            }
+            if destination.is_none()
+                && !hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .any(|(kind, _)| *kind != ' ')
+            {
+                return Err(section_error(
+                    path,
+                    section_line + 1,
+                    "context-only hunk: include an insertion or removal in this file update",
+                ));
             }
             sections.push(Section::Update {
                 path: path.to_string(),
@@ -276,19 +295,19 @@ fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String, Edi
     };
     let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
     let mut cursor = 0;
-    for hunk in hunks {
-        if let Some(anchor) = &hunk.anchor {
-            let needle = format!("{}{}", anchor, ending);
-            let matches: Vec<usize> = (cursor..lines.len())
-                .filter(|&n| lines[n] == needle || lines[n] == *anchor)
-                .collect();
-            if matches.len() != 1 {
-                return Err(EditError::PatchContext {
-                    path: path.into(),
-                    context: anchor.clone(),
-                });
-            }
-            cursor = matches[0] + 1;
+    for (index, hunk) in hunks.iter().enumerate() {
+        let context_error = |section, context, count| EditError::PatchContext {
+            path: path.into(),
+            hunk: index + 1,
+            section,
+            context,
+            count,
+        };
+        if let Some(context) = &hunk.header_context {
+            let needle = [format!("{context}{ending}")];
+            let start = find_context(&lines, cursor, &needle, ending)
+                .map_err(|count| context_error("@@ context", context.clone(), count))?;
+            cursor = start + 1;
         }
         let old: Vec<String> = hunk
             .lines
@@ -296,37 +315,73 @@ fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String, Edi
             .filter(|(kind, _)| *kind != '+')
             .map(|(_, text)| align_line_endings(&format!("{text}\n"), original))
             .collect();
-        let new: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter(|(kind, _)| *kind != '-')
-            .map(|(_, text)| align_line_endings(&format!("{text}\n"), original))
-            .collect();
         let at = if old.is_empty() {
             cursor
         } else {
-            let matches: Vec<usize> = (cursor..=lines.len().saturating_sub(old.len()))
-                .filter(|&n| {
-                    lines.get(n..n + old.len()) == Some(old.as_slice())
-                        || (n + old.len() == lines.len()
-                            && !original.ends_with('\n')
-                            && lines.get(n..n + old.len() - 1) == old.get(..old.len() - 1)
-                            && lines.last().map(String::as_str)
-                                == old.last().and_then(|line| line.strip_suffix(ending)))
-                })
-                .collect();
-            if matches.len() != 1 {
-                return Err(EditError::PatchContext {
-                    path: path.into(),
-                    context: old.concat(),
-                });
-            }
-            matches[0]
+            find_context(&lines, cursor, &old, ending)
+                .map_err(|count| context_error("old lines", old.concat(), count))?
         };
-        lines.splice(at..at + old.len(), new.iter().cloned());
-        cursor = at + new.len();
+        let mut source = lines[at..at + old.len()].iter();
+        let mut new = Vec::new();
+        for (kind, text) in &hunk.lines {
+            match kind {
+                '+' => new.push(align_line_endings(&format!("{text}\n"), original)),
+                ' ' => new.extend(source.next().cloned()),
+                _ => {
+                    source.next();
+                }
+            }
+        }
+        // An unchanged final line may lack a newline. Give it a separator
+        // only when the hunk inserts a line after it.
+        let interior = new.len().saturating_sub(1);
+        for line in &mut new[..interior] {
+            if !line.ends_with('\n') {
+                line.push_str(ending);
+            }
+        }
+        let next = at + new.len();
+        lines.splice(at..at + old.len(), new);
+        cursor = next;
     }
     Ok(lines.concat())
+}
+
+// Exact matches take precedence. Only when none exist do we ignore leading
+// and trailing horizontal whitespace, and the result must still be unique.
+fn find_context(
+    lines: &[String],
+    cursor: usize,
+    old: &[String],
+    ending: &str,
+) -> Result<usize, usize> {
+    for ignore_whitespace in [false, true] {
+        let matches: Vec<_> = lines[cursor..]
+            .windows(old.len())
+            .enumerate()
+            .filter_map(|(offset, window)| {
+                window
+                    .iter()
+                    .zip(old)
+                    .all(|(actual, expected)| {
+                        let actual = actual.strip_suffix(ending).unwrap_or(actual);
+                        let expected = expected.strip_suffix(ending).unwrap_or(expected);
+                        if ignore_whitespace {
+                            actual.trim_matches([' ', '\t']) == expected.trim_matches([' ', '\t'])
+                        } else {
+                            actual == expected
+                        }
+                    })
+                    .then_some(cursor + offset)
+            })
+            .collect();
+        match matches.as_slice() {
+            [at] => return Ok(*at),
+            [] => {}
+            _ => return Err(matches.len()),
+        }
+    }
+    Err(0)
 }
 
 #[cfg(test)]
@@ -377,6 +432,23 @@ mod tests {
             assert!(stage_apply_patch(root, &ProjectConfig::default(), &context, patch, None, None).is_err());
             assert!(!root.join("b.txt").exists());
         }
+    }
+
+    #[test]
+    fn whitespace_fallback_preserves_context_and_refuses_ambiguous_locations() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@  heading\n   keep\n-  old\n+new\n*** End Patch";
+        let sections = parse(patch).unwrap();
+        let [Section::Update { hunks, .. }] = sections.as_slice() else {
+            panic!("expected an update");
+        };
+        assert_eq!(
+            apply_hunks("a.txt", "heading\r\n\tkeep \r\nold\r\n", hunks).unwrap(),
+            "heading\r\n\tkeep \r\nnew\r\n"
+        );
+        assert!(matches!(
+            apply_hunks("a.txt", "heading\nkeep\nold\n\tkeep\n\told\n", hunks),
+            Err(EditError::PatchContext { count: 2, .. })
+        ));
     }
 
     #[test]

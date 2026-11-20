@@ -1,28 +1,14 @@
-use crate::llm::discussion::DiscussionContextRequest;
-use crate::llm::discussion::DiscussionPlanUpdate;
-use crate::llm::discussion::DiscussionResponse;
-use crate::llm::discussion::RepoSearchRequest;
-use tracing::{info, warn};
+//! Addressed text preview for structured discussion responses.
+//!
+//! The final response is decoded by the prompt protocol, not by this filter.
 
-use super::json::decode::{balanced_object_end, StringFieldCursor};
-use super::json::extract_streamed_string_field;
+use super::json::events::{key_path, PreviewEvents};
 use super::EditStreamFilter;
 use crate::providers::StreamEvent;
 
-/// Streaming filter for Structured Output in discussion and planning modes.
-///
-/// It streams a target top-level string field (by default `"message"`) on the fly
-/// as `StreamEvent::TextDelta` while buffering the payload to parse structured
-/// commands (`DiscussionResponse`) at the end of the turn.
-#[derive(Debug)]
+/// Streams only the selected root-level string field of a discussion payload.
 pub struct DiscussionStreamFilter {
-    target_field: String,
-    passthrough: Option<bool>,
-    buffer: String,
-    message_cursor: StringFieldCursor,
-    message_streamed_bytes: usize,
-    message_finished: bool,
-    response: Option<DiscussionResponse>,
+    preview: PreviewEvents,
 }
 
 impl Default for DiscussionStreamFilter {
@@ -32,669 +18,92 @@ impl Default for DiscussionStreamFilter {
 }
 
 impl DiscussionStreamFilter {
-    #[cfg(test)]
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Creates a filter streaming the specified top-level JSON string field.
+    /// Selects one root-level conversational field for live preview.
     pub(crate) fn with_target_field(target_field: impl Into<String>) -> Self {
+        let target_field = target_field.into();
         Self {
-            target_field: target_field.into(),
-            passthrough: None,
-            buffer: String::new(),
-            message_cursor: StringFieldCursor::new(),
-            message_streamed_bytes: 0,
-            message_finished: false,
-            response: None,
-        }
-    }
-
-    /// Advances the on-the-fly `TextDelta` stream of the target field by one
-    /// incremental step, resuming from the cursor's saved scan offsets.
-    fn stream_message_delta(&mut self, events: &mut Vec<StreamEvent>) {
-        if self.message_finished {
-            return;
-        }
-        let (delta, finished) = extract_streamed_string_field(
-            &self.buffer,
-            &self.target_field,
-            &mut self.message_cursor,
-        );
-        if let Some(d) = delta {
-            self.message_streamed_bytes += d.len();
-            events.push(StreamEvent::TextDelta(d));
-        }
-        self.message_finished = finished;
-    }
-
-    /// Pushes a delta chunk and yields any unescaped `TextDelta` stream events.
-    fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
-        self.buffer.push_str(chunk);
-        let mut events = Vec::new();
-
-        // 0. Detect passthrough if provider returned plain text (not JSON)
-        if self.passthrough.is_none() {
-            match self.buffer.chars().find(|c| !c.is_whitespace()) {
-                None => return events,
-                Some(c) => {
-                    let plain = c != '{' && c != '`';
-                    self.passthrough = Some(plain);
-                    if plain {
-                        events.push(StreamEvent::TextDelta(self.buffer.clone()));
-                        return events;
-                    }
-                }
-            }
-        } else if self.passthrough == Some(true) {
-            if !chunk.is_empty() {
-                events.push(StreamEvent::TextDelta(chunk.to_string()));
-            }
-            return events;
-        }
-
-        // If buffer starts with ``` but no { appears after reasonable length, switch to passthrough
-        if self.passthrough == Some(false) && self.buffer.find('{').is_none() {
-            if self.buffer.len() > 64 {
-                self.passthrough = Some(true);
-                events.push(StreamEvent::TextDelta(self.buffer.clone()));
-                return events;
-            }
-            return events;
-        }
-
-        // 1. Stream target field deltas on the fly
-        self.stream_message_delta(&mut events);
-
-        events
-    }
-
-    /// Flushes any remaining streamed content and deserializes the structured response.
-    fn finish_internal(&mut self) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
-        if self.passthrough == Some(true) {
-            self.response = Some(Self::parse_response(&self.buffer));
-            return events;
-        }
-
-        self.stream_message_delta(&mut events);
-
-        let parsed = Self::parse_response(&self.buffer);
-
-        // Finalization guard: residual message text must never stay trapped in the
-        // buffer when the stream closes. If the on-the-fly scanner surfaced nothing
-        // as the target field, emit the parsed content exactly once.
-        if self.message_streamed_bytes == 0 {
-            let fallback_text = if self.target_field == "message" {
-                if !parsed.message.is_empty() {
-                    Some(parsed.message.clone())
-                } else {
-                    None
-                }
-            } else {
-                serde_json::from_str::<serde_json::Value>(self.buffer.trim())
-                    .ok()
-                    .and_then(|v| {
-                        v.get(&self.target_field)
-                            .and_then(|s| s.as_str())
-                            .map(ToString::to_string)
-                    })
-            };
-
-            if let Some(text) = fallback_text {
-                if !text.is_empty() {
-                    events.push(StreamEvent::TextDelta(text));
-                }
-            }
-        }
-
-        self.response = Some(parsed);
-        events
-    }
-
-    /// Consumes the filter, flushing remaining text deltas and returning the parsed response.
-    #[cfg(test)]
-    fn finish_with_response(mut self) -> (Vec<StreamEvent>, DiscussionResponse) {
-        let events = self.finish_internal();
-        let resp = self
-            .response
-            .take()
-            .unwrap_or_else(|| Self::parse_response(&self.buffer));
-        (events, resp)
-    }
-
-    #[cfg(test)]
-    fn response(&self) -> Option<&DiscussionResponse> {
-        self.response.as_ref()
-    }
-
-    /// Robustly parses a raw model output into `DiscussionResponse` with resilient fallbacks.
-    fn parse_response(raw: &str) -> DiscussionResponse {
-        let clean = raw.trim();
-        if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(clean) {
-            Self::sanitize_plan_update(&mut resp);
-            return resp;
-        }
-
-        // Try finding JSON object in raw if markdown wrappers or text surrounds it
-        if let Some(start) = raw.find('{') {
-            if let Some(end) = balanced_object_end(raw, start) {
-                let candidate = &raw[start..end];
-                if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(candidate) {
-                    Self::sanitize_plan_update(&mut resp);
-                    return resp;
-                }
-            }
-        }
-
-        // Partial JSON fallback: try to parse as generic Value
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean) {
-            warn!("DiscussionResponse schema mismatch, attempting partial extraction");
-            let message = val
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| clean.to_string());
-
-            // A present but undecodable `plan_update` is a defect of the payload
-            // rather than an absent mutation: the reason travels with the response
-            // so the boundary that owns the round can refuse it instead of
-            // dropping the mutation the model attempted.
-            let mut plan_update_error: Option<String> = None;
-            let mut plan_update: Option<DiscussionPlanUpdate> = None;
-            if let Some(field) = val.get("plan_update").filter(|v| !v.is_null()) {
-                match serde_json::from_value::<DiscussionPlanUpdate>(field.clone()) {
-                    Ok(update) => {
-                        // An update without a single actionable field states an
-                        // untouched plan, which is not a defect.
-                        plan_update = Some(update).filter(|u| {
-                            u.id.is_some()
-                                || !u.items.is_empty()
-                                || !u.concept.is_empty()
-                                || u.title.is_some()
-                        });
-                    }
-                    Err(error) => {
-                        plan_update_error = Some(format!("invalid plan_update: {error}"));
-                    }
-                }
-            }
-
-            let context_requests = val
-                .get("context_requests")
-                .filter(|v| !v.is_null())
-                .and_then(|v| {
-                    serde_json::from_value::<Vec<DiscussionContextRequest>>(v.clone()).ok()
-                })
-                .unwrap_or_default();
-
-            let repo_searches = val
-                .get("repo_searches")
-                .or_else(|| val.get("search_requests"))
-                .filter(|v| !v.is_null())
-                .and_then(|v| serde_json::from_value::<Vec<RepoSearchRequest>>(v.clone()).ok())
-                .unwrap_or_default();
-
-            let mut response = DiscussionResponse {
-                message,
-                plan_update,
-                plan_update_error,
-                context_requests,
-                repo_searches,
-                ..Default::default()
-            };
-            // Repository discovery requests survive the degraded decode through
-            // the same normalizing builder the typed schema path uses.
-            response.repo_dirs = val.get("repo_dirs").and_then(|field| field.as_bool());
-            if let Some(paths) = val
-                .get("repo_maps")
-                .and_then(|field| serde_json::from_value::<Vec<String>>(field.clone()).ok())
-            {
-                response = response.with_repo_maps(paths);
-            }
-            return response;
-        }
-
-        // Non-JSON plain text fallback
-        info!("Discussion response parsed as plain text fallback");
-        DiscussionResponse::new(raw.trim())
-    }
-
-    fn sanitize_plan_update(resp: &mut DiscussionResponse) {
-        if let Some(ref update) = resp.plan_update {
-            if update.id.is_none()
-                && update.items.is_empty()
-                && update.concept.is_empty()
-                && update.title.is_none()
-            {
-                resp.plan_update = None;
-            }
+            preview: PreviewEvents::new(key_path(&[&target_field])),
         }
     }
 }
 
 impl EditStreamFilter for DiscussionStreamFilter {
     fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
-        DiscussionStreamFilter::push_chunk(self, chunk)
+        self.preview
+            .push(chunk.as_bytes())
+            .into_iter()
+            .map(StreamEvent::TextDelta)
+            .collect()
     }
 
     fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
-        self.finish_internal()
+        self.preview.finish();
+        Vec::new()
     }
 
     fn reset(&mut self) {
-        self.passthrough = None;
-        self.buffer.clear();
-        self.message_cursor = StringFieldCursor::new();
-        self.message_streamed_bytes = 0;
-        self.message_finished = false;
-        self.response = None;
+        self.preview.reset();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::discussion::DiscussionPlanAction;
-    use crate::plan_item::PlanItem;
-    use crate::plan_item::PlanItemStatus;
 
-    #[test]
-    fn test_discussion_stream_filter_character_by_character() {
-        let mut filter = DiscussionStreamFilter::new();
-        let json = r#"{"message":"Hello developer! How can I help?","plan_update":null,"context_requests":[]}"#;
-
-        let mut streamed = String::new();
-        for c in json.chars() {
-            let s = c.to_string();
-            for ev in filter.push_chunk(&s) {
-                if let StreamEvent::TextDelta(d) = ev {
-                    streamed.push_str(&d);
-                }
-            }
-        }
-
-        let (final_events, response) = filter.finish_with_response();
-        for ev in final_events {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert_eq!(streamed, "Hello developer! How can I help?");
-        assert_eq!(response.message, "Hello developer! How can I help?");
-        assert!(response.plan_update.is_none());
-        assert!(response.context_requests.is_empty());
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_escaped_characters() {
-        let mut filter = DiscussionStreamFilter::new();
-        let json = r#"{"message":"Line 1\nLine 2 with \"quotes\" and \\slash and \u0041","plan_update":null,"context_requests":[]}"#;
-
-        let mut streamed = String::new();
-        for chunk in json.as_bytes().chunks(5) {
-            let s = std::str::from_utf8(chunk).unwrap();
-            for ev in filter.push_chunk(s) {
-                if let StreamEvent::TextDelta(d) = ev {
-                    streamed.push_str(&d);
-                }
-            }
-        }
-
-        let (final_events, response) = filter.finish_with_response();
-        for ev in final_events {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        let expected = "Line 1\nLine 2 with \"quotes\" and \\slash and A";
-        assert_eq!(streamed, expected);
-        assert_eq!(response.message, expected);
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_with_plan_update() {
-        let mut filter = DiscussionStreamFilter::new();
-        let json = serde_json::json!({
-            "message": "Updating plan with new steps",
-            "plan_update": {
-                "action": "update",
-                "id": "test-plan",
-                "title": "Test Plan",
-                "description": "Plan description",
-                "items": [
-                    {
-                        "id": "1",
-                        "title": "First step",
-                        "details": "Details of first step",
-                        "status": "todo",
-                        "children": []
-                    }
-                ]
-            },
-            "context_requests": [
-                {
-                    "path": "crates/core/src/lib.rs",
-                    "access": "read_only"
-                }
-            ]
-        })
-        .to_string();
-
-        let events = filter.push_chunk(&json);
-        let mut streamed: String = events
-            .into_iter()
-            .filter_map(|e| {
-                if let StreamEvent::TextDelta(d) = e {
-                    Some(d)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let (final_events, response) = filter.finish_with_response();
-        for ev in final_events {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert_eq!(streamed, "Updating plan with new steps");
-        assert_eq!(response.message, "Updating plan with new steps");
-
-        let plan_update = response.plan_update.expect("plan_update must be present");
-        assert_eq!(plan_update.action, DiscussionPlanAction::Update);
-        assert_eq!(plan_update.id.as_deref(), Some("test-plan"));
-        assert_eq!(plan_update.items.len(), 1);
-        assert_eq!(
-            plan_update.items[0],
-            PlanItem {
-                id: "1".to_string(),
-                title: "First step".to_string(),
-                details: Some("Details of first step".to_string()),
-                status: PlanItemStatus::Todo,
-                blocked_reason: None,
-                commit: None,
-                files: vec![],
-                readonly_files: vec![],
-                outer_docs: vec![],
-                concept_refs: vec![],
-                depends_on: vec![],
-                children: vec![],
-            }
-        );
-
-        assert_eq!(response.context_requests.len(), 1);
-        assert_eq!(
-            response.context_requests[0],
-            DiscussionContextRequest {
-                path: "crates/core/src/lib.rs".to_string(),
-                access: crate::context::ContextAccess::ReadOnly,
-            }
-        );
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_markdown_fence() {
-        let mut filter = DiscussionStreamFilter::new();
-        let raw = "```json\n{\"message\": \"Fenced response message\", \"plan_update\": null, \"context_requests\": []}\n```";
-
-        let mut streamed = String::new();
-        for ev in filter.push_chunk(raw) {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-        let (final_events, response) = filter.finish_with_response();
-        for ev in final_events {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert_eq!(streamed, "Fenced response message");
-        assert_eq!(response.message, "Fenced response message");
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_plain_text_fallback() {
-        let mut filter = DiscussionStreamFilter::new();
-        let plain = "This is a direct plain text response from a non-schema provider.";
-
-        let mut streamed = String::new();
-        for ev in filter.push_chunk(plain) {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-        let (final_events, response) = filter.finish_with_response();
-        for ev in final_events {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert_eq!(streamed, plain);
-        assert_eq!(response.message, plain);
-        assert!(response.plan_update.is_none());
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_records_an_undecodable_plan_update() {
-        // The partial fallback rebuilds the response from a payload the DTO
-        // rejects, so a present but undecodable `plan_update` is recorded as a
-        // decode diagnosis instead of disappearing.
-        let raw = r#"{"message":"Partial valid message","plan_update":{"items":"not-a-list"}}"#;
-        let resp = DiscussionStreamFilter::parse_response(raw);
-        assert_eq!(resp.message, "Partial valid message");
-        assert!(resp.plan_update.is_none());
-        let error = resp
-            .plan_update_error
-            .expect("an undecodable plan_update must be recorded");
-        assert!(error.contains("plan_update"), "{error}");
-
-        // An idle payload states an untouched plan and no defect, whether the
-        // mutation is null or an update that carries no actionable field.
-        for idle in [
-            r#"{"message":"Hello","plan_update":null}"#,
-            r#"{"message":"Hello","plan_update":{}}"#,
-        ] {
-            let resp = DiscussionStreamFilter::parse_response(idle);
-            assert!(resp.plan_update_error.is_none(), "{idle}");
-            assert!(resp.plan_update.is_none(), "{idle}");
-        }
-    }
-
-    #[test]
-    fn test_discussion_stream_filter_partial_json_fallback() {
-        let raw = r#"{"message":"Partial valid message","plan_update":{"broken":true}}"#;
-        let resp = DiscussionStreamFilter::parse_response(raw);
-        assert_eq!(resp.message, "Partial valid message");
-        assert!(resp.plan_update.is_none());
-    }
-
-    #[test]
-    fn test_finish_does_not_leak_json_for_empty_message() {
-        let mut filter = DiscussionStreamFilter::new();
-        let json = r#"{"message":"","plan_update":null,"context_requests":[]}"#;
-
-        let mut streamed = String::new();
-        for c in json.chars() {
-            for ev in filter.push_chunk(&c.to_string()) {
-                if let StreamEvent::TextDelta(d) = ev {
-                    streamed.push_str(&d);
-                }
-            }
-        }
-        for ev in filter.finish_internal() {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert!(
-            streamed.is_empty(),
-            "structured empty message must not leak JSON as text: {streamed:?}"
-        );
-        assert_eq!(filter.response().map(|r| r.message.as_str()), Some(""));
-    }
-
-    #[test]
-    fn test_finish_flushes_held_plain_text() {
-        let mut filter = DiscussionStreamFilter::new();
-        // A short leading-fence payload without a JSON object is buffered while
-        // streaming; finish must flush it instead of dropping it.
-        let _ = filter.push_chunk("```held plain tail");
-        let events = filter.finish_internal();
-        let streamed: String = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::TextDelta(d) => Some(d.as_str()),
+    fn preview(filter: &mut DiscussionStreamFilter, input: &str) -> String {
+        input
+            .chars()
+            .flat_map(|ch| filter.push_chunk(ch.encode_utf8(&mut [0; 4])))
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(text) => Some(text),
                 _ => None,
             })
-            .collect();
-
-        assert!(
-            streamed.contains("held plain tail"),
-            "residual held text must be emitted: {streamed:?}"
-        );
+            .collect()
     }
 
     #[test]
-    fn test_finish_streams_truncated_message_exactly_once() {
-        let mut filter = DiscussionStreamFilter::new();
-        // Truncated payload: the closing quote and brace never arrive.
-        let json = r#"{"message":"Hello wor"#;
-
-        let mut streamed = String::new();
-        for c in json.chars() {
-            for ev in filter.push_chunk(&c.to_string()) {
-                if let StreamEvent::TextDelta(d) = ev {
-                    streamed.push_str(&d);
-                }
-            }
-        }
-        for ev in filter.finish_internal() {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-
-        assert_eq!(streamed, "Hello wor");
+    fn only_the_root_message_is_previewed() {
+        let mut filter = DiscussionStreamFilter::default();
+        let input = r#"{"metadata":{"message":"hidden"},"action":{"message":"hidden too","changes":[{"content":"message"}]},"message":"Live \uD83D\uDE00!"}"#;
+        assert_eq!(preview(&mut filter, input), "Live 😀!");
+        assert!(Box::new(filter).finish().is_empty());
     }
 
     #[test]
-    fn test_discussion_stream_filter_custom_field() {
-        let mut filter = DiscussionStreamFilter::with_target_field("summary");
-        let json = r#"{"summary":"Executive summary text","items":[]}"#;
-        let mut streamed = String::new();
-        for c in json.chars() {
-            for ev in filter.push_chunk(&c.to_string()) {
-                if let StreamEvent::TextDelta(d) = ev {
-                    streamed.push_str(&d);
-                }
-            }
-        }
-        for ev in filter.finish_internal() {
-            if let StreamEvent::TextDelta(d) = ev {
-                streamed.push_str(&d);
-            }
-        }
-        assert_eq!(streamed, "Executive summary text");
-    }
-
-    #[test]
-    fn test_reset_discards_the_voided_attempt() {
-        let mut filter = DiscussionStreamFilter::new();
-        // The interrupted attempt leaves an unterminated `message` value behind,
-        // so the scanner would keep reading through the retried payload.
-        let _ = filter.push_chunk(r#"{"message":"First attempt"#);
-
+    fn incomplete_text_is_live_without_repeats_and_reset_isolates_attempts() {
+        let mut filter = DiscussionStreamFilter::default();
+        assert_eq!(preview(&mut filter, "{\"message\":\"First "), "First ");
         filter.reset();
-        let retried = concat!(
-            "{\"message\":\"Second attempt\",\"plan_update\":null,",
-            "\"context_requests\":[]}"
-        );
+        assert_eq!(preview(&mut filter, "{\"message\":\"Second"), "Second");
+        assert!(Box::new(filter).finish().is_empty());
+    }
 
-        let mut streamed = String::new();
-        for event in filter.push_chunk(retried) {
-            if let StreamEvent::TextDelta(delta) = event {
-                streamed.push_str(&delta);
-            }
+    #[test]
+    fn invalid_or_wrapped_input_never_recovers_a_preview() {
+        for input in [
+            "```json\n{\"message\":\"wrapped\"}\n```",
+            "Prose {\"message\":\"wrapped\"}",
+            "{\"message\":\"before\",!\"message\":\"after\"}",
+        ] {
+            let mut filter = DiscussionStreamFilter::default();
+            let text = preview(&mut filter, input);
+            assert!(
+                !text.contains("wrapped") && !text.contains("after"),
+                "{text}"
+            );
+            assert!(Box::new(filter).finish().is_empty());
         }
-        for event in filter.finish_internal() {
-            if let StreamEvent::TextDelta(delta) = event {
-                streamed.push_str(&delta);
-            }
-        }
+    }
 
-        assert_eq!(streamed, "Second attempt");
+    #[test]
+    fn explanation_only_at_the_root_is_previewed() {
+        let mut filter = DiscussionStreamFilter::with_target_field("explanation");
         assert_eq!(
-            filter.response().map(|response| response.message.as_str()),
-            Some("Second attempt")
-        );
-    }
-    #[test]
-    fn test_discussion_filter_streams_the_field_inside_the_operational_branch() {
-        // The dialogue payload nests its text in the operational branch, so the
-        // filter must stream the field at the depth the branch gives it while the
-        // envelope itself stays hidden from the text channel.
-        let mut filter = DiscussionStreamFilter::new();
-        let json = concat!(
-            "{\"action\":{\"kind\":\"answer\",\"message\":\"Nested answer\"},",
-            "\"plan_update\":null,\"context_requests\":[]}"
-        );
-
-        let mut streamed = String::new();
-        for c in json.chars() {
-            for event in filter.push_chunk(&c.to_string()) {
-                if let StreamEvent::TextDelta(delta) = event {
-                    streamed.push_str(&delta);
-                }
-            }
-        }
-        for event in filter.finish_internal() {
-            if let StreamEvent::TextDelta(delta) = event {
-                streamed.push_str(&delta);
-            }
-        }
-
-        assert_eq!(streamed, "Nested answer");
-        assert!(!streamed.contains("action"), "{streamed}");
-    }
-
-    #[test]
-    fn test_error_message_never_becomes_the_response_channel() {
-        // The error channel is its own property: a failing round reports
-        // `error_message`, and the filter must never stream it as the answer.
-        let mut filter = DiscussionStreamFilter::new();
-        let payload = concat!(
-            "{\"message\":\"\",",
-            "\"action\":{\"kind\":\"edit\",\"changes\":[],",
-            "\"commit_message\":\"\",",
-            "\"error_message\":\"Missing dependency\",\"reason\":\"\"}}"
-        );
-
-        let mut streamed = String::new();
-        for c in payload.chars() {
-            for event in filter.push_chunk(&c.to_string()) {
-                if let StreamEvent::TextDelta(delta) = event {
-                    streamed.push_str(&delta);
-                }
-            }
-        }
-        for event in filter.finish_internal() {
-            if let StreamEvent::TextDelta(delta) = event {
-                streamed.push_str(&delta);
-            }
-        }
-
-        assert!(
-            streamed.is_empty(),
-            "the error channel must never reach the answer stream: {streamed}"
+            preview(
+                &mut filter,
+                r#"{"items":[{"explanation":"hidden"}],"explanation":"Horizon"}"#
+            ),
+            "Horizon"
         );
     }
 }

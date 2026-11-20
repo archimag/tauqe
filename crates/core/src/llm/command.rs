@@ -100,7 +100,7 @@ pub struct ScratchpadCommand {
 pub struct TextCommand {
     /// Conversational answer to the developer, formulated in the language of the
     /// request as readable Markdown.
-    pub(crate) content: String,
+    pub content: String,
 }
 
 /// Semantic blocker emitted when a precondition or assumption fails.
@@ -114,6 +114,16 @@ pub struct BlockedCommand {
     pub(crate) reason: String,
     #[serde(default)]
     pub(crate) details: String,
+}
+
+impl BlockedCommand {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn details(&self) -> &str {
+        &self.details
+    }
 }
 
 /// Unconditional abort emitted when only the developer can act on the host.
@@ -146,6 +156,12 @@ pub struct TurnErrorCommand {
     /// Error message describing why the turn failed; empty otherwise.
     #[serde(default)]
     pub(crate) error_message: String,
+}
+
+impl TurnErrorCommand {
+    pub fn error_message(&self) -> &str {
+        &self.error_message
+    }
 }
 
 /// Terminal skip reason stated by the model when the work is already satisfied.

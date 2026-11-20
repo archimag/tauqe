@@ -80,7 +80,7 @@ impl ReviewStorage {
     /// recommendation the finding already carries is never duplicated. A finding
     /// the named session does not hold is reported as absent instead of being
     /// invented, so a decision can never fabricate a finding.
-    pub(crate) fn apply_decision(
+    pub fn apply_decision(
         repo_root: &Path,
         review_id: &str,
         decision: &ReviewUpdateProposal,
@@ -203,6 +203,38 @@ mod tests {
         assert!(
             applied.is_none(),
             "an absent finding is reported, never invented"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_decision_only_changes_the_explicitly_named_session() {
+        let root = crate::test_paths::scratch_dir("review-decision-session-scope");
+        let first = session_with_finding();
+        let mut second = session_with_finding();
+        second.id = "rev-other".to_string();
+        ReviewStorage::save_session(&root, &first).unwrap();
+        ReviewStorage::save_session(&root, &second).unwrap();
+
+        let decision = ReviewUpdateProposal {
+            item_id: 1,
+            group_id: None,
+            status: ReviewDecisionStatus::Rejected,
+            note: "Not actionable".to_string(),
+            recommendations: Vec::new(),
+        };
+        let applied = ReviewStorage::apply_decision(&root, "rev-decision", &decision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.status, IssueStatus::Rejected);
+        assert_eq!(
+            ReviewStorage::load_review(&root, "rev-other")
+                .unwrap()
+                .unwrap()
+                .find_item(1)
+                .unwrap()
+                .status,
+            IssueStatus::Discussion
         );
 
         let _ = std::fs::remove_dir_all(&root);

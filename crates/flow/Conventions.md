@@ -1,82 +1,45 @@
 # Application Flow Conventions
 
-`tauqe_flow::api::Application` exposes typed scenarios for the session. Clones share
-the session and independently constructed applications have independent state.
-Scenario inputs name the caller's intent, such as a prompt, target, document
-identifier, or model selection. Preparation types, operation leases, and workflow
-tasks are internal. Scripted providers and test timing overrides use explicit
-test seams.
+Flow coordinates scenarios and owns their session lifecycles. These rules are
+review criteria, not an inventory of current RPC routes or event fields.
 
-### Admission and cancellation
+## Admission and ownership
 
-The server decodes parameters before invoking the scenario. An exclusive scenario
-registers before validation, document loads, focus changes, or writes. One
-operation owns a batch and all its steps, including the gaps between them. Its
-guard remains live until the scenario queues terminal notifications. Reads and
-permitted focus changes remain available while the slot is occupied.
-The [RPC scenario inventory](../../docs/rpc-application-boundary.md) identifies
-each route's response mode and registration policy.
+- Claim exclusive work before validation or other side effects that belong to
+  it. Hold the claim through terminal publication and recovery; a batch owns
+  the gaps between its members as well as each member's execution.
+- Keep reads and explicitly permitted non-mutating interactions available
+  during an exclusive operation. Reject stale task or watchdog actions rather
+  than letting them affect a newer owner.
+- Give callers typed scenario inputs and outcomes. Keep preparation details,
+  operation leases, and task supervision inside the application boundary.
 
-Hard cancellation raises a cooperative signal and leaves the registration live
-during recovery. The watchdog waits for the unwind grace before force-aborting a
-stalled task, defers while a Git transaction is open, and confirms the task exit
-against the task deadline. Soft stop lets the current member settle before the
-next scheduling decision. Identity checks prevent a stale watchdog or task
-handle from affecting a newer operation. Task deadlines passed to a spawn are
-resolved before the task starts.
+## Cancellation and completion
 
-### Operations and publication
+- Hard cancellation interrupts current work and takes precedence over other
+  outcomes. Soft stop settles the active batch member before the next is
+  scheduled; it must preserve verified work already committed.
+- Never release ownership while a transaction is still unwinding. A stalled
+  operation must have a bounded recovery path that does not abandon a live
+  transaction or publish success for incomplete work.
+- Close every started edit or batch lifecycle exactly once, including refusal,
+  stream replacement, cancellation, and infrastructure failure. A withdrawn
+  stream must not leave stale text or previews visible.
 
-`ApplicationObserver` accepts typed events and offers asynchronous transport
-readiness. Publication is synchronous. The observer may enqueue an event without
-accessing the application, including while a usage heartbeat holds the accounting
-lock. Flow constructs result metadata, usage and context snapshots, ready-to-send
-document lists, edit outcomes, Git state, and terminal batch reports. Semantic
-tracing belongs to the layer that performs the work. The server projects event fields onto the existing wire
-contracts and manages backpressure, process signals, and logging sinks.
+## Scenario boundaries
 
-Interactive and step turns resolve their provider, apply policy, prompts,
-capabilities, and session affinity in flow using core services. Stream resets discard text from
-the withdrawn attempt and close any open edit cycle. Cancellation wins over task
-and stream failure. A task failure triggers recovery. Each open edit cycle closes
-once, including on abort, refusal, or stream failure. On successful interactive
-completion flow flushes usage, merges context, publishes edit/Git completion,
-persists the history outcome, and publishes context and document updates before
-the model result and finished notice. A Git commit notice precedes the refreshed
-repository state and edit completion.
-
-Usage windows retain reports from failed attempts. Flushing folds a window into
-session and project totals once and attempts persistence before the final
-snapshot. The heartbeat derives the current duration under the accounting lock,
-checks ownership there, and ceases publication after a window closes or is
-replaced. A stale window cannot update its successor. History publications carry
-the estimate and, for compaction, the count taken at the mutation.
-
-Plan and review workflows validate queued targets and run preflight under the
-same operation they use for execution. Implementation hosts, Architect and
-critic calls, reviewer resolution, and automatic post-analysis use core execution services. A plan
-failure ends its pipeline. Review retains local failure and skip handling.
-Architectural findings require their group horizon, and unresolved questions
-prevent that group from starting. Review preview is read-only and keeps preset
-group budgets separate from the interactive context window.
-
-### Repository, configuration, and documents
-
-Flow initializes and rebinds the configuration, context, project usage, and
-history under one operation. It resolves effective model configuration, roles,
-history model, available choices, and readiness before returning a view.
-Configuration changes validate before committing. Module-owned fields take
-precedence over patch validation. Credentials preserve the active selection and
-dialogue identity. Model changes rotate dialogue identity when the effective
-model changes. File-writing commands report the path they wrote even if
-rediscovery fails.
-
-Flow orchestrates Git revision validation, squash base selection and message generation,
-manual context editing, cache reconciliation, and history cleanup. The squash
-preview keeps a consistent view under exclusive admission. History cleanup resets
-dialogue identity and detaches focus even if journal removal fails. Document
-commands validate identifiers and trees, resolve active and first-document
-fallbacks for reads, enforce explicit review update targets, and release matching
-focus after deletion. Reads leave active pointers intact. Document updates and
-list notifications are prepared while holding admission. Storage and publication
-preserve their best-effort behavior where the scenario allows recovery.
+- Reuse core execution mechanisms instead of copying turn logic into each
+  scenario. The scenario determines its target, permissions, continuation,
+  and durable result; the engine executes the prepared work.
+- Reuse queue mechanics where sequencing is the same. Keep plan and review
+  decisions about readiness, failure, replanning, and closure with their
+  respective scenarios rather than imposing one domain's rules on another.
+- Validate document mutations and configuration changes before persisting
+  them. Reads must not mutate stored state as a hidden side effect.
+- Treat usage, history, context, and published outcomes as one observable
+  scenario: publish coherent snapshots after the corresponding state changes,
+  without dropping reports from failed attempts or publishing a terminal
+  result before its recovery completes.
+- Keep transport concerns in the server. Publish typed semantic events;
+  do not serialize RPC payloads, configure logging sinks, or wait on a TUI
+  from inside a scenario.

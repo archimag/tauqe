@@ -3,8 +3,11 @@ use std::borrow::Cow;
 use crate::review::{IssueStatus, IssueType, ReviewIssue};
 use serde::Deserialize;
 
+use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::balanced_object_end;
+use crate::edits::stream::json::decode::prepare_json_payload;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
+use crate::review::prompt::build_review_system_prompt;
 
 /// Strict JSON Schema for the review synthesis output.
 ///
@@ -127,6 +130,59 @@ pub struct ReviewFindingOutput {
     file_path: Option<String>,
 }
 
+/// Decoded single audit, including the exact provider text kept in the session.
+pub struct SingleReviewOutput {
+    pub raw_markdown: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub issues: Vec<ReviewIssue>,
+}
+
+/// The single audit keeps nonempty unstructured text as an informational finding.
+pub fn single_review_contract() -> StructuredContract<SingleReviewOutput> {
+    StructuredContract {
+        instructions: build_review_system_prompt(),
+        format: review_findings_response_format(),
+        decode: decode_single_review,
+        visibility: StructuredVisibility::TextField("summary"),
+        require_done: false,
+    }
+}
+
+/// Group audits reject unstructured text instead of recording it as a finding.
+pub fn group_review_contract() -> StructuredContract<Vec<ReviewIssue>> {
+    StructuredContract {
+        instructions: build_review_system_prompt(),
+        format: review_findings_response_format(),
+        decode: decode_group_review,
+        visibility: StructuredVisibility::TextField("summary"),
+        require_done: false,
+    }
+}
+
+pub fn decode_single_review(raw: &str) -> Result<SingleReviewOutput, String> {
+    if raw.trim().is_empty() {
+        return Err("Model returned an empty review".into());
+    }
+    let (title, summary, issues) = parse_review_output(raw);
+    Ok(SingleReviewOutput {
+        raw_markdown: raw.to_string(),
+        title,
+        summary,
+        issues,
+    })
+}
+
+pub fn decode_group_review(raw: &str) -> Result<Vec<ReviewIssue>, String> {
+    if raw.trim().is_empty() {
+        return Err("Model returned an empty review".into());
+    }
+    let payload = prepare_json_payload(raw);
+    let output: ReviewFindingsOutput =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    Ok(issues_from_output(output).2)
+}
+
 /// Parses the model's review synthesis output into a session title, a
 /// high-level summary, and structured issues.
 ///
@@ -138,49 +194,7 @@ pub struct ReviewFindingOutput {
 /// review output is never silently discarded.
 pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<ReviewIssue>) {
     match parse_findings_output(raw) {
-        Some(output) => {
-            let ReviewFindingsOutput {
-                title,
-                summary,
-                findings,
-            } = output;
-            let issues = findings
-                .into_iter()
-                .enumerate()
-                .map(|(index, finding)| {
-                    let issue_type = finding.issue_type;
-                    let mut files = normalize_list(finding.files);
-                    if files.is_empty() {
-                        if let Some(path) = finding.file_path {
-                            let trimmed = path.trim();
-                            if !trimmed.is_empty() {
-                                files.push(trimmed.to_string());
-                            }
-                        }
-                    }
-                    ReviewIssue {
-                        id: index as u32 + 1,
-                        title: normalize_title(finding.title, issue_type),
-                        uuid: None,
-                        commit: None,
-                        group: None,
-                        model: None,
-                        issue_type,
-                        status: IssueStatus::Discussion,
-                        description: finding.description.trim().to_string(),
-                        recommendations: normalize_list(finding.recommendations),
-                        files,
-                        readonly_files: normalize_list(finding.readonly_files),
-                        note: None,
-                    }
-                })
-                .collect();
-            (
-                normalize_optional(title),
-                normalize_optional(summary),
-                issues,
-            )
-        }
+        Some(output) => issues_from_output(output),
         None => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -210,10 +224,57 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
     }
 }
 
+fn issues_from_output(
+    output: ReviewFindingsOutput,
+) -> (Option<String>, Option<String>, Vec<ReviewIssue>) {
+    let ReviewFindingsOutput {
+        title,
+        summary,
+        findings,
+    } = output;
+    let issues = findings
+        .into_iter()
+        .enumerate()
+        .map(|(index, finding)| {
+            let issue_type = finding.issue_type;
+            let mut files = normalize_list(finding.files);
+            if files.is_empty() {
+                if let Some(path) = finding.file_path {
+                    let trimmed = path.trim();
+                    if !trimmed.is_empty() {
+                        files.push(trimmed.to_string());
+                    }
+                }
+            }
+            ReviewIssue {
+                id: index as u32 + 1,
+                title: normalize_title(finding.title, issue_type),
+                uuid: None,
+                commit: None,
+                group: None,
+                model: None,
+                issue_type,
+                status: IssueStatus::Discussion,
+                description: finding.description.trim().to_string(),
+                recommendations: normalize_list(finding.recommendations),
+                files,
+                readonly_files: normalize_list(finding.readonly_files),
+                note: None,
+            }
+        })
+        .collect();
+    (
+        normalize_optional(title),
+        normalize_optional(summary),
+        issues,
+    )
+}
+
 /// Parses the model's review synthesis output into structured `ReviewIssue` instances.
 ///
 /// Compatibility wrapper around [`parse_review_output`] that discards the
 /// session title and the high-level summary.
+#[cfg(test)]
 pub(crate) fn parse_review_findings(raw: &str) -> Vec<ReviewIssue> {
     parse_review_output(raw).2
 }
@@ -268,6 +329,38 @@ fn parse_findings_output(raw: &str) -> Option<ReviewFindingsOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contracts_distinguish_single_fallback_from_group_json() {
+        let single = single_review_contract();
+        let group = group_review_contract();
+        assert!(!single.require_done && !group.require_done);
+        assert!(matches!(
+            single.visibility,
+            StructuredVisibility::TextField("summary")
+        ));
+        assert!(matches!(
+            group.visibility,
+            StructuredVisibility::TextField("summary")
+        ));
+        assert!(matches!(single.format, ResponseFormat::JsonSchema { .. }));
+        assert!(matches!(group.format, ResponseFormat::JsonSchema { .. }));
+        assert_eq!(single.instructions, group.instructions);
+        let raw = "  Prose without JSON.  ";
+        let decoded = (single.decode)(raw).unwrap();
+        assert_eq!(decoded.raw_markdown, raw);
+        assert_eq!(decoded.issues[0].description, raw.trim());
+        assert!((group.decode)(raw).is_err());
+        assert!((single.decode)(" \n ").is_err());
+        assert!((group.decode)(" \n ").is_err());
+
+        let wrapped = "Before {not json} then ```json\n{\"summary\":\"ok\",\"findings\":[]}\n```";
+        assert_eq!((single.decode)(wrapped).unwrap().raw_markdown, wrapped);
+        assert!((group.decode)(wrapped).is_err());
+        assert!((group.decode)("```json\n{\"findings\":[]}\n```")
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn test_parse_structured_json_review() {

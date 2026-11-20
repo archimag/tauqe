@@ -8,15 +8,11 @@
 //! terminal outcome is mapped back onto the storage that owns the entity
 //! instead of being guessed.
 
-use crate::workflow::turn::{ModelTurnPlanContext, TurnWorkContext, TurnWorkQueue};
-use std::path::Path;
-
-use crate::plan::storage::PlanStorage;
 use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation};
 use crate::review::prompt::apply_group_architectural_context;
-use crate::review::storage::ReviewStorage;
 use crate::review::{ReviewItem, ReviewSession, DEFAULT_REVIEW_GROUP_ID};
 use crate::workflow::implementation::StepFailure;
+use crate::workflow::turn::{ModelTurnPlanContext, TurnWorkContext, TurnWorkQueue};
 
 /// The source of work an implementation horizon is resolved from.
 ///
@@ -38,31 +34,10 @@ pub enum ExecutionScope {
 
 impl ExecutionScope {
     /// Targeted plan step or subtree, if the scope is constrained to one.
-    pub(crate) fn target_step_id(&self) -> Option<&str> {
+    pub fn target_step_id(&self) -> Option<&str> {
         match self {
             Self::Plan { step_id, .. } => step_id.as_deref(),
             Self::ReviewGroup { .. } | Self::ReviewFinding { .. } => None,
-        }
-    }
-}
-
-impl ExecutionScope {
-    /// Resolves the frame this scope executes.
-    ///
-    /// Only the horizon of a review group and the degenerate horizon of a
-    /// single finding are assembled here; a local plan is executed exactly as
-    /// it is stored. The resolution is read-only: nothing is written back, so a
-    /// frame that is never executed leaves the repositories untouched.
-    pub fn resolve(&self, repo_root: &Path) -> Result<ImplementationFrame, StepFailure> {
-        match self {
-            Self::Plan { plan_id, step_id } => resolve_plan(repo_root, plan_id, step_id.as_deref()),
-            Self::ReviewGroup {
-                review_id,
-                group_id,
-            } => resolve_group(repo_root, review_id, group_id),
-            Self::ReviewFinding { review_id, item_id } => {
-                resolve_finding(repo_root, review_id, *item_id)
-            }
         }
     }
 }
@@ -82,91 +57,76 @@ pub struct ImplementationFrame {
     findings: Vec<ReviewItem>,
 }
 
-/// Resolves a stored local plan into its execution frame.
-fn resolve_plan(
-    repo_root: &Path,
-    plan_id: &str,
-    step_id: Option<&str>,
-) -> Result<ImplementationFrame, StepFailure> {
-    let plan = PlanStorage::load_plan(repo_root, plan_id)
-        .map_err(|err| StepFailure::infrastructure(err.to_string()))?
-        .ok_or_else(|| StepFailure::infrastructure(format!("Plan '{}' not found", plan_id)))?;
-    Ok(ImplementationFrame {
-        scope: ExecutionScope::Plan {
-            plan_id: plan.id.clone(),
-            step_id: step_id.map(str::to_string),
-        },
-        plan,
-        findings: Vec::new(),
-    })
-}
+impl ImplementationFrame {
+    /// Wraps a loaded plan without changing its stored horizon.
+    pub fn from_plan(plan: Plan, step_id: Option<&str>) -> Self {
+        Self {
+            scope: ExecutionScope::Plan {
+                plan_id: plan.id.clone(),
+                step_id: step_id.map(str::to_string),
+            },
+            plan,
+            findings: Vec::new(),
+        }
+    }
 
-/// Resolves an architectural review group into its execution frame.
-///
-/// The group is the operational unit of remediation, so the frame carries the
-/// group's own horizon together with the Architect provenance it records, and
-/// renders the findings that manifest the root cause into the concept tree.
-/// Their descriptions therefore reach the context of every step the horizon
-/// executes, which is the invariant a sub-step turn relies on.
-fn resolve_group(
-    repo_root: &Path,
-    review_id: &str,
-    group_id: &str,
-) -> Result<ImplementationFrame, StepFailure> {
-    let session = load_review(repo_root, review_id)?;
-    let group = session
-        .groups
-        .iter()
-        .find(|group| group.id == group_id)
-        .cloned()
-        .ok_or_else(|| {
+    /// Resolves an architectural review group into its execution frame.
+    ///
+    /// The group is the operational unit of remediation, so the frame carries the
+    /// group's own horizon together with the Architect provenance it records, and
+    /// renders the findings that manifest the root cause into the concept tree.
+    /// Their descriptions therefore reach the context of every step the horizon
+    /// executes, which is the invariant a sub-step turn relies on.
+    pub fn from_group(session: &ReviewSession, group_id: &str) -> Result<Self, StepFailure> {
+        let group = session
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .cloned()
+            .ok_or_else(|| {
+                StepFailure::infrastructure(format!(
+                    "Review group '{}' not found in session '{}'",
+                    group_id, session.id
+                ))
+            })?;
+        let findings = group_findings(session, group_id);
+        let mut plan = Plan::from_parts(
+            session.id.clone(),
+            group.title.clone(),
+            group.description.clone(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+        // The horizon, its Architect provenance, and the step whose horizon was
+        // last reprojected belong to the group: the frame executes exactly them.
+        plan.implementation = group.implementation.clone();
+        apply_group_architectural_context(&mut plan, &group, &findings);
+        Ok(Self {
+            scope: ExecutionScope::ReviewGroup {
+                review_id: session.id.clone(),
+                group_id: group.id.clone(),
+            },
+            plan,
+            findings,
+        })
+    }
+
+    /// Resolves a single review finding into a degenerate one-step frame.
+    ///
+    /// A finding owns no horizon on disk, so its frame exists in memory only and is
+    /// never persisted: the finding itself is the single leaf step, and the files
+    /// it declares are the files that step targets.
+    pub fn from_finding(session: &ReviewSession, item_id: u32) -> Result<Self, StepFailure> {
+        let finding = session.find_item(item_id).cloned().ok_or_else(|| {
             StepFailure::infrastructure(format!(
-                "Review group '{}' not found in session '{}'",
-                group_id, review_id
+                "Review item #{} not found in session '{}'",
+                item_id, session.id
             ))
         })?;
-    let findings = group_findings(&session, group_id);
-    let mut plan = Plan::from_parts(
-        session.id.clone(),
-        group.title.clone(),
-        group.description.clone(),
-        0,
-        0,
-        Vec::new(),
-        Vec::new(),
-    );
-    // The horizon, its Architect provenance, and the step whose horizon was
-    // last reprojected belong to the group: the frame executes exactly them.
-    plan.implementation = group.implementation.clone();
-    apply_group_architectural_context(&mut plan, &group, &findings);
-    Ok(ImplementationFrame {
-        scope: ExecutionScope::ReviewGroup {
-            review_id: session.id.clone(),
-            group_id: group.id.clone(),
-        },
-        plan,
-        findings,
-    })
-}
-
-/// Resolves a single review finding into a degenerate one-step frame.
-///
-/// A finding owns no horizon on disk, so its frame exists in memory only and is
-/// never persisted: the finding itself is the single leaf step, and the files
-/// it declares are the files that step targets.
-fn resolve_finding(
-    repo_root: &Path,
-    review_id: &str,
-    item_id: u32,
-) -> Result<ImplementationFrame, StepFailure> {
-    let session = load_review(repo_root, review_id)?;
-    let finding = session.find_item(item_id).cloned().ok_or_else(|| {
-        StepFailure::infrastructure(format!(
-            "Review item #{} not found in session '{}'",
-            item_id, review_id
-        ))
-    })?;
-    Ok(degenerate_finding_frame(review_id, finding))
+        Ok(degenerate_finding_frame(&session.id, finding))
+    }
 }
 
 /// Builds the in-memory one-step frame of a single review finding.
@@ -204,15 +164,6 @@ fn degenerate_finding_frame(review_id: &str, finding: ReviewItem) -> Implementat
         plan,
         findings: vec![finding],
     }
-}
-
-/// Loads a stored review session or reports it as an infrastructure failure.
-fn load_review(repo_root: &Path, review_id: &str) -> Result<ReviewSession, StepFailure> {
-    ReviewStorage::load_review(repo_root, review_id)
-        .map_err(|err| StepFailure::infrastructure(err.to_string()))?
-        .ok_or_else(|| {
-            StepFailure::infrastructure(format!("Review session '{}' not found", review_id))
-        })
 }
 
 /// Resolves every finding that belongs to `group_id`, in stored order.
@@ -320,10 +271,54 @@ pub fn classify_scope_stall(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::storage::PlanStorage;
     use crate::plan::PlanImplementation;
+    use crate::review::storage::ReviewStorage;
     use crate::review::ReviewGroup;
     use crate::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn resolve_fixture(
+        scope: &ExecutionScope,
+        root: &Path,
+    ) -> Result<ImplementationFrame, StepFailure> {
+        match scope {
+            ExecutionScope::Plan { plan_id, step_id } => {
+                let plan = PlanStorage::load_plan(root, plan_id)
+                    .map_err(|err| StepFailure::infrastructure(err.to_string()))?
+                    .ok_or_else(|| {
+                        StepFailure::infrastructure(format!("Plan '{}' not found", plan_id))
+                    })?;
+                Ok(ImplementationFrame::from_plan(plan, step_id.as_deref()))
+            }
+            ExecutionScope::ReviewGroup {
+                review_id,
+                group_id,
+            } => {
+                let session = ReviewStorage::load_review(root, review_id)
+                    .map_err(|err| StepFailure::infrastructure(err.to_string()))?
+                    .ok_or_else(|| {
+                        StepFailure::infrastructure(format!(
+                            "Review session '{}' not found",
+                            review_id
+                        ))
+                    })?;
+                ImplementationFrame::from_group(&session, group_id)
+            }
+            ExecutionScope::ReviewFinding { review_id, item_id } => {
+                let session = ReviewStorage::load_review(root, review_id)
+                    .map_err(|err| StepFailure::infrastructure(err.to_string()))?
+                    .ok_or_else(|| {
+                        StepFailure::infrastructure(format!(
+                            "Review session '{}' not found",
+                            review_id
+                        ))
+                    })?;
+                ImplementationFrame::from_finding(&session, *item_id)
+            }
+        }
+    }
 
     /// Builds a finding that declares one editable and one protected file.
     fn finding(id: u32, title: &str, body: &str) -> ReviewItem {
@@ -403,7 +398,7 @@ mod tests {
             plan_id: "frame-plan".to_string(),
             step_id: None,
         };
-        let frame = scope.resolve(dir.path()).expect("the stored plan resolves");
+        let frame = resolve_fixture(&scope, dir.path()).expect("the stored plan resolves");
 
         assert_eq!(frame.plan.id, "frame-plan");
         assert_eq!(frame.plan.implementation.items.len(), 1);
@@ -423,9 +418,7 @@ mod tests {
             review_id: "rev-frame".to_string(),
             group_id: "arch-1".to_string(),
         };
-        let frame = scope
-            .resolve(dir.path())
-            .expect("the stored group resolves");
+        let frame = resolve_fixture(&scope, dir.path()).expect("the stored group resolves");
 
         assert_eq!(frame.plan.id, "rev-frame");
         assert_eq!(frame.plan.title, "Unified error handling");
@@ -461,9 +454,7 @@ mod tests {
             review_id: "rev-frame".to_string(),
             item_id: 7,
         };
-        let frame = scope
-            .resolve(dir.path())
-            .expect("the stored finding resolves");
+        let frame = resolve_fixture(&scope, dir.path()).expect("the stored finding resolves");
 
         assert_eq!(frame.plan.id, "rev-frame");
         assert_eq!(frame.plan.title, "Guard the parser");
@@ -503,7 +494,7 @@ mod tests {
         };
 
         for scope in [plan, group, finding] {
-            let failure = scope.resolve(dir.path()).expect_err("nothing is stored");
+            let failure = resolve_fixture(&scope, dir.path()).expect_err("nothing is stored");
             assert!(!failure.is_domain());
             assert!(!failure.is_unreverted());
         }

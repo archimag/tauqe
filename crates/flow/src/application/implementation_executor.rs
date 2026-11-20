@@ -11,27 +11,25 @@
 //! request only declares the files the step targets so the host can preload
 //! them.
 
+use crate::api::Application;
+use crate::application::implementation_host::ImplementationHost;
 use std::path::Path;
 
-use crate::config::ModelsConfig;
-use crate::models::{ModelEntry, ModelRole, ModelSelection, ReasoningEffort};
-use crate::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
-use crate::plan::storage::PlanStorage;
-use crate::plan::{PlanItem, PlanItemStatus, PlanScopeEvaluation};
-use crate::providers::{
+use async_trait::async_trait;
+use tauqe_core::config::ModelsConfig;
+use tauqe_core::models::{ModelEntry, ModelRole, ModelSelection, ReasoningEffort};
+use tauqe_core::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
+use tauqe_core::plan::{PlanItem, PlanItemStatus, PlanScopeEvaluation};
+use tauqe_core::providers::{
     format_session_id, StreamEvent, SESSION_PREFIX_PLAN, SESSION_PREFIX_REVIEW,
 };
-use crate::review::storage::ReviewStorage;
-use crate::review::IssueStatus;
-use crate::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
-use crate::workflow::implementation::{
-    classify_scope_stall, ExecutionScope, ImplementationFrame, ImplementationHost, StepFailure,
-    StepTurnRequest, StepTurnResult,
+use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
+use tauqe_core::workflow::implementation::{
+    classify_scope_stall, ExecutionScope, ImplementationFrame, LeafTransition,
+    LeafTransitionResult, StepFailure, StepTurnRequest, StepTurnResult,
 };
-use crate::workflow::turn::TurnWorkItem;
-use crate::workflow::turn::TurnWorkQueue;
-use crate::workflow::EditProtocolKind;
-use async_trait::async_trait;
+use tauqe_core::workflow::turn::{TurnWorkItem, TurnWorkQueue};
+use tauqe_core::workflow::EditProtocolKind;
 use tokio::sync::{mpsc, watch};
 
 /// Configuration of one implementation run.
@@ -43,21 +41,21 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone)]
 pub struct ImplementationRunConfig {
     /// Coder ladder and the automatic escalation policy of the run.
-    pub(crate) models: ModelsConfig,
+    pub models: ModelsConfig,
     /// Protocol that shapes the step prompts and their control tags.
-    pub(crate) protocol: EditProtocolKind,
+    pub protocol: EditProtocolKind,
     /// Turn marker bound to the tagged control channel.
-    pub(crate) marker: Option<String>,
+    pub marker: Option<String>,
     /// Coder selection the run starts from.
-    pub(crate) selection: Option<ModelSelection>,
+    pub selection: Option<ModelSelection>,
     /// Additional instructions of the run, forwarded to every step turn.
-    pub(crate) instructions: Option<String>,
+    pub instructions: Option<String>,
     /// Ordered identifiers of the scheduled leaves, the running one included.
     ///
     /// The queue drives the work marker and the `[i/N]` position a client
     /// renders. A step the queue does not list is appended to it, so the
     /// running leaf is always declared and its position is always exact.
-    pub(crate) queue: Vec<String>,
+    pub queue: Vec<String>,
 }
 
 /// Executes the leaves of one implementation horizon as bounded step turns.
@@ -68,21 +66,24 @@ pub struct ImplementationRunConfig {
 pub struct PlanImplementationStepExecutor<'a> {
     repo_root: &'a Path,
     scope: ExecutionScope,
+    application: &'a Application,
     host: &'a dyn ImplementationHost,
     config: ImplementationRunConfig,
 }
 
 impl<'a> PlanImplementationStepExecutor<'a> {
     /// Creates an executor for the horizon `scope` resolves to.
-    pub(crate) fn new(
+    pub fn new(
         repo_root: &'a Path,
         scope: ExecutionScope,
+        application: &'a Application,
         host: &'a dyn ImplementationHost,
         config: ImplementationRunConfig,
     ) -> Self {
         Self {
             repo_root,
             scope,
+            application,
             host,
             config,
         }
@@ -112,7 +113,11 @@ impl PlanImplementationStepExecutor<'_> {
         // The horizon is re-resolved from the storage that owns it, so the
         // executor never decides a lifecycle transition from a stale copy of
         // the step graph.
-        let mut frame = match self.scope.resolve(self.repo_root) {
+        let mut frame = match self
+            .application
+            .implementation_frame(&self.scope, self.repo_root)
+            .await
+        {
             Ok(frame) => frame,
             Err(failure) => return BatchStepOutcome::failed(failure.into_reason()),
         };
@@ -175,8 +180,9 @@ impl PlanImplementationStepExecutor<'_> {
             return BatchStepOutcome::cancelled();
         }
 
-        if let Err(failure) =
-            self.set_status(&mut frame, &leaf.id, PlanItemStatus::InProgress, None, None)
+        if let Err(failure) = self
+            .set_status(&mut frame, &leaf.id, PlanItemStatus::InProgress, None, None)
+            .await
         {
             return BatchStepOutcome::failed(failure.into_reason());
         }
@@ -221,7 +227,7 @@ impl PlanImplementationStepExecutor<'_> {
         ) {
             Ok(prompt) => prompt,
             Err(err) => {
-                self.reset(&mut frame, &leaf.id);
+                self.reset(&mut frame, &leaf.id).await;
                 return BatchStepOutcome::failed(err);
             }
         };
@@ -232,7 +238,7 @@ impl PlanImplementationStepExecutor<'_> {
             // cancel observed here ends the step before another turn is
             // requested and returns the step to TODO.
             if *cancel_rx.borrow() {
-                self.reset(&mut frame, &leaf.id);
+                self.reset(&mut frame, &leaf.id).await;
                 return BatchStepOutcome::cancelled();
             }
 
@@ -258,13 +264,16 @@ impl PlanImplementationStepExecutor<'_> {
                     // it is written by the very transition that marks the step
                     // `Done`: a finished step never exists without the change set
                     // that produced it.
-                    if let Err(failure) = self.set_status(
-                        &mut frame,
-                        &leaf.id,
-                        PlanItemStatus::Done,
-                        None,
-                        commit.as_deref(),
-                    ) {
+                    if let Err(failure) = self
+                        .set_status(
+                            &mut frame,
+                            &leaf.id,
+                            PlanItemStatus::Done,
+                            None,
+                            commit.as_deref(),
+                        )
+                        .await
+                    {
                         return BatchStepOutcome::failed(failure.into_reason());
                     }
                     tracing::info!(
@@ -280,13 +289,16 @@ impl PlanImplementationStepExecutor<'_> {
                     // let the next queue schedule the same step again, so a
                     // failed write is reported instead of a block nobody can
                     // observe.
-                    if let Err(failure) = self.set_status(
-                        &mut frame,
-                        &leaf.id,
-                        PlanItemStatus::Blocked,
-                        Some(reason.as_str()),
-                        None,
-                    ) {
+                    if let Err(failure) = self
+                        .set_status(
+                            &mut frame,
+                            &leaf.id,
+                            PlanItemStatus::Blocked,
+                            Some(reason.as_str()),
+                            None,
+                        )
+                        .await
+                    {
                         return BatchStepOutcome::failed(failure.into_reason());
                     }
                     tracing::warn!(
@@ -297,7 +309,7 @@ impl PlanImplementationStepExecutor<'_> {
                     return BatchStepOutcome::blocked(reason);
                 }
                 StepTurnResult::Abort(message) => {
-                    self.reset(&mut frame, &leaf.id);
+                    self.reset(&mut frame, &leaf.id).await;
                     tracing::warn!(
                         step_id = leaf.id.as_str(),
                         message = message.as_str(),
@@ -306,12 +318,12 @@ impl PlanImplementationStepExecutor<'_> {
                     return BatchStepOutcome::failed(message);
                 }
                 StepTurnResult::Cancelled => {
-                    self.reset(&mut frame, &leaf.id);
+                    self.reset(&mut frame, &leaf.id).await;
                     return BatchStepOutcome::cancelled();
                 }
                 StepTurnResult::Failed(failure) => {
                     if *cancel_rx.borrow() {
-                        self.reset(&mut frame, &leaf.id);
+                        self.reset(&mut frame, &leaf.id).await;
                         return BatchStepOutcome::cancelled();
                     }
                     // A failed change set the host could not roll back leaves
@@ -319,7 +331,7 @@ impl PlanImplementationStepExecutor<'_> {
                     // attempt. Retrying would build the next attempt on lines
                     // nobody verified, so the failure ends the step here.
                     if failure.is_unreverted() {
-                        self.reset(&mut frame, &leaf.id);
+                        self.reset(&mut frame, &leaf.id).await;
                         tracing::warn!(
                             step_id = leaf.id.as_str(),
                             reason = failure.reason(),
@@ -331,7 +343,7 @@ impl PlanImplementationStepExecutor<'_> {
                     // tier attempt: a stronger model would meet the same broken
                     // transport, a missing credential, or the same cancellation.
                     if !failure.is_domain() {
-                        self.reset(&mut frame, &leaf.id);
+                        self.reset(&mut frame, &leaf.id).await;
                         tracing::warn!(
                             step_id = leaf.id.as_str(),
                             reason = failure.reason(),
@@ -353,7 +365,7 @@ impl PlanImplementationStepExecutor<'_> {
                         };
                         match next_rung {
                             None => {
-                                self.reset(&mut frame, &leaf.id);
+                                self.reset(&mut frame, &leaf.id).await;
                                 let message = if models.auto_level_up {
                                     saturation_message(models, &selection, &leaf, failure.reason())
                                 } else {
@@ -477,27 +489,8 @@ impl PlanImplementationStepExecutor<'_> {
         }
     }
 
-    /// Persists one step status through the storage that owns the horizon.
-    ///
-    /// The horizon is the single source of truth for its steps, so a lifecycle
-    /// transition never lives in the executor alone: a plan step is written by
-    /// [`PlanStorage::update_item`], a review group step is written as the whole
-    /// horizon of that group by [`ReviewStorage::update_group_subplan`], and a
-    /// degenerate single-finding run is written onto the finding itself by
-    /// [`ReviewStorage::update_session_item_status`].
-    ///
-    /// Only the lifecycle the run owns reaches the finding: taking the step
-    /// marks it `InProgress`, a reset returns it to `Todo`, and completing it
-    /// records the commit that carried the step. The verdict is not written
-    /// here: the finding is closed as `Fixed` or `Skipped` exactly once by the
-    /// pipeline settlement, which is the single writer of a verdict.
-    /// Every storage entry point offloads its own file I/O through the blocking
-    /// pool, so the executor awaits the step loop without blocking a worker.
-    ///
-    /// `commit` is the identifier of the Git commit that carried the step, and it
-    /// is written by the same transition that finishes the step: a completed step
-    /// never exists without the pointer to the change set it produced.
-    fn set_status(
+    /// Adopts the horizon only after the workflow owner has completed its write.
+    async fn set_status(
         &self,
         frame: &mut ImplementationFrame,
         step_id: &str,
@@ -505,143 +498,32 @@ impl PlanImplementationStepExecutor<'_> {
         blocked_reason: Option<&str>,
         commit: Option<&str>,
     ) -> Result<(), StepFailure> {
-        match frame.scope.clone() {
-            ExecutionScope::Plan { plan_id, .. } => {
-                let updated = PlanStorage::update_item(
-                    self.repo_root,
-                    &plan_id,
-                    step_id,
-                    Some(status),
-                    blocked_reason,
-                    commit,
-                )
-                .map_err(|err| {
-                    StepFailure::infrastructure(format!(
-                        "Failed to persist the status of step '{}': {}",
-                        step_id, err
-                    ))
-                })?;
-                let Some(plan) = updated else {
-                    return Err(StepFailure::infrastructure(format!(
-                        "Plan '{}' does not store step '{}'",
-                        plan_id, step_id
-                    )));
-                };
-                frame.plan = plan;
-                Ok(())
-            }
-            ExecutionScope::ReviewGroup {
-                review_id,
-                group_id,
-            } => {
-                let mut items = frame.plan.implementation.items.clone();
-                if !set_leaf_state(&mut items, step_id, status, blocked_reason, commit) {
-                    return Err(StepFailure::infrastructure(format!(
-                        "Review group '{}' of session '{}' does not store step '{}'",
-                        group_id, review_id, step_id
-                    )));
-                }
-                let updated = ReviewStorage::update_group_subplan(
-                    self.repo_root,
-                    &review_id,
-                    &group_id,
-                    items,
-                )
-                .map_err(|err| {
-                    StepFailure::infrastructure(format!(
-                        "Failed to persist the status of step '{}': {}",
-                        step_id, err
-                    ))
-                })?;
-                let Some(group) = updated else {
-                    return Err(StepFailure::infrastructure(format!(
-                        "Review group '{}' of session '{}' is not stored",
-                        group_id, review_id
-                    )));
-                };
-                frame.plan.implementation = group.implementation;
-                Ok(())
-            }
-            // A single finding executes as a degenerate in-memory horizon, so it
-            // owns no persisted step graph: the lifecycle of the run is written
-            // onto the finding itself. A completed step records the commit that
-            // carried it, because the verdict the settlement states describes the
-            // finding and never the change set that resolved it.
-            ExecutionScope::ReviewFinding { review_id, item_id } => {
-                let issue_status = match status {
-                    PlanItemStatus::InProgress => IssueStatus::InProgress,
-                    PlanItemStatus::Todo => IssueStatus::Todo,
-                    // The commit is recorded by the transition that completes the
-                    // step; the verdict that closes the finding belongs to the
-                    // pipeline settlement, so no status is written here.
-                    PlanItemStatus::Done => {
-                        return self.record_finding_commit(&review_id, item_id, commit);
-                    }
-                    PlanItemStatus::Blocked
-                    | PlanItemStatus::Discussion
-                    | PlanItemStatus::Cancelled => return Ok(()),
-                };
-                let updated = ReviewStorage::update_session_item_status(
-                    self.repo_root,
-                    &review_id,
-                    item_id,
-                    issue_status,
-                )
-                .map_err(|err| {
-                    StepFailure::infrastructure(format!(
-                        "Failed to persist the status of review finding #{}: {}",
-                        item_id, err
-                    ))
-                })?;
-                if updated.is_none() {
-                    return Err(StepFailure::infrastructure(format!(
-                        "Review session '{}' does not store finding #{}",
-                        review_id, item_id
-                    )));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Records the commit of a completed single-finding step on the finding.
-    ///
-    /// The commit is the durable pointer of the change set the step produced, so
-    /// it is written by the very transition that completes the step, exactly as a
-    /// plan step stores it. A step that produced no commit records nothing. The
-    /// verdict of the finding is never written here: the pipeline settlement
-    /// states it exactly once.
-    fn record_finding_commit(
-        &self,
-        review_id: &str,
-        item_id: u32,
-        commit: Option<&str>,
-    ) -> Result<(), StepFailure> {
-        let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty()) else {
-            return Ok(());
-        };
-        let updated =
-            ReviewStorage::update_session_item(self.repo_root, review_id, item_id, |issue| {
-                issue.commit = Some(commit.to_string());
-            })
-            .map_err(|err| {
-                StepFailure::infrastructure(format!(
-                    "Failed to persist the commit of review finding #{}: {}",
-                    item_id, err
-                ))
-            })?;
-        if updated.is_none() {
-            return Err(StepFailure::infrastructure(format!(
-                "Review session '{}' does not store finding #{}",
-                review_id, item_id
-            )));
+        let result = self
+            .application
+            .persist_implementation_leaf(
+                self.repo_root,
+                LeafTransition {
+                    scope: frame.scope.clone(),
+                    step_id: step_id.to_string(),
+                    status,
+                    blocked_reason: blocked_reason.map(str::to_string),
+                    commit: commit.map(str::to_string),
+                    group_items: frame.plan.implementation.items.clone(),
+                },
+            )
+            .await?;
+        if let LeafTransitionResult::Horizon(implementation) = result {
+            frame.plan.implementation = implementation;
         }
         Ok(())
     }
 
     /// Returns a step to TODO after a turn that produced no durable progress.
-    fn reset(&self, frame: &mut ImplementationFrame, step_id: &str) {
-        if let Err(failure) = self.set_status(frame, step_id, PlanItemStatus::Todo, None, None) {
+    async fn reset(&self, frame: &mut ImplementationFrame, step_id: &str) {
+        if let Err(failure) = self
+            .set_status(frame, step_id, PlanItemStatus::Todo, None, None)
+            .await
+        {
             tracing::warn!(
                 step_id = step_id,
                 error = failure.reason(),
@@ -649,51 +531,6 @@ impl PlanImplementationStepExecutor<'_> {
             );
         }
     }
-}
-
-/// Sets the status, the commit, and the blocker report of one leaf inside a horizon tree.
-///
-/// The traversal follows the protocol identity rule: identifiers compare
-/// case-insensitively after trimming, so a step is reached by the same spelling
-/// the horizon resolves. A container is never a target, because only a leaf
-/// carries an authoritative status.
-fn set_leaf_state(
-    items: &mut [PlanItem],
-    step_id: &str,
-    status: PlanItemStatus,
-    blocked_reason: Option<&str>,
-    commit: Option<&str>,
-) -> bool {
-    for item in items {
-        if item.id.trim().eq_ignore_ascii_case(step_id.trim()) {
-            if !item.is_leaf() {
-                return false;
-            }
-            item.status = status;
-            // The commit identifier belongs to the completed record of the step:
-            // it is stored once, together with the transition that finishes the
-            // step, and is never restated by a later one.
-            if let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty()) {
-                item.commit = Some(commit.to_string());
-            }
-            // The report belongs to the BLOCKED state alone: leaving it drops the
-            // stale diagnostic, so a resumed step never keeps describing a
-            // blocker that no longer holds.
-            item.blocked_reason = if status == PlanItemStatus::Blocked {
-                blocked_reason
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty())
-                    .map(str::to_string)
-            } else {
-                None
-            };
-            return true;
-        }
-        if set_leaf_state(&mut item.children, step_id, status, blocked_reason, commit) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Diagnostic reported when automatic escalation cannot advance beyond the rung
@@ -738,30 +575,33 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
 
-    use crate::config::ModelsConfig;
-    use crate::models::{
+    use super::{ImplementationRunConfig, PlanImplementationStepExecutor};
+    use crate::api::Application;
+    use crate::application::implementation_host::ImplementationHost;
+    use async_trait::async_trait;
+    use tauqe_core::config::ModelsConfig;
+    use tauqe_core::models::{
         ArchitectTier, ModelEntry, ModelRef, ModelRole, ModelSelection, ReasoningEffort,
     };
-    use crate::plan::storage::PlanStorage;
-    use crate::plan::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
-    use crate::providers::StreamEvent;
-    use crate::review::storage::ReviewStorage;
-    use crate::review::{IssueStatus, IssueType, ReviewIssue};
-    use crate::review::{ReviewGroup, ReviewItem, ReviewSession};
-    use crate::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepStatus};
-    use crate::workflow::implementation::{
-        ExecutionScope, ImplementationHost, ImplementationRunConfig,
-        PlanImplementationStepExecutor, RefinementRequest, RefinementResult, StepFailure,
-        StepTurnRequest, StepTurnResult,
+    use tauqe_core::plan::storage::PlanStorage;
+    use tauqe_core::plan::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
+    use tauqe_core::providers::StreamEvent;
+    use tauqe_core::review::storage::ReviewStorage;
+    use tauqe_core::review::{IssueStatus, IssueType, ReviewIssue};
+    use tauqe_core::review::{ReviewGroup, ReviewItem, ReviewSession};
+    use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepStatus};
+    use tauqe_core::workflow::implementation::{
+        ExecutionScope, RefinementRequest, RefinementResult, StepFailure, StepTurnRequest,
+        StepTurnResult,
     };
-    use crate::workflow::EditProtocolKind;
-    use async_trait::async_trait;
+    use tauqe_core::workflow::EditProtocolKind;
     use tempfile::tempdir;
     use tokio::sync::{mpsc, watch};
 
     /// Host that replays a scripted sequence of step results and records every
     /// request it was asked to run.
     struct ScriptedHost {
+        application: Application,
         script: Mutex<VecDeque<StepTurnResult>>,
         requests: Mutex<Vec<StepTurnRequest>>,
     }
@@ -769,9 +609,19 @@ mod tests {
     impl ScriptedHost {
         fn new(script: Vec<StepTurnResult>) -> Self {
             Self {
+                application: Application::default(),
                 script: Mutex::new(script.into()),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn executor<'a>(
+            &'a self,
+            root: &'a Path,
+            scope: ExecutionScope,
+            config: ImplementationRunConfig,
+        ) -> PlanImplementationStepExecutor<'a> {
+            PlanImplementationStepExecutor::new(root, scope, &self.application, self, config)
         }
 
         fn requests(&self) -> MutexGuard<'_, Vec<StepTurnRequest>> {
@@ -979,8 +829,7 @@ mod tests {
             plan_id: "step-horizon".to_string(),
             step_id: None,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
+        let mut executor = host.executor(dir.path(), scope, run_config("1"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -988,7 +837,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
@@ -1033,8 +882,7 @@ mod tests {
             plan_id: "step-horizon".to_string(),
             step_id: None,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
+        let mut executor = host.executor(dir.path(), scope, run_config("1"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1075,7 +923,7 @@ mod tests {
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1083,7 +931,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         let requests = host.requests();
         assert_eq!(requests.len(), 2);
         // The promoted rung travels as the whole `(model, effort)` pair, so the
@@ -1123,7 +971,7 @@ mod tests {
         };
         let mut config = run_config("1");
         config.models = single_model_ladder();
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1131,7 +979,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         let requests = host.requests();
         assert_eq!(requests.len(), 2);
         // The promoted rung addresses the exact ladder entry the run entered:
@@ -1167,7 +1015,7 @@ mod tests {
         };
         let mut config = run_config("1");
         config.models = single_model_ladder();
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, mut stream_rx, cancel_rx) = channels_with_events();
 
         let outcome = executor
@@ -1175,7 +1023,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         match stream_rx.try_recv() {
             Ok(StreamEvent::TierEscalated {
                 tier,
@@ -1209,7 +1057,7 @@ mod tests {
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1246,7 +1094,7 @@ mod tests {
         config.selection = Some(ModelSelection::Specific(ModelRef::openrouter(
             "reserved/model",
         )));
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1286,7 +1134,7 @@ mod tests {
         config.selection = Some(ModelSelection::Specific(ModelRef::openrouter(
             "reserved/model",
         )));
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1318,8 +1166,7 @@ mod tests {
             review_id: "review-horizon".to_string(),
             group_id: "arch-1".to_string(),
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("s-1"));
+        let mut executor = host.executor(dir.path(), scope, run_config("s-1"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1327,7 +1174,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
             .unwrap()
             .unwrap();
@@ -1358,8 +1205,7 @@ mod tests {
             review_id: "review-horizon".to_string(),
             item_id: 7,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("7"));
+        let mut executor = host.executor(dir.path(), scope, run_config("7"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1367,7 +1213,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         // The run owns the lifecycle of the finding, so the step it completed
         // leaves the finding InProgress; the verdict is settled by the pipeline.
         let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
@@ -1391,8 +1237,7 @@ mod tests {
             review_id: "review-horizon".to_string(),
             item_id: 7,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("7"));
+        let mut executor = host.executor(dir.path(), scope, run_config("7"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1400,7 +1245,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.is_success());
+        assert_eq!(outcome.status, BatchStepStatus::Succeeded);
         // The commit belongs to the completed record of the step, so the finding
         // points at the change set that resolved it even before the settlement
         // states the verdict.
@@ -1431,7 +1276,7 @@ mod tests {
             attempts: Some(1),
             level_up: None,
         }]);
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1455,8 +1300,7 @@ mod tests {
             review_id: "review-horizon".to_string(),
             item_id: 7,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("7"));
+        let mut executor = host.executor(dir.path(), scope, run_config("7"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1482,8 +1326,7 @@ mod tests {
             plan_id: "step-horizon".to_string(),
             step_id: None,
         };
-        let mut executor =
-            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
+        let mut executor = host.executor(dir.path(), scope, run_config("1"));
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1515,7 +1358,7 @@ mod tests {
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
-        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let mut executor = host.executor(dir.path(), scope, config);
         let (stream_tx, cancel_rx) = channels();
 
         let outcome = executor
@@ -1537,7 +1380,7 @@ mod tests {
 
     #[test]
     fn saturation_message_distinguishes_the_excluded_rung_from_its_sibling() {
-        use crate::models::ReasoningEffort;
+        use tauqe_core::models::ReasoningEffort;
 
         let shared = ModelRef::openrouter("shared/model");
         let mut excluded = ModelEntry::new(shared.clone(), Some(ReasoningEffort::Max));

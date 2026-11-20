@@ -257,6 +257,8 @@ fn section_hint(text: &str, lines: &[LineSpan], before_line: usize) -> Option<St
 /// move registration, and full-content overwrite. Keeping this logic in one
 /// place guarantees the streaming UI status never diverges between protocols.
 pub(crate) struct StagingSimulator {
+    /// Seeded contents at the start of every attempt; moves never relocate this base.
+    base_contents: HashMap<String, String>,
     staged_contents: HashMap<String, String>,
     /// The content every file had before the change set touched it.
     ///
@@ -264,6 +266,8 @@ pub(crate) struct StagingSimulator {
     /// looked before the change set, so a batch of anchored ranges resolves
     /// against this snapshot while `staged_contents` keeps the cumulative result.
     original_contents: HashMap<String, String>,
+    /// Disk sources read during an attempt, kept separate from staged writes.
+    disk_contents: HashMap<String, String>,
     excluded_disk_sources: HashSet<String>,
     repo_root: PathBuf,
 }
@@ -273,7 +277,9 @@ impl StagingSimulator {
         Self {
             excluded_disk_sources: HashSet::new(),
             original_contents: staged_contents.clone(),
+            base_contents: staged_contents.clone(),
             staged_contents,
+            disk_contents: HashMap::new(),
             repo_root,
         }
     }
@@ -284,7 +290,9 @@ impl StagingSimulator {
     /// they also become the snapshot anchored ranges are resolved against.
     fn set_staged_contents(&mut self, staged_contents: HashMap<String, String>) {
         self.original_contents = staged_contents.clone();
+        self.base_contents = staged_contents.clone();
         self.staged_contents = staged_contents;
+        self.disk_contents.clear();
     }
 
     /// Restores the staged contents to the snapshot the change set starts from.
@@ -294,7 +302,8 @@ impl StagingSimulator {
     /// attempt instead of applying the replacement on top of them. The snapshot
     /// itself is preserved, because the anchors still name the lines it held.
     fn reset(&mut self) {
-        self.staged_contents = self.original_contents.clone();
+        self.staged_contents = self.base_contents.clone();
+        self.original_contents = self.base_contents.clone();
     }
 
     /// Returns the content a file had before the change set touched it.
@@ -306,9 +315,26 @@ impl StagingSimulator {
         if let Some(content) = self.original_contents.get(path) {
             return Ok(content.clone());
         }
-        let content = self.current_content(path)?;
+        let content = self.source_content(path)?;
         self.original_contents
             .insert(path.to_string(), content.clone());
+        Ok(content)
+    }
+
+    /// Reads an unstaged source once for later attempts without caching staged writes.
+    fn source_content(&mut self, path: &str) -> Result<String, String> {
+        if let Some(content) = self.staged_contents.get(path) {
+            return Ok(content.clone());
+        }
+        let resolved = resolve_preview_read_path(&self.repo_root, path)?;
+        if self.excluded_disk_sources.contains(&resolved) {
+            return Err(format!("No current text for '{path}'"));
+        }
+        if let Some(content) = self.disk_contents.get(&resolved) {
+            return Ok(content.clone());
+        }
+        let content = read_repository_source(&self.repo_root, path)?;
+        self.disk_contents.insert(resolved, content.clone());
         Ok(content)
     }
     /// Applies one batch of anchored ranges against the original snapshot.
@@ -351,12 +377,12 @@ impl StagingSimulator {
         if let Some(content) = self.staged_contents.get(path) {
             return Ok(content.clone());
         }
-        if !self.excluded_disk_sources.is_empty()
-            && self
-                .excluded_disk_sources
-                .contains(&resolve_preview_read_path(&self.repo_root, path)?)
-        {
+        let resolved = resolve_preview_read_path(&self.repo_root, path)?;
+        if self.excluded_disk_sources.contains(&resolved) {
             return Err(format!("No current text for '{path}'"));
+        }
+        if let Some(content) = self.disk_contents.get(&resolved) {
+            return Ok(content.clone());
         }
         read_repository_source(&self.repo_root, path)
     }
@@ -387,7 +413,7 @@ impl StagingSimulator {
             };
             return Err(rejection.to_string());
         }
-        let current_content = self.current_content(path)?;
+        let current_content = self.source_content(path)?;
         let updated = crate::edits::apply_replace(&current_content, old_text, new_text, path)
             .map_err(|err| err.to_string())?;
         let coordinates = HunkCoordinates::replacement(&current_content, old_text, new_text);
@@ -407,7 +433,7 @@ impl StagingSimulator {
         if let Some(content) = self.staged_contents.remove(from) {
             self.staged_contents.insert(to.to_string(), content);
         } else {
-            match self.current_content(from) {
+            match self.source_content(from) {
                 Ok(content) => {
                     self.staged_contents.insert(to.to_string(), content);
                 }

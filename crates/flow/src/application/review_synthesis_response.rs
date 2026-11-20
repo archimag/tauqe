@@ -1,10 +1,10 @@
-//! Completion classification for a single-audit review stream.
+//! Completion classification for a typed single-audit result.
 
-use tauqe_core::providers::StreamEvent;
-use tauqe_core::review::parser::ReviewFindingsOutput;
-use tauqe_core::review::stream::{ReviewStream, ReviewStreamError, ReviewStreamUpdate};
+use crate::application::infrastructure::structured_task::StructuredTaskError;
+use tauqe_core::control::structured::StructuredError;
+use tauqe_core::review::parser::SingleReviewOutput;
 use tauqe_core::review::synthesis::{
-    EmptyReviewResponse, ReviewSynthesisMetadata, ReviewSynthesisResponse,
+    materialize_review, EmptyReviewResponse, ReviewSynthesisMetadata,
 };
 use tauqe_core::review::ReviewSession;
 
@@ -18,37 +18,59 @@ pub enum ReviewSynthesisCompletionError {
     EmptyResponse(#[from] EmptyReviewResponse),
 }
 
-impl ReviewSynthesisCompletionError {
-    pub fn requires_abort(&self) -> bool {
-        matches!(self, Self::Cancelled | Self::Provider(_))
-    }
-}
-
-#[derive(Default)]
-pub struct ReviewSynthesisStream {
-    stream: ReviewStream<ReviewFindingsOutput>,
-}
+pub struct ReviewSynthesisStream;
 
 impl ReviewSynthesisStream {
-    pub fn observe(&mut self, event: StreamEvent) -> ReviewStreamUpdate {
-        self.stream.observe(event)
-    }
-
-    /// Called after usage publication. Empty output retains its detach policy.
+    /// Interpret the supervised request only after its usage has been published.
     pub fn finish(
-        self,
+        result: Result<SingleReviewOutput, StructuredTaskError>,
         metadata: ReviewSynthesisMetadata,
         cancelled: bool,
     ) -> Result<ReviewSession, ReviewSynthesisCompletionError> {
-        let filter = self.stream.finish(cancelled).map_err(|error| match error {
-            ReviewStreamError::Cancelled => ReviewSynthesisCompletionError::Cancelled,
-            ReviewStreamError::Provider(message) => {
-                ReviewSynthesisCompletionError::Provider(message)
+        if cancelled {
+            return Err(ReviewSynthesisCompletionError::Cancelled);
+        }
+        let output = match result {
+            Ok(output) => output,
+            Err(
+                StructuredTaskError::Cancelled
+                | StructuredTaskError::Request(StructuredError::Cancelled),
+            ) => {
+                return Err(ReviewSynthesisCompletionError::Cancelled);
             }
-        })?;
-        ReviewSynthesisResponse::from_filter(filter)
-            .finish(metadata)
-            .map_err(Into::into)
+            Err(StructuredTaskError::Request(StructuredError::Empty)) => {
+                return Err(EmptyReviewResponse.into());
+            }
+            Err(StructuredTaskError::Request(StructuredError::Decode(message)))
+                if message == "Model returned an empty review" =>
+            {
+                return Err(EmptyReviewResponse.into());
+            }
+            Err(
+                StructuredTaskError::Stream(message)
+                | StructuredTaskError::Task(message)
+                | StructuredTaskError::Request(StructuredError::Failed(message))
+                | StructuredTaskError::Request(StructuredError::Decode(message)),
+            ) => {
+                return Err(ReviewSynthesisCompletionError::Provider(message));
+            }
+            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
+                return Err(ReviewSynthesisCompletionError::Provider(
+                    "Structured request closed without Done".into(),
+                ));
+            }
+            Err(StructuredTaskError::ForeignOperation) => {
+                return Err(ReviewSynthesisCompletionError::Provider(
+                    "review synthesis requires an active operation for this session".into(),
+                ));
+            }
+            Err(StructuredTaskError::Orphaned) => {
+                return Err(ReviewSynthesisCompletionError::Provider(
+                    "review synthesis task did not stop within its exit deadline".into(),
+                ));
+            }
+        };
+        Ok(materialize_review(metadata, output))
     }
 }
 
@@ -56,7 +78,6 @@ impl ReviewSynthesisStream {
 mod tests {
     use super::*;
     use tauqe_core::models::ModelRef;
-    use tauqe_core::providers::ModelUsageInfo;
 
     fn metadata() -> ReviewSynthesisMetadata {
         ReviewSynthesisMetadata {
@@ -69,97 +90,57 @@ mod tests {
     }
 
     #[test]
-    fn retry_discards_partial_json_and_keeps_each_usage_report_visible() {
-        let mut response = ReviewSynthesisStream::default();
-        response.observe(StreamEvent::TextDelta("{\"summary\":\"abandoned".into()));
-        let mut tokens = 0;
-        if let ReviewStreamUpdate::Usage(usage) =
-            response.observe(StreamEvent::Usage(ModelUsageInfo {
-                total_tokens: 11,
-                ..Default::default()
-            }))
-        {
-            tokens += usage.total_tokens;
-        }
-        assert!(matches!(
-            response.observe(StreamEvent::ResetStream),
-            ReviewStreamUpdate::Reset
-        ));
+    fn typed_output_preserves_provider_text_and_review_identity() {
         let raw = serde_json::json!({"summary": "Fresh verdict", "title": "Audit", "findings": []})
             .to_string();
-        assert!(
-            matches!(response.observe(StreamEvent::TextDelta(raw.clone())), ReviewStreamUpdate::Content(text) if text == "Fresh verdict")
-        );
-        if let ReviewStreamUpdate::Usage(usage) =
-            response.observe(StreamEvent::Usage(ModelUsageInfo {
-                total_tokens: 7,
-                ..Default::default()
-            }))
-        {
-            tokens += usage.total_tokens;
-        }
-        assert!(matches!(
-            response.observe(StreamEvent::Done),
-            ReviewStreamUpdate::Finished
-        ));
-        let review = response.finish(metadata(), false).unwrap();
+        let output = tauqe_core::review::parser::decode_single_review(&raw).unwrap();
+        let review = ReviewSynthesisStream::finish(Ok(output), metadata(), false).unwrap();
         assert_eq!(review.raw_markdown, raw);
         assert_eq!(review.description.as_deref(), Some("Fresh verdict"));
-        assert_eq!(tokens, 18);
+        assert_eq!(review.id, "review-stream");
     }
 
     #[test]
     fn cancellation_precedes_provider_errors_and_empty_response_validation() {
-        let mut response = ReviewSynthesisStream::default();
-        assert!(matches!(
-            response.observe(StreamEvent::Error("provider failed".into())),
-            ReviewStreamUpdate::Finished
-        ));
-        let error = response.finish(metadata(), true).unwrap_err();
+        let error = ReviewSynthesisStream::finish(
+            Err(StructuredTaskError::Stream("provider failed".into())),
+            metadata(),
+            true,
+        )
+        .unwrap_err();
         assert!(matches!(error, ReviewSynthesisCompletionError::Cancelled));
-        assert!(error.requires_abort());
-        let mut response = ReviewSynthesisStream::default();
-        response.observe(StreamEvent::Error("provider failed".into()));
-        let error = response.finish(metadata(), false).unwrap_err();
+        let error = ReviewSynthesisStream::finish(
+            Err(StructuredTaskError::Stream("provider failed".into())),
+            metadata(),
+            false,
+        )
+        .unwrap_err();
         assert!(
             matches!(&error, ReviewSynthesisCompletionError::Provider(message) if message == "provider failed")
         );
-        assert!(error.requires_abort());
-        let mut response = ReviewSynthesisStream::default();
         assert!(matches!(
-            response.observe(StreamEvent::Cancelled),
-            ReviewStreamUpdate::Finished
-        ));
-        assert!(matches!(
-            response.finish(metadata(), false),
+            ReviewSynthesisStream::finish(Err(StructuredTaskError::Cancelled), metadata(), false),
             Err(ReviewSynthesisCompletionError::Cancelled)
         ));
     }
 
     #[test]
-    fn empty_output_keeps_detach_policy_and_nonempty_unstructured_output_is_retained() {
-        let error = ReviewSynthesisStream::default()
-            .finish(metadata(), false)
-            .unwrap_err();
+    fn empty_output_is_refused_and_nonempty_unstructured_output_is_retained() {
+        let error = ReviewSynthesisStream::finish(
+            Err(StructuredTaskError::Request(StructuredError::Empty)),
+            metadata(),
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ReviewSynthesisCompletionError::EmptyResponse(_)
         ));
         assert_eq!(error.to_string(), "Model returned an empty review");
-        assert!(!error.requires_abort());
-        let mut response = ReviewSynthesisStream::default();
-        assert!(
-            matches!(response.observe(StreamEvent::ReasoningDelta("Check boundaries".into())), ReviewStreamUpdate::Reasoning(text) if text == "Check boundaries")
-        );
-        assert!(matches!(
-            response.observe(StreamEvent::RepoMapTokens(10)),
-            ReviewStreamUpdate::Ignored
-        ));
-        response.observe(StreamEvent::TextDelta(
-            "Unstructured review remains visible".into(),
-        ));
-        // Channel closure without a Done event retains the existing decoding policy.
-        let review = response.finish(metadata(), false).unwrap();
+        let output =
+            tauqe_core::review::parser::decode_single_review("Unstructured review remains visible")
+                .unwrap();
+        let review = ReviewSynthesisStream::finish(Ok(output), metadata(), false).unwrap();
         assert_eq!(review.items.len(), 1);
         assert!(review.items[0]
             .body

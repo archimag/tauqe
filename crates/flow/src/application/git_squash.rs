@@ -1,13 +1,15 @@
 //! Scribe squash-message generation, Git rewrite, and history policy.
 use crate::api::{
-    Application, ApplicationEvent, ApplicationObserver, Awaited, OperationGuard, UsageGuard,
+    Application, ApplicationEvent, ApplicationObserver, OperationGuard, UsageGuard,
     UsageTotalsSnapshot,
 };
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::config::AppConfig;
+use tauqe_core::control::structured::StructuredError;
 use tauqe_core::git::CommitSummary;
-use tauqe_core::models::{ModelRef, ModelRole};
+use tauqe_core::models::{ModelRole, ModelSelection};
 use tauqe_core::providers::{ChatMessage, StreamEvent};
 #[derive(Debug, thiserror::Error)]
 pub enum SquashMessageError {
@@ -25,8 +27,6 @@ pub enum SquashMessageError {
 struct PreparedSquashMessage {
     commits: Vec<CommitSummary>,
     prompt: String,
-    config: AppConfig,
-    model: ModelRef,
 }
 pub struct SquashMessage {
     pub message: String,
@@ -99,13 +99,9 @@ impl Application {
             &pinned_files,
         );
 
-        let config = self.configuration().await.config;
-        let model = config.resolve_role(ModelRole::Scribe);
         Ok(PreparedSquashMessage {
             commits: commits_ahead,
             prompt,
-            config,
-            model,
         })
     }
     pub async fn generate_squash_message(
@@ -121,11 +117,12 @@ impl Application {
         let PreparedSquashMessage {
             commits: commits_ahead,
             prompt,
-            config,
-            model,
         } = prepared;
-        let provider = self.resolve_provider(model.provider, &config).await.ok();
-        let (message, usage_snapshot) = if let Some(provider) = provider {
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, &operation);
+        let execution = environment
+            .for_scribe_structured(self, &operation, &ModelSelection::Role(ModelRole::Scribe))
+            .await;
+        let (message, usage_snapshot) = if let Ok(execution) = execution {
             // The slot claimed at entry already owns this operation.
             // The identifier and the usage window exist before the first streamed
             // byte, so a cancellation delivered before the stream starts still
@@ -137,140 +134,69 @@ impl Application {
                     publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
                 })
                 .await;
-            let cancel_rx = operation.cancel_receiver();
-            // The signal is also observed after the event loop, so a provider that
-            // stops streaming on cancellation without reporting it is still
-            // recognized as a cancelled turn.
-            let cancel_observer = cancel_rx.clone();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(50);
-            let msgs = vec![ChatMessage::user(&prompt)];
-            let model_name = model.name.clone();
-            let response_format = tauqe_core::prompt::squash_commit_response_format();
-            let stream_task = tokio::spawn(async move {
-                provider
-                    .stream(
-                        tauqe_core::providers::LlmRequest {
-                            response_format: Some(response_format),
-                            ..tauqe_core::providers::LlmRequest::new(&model_name, msgs)
-                        },
-                        tx,
-                        cancel_rx,
-                    )
-                    .await
-            });
-            // The handle lets the last-resort watchdog interrupt a provider request
-            // that never observes the cancellation signal.
-            operation.set_abort_handle(stream_task.abort_handle());
-            let mut full_text = String::new();
-            let mut stream_error: Option<String> = None;
-            let mut cancelled = false;
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    StreamEvent::TextDelta(delta) => {
-                        full_text.push_str(&delta);
-                    }
-                    // Providers may report usage on intermediate chunks. It stays
-                    // in the in-flight window and is folded into the session totals
-                    // only by the single terminal flush below, so an intermediate
-                    // report can never be counted twice.
-                    StreamEvent::Usage(reported) => {
-                        usage_guard.observe(&reported).await;
-                    }
-                    StreamEvent::Error(msg) => {
-                        stream_error = Some(msg);
-                        break;
-                    }
-                    // An explicit provider cancellation is reported as `CANCELLED`
-                    // instead of being swallowed by the catch-all arm and surfacing
-                    // later as a generic internal failure.
-                    StreamEvent::Cancelled => {
-                        cancelled = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            // The signal itself is authoritative: a provider may end the stream on
-            // cancellation without ever reporting a cancellation event.
-            let cancelled = cancelled || *cancel_observer.borrow();
-
-            // Surface both a cancelled turn and a streamed provider error so a
-            // broken or interrupted provider never masquerades as a successful
-            // fallback message. The abandoned request is reaped through the shared
-            // bounded task-exit confirmation (`crate::api::abort_and_reap_with_deadline`, governed by
-            // the task-exit deadline) before the outcome is reported, so no provider call
-            // outlives the response and a task that never reaches a suspension point
-            // cannot park the handler.
-            if cancelled || stream_error.is_some() {
-                let _ = crate::api::abort_and_reap_with_deadline(
-                    &op_id,
-                    "squash-message-stream",
-                    exit_deadline,
-                    stream_task,
-                )
-                .await;
-                operation.clear_abort_handle();
-                close_squash_usage(self, usage_guard, &op_id, &observer).await;
-                let (code, message) = if cancelled {
-                    (true, "Squash message generation was cancelled".to_string())
-                } else {
-                    (
-                        false,
-                        stream_error.unwrap_or_else(|| "Squash message stream failed".to_string()),
-                    )
-                };
-                return Err(if code {
-                    SquashMessageError::Cancelled(message)
-                } else {
-                    SquashMessageError::Model(message)
-                });
-            }
-
-            // A completed stream is awaited through the shared bounded task-exit
-            // confirmation (`crate::api::await_with_deadline`, governed by the task-exit
-            // deadline).
-            let stream_result = crate::api::await_with_deadline(
+            let cancel = operation.cancel_receiver();
+            let result = structured_task::run(
+                self,
+                &operation,
+                &execution,
+                tauqe_core::prompt::squash_commit_contract(),
+                vec![ChatMessage::user(&prompt)],
                 &op_id,
-                "squash-message-stream",
                 exit_deadline,
-                stream_task,
+                |event| {
+                    let usage = &usage_guard;
+                    async move {
+                        if let StreamEvent::Usage(reported) = event {
+                            usage.observe(&reported).await;
+                        }
+                    }
+                },
             )
             .await;
-            operation.clear_abort_handle();
-            match stream_result {
-                Awaited::Joined(Ok(Ok(()))) => {}
-                Awaited::Joined(Ok(Err(err))) => {
-                    close_squash_usage(self, usage_guard, &op_id, &observer).await;
-                    return Err(SquashMessageError::Model(err.to_string()));
+            let snapshot = close_squash_usage(self, usage_guard, &op_id, &observer).await;
+            if *cancel.borrow() {
+                return Err(SquashMessageError::Cancelled(
+                    "Squash message generation was cancelled".into(),
+                ));
+            }
+            let message = match result {
+                Ok(message) => message,
+                Err(StructuredTaskError::Request(StructuredError::Empty)) => None,
+                Err(StructuredTaskError::Cancelled)
+                | Err(StructuredTaskError::Request(StructuredError::Cancelled)) => {
+                    return Err(SquashMessageError::Cancelled(
+                        "Squash message generation was cancelled".into(),
+                    ));
                 }
-                Awaited::Joined(Err(join_err)) => {
-                    close_squash_usage(self, usage_guard, &op_id, &observer).await;
-                    return Err(SquashMessageError::Model(format!(
-                        "Squash message stream task failed: {}",
-                        join_err
-                    )));
-                }
-                Awaited::Orphaned => {
-                    // The confirmation expired, so the abandoned task is still running:
-                    // the response carries the recorded expiry diagnostic instead of a
-                    // result the provider never delivered.
-                    close_squash_usage(self, usage_guard, &op_id, &observer).await;
-                    let message = format!(
-                    "Squash message stream task did not stop within the {} ms task-exit deadline",
-                    exit_deadline.as_millis()
-                );
+                Err(StructuredTaskError::Stream(message))
+                | Err(StructuredTaskError::Task(message))
+                | Err(StructuredTaskError::Request(StructuredError::Failed(message)))
+                | Err(StructuredTaskError::Request(StructuredError::Decode(message))) => {
                     return Err(SquashMessageError::Model(message));
                 }
-            }
-            let msg =
-                tauqe_core::prompt::parse_squash_commit_message(&full_text).unwrap_or_else(|| {
-                    commits_ahead
-                        .first()
-                        .map(|c| c.subject.clone())
-                        .unwrap_or_else(|| "Squashed commits".to_string())
-                });
-            let snapshot = close_squash_usage(self, usage_guard, &op_id, &observer).await;
+                Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
+                    return Err(SquashMessageError::Model(
+                        "Structured request closed without Done".into(),
+                    ));
+                }
+                Err(StructuredTaskError::ForeignOperation) => {
+                    return Err(SquashMessageError::Model(
+                        "squash message requires an active operation for this session".into(),
+                    ));
+                }
+                Err(StructuredTaskError::Orphaned) => {
+                    return Err(SquashMessageError::Model(format!(
+                        "Squash message stream task did not stop within the {} ms task-exit deadline",
+                        exit_deadline.as_millis()
+                    )));
+                }
+            };
+            let msg = message.unwrap_or_else(|| {
+                commits_ahead
+                    .first()
+                    .map(|c| c.subject.clone())
+                    .unwrap_or_else(|| "Squashed commits".to_string())
+            });
             (msg, Some(snapshot))
         } else {
             // Without a provider no usage window opens, so the zero operation

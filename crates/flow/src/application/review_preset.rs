@@ -1,5 +1,6 @@
 //! Preset review preparation and grouped audit lifecycle.
 use crate::api::{Application, OperationGuard};
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +16,7 @@ pub struct ResolvedPresetReview {
     name: String,
     preset: ReviewPreset,
     pub model: ModelRef,
+    pub selection: ModelSelection,
     groups: Vec<ReviewGroup>,
     mode: PostAnalysisMode,
 }
@@ -30,10 +32,11 @@ pub enum PresetReviewPreparationError {
 impl Application {
     pub(crate) async fn resolve_review_preset(
         &self,
+        environment: &PlanExecutionEnvironment,
         name: &str,
         selection: Option<&ModelSelection>,
     ) -> Result<ResolvedPresetReview, PresetReviewPreparationError> {
-        let cfg = self.configuration().await.config;
+        let cfg = environment.config();
         let preset = cfg
             .review
             .presets
@@ -41,11 +44,10 @@ impl Application {
             .find(|p| p.name.trim() == name)
             .cloned()
             .ok_or_else(|| PresetReviewPreparationError::NotFound(name.into()))?;
-        let model = cfg.resolve_model(
-            &selection
-                .cloned()
-                .unwrap_or(ModelSelection::Role(ModelRole::Reviewer)),
-        );
+        let selection = selection
+            .cloned()
+            .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
+        let model = cfg.resolve_model(&selection);
         let groups = preset.to_launch_groups();
         if groups.is_empty() {
             return Err(PresetReviewPreparationError::EmptyGroups(name.into()));
@@ -55,6 +57,7 @@ impl Application {
             name: name.into(),
             preset,
             model,
+            selection,
             groups,
             mode,
         })
@@ -157,6 +160,7 @@ async fn offload<T: Send + 'static>(
 impl Application {
     pub(crate) async fn execute_preset_review(
         &self,
+        binding: (&PlanExecutionEnvironment, &ModelSelection),
         operation: Arc<OperationGuard>,
         root: &Path,
         session: ReviewSession,
@@ -164,6 +168,7 @@ impl Application {
         deadline: Duration,
     ) -> Result<PresetReviewResult, PresetReviewExecutionError> {
         use PresetReviewExecutionError::{Cancelled, Failed};
+        let (environment, selection) = binding;
         if !self.owns_operation(&operation) {
             return Err(Failed(
                 "preset review requires an active operation for this session".into(),
@@ -182,19 +187,12 @@ impl Application {
             groups = session.groups.len(),
             "preset review session persisted"
         );
-        let resolved = self
-            .resolve_review_synthesis(Some(&ModelSelection::Specific(session.model.clone())))
-            .await;
-        let provider = self
-            .resolve_provider(resolved.model.provider, &resolved.config)
-            .await
-            .map_err(|error| Failed(error.to_string()))?;
         let report = crate::api::run_group_audits(
             self,
+            (environment, selection),
             root,
             &session,
             operation.clone(),
-            provider,
             observer.clone(),
             deadline,
         )
@@ -232,7 +230,16 @@ impl Application {
             .unwrap_or(PostAnalysisMode::None);
         if mode == PostAnalysisMode::Automatic && report.is_success() {
             stored = self
-                .run_review_analysis(&operation, root, &stored, None, observer, true, deadline)
+                .run_review_analysis(
+                    &operation,
+                    environment,
+                    root,
+                    &stored,
+                    None,
+                    observer,
+                    true,
+                    deadline,
+                )
                 .await
                 .map_err(|error| Failed(error.to_string()))?;
         }

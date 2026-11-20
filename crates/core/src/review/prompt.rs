@@ -24,7 +24,7 @@ pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt_items,
     format_review_group_discussion_prompt,
 };
-pub(crate) use group_context::apply_group_architectural_context;
+pub use group_context::apply_group_architectural_context;
 
 #[cfg(test)]
 pub(crate) use discussion::format_review_discussion_prompt;

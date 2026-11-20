@@ -472,11 +472,7 @@ impl ModelsConfig {
     /// A selection the role does not configure names no entry and keeps the
     /// deterministic default of the role it runs in, so a model outside the
     /// configuration never inherits a budget somebody else declared.
-    pub(crate) fn resolve_selection_attempts(
-        &self,
-        role: ModelRole,
-        selection: &ModelSelection,
-    ) -> u32 {
+    pub fn resolve_selection_attempts(&self, role: ModelRole, selection: &ModelSelection) -> u32 {
         let (attempts, level_up) = self.selection_parameters(role, selection);
         let model = self.resolve_model(selection);
         let effort = self.resolve_selection_effort(role, selection);
@@ -514,7 +510,7 @@ impl ModelsConfig {
     }
 
     /// Resolves a [`ModelSelection`] to a concrete [`ModelRef`].
-    pub(crate) fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
+    pub fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
         match selection {
             ModelSelection::Role(role) => self.resolve_role(*role),
             ModelSelection::Specific(model) => model.clone(),
@@ -570,7 +566,7 @@ impl ModelsConfig {
     /// `level_up = false` begins at the strongest eligible position
     /// ([`ModelsConfig::coder_tier_index`]), so it saturates here as well and no
     /// stronger tier is ever entered automatically.
-    pub(crate) fn next_coder_tier(&self, idx: usize) -> Option<(usize, ModelEntry)> {
+    pub fn next_coder_tier(&self, idx: usize) -> Option<(usize, ModelEntry)> {
         let current = self.coder_tier(idx);
         let next_idx = idx + 1;
         let next = self.coder_tier(next_idx);
@@ -594,7 +590,7 @@ impl ModelsConfig {
     /// ladder position either, yet it is already at the top: it starts from the
     /// strongest eligible rung and leaves the ladder saturated
     /// ([`ModelsConfig::next_coder_tier`]).
-    pub(crate) fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
+    pub fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
         let Some(selection) = selection else {
             return 0;
         };
@@ -709,7 +705,7 @@ impl ModelsConfig {
     /// A recorded rung the ladder excludes by `level_up = false` is a manual run
     /// the developer pinned: restarting would silently downgrade it, so the
     /// configuration stays as it is and escalation is saturated.
-    pub(crate) fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
+    pub fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
         let Some(recorded) = recorded else {
             return self.architect_tier(0);
         };

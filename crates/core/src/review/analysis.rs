@@ -28,8 +28,25 @@ use crate::review::IssueStatus;
 
 use std::borrow::Cow;
 
+use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::balanced_object_end;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
+use crate::review::prompt::build_post_analysis_system_prompt;
+
+/// Model-facing post-analysis request; identity checks and regrouping follow decoding.
+pub fn post_analysis_contract() -> StructuredContract<PostAnalysisOutput> {
+    StructuredContract {
+        instructions: build_post_analysis_system_prompt(),
+        format: post_analysis_response_format(),
+        decode: decode_post_analysis,
+        visibility: StructuredVisibility::TextField("summary"),
+        require_done: false,
+    }
+}
+
+fn decode_post_analysis(raw: &str) -> Result<PostAnalysisOutput, String> {
+    parse_post_analysis(raw).map_err(|error| format!("{error:#}"))
+}
 
 /// Strict JSON Schema for the review post-analysis output.
 ///
@@ -287,6 +304,22 @@ pub(crate) fn validate_post_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_decodes_wrapped_analysis_without_validating_references() {
+        let contract = post_analysis_contract();
+        assert!(!contract.require_done);
+        assert!(matches!(
+            contract.visibility,
+            StructuredVisibility::TextField("summary")
+        ));
+        assert!(matches!(contract.format, ResponseFormat::JsonSchema { .. }));
+        let wrapped = "Before {bad json} then ```json\n{\"summary\":\"OK\",\"independent_issues\":[\"foreign\"]}\n```";
+        let output = (contract.decode)(wrapped).unwrap();
+        assert_eq!(output.summary, "OK");
+        assert_eq!(output.independent_issues, ["foreign"]);
+        assert!((contract.decode)(" ").is_err());
+    }
 
     /// Finding identity the classified session actually holds.
     const FINDING_UUID: &str = "018f9c1e-6b3a-7c1e-8b3a-000000000001";

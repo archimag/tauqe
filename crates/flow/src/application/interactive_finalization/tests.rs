@@ -117,6 +117,9 @@ async fn outcome(app: &Application, edit: bool) -> InteractiveTaskOutcome {
                 review_decisions_applied: vec![],
                 envelope: ResponseEnvelope::default(),
                 commit_hash: None,
+                verification: None,
+                commit_error: None,
+                rounds_spent: 1,
             },
             ResponseEnvelope::default(),
         ))),
@@ -215,7 +218,7 @@ async fn task_failure_overrides_stream_failure_and_records_history_before_accoun
     );
 }
 #[tokio::test]
-async fn stream_failure_keeps_only_current_attempt_text_and_does_not_adopt_context() {
+async fn stream_failure_records_diagnostic_instead_of_preview_and_does_not_adopt_context() {
     let root = tempfile::tempdir().unwrap();
     let (app, operation, turn_id, mut usage, mut observer) = setup(root.path()).await;
     let identity = app.session_uuid().await;
@@ -241,7 +244,7 @@ async fn stream_failure_keeps_only_current_attempt_text_and_does_not_adopt_conte
     assert!(
         matches!(result.outcome,InteractiveFinalizationOutcome::Interrupted{cancelled:false,error:Some(reason)} if reason=="offline")
     );
-    assert_eq!(observer.snapshots[0].2.as_deref(), Some("Current attempt"));
+    assert_eq!(observer.snapshots[0].2.as_deref(), Some("offline"));
     assert_eq!(*observer.trace.lock().unwrap(), ["totals", "usage"]);
     assert_eq!(app.session_uuid().await, identity);
     assert!(!app
@@ -297,7 +300,11 @@ async fn control_error_is_completed_after_accounting_and_keeps_adopted_context()
     let result = app
         .finalize_interactive_turn(
             &operation,
-            input(Ok(joined), turn_id, vec![]),
+            input(
+                Ok(joined),
+                turn_id,
+                vec![StreamEvent::TextDelta("Premature preview".into())],
+            ),
             &mut usage,
             &mut observer,
         )
@@ -316,6 +323,10 @@ async fn control_error_is_completed_after_accounting_and_keeps_adopted_context()
         .items
         .iter()
         .any(|item| item.path == "new.rs"));
+    assert_eq!(
+        observer.snapshots[2].2.as_deref(),
+        Some("provider error: offline")
+    );
 }
 #[tokio::test]
 async fn foreign_operation_does_not_flush_or_publish_or_change_history() {

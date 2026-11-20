@@ -139,7 +139,7 @@ static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
 static APPLY_PATCH: StrategyProfile = StrategyProfile {
     replaced_line_fields: &[],
     content_description: "",
-    structured_instruction: "- `patch`: one Codex patch delimited by `*** Begin Patch` and `*** End Patch`. Use repository-relative paths in `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` sections. Add-file lines start with `+`. Updates use `@@` or `@@ context` followed by lines prefixed with a space for context, `-` for removal, and `+` for insertion. An update may put `*** Move to: destination` immediately after its header. Use enough exact context to identify each hunk uniquely.",
+    structured_instruction: "- `patch`: one Codex patch delimited by `*** Begin Patch` and `*** End Patch`. Use repository-relative paths in `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` sections. Add-file lines start with `+`. Updates use `@@` or `@@ context` followed by lines prefixed with a space for context, `-` for removal, and `+` for insertion. An update may put `*** Move to: destination` immediately after its header. Use enough exact context to identify each hunk uniquely. A context-only hunk may locate the section for a later change. Each update must change content or move the file.",
     empty_field_guidance: "",
     replace_invariant: "",
     no_match_hint: "Copy the exact current context around the hunk.",

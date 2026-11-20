@@ -33,11 +33,17 @@ pub(crate) mod outer_docs_cache;
 pub(crate) mod outer_docs_preload;
 
 mod implementation;
+mod implementation_executor;
+mod implementation_persistence;
+mod implementation_pipeline;
 
 pub(crate) mod implementation_refinement;
 
 pub(crate) mod implementation_step;
 
+mod review_execution;
+mod review_sequence;
+mod review_step;
 pub(crate) mod step_dispatch;
 mod step_execution;
 
@@ -46,6 +52,8 @@ pub(crate) mod turn_setup;
 pub(crate) mod interactive_history;
 
 pub(crate) mod interactive_completion;
+
+pub(crate) mod interactive_dialogue;
 
 pub(crate) mod interactive_interruption;
 
@@ -73,7 +81,6 @@ pub(crate) mod review_synthesis_completion;
 
 pub(crate) mod review_synthesis_preparation;
 
-pub(crate) mod provider_task;
 pub(crate) mod review_synthesis_request;
 
 pub(crate) mod review_synthesis_response;
@@ -98,6 +105,7 @@ pub(crate) mod plan_batch;
 pub(crate) mod plan_two_phase;
 
 pub(crate) mod architect;
+mod architect_synthesis;
 
 pub(crate) mod review_batch;
 

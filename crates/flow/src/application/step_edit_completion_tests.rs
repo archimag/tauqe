@@ -1,11 +1,10 @@
+use crate::application::review_execution::{
+    PlanSequenceArtifact, PlanSequenceStop, PlanStepArtifact,
+};
 use crate::application::step_completion::*;
 use crate::application::step_dispatch::StepLoopReport;
 use tauqe_core::control::outcome::LoopResult;
 use tauqe_core::control::outcome::{FailureReport, LoopSuccess, ResponseEnvelope};
-use tauqe_core::control::plan::{
-    sequence::{PlanSequenceArtifact, PlanSequenceStop},
-    step::PlanStepArtifact,
-};
 use tauqe_core::control::turn::TurnArtifact;
 use tauqe_core::edits::VerificationVerdict;
 fn turn(

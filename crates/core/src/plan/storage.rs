@@ -762,19 +762,19 @@ impl PlanStorage {
 /// Result of applying plan operations from model output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApplicationOutcome {
-    pub(crate) applied: Vec<Plan>,
+    pub applied: Vec<Plan>,
     /// Mutations the storage barrier rejected; a rejected mutation leaves the
     /// stored plan untouched.
     ///
     /// Every entry is classified where the refusal was produced, so a caller
     /// reads the category from the typed field and never from the wording.
-    pub(crate) errors: Vec<PlanRejection>,
+    pub errors: Vec<PlanRejection>,
     /// Repairs the lifecycle barrier applied to an otherwise valid mutation.
     ///
     /// A repaired mutation is applied, so its reports never share the rejection
     /// channel: a caller that treats `errors` as failures stays accurate while
     /// the repair remains visible.
-    pub(crate) warnings: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

@@ -2,16 +2,14 @@
 use crate::api::{Application, OperationGuard};
 use crate::api::{ApplicationEvent, ApplicationObserver};
 use crate::application::architect::publish_architect_started;
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
 use std::sync::Arc;
-use tauqe_core::config::ModelsConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::control::refine::{StructuredRefineOutcome, StructuredRefineStatus};
 use tauqe_core::models::{ArchitectTier, ModelRole, ModelSelection};
 use tauqe_core::plan::prompt::{format_architect_escalation_note, PlanHorizonDiagnostics};
 use tauqe_core::plan::{find_duplicate_item_ids, storage::PlanStorage};
 use tauqe_core::plan::{Plan, PlanSynthesisResult};
-use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT};
-use tauqe_core::workflow::WorkflowOptions;
 
 use std::collections::HashSet;
 
@@ -66,11 +64,16 @@ pub struct PlanHorizonContour {
     pub operation_id: String,
     pub task: String,
     pub context: ContextManager,
-    pub options: WorkflowOptions,
-    pub models_config: ModelsConfig,
+    pub scope: ArchitectScope,
     pub tier: ArchitectTier,
     pub intro_header: String,
     pub budget_hint: String,
+}
+/// Identity of the plan or review audit whose Architect prefix is warmed.
+#[derive(Clone)]
+pub enum ArchitectScope {
+    Plan(String),
+    Review(String),
 }
 pub struct PlanHorizonRequest {
     pub plan: Plan,
@@ -157,6 +160,8 @@ impl Application {
             operation_title,
         } = request;
         let repo_root = application.repository_root().await;
+        let environment =
+            PlanExecutionEnvironment::new(application.configuration().await, operation);
 
         tracing::info!(
             plan_id = %plan.id,
@@ -166,10 +171,10 @@ impl Application {
             "plan horizon synthesis started"
         );
 
-        let (architect_tier, level_up, escalation_excluded, options, models_config) = {
-            let cfg = application.configuration().await.config.clone();
+        let (architect_tier, level_up, escalation_excluded) = {
+            let cfg = environment.config();
             let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
-                &cfg,
+                cfg,
                 plan.implementation.architect.as_ref(),
                 custom_model.as_ref(),
                 diagnostics.as_ref().map(|d| d.blocked_step_id.as_str()),
@@ -183,22 +188,7 @@ impl Application {
                 &architect_tier.model,
                 architect_tier.effort,
             );
-            // Every operational budget of the synthesis — research rounds, file and
-            // repomap budgets, the eager-map switch, and the research limits — belongs
-            // to the turn, so the contour reads them from one options value instead of
-            // a per-request parameter set.
-            let mut options = WorkflowOptions::from_app_config(&cfg);
-            // Horizon synthesis is an isolated design dialogue: its cache is keyed by
-            // the plan, never by the interactive REPL session. The contour rotates the
-            // identifier itself when it promotes another model (crates/core/Conventions.md §9.9).
-            options.session_id = Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id));
-            (
-                architect_tier,
-                level_up,
-                escalation_excluded,
-                options,
-                cfg.models.clone(),
-            )
+            (architect_tier, level_up, escalation_excluded)
         };
 
         // The resolved rung is recorded with the synthesized horizon so a later
@@ -307,14 +297,14 @@ impl Application {
 
         let budget_hint = "The plan is too broad and should be manually decomposed or scoped down.";
         let (contour_result, summary) = application
-            .run_architect_contour(
+            .run_architect_contour_with_environment(
                 operation,
+                &environment,
                 PlanHorizonContour {
                     operation_id: op_id.clone(),
                     task,
                     context: context_snapshot,
-                    options,
-                    models_config,
+                    scope: ArchitectScope::Plan(plan.id.clone()),
                     tier: architect_tier,
                     intro_header,
                     budget_hint: budget_hint.to_string(),

@@ -60,6 +60,17 @@ pub trait PromptProtocol: Send + Sync {
     /// decoder accepts one. Binding the project does not change the capability
     /// tree the protocol received at construction.
     fn with_project(&self, project: Option<ProjectConfig>) -> Box<dyn PromptProtocol>;
+
+    /// Binds the grant used by every projection of the next request.
+    /// Protocols without dynamic grants reject a different tree.
+    fn with_capabilities(&self, capabilities: CapabilityTree) -> Box<dyn PromptProtocol> {
+        assert_eq!(
+            self.capability_expr(),
+            capabilities,
+            "protocol cannot change its capability tree"
+        );
+        self.with_project(None)
+    }
     /// Decodes raw model output into normalized core commands.
     ///
     /// `context_paths` lists the files an edit may address this turn: every file

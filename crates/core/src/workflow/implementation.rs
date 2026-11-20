@@ -15,34 +15,20 @@
 //!   storages, carrying the identifiers that map its outcome back;
 //! - [`classify_scope_stall`] — the stall classification that decides whether a
 //!   blocked scope justifies an Architect replanning wave;
-//! - [`ImplementationHost`] — the turn seam the server implements, so the engine
-//!   drives a bounded turn without ever touching provider telemetry or usage
-//!   windows;
-//! - [`PlanImplementationStepExecutor`] — the step executor that resolves one
-//!   horizon leaf, drives the coder ladder through the seam, and persists the
-//!   step lifecycle through the storage that owns the horizon;
-//! - [`PlanImplementationPipeline`] — the batch driver that schedules the ready
-//!   leaves, reprojects the remaining horizon around a failed step, and reports
-//!   the whole run as one typed outcome.
+//!
+//! The application owns leaf execution, coder escalation, and the batch driver;
+//! this module supplies their shared frame, failure, and request types.
 
 mod turn_outcome;
 pub use turn_outcome::{classify_refinement, classify_step_turn};
 
-mod executor;
-mod pipeline;
 mod scope;
 
-pub use executor::{ImplementationRunConfig, PlanImplementationStepExecutor};
-pub use pipeline::{
-    PlanImplementationOptions, PlanImplementationPipeline, PlanImplementationReport,
-    PlanImplementationStop,
-};
 pub use scope::{classify_scope_stall, ExecutionScope, ImplementationFrame};
 
 use crate::models::{ArchitectTier, ModelSelection, ReasoningEffort};
-use crate::plan::PlanItem;
+use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 use crate::workflow::turn::TurnWorkQueue;
-use async_trait::async_trait;
 use tokio::sync::watch;
 
 /// Category of an implementation step failure, controlling pipeline behavior.
@@ -78,7 +64,7 @@ pub struct StepFailure {
 
 impl StepFailure {
     /// Creates a domain failure: confine the current step and continue.
-    pub(crate) fn domain(reason: impl Into<String>) -> Self {
+    pub fn domain(reason: impl Into<String>) -> Self {
         Self {
             kind: StepFailureKind::Domain,
             reason: reason.into(),
@@ -98,8 +84,7 @@ impl StepFailure {
     /// Creates an unreverted-worktree failure: the failed change set was not
     /// rolled back, so the working tree carries bytes nobody verified and the
     /// run must stop instead of building on them.
-    #[cfg(test)]
-    fn unreverted(reason: impl Into<String>) -> Self {
+    pub fn unreverted(reason: impl Into<String>) -> Self {
         Self {
             kind: StepFailureKind::Unreverted,
             reason: reason.into(),
@@ -113,18 +98,18 @@ impl StepFailure {
     /// reproject the remaining horizon around the failed approach, so it is
     /// attached where the step actually failed instead of being reconstructed
     /// by the caller.
-    fn with_step(mut self, step_id: impl Into<String>) -> Self {
+    pub fn with_step(mut self, step_id: impl Into<String>) -> Self {
         self.failed_step = Some(step_id.into());
         self
     }
 
     /// The step whose execution failed, when the failure is attributable to one.
-    fn failed_step(&self) -> Option<&str> {
+    pub fn failed_step(&self) -> Option<&str> {
         self.failed_step.as_deref()
     }
 
     /// Whether the failure is confined to the current step.
-    pub(crate) fn is_domain(&self) -> bool {
+    pub fn is_domain(&self) -> bool {
         matches!(self.kind, StepFailureKind::Domain)
     }
 
@@ -133,12 +118,12 @@ impl StepFailure {
     /// The predicate is mutually exclusive with [`Self::is_domain`]: a dirty
     /// tree is a transaction failure of the harness, never a content verdict of
     /// the step.
-    fn is_unreverted(&self) -> bool {
+    pub fn is_unreverted(&self) -> bool {
         matches!(self.kind, StepFailureKind::Unreverted)
     }
 
     /// Human-readable diagnostic carried by the failure.
-    pub(crate) fn reason(&self) -> &str {
+    pub fn reason(&self) -> &str {
         &self.reason
     }
 
@@ -148,7 +133,7 @@ impl StepFailure {
     }
 }
 
-/// One bounded step turn requested from the [`ImplementationHost`].
+/// One bounded step turn requested by the application workflow.
 ///
 /// The request is a core-internal DTO, never a wire type: it carries exactly
 /// what the host needs in order to run one turn of a horizon leaf. Application
@@ -205,7 +190,49 @@ pub enum StepTurnResult {
     Failed(StepFailure),
 }
 
-/// One Architect refinement wave requested from the [`ImplementationHost`].
+/// Terminal reason an implementation run stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanImplementationStop {
+    /// Every executable leaf of the horizon finished.
+    Completed,
+    /// A failure the pipeline cannot repair by reprojecting the horizon.
+    Failed {
+        /// The step the failure is attributed to, when it is attributable.
+        step: Option<String>,
+        /// Diagnostic of the failure.
+        reason: String,
+    },
+    /// A step cannot proceed until the developer resolves the stated blocker.
+    Blocked {
+        /// The step the blocker is attributed to, when it is attributable.
+        step: Option<String>,
+        /// Diagnostic of the blocker.
+        reason: String,
+    },
+    /// The run observed a cancellation request.
+    Cancelled,
+    /// The run observed a soft-stop request and drained the running step.
+    Stopped,
+}
+
+/// A durable transition requested by the step executor from the workflow owner.
+pub struct LeafTransition {
+    pub scope: ExecutionScope,
+    pub step_id: String,
+    pub status: PlanItemStatus,
+    pub blocked_reason: Option<String>,
+    pub commit: Option<String>,
+    /// The group's current horizon for its whole-horizon storage operation.
+    pub group_items: Vec<PlanItem>,
+}
+
+/// Data returned after a successful durable transition.
+pub enum LeafTransitionResult {
+    Horizon(PlanImplementation),
+    Finding,
+}
+
+/// One Architect refinement wave requested by the application workflow.
 ///
 /// A wave reprojects the remaining horizon around a failed approach, so the
 /// request carries the differential the Architect needs: which step failed and
@@ -243,26 +270,6 @@ pub enum RefinementResult {
         /// Architect configuration that reported the block.
         tier: ArchitectTier,
     },
-}
-
-/// Turn seam between the implementation machinery and the server running it.
-///
-/// The engine owns *what* must happen — which leaf runs, on which coder rung,
-/// with which prompt, and when a failure justifies escalation — while the
-/// implementation owns *how* a turn is executed: provider telemetry, usage
-/// windows, streamed events, and Git transactions all live behind this seam.
-/// The trait is deliberately small: [`Self::run_step`] executes one bounded
-/// step turn and [`Self::run_refinement`] executes one Architect wave that
-/// reprojects a horizon. Its shape follows `ApplyPolicy` and
-/// `ProviderResolver`: the contract is declared by the engine and implemented
-/// by the server.
-#[async_trait]
-pub trait ImplementationHost: Send + Sync {
-    /// Executes one bounded step turn and classifies its terminal outcome.
-    async fn run_step(&self, request: StepTurnRequest) -> StepTurnResult;
-
-    /// Executes one Architect refinement wave over the horizon of `request`.
-    async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult;
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! Persistence of step progress for review batch members.
 
+use crate::application::review_execution::StepPersistence;
 use std::path::Path;
-use tauqe_core::control::{plan::step::StepPersistence, SystemError};
+use tauqe_core::control::SystemError;
 use tauqe_core::plan::{Plan, PlanItemStatus};
 use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
@@ -118,8 +119,7 @@ impl StepPersistence for ReviewFindingPersistence {
             review_id: self.review_id.clone(),
             item_id: self.item_id,
         };
-        scope
-            .resolve(repo_root)
+        crate::application::implementation::resolve_frame_sync(&scope, repo_root)
             .map(|frame| frame.plan)
             .map_err(|failure| SystemError::Other(failure.into_reason()))
     }

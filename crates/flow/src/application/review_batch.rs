@@ -7,11 +7,14 @@ use std::sync::Arc;
 use crate::api::{
     Application, ApplicationEvent, ApplicationObserver, OperationGuard, PreflightVerdict,
 };
-use crate::application::step_dispatch::{StepLoopBody, StepLoopReport};
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+use crate::application::infrastructure::step_run::StepRunPublication;
+use crate::application::review_execution::StepPersistence;
+use crate::application::step_dispatch::StepLoopReport;
+use crate::application::turn_setup::ResolvedTurnModel;
 use async_trait::async_trait;
 pub(crate) use persistence::ReviewMemberPersistence;
 use tauqe_core::control::outcome::LoopResult;
-use tauqe_core::control::plan::step::StepPersistence;
 use tauqe_core::models::ModelSelection;
 use tauqe_core::plan::{PlanItemStatus, PlanScopeEvaluation};
 use tauqe_core::providers::{format_session_id, StreamEvent, SESSION_PREFIX_REVIEW};
@@ -690,7 +693,8 @@ struct ReviewBatchExecutor<'a> {
     operation: Arc<OperationGuard>,
     observer: &'a Arc<dyn ApplicationObserver>,
     repo_root: &'a Path,
-    model: Option<ModelSelection>,
+    execution: PlanExecutionEnvironment,
+    publication_model: ResolvedTurnModel,
     /// Findings the completed members repaired.
     fixed_items: usize,
 }
@@ -969,8 +973,8 @@ impl ReviewBatchExecutor<'_> {
         let resolve_scope = scope.clone();
         let root = self.repo_root.to_path_buf();
         matches!(
-            offload(move || resolve_scope.resolve(&root)).await,
-            Ok(Ok(frame)) if frame.plan.implementation.status() == PlanItemStatus::Done
+            self.application.implementation_frame(&resolve_scope, &root).await,
+            Ok(frame) if frame.plan.implementation.status() == PlanItemStatus::Done
         )
     }
 
@@ -983,10 +987,13 @@ impl ReviewBatchExecutor<'_> {
     async fn member_run(&self, scope: &ExecutionScope) -> Result<MemberRun, String> {
         let resolve_scope = scope.clone();
         let root = self.repo_root.to_path_buf();
-        let frame = match offload(move || resolve_scope.resolve(&root)).await {
-            Ok(Ok(frame)) => frame,
-            Ok(Err(failure)) => return Err(failure.into_reason()),
-            Err(err) => return Err(err),
+        let frame = match self
+            .application
+            .implementation_frame(&resolve_scope, &root)
+            .await
+        {
+            Ok(frame) => frame,
+            Err(failure) => return Err(failure.into_reason()),
         };
         let title = frame.plan.title.clone();
         match scope {
@@ -1153,23 +1160,61 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
             self.application
                 .publish_review_snapshot(self.repo_root, &review_id, self.observer.as_ref())
                 .await;
+            let model = &self.publication_model;
+            let publication = StepRunPublication {
+                model: model.model.clone(),
+                role: model.role,
+                effort: model.effort,
+                alias: model.alias.clone(),
+                plan_context: None,
+                work_context: Some(run.work),
+                session_label: Some(format_session_id(SESSION_PREFIX_REVIEW, &review_id)),
+            };
+            let app = self.application.clone();
+            let operation = self.operation.clone();
+            let environment = self.execution.clone();
+            let root = self.repo_root.to_path_buf();
+            let context = self.application.context_for_turn().await;
+            let selection = model.selection.clone();
+            let session_id = Some(format_session_id(SESSION_PREFIX_REVIEW, &review_id));
             let report = self
                 .application
-                .run_step_loop(
-                    crate::api::StepLoopOptions {
-                        reasoning_effort: None,
-                        marker: None,
-                        plan_context: None,
-                        operation: self.operation.clone(),
-                        selection: self.model.clone(),
-                        session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &review_id)),
-                        work_context: Some(run.work),
-                        body: StepLoopBody::Sequence {
-                            persistence: Box::new(persistence),
-                            steps: run.steps,
-                        },
-                    },
+                .run_prepared_step(
+                    publication,
                     self.observer.clone(),
+                    move |op_id, sink| async move {
+                        let task_app = app.clone();
+                        let task_operation = operation.clone();
+                        app.run_step_task(&operation, &op_id, async move {
+                            let mut context = context;
+                            let result = crate::application::review_sequence::run(
+                                &task_app,
+                                &task_operation,
+                                &environment,
+                                &root,
+                                &mut context,
+                                Box::new(persistence),
+                                &run.steps,
+                                Some(selection),
+                                session_id,
+                                None,
+                                &tauqe_core::control::context::CancellationToken::from_receiver(
+                                    task_operation.cancel_receiver(),
+                                ),
+                                &sink,
+                            )
+                            .await;
+                            let report = match result {
+                                Ok(result) => StepLoopReport::Sequence(result),
+                                Err(tauqe_core::control::outcome::SystemError::Cancelled) => {
+                                    StepLoopReport::Cancelled
+                                }
+                                Err(error) => StepLoopReport::Failed(error.to_string()),
+                            };
+                            (report, context)
+                        })
+                        .await
+                    },
                 )
                 .await;
             self.settle_run(&scope, report).await
@@ -1382,12 +1427,16 @@ impl Application {
         // verification, and commit before the queue stops.
         let soft_stop_rx = operation.soft_stop_receiver();
 
+        let snapshot = self.configuration().await;
+        let execution = PlanExecutionEnvironment::new(snapshot, &operation);
+        let publication_model = execution.resolve_step_model(model);
         let mut executor = ReviewBatchExecutor {
             application: self,
             operation: operation.clone(),
             observer: &observer,
             repo_root: &repo_root,
-            model,
+            execution,
+            publication_model,
             fixed_items: 0,
         };
 

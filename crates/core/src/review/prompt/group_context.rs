@@ -60,7 +60,7 @@ fn push_concept_child(
 /// finding becomes a child node that names the symptom and, when the reviewer
 /// stated one, its body. A whole group therefore renders the cause and its
 /// manifestations together for every sub-step it executes.
-pub(crate) fn apply_group_architectural_context(
+pub fn apply_group_architectural_context(
     plan: &mut Plan,
     group: &ReviewGroup,
     findings: &[ReviewItem],

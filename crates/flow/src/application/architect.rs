@@ -3,10 +3,10 @@ use crate::api::{
     Application, ApplicationEvent, ApplicationObserver, ContourRelaySummary, OperationGuard,
     PlanHorizonContour, UsageGuard,
 };
+use crate::application::architect_synthesis::run_architect_synthesis;
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
 use std::sync::Arc;
-use tauqe_core::control::refine::{
-    run_structured_refine, ProviderResolver, StructuredRefineConfig, StructuredRefineOutcome,
-};
+use tauqe_core::control::refine::StructuredRefineOutcome;
 use tauqe_core::providers::StreamEvent;
 use tokio::sync::{mpsc, watch};
 const CONTOUR_EVENT_CAPACITY: usize = 256;
@@ -35,27 +35,12 @@ async fn relay_architect_events(
     usage.flush().await;
     summary
 }
-struct ArchitectProviderResolver {
-    application: Application,
-    config: tauqe_core::config::AppConfig,
-}
-#[async_trait::async_trait]
-impl ProviderResolver for ArchitectProviderResolver {
-    async fn resolve(
-        &self,
-        kind: tauqe_core::models::ProviderKind,
-    ) -> anyhow::Result<Arc<dyn tauqe_core::providers::LlmProvider>> {
-        Ok(self
-            .application
-            .resolve_provider(kind, &self.config)
-            .await?)
-    }
-}
-
 impl Application {
-    pub(crate) async fn run_architect_contour(
+    /// Executes an automatic wave under the technical snapshot of its plan run.
+    pub(crate) async fn run_architect_contour_with_environment(
         &self,
         operation: &OperationGuard,
+        environment: &PlanExecutionEnvironment,
         work: PlanHorizonContour,
         observer: Arc<dyn ApplicationObserver>,
     ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
@@ -74,19 +59,18 @@ impl Application {
             operation_id,
             task,
             context,
-            options,
-            models_config: models,
+            scope,
             tier,
             intro_header,
             budget_hint,
         } = work;
         let op_id = operation_id.as_str();
-        let resolver = ArchitectProviderResolver {
-            application: self.clone(),
-            config: self.configuration().await.config,
-        };
-        let provider = match resolver.resolve(tier.model.provider).await {
-            Ok(provider) => provider,
+        let repo_root = context.repo_root().to_path_buf();
+        let execution = match environment
+            .for_architect_research(self, operation, &tier, &scope)
+            .await
+        {
+            Ok(execution) => execution,
             Err(err) => {
                 observer.publish(
                     op_id,
@@ -96,13 +80,11 @@ impl Application {
                     Err(anyhow::anyhow!(err.to_string())),
                     ContourRelaySummary {
                         error: Some(err.to_string()),
-                        ..ContourRelaySummary::default()
+                        ..Default::default()
                     },
                 );
             }
         };
-
-        let repo_root = context.repo_root().to_path_buf();
         let (events_tx, events_rx) = mpsc::channel::<StreamEvent>(CONTOUR_EVENT_CAPACITY);
         let cancel_rx = operation.cancel_receiver();
         // The relay waits out a client that stopped reading, so it shares the very
@@ -128,19 +110,14 @@ impl Application {
 
         let contour = tokio::spawn(async move {
             let mut contour_context = context;
-            let result = run_structured_refine(
+            let result = run_architect_synthesis(
+                execution,
                 &mut contour_context,
-                provider,
                 &task,
-                StructuredRefineConfig {
-                    repo_root: repo_root.as_path(),
-                    options: &options,
-                    models: &models,
-                    tier,
-                    providers: &resolver,
-                    intro_header: intro_header.as_str(),
-                    budget_hint: budget_hint.as_str(),
-                },
+                &repo_root,
+                tier,
+                &intro_header,
+                &budget_hint,
                 events_tx,
                 cancel_rx,
             )
@@ -242,7 +219,9 @@ impl Application {
         work: PlanHorizonContour,
         observer: Arc<dyn ApplicationObserver>,
     ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
-        self.run_architect_contour(operation, work, observer).await
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, operation);
+        self.run_architect_contour_with_environment(operation, &environment, work, observer)
+            .await
     }
 }
 

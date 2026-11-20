@@ -148,7 +148,9 @@ impl Application {
                 .persist_interactive_interruption(
                     operation,
                     InteractiveInterruption::StreamFailure {
-                        streamed_text: stream.text,
+                        // A preview can precede a terminal provider failure. It
+                        // must not replace the failure in the durable response.
+                        streamed_text: String::new(),
                         error: Some(error.clone()),
                     },
                 )
@@ -163,7 +165,14 @@ impl Application {
             });
         }
         let usage = self.flush_interactive_usage(usage, observer).await;
-        let completion = crate::api::classify_interactive_completion(outcome.result, stream.text);
+        // Only a successful execution may promote speculative text to its
+        // answer. A rejected structured response keeps its diagnostic instead.
+        let streamed_text = if outcome.result.is_err() {
+            String::new()
+        } else {
+            stream.text
+        };
+        let completion = crate::api::classify_interactive_completion(outcome.result, streamed_text);
         if let Err(error) = self.merge_turn_context(outcome.context).await {
             tracing::warn!(error=%error,"Failed to merge the turn context");
         }

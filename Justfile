@@ -90,3 +90,9 @@ log-tail n="50":
 [metadata('timeout', '600')]
 hawk *args="":
     cargo +1.99.0 hawk check {{args}}
+
+[group('tauqe')]
+[doc('Fix dead code across the workspace with cargo hawk')]
+[metadata('timeout', '600')]
+hawk-fix *args="":
+    cargo +1.99.0 hawk check --fix {{args}}

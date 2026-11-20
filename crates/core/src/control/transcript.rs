@@ -2,6 +2,7 @@
 
 use crate::context::{ContextAccess, ContextFileContent};
 use crate::edits::StagedEditsState;
+use crate::history::HistorySnapshot;
 use crate::llm::CapabilityTree;
 use crate::providers::ChatMessage;
 use crate::workflow::PatchStrategy;
@@ -34,6 +35,8 @@ pub struct TurnTranscript {
     pending_feedback: Option<String>,
     /// Serialized capability tree the prefix was seeded with.
     seed_signature: Option<String>,
+    /// History rendered into the seeded prefix, including explicit absence.
+    seed_history: Option<Option<HistorySnapshot>>,
     /// The latest answer for the round-budget outcome.
     pub(super) last_answer: Option<String>,
 }
@@ -49,6 +52,7 @@ impl Default for TurnTranscript {
             added_context: Vec::new(),
             pending_feedback: None,
             seed_signature: None,
+            seed_history: None,
             last_answer: None,
         }
     }
@@ -72,8 +76,9 @@ impl TurnTranscript {
         prefix: Vec<ChatMessage>,
         task: ChatMessage,
         capabilities: &CapabilityTree,
+        history: Option<&HistorySnapshot>,
     ) {
-        self.reseed_prefix(prefix, capabilities);
+        self.reseed_prefix(prefix, capabilities, history);
         self.task = task;
     }
 
@@ -85,8 +90,10 @@ impl TurnTranscript {
         &mut self,
         prefix: Vec<ChatMessage>,
         capabilities: &CapabilityTree,
+        history: Option<&HistorySnapshot>,
     ) {
         self.seed_signature = Some(serde_json::to_string(capabilities).unwrap_or_default());
+        self.seed_history = Some(history.cloned());
         self.prefix = prefix;
         self.delivered_originals = self.originals.len();
         self.added_context.clear();
@@ -114,9 +121,17 @@ impl TurnTranscript {
     /// A different tree is the phase boundary of the turn: the head the turn renders
     /// is rewritten once, while the task message and the rounds already exchanged keep
     /// their exact bytes.
-    pub(crate) fn advertises(&self, capabilities: &CapabilityTree) -> bool {
+    pub(crate) fn advertises(
+        &self,
+        capabilities: &CapabilityTree,
+        history: Option<&HistorySnapshot>,
+    ) -> bool {
         let signature = serde_json::to_string(capabilities).unwrap_or_default();
         self.seed_signature.as_deref() == Some(signature.as_str())
+            && self
+                .seed_history
+                .as_ref()
+                .is_some_and(|seeded| seeded.as_ref() == history)
     }
 
     /// Adds originals discovered since the last render to the stable sequence.

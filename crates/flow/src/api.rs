@@ -39,7 +39,6 @@ pub(crate) use crate::application::implementation_refinement::PreparedImplementa
 pub use crate::application::implementation_step::StepPreparationError;
 
 pub use crate::application::turn_setup::TurnProviderError;
-pub(crate) use crate::application::turn_setup::{ResolvedTurnModel, TurnMode};
 
 pub(crate) use crate::application::interactive_completion::classify_interactive_completion;
 pub use crate::application::interactive_completion::InteractiveTurnCompletion;
@@ -62,9 +61,7 @@ pub use crate::application::task_exit::{
 };
 
 pub use crate::application::review_analysis_response::ReviewAnalysisCompletionError;
-pub(crate) use crate::application::review_analysis_response::{
-    ReviewAnalysisResponse, ReviewAnalysisUpdate,
-};
+pub(crate) use crate::application::review_analysis_response::ReviewAnalysisResponse;
 
 pub use crate::application::review_analysis_completion::ReviewAnalysisPersistenceError;
 
@@ -77,7 +74,6 @@ pub(crate) use crate::application::review_synthesis_completion::ReviewSynthesisP
 pub(crate) use crate::application::review_synthesis_preparation::ResolvedReviewSynthesis;
 pub use crate::application::review_synthesis_preparation::ReviewSynthesisPreparationError;
 
-pub(crate) use crate::application::provider_task::{ProviderTask, ProviderTaskError};
 pub(crate) use crate::application::review_synthesis_request::PreparedReviewSynthesisRequest;
 
 pub(crate) use crate::application::review_synthesis_response::{
@@ -102,7 +98,7 @@ pub use crate::application::git_squash::{AppliedSquash, SquashApplyError};
 
 #[cfg(feature = "test-support")]
 pub use crate::application::plan_horizon::{
-    collect_plan_context_files, ContourRelaySummary, PlanHorizonContour,
+    collect_plan_context_files, ArchitectScope, ContourRelaySummary, PlanHorizonContour,
 };
 #[cfg(not(feature = "test-support"))]
 pub(crate) use crate::application::plan_horizon::{ContourRelaySummary, PlanHorizonContour};
@@ -147,9 +143,7 @@ pub(crate) use crate::application::step_completion::{
 
 #[cfg(feature = "test-support")]
 pub use crate::application::turn_execution::turn_prompt_protocol;
-pub(crate) use crate::application::turn_execution::{
-    InteractiveExecutionRequest, StepExecutionRequest,
-};
+pub(crate) use crate::application::turn_execution::InteractiveExecutionRequest;
 
 pub(crate) use crate::application::interactive_finalization::{
     InteractiveFinalizationInput, InteractiveFinalizationObserver, InteractiveFinalizationOutcome,

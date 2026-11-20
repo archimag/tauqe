@@ -479,8 +479,9 @@ impl PlanStorage {
         )
     }
 
-    /// Applies a batch of structured discussion updates as one storage transaction.
-    pub(crate) fn apply_discussion_plan_updates_with_mode(
+    /// Applies a batch of structured discussion updates under the explicitly chosen
+    /// mutation mode, returning one typed outcome per update in input order.
+    pub fn apply_discussion_plan_updates_with_mode(
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],
         mode: PlanMutationMode,
@@ -1043,6 +1044,65 @@ mod tests {
         assert_eq!(
             PlanStorage::load_active_id(root).unwrap(),
             Some("batch-b".to_string())
+        );
+    }
+
+    #[test]
+    fn public_batch_contract_preserves_repl_and_done_refusals() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut seed = probe_payload("guarded", vec![probe_leaf("1", "src/step.rs")]);
+        let created = PlanStorage::apply_discussion_plan_updates_with_mode(
+            root,
+            std::slice::from_ref(&seed),
+            PlanMutationMode::Repl,
+        );
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].applied.len(), 1);
+        assert!(created[0].errors.is_empty());
+
+        seed.title = Some("Changed".to_string());
+        let refused = PlanStorage::apply_discussion_plan_updates_with_mode(
+            root,
+            std::slice::from_ref(&seed),
+            PlanMutationMode::Repl,
+        );
+        assert!(refused[0].applied.is_empty());
+        assert_eq!(refused[0].errors[0].kind, PlanRejectionKind::ModeForbidden);
+        assert!(refused[0].warnings.is_empty());
+        assert_eq!(
+            PlanStorage::load_plan(root, "guarded")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Plan guarded"
+        );
+
+        PlanStorage::update_item(root, "guarded", "1", Some(PlanItemStatus::Done), None, None)
+            .unwrap();
+        let mut update = seed;
+        update.action = DiscussionPlanAction::Update;
+        update.items[0].status = PlanItemStatus::Done;
+        update.items[0].title = "Changed step".to_string();
+        let refused = PlanStorage::apply_discussion_plan_updates_with_mode(
+            root,
+            &[update],
+            PlanMutationMode::Discussion,
+        );
+        assert!(refused[0].applied.is_empty());
+        assert_eq!(refused[0].errors[0].kind, PlanRejectionKind::PayloadDefect);
+        assert!(refused[0].errors[0]
+            .message
+            .contains("Cannot modify title of completed step '1'"));
+        assert_eq!(
+            PlanStorage::load_plan(root, "guarded")
+                .unwrap()
+                .unwrap()
+                .implementation
+                .find_item("1")
+                .unwrap()
+                .title,
+            "Step 1"
         );
     }
 

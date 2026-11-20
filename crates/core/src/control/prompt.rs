@@ -4,10 +4,10 @@
 use crate::context::ContextAccess;
 use crate::models::{ModelRef, ReasoningEffort};
 use crate::workflow::PatchStrategy;
-use tokio::sync::mpsc;
 
 use super::context::LoopContext;
 use super::outcome::{ResponseEnvelope, SystemError};
+use super::request;
 use crate::config::OuterDocEntry;
 use crate::control::cache::TurnInputCache;
 use crate::edits::StagedEditsState;
@@ -151,12 +151,6 @@ impl<'a> PromptBuilder<'a> {
         self
     }
 
-    pub(crate) fn set_turn_brief(&mut self, turn_brief: Option<TurnBrief>) -> &mut Self {
-        self.turn_brief = turn_brief;
-        self
-    }
-
-    #[cfg(test)]
     pub(crate) fn set_history(&mut self, history: Option<&'a HistorySnapshot>) -> &mut Self {
         self.history = history;
         self
@@ -318,6 +312,14 @@ async fn execute_round_inner(
             .await
     };
 
+    // Freeze one grant and project for the instructions, schema, decoder and preview.
+    let scoped_protocol = ctx
+        .prompt_builder
+        .protocol
+        .with_capabilities(ctx.capabilities.clone())
+        .with_project(Some(project.clone()));
+    let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
+
     let mut assembly = PromptAssembly::new(
         repo_state,
         ctx_state.revision,
@@ -333,14 +335,6 @@ async fn execute_round_inner(
     .with_outer_docs(ctx.prompt_builder.outer_docs.clone());
 
     assembly.turn_brief = ctx.prompt_builder.turn_brief.clone();
-
-    // The protocol was constructed with the contour's capability tree. A round
-    // binds only the project declaration used by its schema and decoder.
-    let scoped_protocol = ctx
-        .prompt_builder
-        .protocol
-        .with_project(Some(project.clone()));
-    let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
     let base_prompt = ctx.prompt_builder.prompt.as_deref().unwrap_or("");
     let rebuilt_user_prompt = match round_assembly {
@@ -397,8 +391,13 @@ async fn execute_round_inner(
                             "the prompt assembly rendered no message".to_string(),
                         ));
                     };
-                    transcript.seed(prefix.to_vec(), task.clone(), &ctx.capabilities);
-                } else if !transcript.advertises(&ctx.capabilities) {
+                    transcript.seed(
+                        prefix.to_vec(),
+                        task.clone(),
+                        &ctx.capabilities,
+                        ctx.prompt_builder.history,
+                    );
+                } else if !transcript.advertises(&ctx.capabilities, ctx.prompt_builder.history) {
                     let assembled = assembly.assemble_chat_messages_with_context_cache(
                         base_prompt,
                         protocol,
@@ -408,7 +407,7 @@ async fn execute_round_inner(
                         .split_last()
                         .map(|(_, prefix)| prefix.to_vec())
                         .unwrap_or_default();
-                    transcript.reseed_prefix(prefix, &ctx.capabilities);
+                    transcript.reseed_prefix(prefix, &ctx.capabilities, ctx.prompt_builder.history);
                 }
                 transcript.append_discoveries(ctx.prompt_builder.patch_strategy);
                 if let Some(feedback) = transcript.take_pending_feedback() {
@@ -460,8 +459,6 @@ async fn execute_round_inner(
             _ => String::new(),
         };
 
-        let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(64);
-        let event_sink = ctx.events.clone();
         let mut stream_filter = protocol.create_stream_filter_with_strategy(
             context_paths.clone(),
             root_buf.clone(),
@@ -484,54 +481,6 @@ async fn execute_round_inner(
             stream_filter.exclude_disk_sources(missing);
         }
 
-        let forward = tokio::spawn(async move {
-            let mut text = String::new();
-            let mut stream_error: Option<String> = None;
-            let mut cancelled = false;
-            let mut completed = false;
-            let mut token_usage = None;
-            while let Some(event) = llm_rx.recv().await {
-                match event {
-                    StreamEvent::TextDelta(delta) => {
-                        text.push_str(&delta);
-                        for filtered in stream_filter.push_chunk(&delta) {
-                            event_sink.emit(filtered);
-                        }
-                    }
-                    // The transport voided the interrupted attempt and re-issued
-                    // the request, so the payload accumulated for decoding and the
-                    // streamed preview restart together with the new attempt.
-                    StreamEvent::ResetStream => {
-                        text.clear();
-                        token_usage = None;
-                        stream_filter.reset();
-                        event_sink.emit(StreamEvent::ResetStream);
-                    }
-                    StreamEvent::Error(message) => {
-                        event_sink.emit(StreamEvent::Error(message.clone()));
-                        stream_error = Some(message);
-                    }
-                    StreamEvent::Cancelled => {
-                        event_sink.emit(StreamEvent::Cancelled);
-                        cancelled = true;
-                    }
-                    StreamEvent::Done => {
-                        completed = true;
-                        event_sink.emit(StreamEvent::Done);
-                    }
-                    StreamEvent::Usage(usage) => {
-                        token_usage = Some((usage.prompt_tokens, usage.cached_tokens));
-                        event_sink.emit(StreamEvent::Usage(usage));
-                    }
-                    other => event_sink.emit(other),
-                }
-            }
-            for filtered in stream_filter.finish() {
-                event_sink.emit(filtered);
-            }
-            (text, stream_error, cancelled, completed, token_usage)
-        });
-
         ctx.check_cancelled()?;
         let round = ctx
             .rounds_spent
@@ -548,27 +497,27 @@ async fn execute_round_inner(
                 },
             });
         }
-        let client_result = ctx
-            .prompt_builder
-            .provider
-            .stream(
-                crate::providers::LlmRequest {
-                    model: &ctx.prompt_builder.model.name,
-                    messages,
-                    response_format,
-                    reasoning_effort: ctx.prompt_builder.reasoning_effort,
-                    session_id: ctx.prompt_builder.session_id.as_deref(),
-                },
-                llm_tx,
-                ctx.cancel.receiver(),
-            )
-            .await;
-
-        client_result.map_err(|error| SystemError::Provider(error.to_string()))?;
-
-        let (assistant_text, stream_error, cancelled, completed, token_usage) = forward
-            .await
-            .map_err(|error| SystemError::Other(format!("control stream task failed: {error}")))?;
+        let stream = request::execute(
+            ctx.prompt_builder.provider,
+            crate::providers::LlmRequest {
+                model: &ctx.prompt_builder.model.name,
+                messages,
+                response_format,
+                reasoning_effort: ctx.prompt_builder.reasoning_effort,
+                session_id: ctx.prompt_builder.session_id.as_deref(),
+            },
+            stream_filter,
+            ctx.events,
+            ctx.cancel.receiver(),
+        )
+        .await?;
+        let request::RequestStream {
+            text: assistant_text,
+            stream_error,
+            cancelled,
+            completed,
+            token_usage,
+        } = stream;
 
         if cancelled || ctx.cancel.is_cancelled() {
             return Err(SystemError::Cancelled);
@@ -679,6 +628,7 @@ mod tests {
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::research::journal::TurnResearchJournal;
+    use tokio::sync::mpsc;
 
     struct ReconnectingProvider;
 

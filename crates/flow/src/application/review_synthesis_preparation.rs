@@ -5,13 +5,12 @@ use tauqe_core::config::AppConfig;
 
 use std::path::PathBuf;
 use tauqe_core::context::ContextFileContent;
-use tauqe_core::models::{ModelRef, ModelRole, ModelSelection, ReasoningEffort};
+use tauqe_core::models::{ModelRef, ModelRole, ModelSelection};
 use tauqe_core::review::window::{expand_window, WindowBudgets, WindowContext};
 
 pub struct ResolvedReviewSynthesis {
     pub(crate) config: AppConfig,
     pub model: ModelRef,
-    pub effort: Option<ReasoningEffort>,
 }
 
 pub struct PreparedReviewSynthesisWindow {
@@ -31,23 +30,24 @@ pub enum ReviewSynthesisPreparationError {
 
 impl Application {
     /// Resolve before provider setup and before reading the active context.
+    #[cfg(test)]
     pub(crate) async fn resolve_review_synthesis(
         &self,
         selection: Option<&ModelSelection>,
     ) -> ResolvedReviewSynthesis {
         let config = self.configuration().await.config;
+        Self::resolve_review_synthesis_from_config(config, selection)
+    }
+
+    pub(crate) fn resolve_review_synthesis_from_config(
+        config: AppConfig,
+        selection: Option<&ModelSelection>,
+    ) -> ResolvedReviewSynthesis {
         let selection = selection
             .cloned()
             .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
         let model = config.resolve_model(&selection);
-        let effort = config
-            .models
-            .resolve_selection_effort(ModelRole::Reviewer, &selection);
-        ResolvedReviewSynthesis {
-            config,
-            model,
-            effort,
-        }
+        ResolvedReviewSynthesis { config, model }
     }
 
     /// Prepare before claiming the operation slot, preserving refusal priority.
@@ -163,9 +163,11 @@ impl Application {
 mod tests {
     use super::*;
     use crate::api::ReloadSelection;
+    use crate::application::configuration::ConfigurationSnapshot;
+    use crate::application::infrastructure::execution::ExecutionEnvironment;
     use tauqe_core::config::{ModelsConfig, OpenRouterConfig};
     use tauqe_core::context::ContextAccess;
-    use tauqe_core::models::ModelEntry;
+    use tauqe_core::models::{ModelEntry, ReasoningEffort};
 
     fn config() -> AppConfig {
         AppConfig {
@@ -210,18 +212,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewer_resolution_preserves_explicit_effort_for_repeated_models() {
+    async fn reviewer_resolution_preserves_explicit_model_for_repeated_models() {
         let app = Application::new(config());
         let base = app.resolve_review_synthesis(None).await;
         assert_eq!(base.model, ModelRef::openrouter("test/reviewer"));
-        assert_eq!(base.effort, Some(ReasoningEffort::Low));
         let selected = ModelSelection::Tier {
             model: base.model.clone(),
             effort: Some(ReasoningEffort::High),
         };
         let deep = app.resolve_review_synthesis(Some(&selected)).await;
         assert_eq!(deep.model, base.model);
-        assert_eq!(deep.effort, Some(ReasoningEffort::High));
     }
 
     #[tokio::test]
@@ -295,8 +295,12 @@ mod tests {
         });
         app.replace_configuration(changed, ReloadSelection::Preserve)
             .await;
-        assert!(app
-            .resolve_provider(frozen.model.provider, &frozen.config)
+        let frozen_environment = ExecutionEnvironment::new(ConfigurationSnapshot {
+            selection: frozen.config.default_selection(),
+            config: frozen.config.clone(),
+        });
+        assert!(frozen_environment
+            .provider(&app, frozen.model.provider)
             .await
             .is_err());
         let window = app
@@ -305,8 +309,12 @@ mod tests {
             .unwrap();
         assert_eq!(window.files.len(), 1);
         let current = app.resolve_review_synthesis(None).await;
-        assert!(app
-            .resolve_provider(current.model.provider, &current.config)
+        let current_environment = ExecutionEnvironment::new(ConfigurationSnapshot {
+            selection: current.config.default_selection(),
+            config: current.config.clone(),
+        });
+        assert!(current_environment
+            .provider(&app, current.model.provider)
             .await
             .is_ok());
         assert!(matches!(

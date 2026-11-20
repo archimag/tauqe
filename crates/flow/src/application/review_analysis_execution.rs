@@ -3,12 +3,15 @@
 use crate::api::{
     Application, OperationGuard, PreparedReviewPostAnalysis, ReviewAnalysisCompletionError,
     ReviewAnalysisPersistenceError, ReviewAnalysisPreparationError, ReviewAnalysisResponse,
-    ReviewAnalysisUpdate,
 };
+use crate::application::infrastructure::execution::StructuredExecution;
+use crate::application::infrastructure::structured_task;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::providers::LlmProvider;
+use tauqe_core::providers::StreamEvent;
+use tauqe_core::review::analysis::post_analysis_contract;
+use tauqe_core::review::stream::ReviewStreamUpdate;
 use tauqe_core::review::ReviewSession;
 
 pub use crate::application::review_observer::ReviewObserver as ReviewAnalysisObserver;
@@ -30,7 +33,7 @@ impl Application {
         operation: &OperationGuard,
         root: &Path,
         prepared: &PreparedReviewPostAnalysis,
-        provider: Arc<dyn LlmProvider>,
+        execution: &StructuredExecution,
         observer: Arc<dyn ReviewAnalysisObserver>,
         exit_deadline: Duration,
     ) -> Result<ReviewSession, ReviewAnalysisExecutionError> {
@@ -44,31 +47,40 @@ impl Application {
                 publisher.publish_usage_totals(id, snapshot);
             })
             .await;
-        let mut cancel = operation.cancel_receiver();
-        let mut task = self.start_review_post_analysis(operation, prepared, provider)?;
-        let mut response = ReviewAnalysisResponse::default();
-        while let Some(event) = task.next_event().await {
-            observer.pace(&event, &mut cancel).await;
-            match response.observe(event) {
-                ReviewAnalysisUpdate::Usage(report) => usage.observe(&report).await,
-                ReviewAnalysisUpdate::Finished => break,
-                ReviewAnalysisUpdate::Ignored => {}
-                update => observer.publish(update),
-            }
-        }
-        task.clear_abort_handle();
+        let cancel = operation.cancel_receiver();
+        let result = structured_task::run(
+            self,
+            operation,
+            execution,
+            post_analysis_contract(),
+            prepared.messages(),
+            &operation_id,
+            exit_deadline,
+            |event| {
+                let usage = &usage;
+                let observer = &observer;
+                let mut pacing_cancel = cancel.clone();
+                async move {
+                    observer.pace(&event, &mut pacing_cancel).await;
+                    match event {
+                        StreamEvent::Usage(report) => usage.observe(&report).await,
+                        StreamEvent::TextDelta(delta) => {
+                            observer.publish(ReviewStreamUpdate::Content(delta))
+                        }
+                        StreamEvent::ReasoningDelta(delta) => {
+                            observer.publish(ReviewStreamUpdate::Reasoning(delta))
+                        }
+                        StreamEvent::ResetStream => observer.publish(ReviewStreamUpdate::Reset),
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await;
         usage.flush().await;
         observer.publish_usage(&self.usage_snapshot().await);
         let cancelled = *cancel.borrow();
-        let regrouping = match response.finish(&prepared.session, cancelled) {
-            Ok(regrouping) => regrouping,
-            Err(error) => {
-                if error.requires_abort() {
-                    let _ = task.abort_and_reap(&operation_id, exit_deadline).await;
-                }
-                return Err(error.into());
-            }
-        };
+        let regrouping = ReviewAnalysisResponse::finish(result, &prepared.session, cancelled)?;
         self.persist_review_post_analysis(operation, root, prepared, regrouping)
             .await
             .map_err(Into::into)
@@ -79,9 +91,11 @@ impl Application {
 mod tests {
     use super::*;
     use crate::api::UsageTotalsSnapshot;
+    use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+    use crate::application::plan_horizon::ArchitectScope;
     use std::sync::Mutex;
     use tauqe_core::config::{AppConfig, ModelsConfig};
-    use tauqe_core::models::{ModelEntry, ModelRef};
+    use tauqe_core::models::{ModelEntry, ModelRef, ProviderKind};
     use tauqe_core::providers::{mock::MockResponse, MockLlmProvider, ModelUsageInfo, StreamEvent};
     use tauqe_core::review::ReviewStorage;
     use tokio::sync::watch;
@@ -104,11 +118,11 @@ mod tests {
                 }
             }
         }
-        fn publish(&self, update: ReviewAnalysisUpdate) {
+        fn publish(&self, update: ReviewStreamUpdate) {
             let label = match update {
-                ReviewAnalysisUpdate::Reasoning(_) => "reasoning",
-                ReviewAnalysisUpdate::Content(_) => "content",
-                ReviewAnalysisUpdate::Reset => "reset",
+                ReviewStreamUpdate::Reasoning(_) => "reasoning",
+                ReviewStreamUpdate::Content(_) => "content",
+                ReviewStreamUpdate::Reset => "reset",
                 _ => panic!("accounting and terminal updates stay inside core"),
             };
             self.updates.lock().unwrap().push(label);
@@ -156,7 +170,23 @@ mod tests {
             ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
-        app.prepare_review_post_analysis(operation, root, &session, None)
+        let environment = PlanExecutionEnvironment::new(app.configuration().await, operation);
+        app.prepare_review_post_analysis(operation, &environment, root, &session, None)
+            .await
+            .unwrap()
+    }
+    async fn execution(
+        app: &Application,
+        operation: &OperationGuard,
+        prepared: &PreparedReviewPostAnalysis,
+    ) -> StructuredExecution {
+        PlanExecutionEnvironment::new(app.configuration().await, operation)
+            .for_review_post_analysis(
+                app,
+                operation,
+                &prepared.tier,
+                &ArchitectScope::Review(prepared.session.id.clone()),
+            )
             .await
             .unwrap()
     }
@@ -177,18 +207,28 @@ mod tests {
             ..Default::default()
         });
         let provider = Arc::new(MockLlmProvider::scripted([response()]));
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
+        let execution = execution(&app, &operation, &prepared).await;
         let stored = app
             .execute_review_post_analysis(
                 &operation,
                 root.path(),
                 &prepared,
-                provider,
+                &execution,
                 observer.clone(),
                 Duration::from_secs(1),
             )
             .await
             .unwrap();
         assert_eq!(stored.description.as_deref(), Some("One boundary"));
+        let request = provider.last_request().unwrap();
+        assert_eq!(
+            request.session_id.as_deref(),
+            Some("tauqe-review-execution-review")
+        );
+        assert_eq!(request.messages[0].role, "system");
+        assert_eq!(request.messages[1], prepared.messages()[0]);
         let snapshot = observer.final_usage.lock().unwrap().clone().unwrap();
         assert_eq!(snapshot.operations, 1);
         assert_eq!(snapshot.prev.total_tokens, 17);
@@ -213,12 +253,18 @@ mod tests {
             cancel_on_usage: Some(app.clone()),
             ..Default::default()
         });
+        app.test_set_provider_for(
+            ProviderKind::OpenRouter,
+            Arc::new(MockLlmProvider::scripted([response()])),
+        )
+        .await;
+        let execution = execution(&app, &operation, &prepared).await;
         let result = app
             .execute_review_post_analysis(
                 &operation,
                 root.path(),
                 &prepared,
-                Arc::new(MockLlmProvider::scripted([response()])),
+                &execution,
                 observer.clone(),
                 Duration::from_secs(1),
             )
@@ -265,12 +311,15 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::error(
             "provider failed",
         )]));
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
+        let execution = execution(&app, &operation, &prepared).await;
         let result = app
             .execute_review_post_analysis(
                 &foreign,
                 root.path(),
                 &prepared,
-                provider.clone(),
+                &execution,
                 observer.clone(),
                 Duration::from_secs(1),
             )
@@ -288,7 +337,7 @@ mod tests {
                 &operation,
                 root.path(),
                 &prepared,
-                provider,
+                &execution,
                 observer.clone(),
                 Duration::from_secs(1),
             )

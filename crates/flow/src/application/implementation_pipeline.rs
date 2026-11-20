@@ -39,25 +39,26 @@
 //! single-finding run states whether the run addressed the finding or skipped
 //! it.
 
-use crate::workflow::batch::QueueInterruption;
+use crate::api::Application;
+use crate::application::implementation_executor::{
+    ImplementationRunConfig, PlanImplementationStepExecutor,
+};
+use crate::application::implementation_host::ImplementationHost;
 use std::path::Path;
+use tauqe_core::workflow::batch::QueueInterruption;
 
-use crate::models::{ArchitectTier, ModelSelection};
-use crate::plan::{PlanItem, PlanItemStatus, PlanScopeEvaluation};
-use crate::review::IssueStatus;
-use crate::workflow::EditProtocolKind;
+use tauqe_core::models::{ArchitectTier, ModelSelection};
+use tauqe_core::plan::{PlanItem, PlanScopeEvaluation};
+use tauqe_core::workflow::EditProtocolKind;
 use tokio::sync::{mpsc, watch};
 
-use crate::config::AppConfig;
-use crate::plan::prompt::resolve_architect_tier;
-use crate::plan::storage::PlanStorage;
-use crate::providers::StreamEvent;
-use crate::review::storage::ReviewStorage;
-use crate::workflow::batch::{BatchExecution, BatchStep, BatchStepStatus, BatchStop};
-use crate::workflow::implementation::{
-    classify_scope_stall, ExecutionScope, ImplementationFrame, ImplementationHost,
-    ImplementationRunConfig, PlanImplementationStepExecutor, RefinementRequest, RefinementResult,
-    StepFailure,
+use tauqe_core::config::AppConfig;
+use tauqe_core::plan::prompt::resolve_architect_tier;
+use tauqe_core::providers::StreamEvent;
+use tauqe_core::workflow::batch::{BatchExecution, BatchStep, BatchStepStatus, BatchStop};
+use tauqe_core::workflow::implementation::{
+    classify_scope_stall, ExecutionScope, ImplementationFrame, PlanImplementationStop,
+    RefinementRequest, RefinementResult, StepFailure,
 };
 
 /// Knobs a caller declares for one implementation run.
@@ -69,31 +70,6 @@ pub struct PlanImplementationOptions {
     pub instructions: Option<String>,
     /// Turn marker bound to the tagged control channel.
     pub marker: Option<String>,
-}
-
-/// Terminal reason an implementation run stopped.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanImplementationStop {
-    /// Every executable leaf of the horizon finished.
-    Completed,
-    /// A failure the pipeline cannot repair by reprojecting the horizon.
-    Failed {
-        /// The step the failure is attributed to, when it is attributable.
-        step: Option<String>,
-        /// Diagnostic of the failure.
-        reason: String,
-    },
-    /// A step cannot proceed until the developer resolves the stated blocker.
-    Blocked {
-        /// The step the blocker is attributed to, when it is attributable.
-        step: Option<String>,
-        /// Diagnostic of the blocker.
-        reason: String,
-    },
-    /// The run observed a cancellation request.
-    Cancelled,
-    /// The run observed a soft-stop request and drained the running step.
-    Stopped,
 }
 
 /// Terminal report of one implementation run.
@@ -130,6 +106,7 @@ pub struct PlanImplementationReport {
 pub struct PlanImplementationPipeline<'a> {
     repo_root: &'a Path,
     scope: ExecutionScope,
+    application: &'a Application,
     host: &'a dyn ImplementationHost,
     config: AppConfig,
     options: PlanImplementationOptions,
@@ -140,6 +117,7 @@ impl<'a> PlanImplementationPipeline<'a> {
     pub fn new(
         repo_root: &'a Path,
         scope: ExecutionScope,
+        application: &'a Application,
         host: &'a dyn ImplementationHost,
         config: AppConfig,
         options: PlanImplementationOptions,
@@ -147,6 +125,7 @@ impl<'a> PlanImplementationPipeline<'a> {
         Self {
             repo_root,
             scope,
+            application,
             host,
             config,
             options,
@@ -172,7 +151,15 @@ impl<'a> PlanImplementationPipeline<'a> {
         soft_stop_rx: &watch::Receiver<bool>,
     ) -> PlanImplementationReport {
         let report = self.drive(stream_tx, cancel_rx, soft_stop_rx).await;
-        self.settle_completed_scope(&report);
+        self.application
+            .settle_implementation_scope(
+                self.repo_root,
+                &self.scope,
+                &report.stop,
+                report.succeeded,
+                report.scheduled,
+            )
+            .await;
         report
     }
 
@@ -206,7 +193,11 @@ impl<'a> PlanImplementationPipeline<'a> {
             // The horizon is re-resolved from the storage that owns it before every
             // round, so the pipeline never decides the next round from a stale copy
             // of the graph.
-            let frame = match self.scope.resolve(self.repo_root) {
+            let frame = match self
+                .application
+                .implementation_frame(&self.scope, self.repo_root)
+                .await
+            {
                 Ok(frame) => frame,
                 Err(failure) => {
                     return self.report(
@@ -324,6 +315,7 @@ impl<'a> PlanImplementationPipeline<'a> {
             let mut executor = PlanImplementationStepExecutor::new(
                 self.repo_root,
                 self.scope.clone(),
+                self.application,
                 self.host,
                 run_config,
             );
@@ -424,136 +416,6 @@ impl<'a> PlanImplementationPipeline<'a> {
         }
     }
 
-    /// Applies the completion discipline of the scope the run belongs to.
-    ///
-    /// A local plan needs no settlement: its steps are its whole state. A review
-    /// scope does, because its findings are entities distinct from the horizon
-    /// that resolves them, and the pipeline is the only place that knows the
-    /// horizon reached its end.
-    ///
-    /// The lifecycle of a running step is not part of the settlement: the step
-    /// executor already wrote `InProgress` when it took the finding and `Todo`
-    /// when it reset it. The settlement states the verdict alone, exactly once,
-    /// so no second writer touches the status of a finding.
-    fn settle_completed_scope(&self, report: &PlanImplementationReport) {
-        match &self.scope {
-            ExecutionScope::Plan { .. } => {}
-            ExecutionScope::ReviewGroup {
-                review_id,
-                group_id,
-            } => self.close_completed_group(review_id, group_id),
-            ExecutionScope::ReviewFinding { review_id, item_id } => {
-                self.settle_finding(report, review_id, *item_id);
-            }
-        }
-    }
-
-    /// Closes the findings of a group whose horizon reached the aggregate `Done`
-    /// status.
-    ///
-    /// The trigger reads the persisted horizon, never the report of the run: the
-    /// group is complete exactly when its step graph is, and the graph is the
-    /// storage's answer. A horizon that is still running, stalled, or carries no
-    /// step at all therefore closes nothing.
-    fn close_completed_group(&self, review_id: &str, group_id: &str) {
-        let complete = self
-            .scope
-            .resolve(self.repo_root)
-            .is_ok_and(|frame| frame.plan.implementation.status() == PlanItemStatus::Done);
-        if !complete {
-            return;
-        }
-
-        match ReviewStorage::close_group_implementation(
-            self.repo_root,
-            review_id,
-            group_id,
-            GROUP_COMPLETION_NOTE,
-        ) {
-            Ok(Some(closed)) => tracing::info!(
-                review_id = review_id,
-                group_id = group_id,
-                closed = closed,
-                "review group implementation closed"
-            ),
-            Ok(None) => tracing::warn!(
-                review_id = review_id,
-                group_id = group_id,
-                "the review group completion was not persisted: the group was not found"
-            ),
-            Err(err) => tracing::warn!(
-                review_id = review_id,
-                group_id = group_id,
-                error = %err,
-                "the review group completion was not persisted"
-            ),
-        }
-    }
-
-    /// States the verdict of the single finding a degenerate run implements.
-    ///
-    /// A degenerate horizon owns no persisted step graph, so the finding is the
-    /// only durable record of the run: a completed run closes it as `Fixed` with
-    /// the result of the change set, and a run whose step could not be implemented
-    /// as approved closes it as `Skipped` with the diagnostic. Cancellation and a
-    /// soft stop are not verdicts on the finding, so an interrupted run writes no
-    /// verdict and keeps the lifecycle its step executor recorded.
-    ///
-    /// The commit is never restated by the verdict: the step executor wrote the
-    /// commit of the completed step on the finding, and the settlement states the
-    /// status and the note only, so a finished finding keeps the exact pointer to
-    /// the change set that resolved it.
-    fn settle_finding(&self, report: &PlanImplementationReport, review_id: &str, item_id: u32) {
-        let (status, note) = match &report.stop {
-            PlanImplementationStop::Completed => (
-                IssueStatus::Fixed,
-                format!(
-                    "Addressed by the implementation run: {} of {} scheduled step(s) succeeded",
-                    report.succeeded, report.scheduled
-                ),
-            ),
-            PlanImplementationStop::Failed { reason, .. }
-            | PlanImplementationStop::Blocked { reason, .. } => (
-                IssueStatus::Skipped,
-                format!("The implementation run could not address this finding: {reason}"),
-            ),
-            PlanImplementationStop::Cancelled | PlanImplementationStop::Stopped => return,
-        };
-
-        let result =
-            ReviewStorage::update_session_item(self.repo_root, review_id, item_id, |issue| {
-                issue.status = status;
-                // The commit the step executor recorded is the durable pointer of
-                // the change set, so the verdict states the status and the note
-                // and leaves it untouched.
-                // A note the developer already stated is never overwritten: the run
-                // records its verdict on a finding that carries none.
-                if !carries_note(issue.note.as_deref()) {
-                    issue.note = Some(note.clone());
-                }
-            });
-
-        match result {
-            Ok(Some(_)) => tracing::info!(
-                review_id = review_id,
-                item_id = item_id,
-                status = status.as_str(),
-                "review finding settled"
-            ),
-            Ok(None) => tracing::warn!(
-                review_id = review_id,
-                item_id = item_id,
-                "the review finding verdict was not persisted: the finding was not found"
-            ),
-            Err(err) => tracing::warn!(
-                review_id = review_id,
-                item_id = item_id,
-                error = %err,
-                "the review finding verdict was not persisted"
-            ),
-        }
-    }
-
     /// Applies the replanning policy to one attributed failure.
     ///
     /// A wave is spent only on a domain failure that names the step whose approach
@@ -608,7 +470,7 @@ impl<'a> PlanImplementationPipeline<'a> {
             );
             // The group keeps the diagnosis of the approach that failed, so the
             // durable session states why its horizon was not reprojected.
-            self.record_group_blocker(Some(failure.reason()));
+            self.record_group_blocker(Some(failure.reason())).await;
             return ReplanOutcome::Unrepaired {
                 reason: format!(
                     "Replanning budget exhausted (max_replans = {}) for step '{}': {}",
@@ -707,12 +569,12 @@ impl<'a> PlanImplementationPipeline<'a> {
                             .to_string(),
                     };
                 }
-                match self.persist_horizon(items, tier, failed_step) {
+                match self.persist_horizon(items, tier, failed_step).await {
                     Ok(()) => {
                         // A group that owns a fresh horizon is no longer stopped, so a
                         // client never renders a stale blocker beside a synthesized
                         // plan.
-                        self.record_group_blocker(None);
+                        self.record_group_blocker(None).await;
                         tracing::info!(
                             scope = ?self.scope,
                             "implementation horizon synthesized"
@@ -725,7 +587,7 @@ impl<'a> PlanImplementationPipeline<'a> {
             RefinementResult::Blocked { reason, .. } => {
                 // The blocker belongs to the group that has to resolve it, not to the
                 // findings its horizon manifests.
-                self.record_group_blocker(Some(reason.as_str()));
+                self.record_group_blocker(Some(reason.as_str())).await;
                 WaveOutcome::Blocked { reason }
             }
         }
@@ -737,46 +599,22 @@ impl<'a> PlanImplementationPipeline<'a> {
     /// that closes a dependency cycle, record the Architect configuration that
     /// produced it, and persist the reprojected step together with it, so the next
     /// wave reads its escalation input from disk.
-    fn persist_horizon(
+    async fn persist_horizon(
         &self,
         items: Vec<PlanItem>,
         tier: ArchitectTier,
         last_replanned_step: Option<String>,
     ) -> Result<(), String> {
-        match &self.scope {
-            ExecutionScope::Plan { plan_id, .. } => PlanStorage::replace_uncompleted_horizon(
+        self.application
+            .replace_implementation_horizon(
                 self.repo_root,
-                plan_id,
+                self.scope.clone(),
                 items,
                 tier,
                 last_replanned_step,
             )
-            .map(|_| ())
-            .map_err(|err| err.to_string()),
-            ExecutionScope::ReviewGroup {
-                review_id,
-                group_id,
-            } => {
-                let updated = ReviewStorage::replace_uncompleted_group_subplan(
-                    self.repo_root,
-                    review_id,
-                    group_id,
-                    items,
-                    tier,
-                    last_replanned_step,
-                )
-                .map_err(|err| err.to_string())?;
-                updated.map(|_| ()).ok_or_else(|| {
-                    format!(
-                        "Review group '{}' of session '{}' is not stored; the synthesized horizon was not persisted",
-                        group_id, review_id
-                    )
-                })
-            }
-            ExecutionScope::ReviewFinding { .. } => {
-                Err("A single review finding owns no persisted horizon to rewrite".to_string())
-            }
-        }
+            .await
+            .map_err(StepFailure::into_reason)
     }
 
     /// Records or clears the blocker of a review group.
@@ -785,7 +623,7 @@ impl<'a> PlanImplementationPipeline<'a> {
     /// owns no group, so both scopes resolve to nothing. The write is best-effort:
     /// it accompanies a verdict the run already reached, so a storage problem is
     /// journaled instead of replacing that verdict.
-    fn record_group_blocker(&self, reason: Option<&str>) {
+    async fn record_group_blocker(&self, reason: Option<&str>) {
         let ExecutionScope::ReviewGroup {
             review_id,
             group_id,
@@ -793,9 +631,13 @@ impl<'a> PlanImplementationPipeline<'a> {
         else {
             return;
         };
-        match ReviewStorage::set_group_blocked_reason(self.repo_root, review_id, group_id, reason) {
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::warn!(
+        match self
+            .application
+            .persist_group_blocker(self.repo_root, review_id, group_id, reason)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
                 review_id = review_id.as_str(),
                 group_id = group_id.as_str(),
                 "the review group blocker was not persisted: the group was not found"
@@ -803,7 +645,7 @@ impl<'a> PlanImplementationPipeline<'a> {
             Err(err) => tracing::warn!(
                 review_id = review_id.as_str(),
                 group_id = group_id.as_str(),
-                error = %err,
+                error = err.reason(),
                 "the review group blocker was not persisted"
             ),
         }
@@ -827,21 +669,6 @@ impl<'a> PlanImplementationPipeline<'a> {
             replans,
         }
     }
-}
-
-/// Note recorded on the findings a completed group horizon closes.
-///
-/// It states why the findings became `Fixed`: the horizon the group owns
-/// finished. A finding that already carries a note keeps it.
-const GROUP_COMPLETION_NOTE: &str =
-    "Resolved by the completed implementation horizon of the review group";
-
-/// Whether a finding already carries a resolution note.
-///
-/// A note the developer stated is never rewritten by a settlement: the note of
-/// the run is recorded only on a finding that carries none.
-fn carries_note(note: Option<&str>) -> bool {
-    note.map(str::trim).is_some_and(|text| !text.is_empty())
 }
 
 /// Accumulated step counters of a pipeline run.
@@ -891,16 +718,20 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use crate::models::{ArchitectTier, ModelEntry, ModelRef, ModelSelection, ReasoningEffort};
-    use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
-    use crate::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
-    use crate::review::{ReviewGroup, ReviewItem, ReviewSession};
     use async_trait::async_trait;
+    use tauqe_core::models::{
+        ArchitectTier, ModelEntry, ModelRef, ModelSelection, ReasoningEffort,
+    };
+    use tauqe_core::plan::storage::PlanStorage;
+    use tauqe_core::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
+    use tauqe_core::review::storage::ReviewStorage;
+    use tauqe_core::review::{IssueStatus, IssueType, ReviewGroupKind, ReviewIssue};
+    use tauqe_core::review::{ReviewGroup, ReviewItem, ReviewSession};
     use tempfile::tempdir;
 
     use super::*;
-    use crate::config::ModelsConfig;
-    use crate::workflow::implementation::{StepTurnRequest, StepTurnResult};
+    use tauqe_core::config::ModelsConfig;
+    use tauqe_core::workflow::implementation::{StepTurnRequest, StepTurnResult};
 
     /// Identifier of the plan every plan-scope fixture stores.
     const PLAN_ID: &str = "pipeline-plan";
@@ -1075,6 +906,15 @@ mod tests {
         ModelEntry::from(ModelRef::openrouter(model))
     }
 
+    fn architect_tier(model: ModelRef, effort: Option<ReasoningEffort>) -> ArchitectTier {
+        ArchitectTier {
+            model,
+            effort,
+            attempts: None,
+            level_up: None,
+        }
+    }
+
     /// Builds the single concept node of a plan fixture.
     fn concept() -> Vec<ConceptItem> {
         vec![ConceptItem {
@@ -1165,9 +1005,11 @@ mod tests {
         config: AppConfig,
         channels: &Channels,
     ) -> PlanImplementationReport {
+        let application = Application::default();
         PlanImplementationPipeline::new(
             root,
             scope,
+            &application,
             host,
             config,
             PlanImplementationOptions::default(),
@@ -1236,7 +1078,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_first_failure_of_a_step_keeps_the_recorded_architect() {
         let dir = tempdir().unwrap();
-        let recorded = ArchitectTier::new(
+        let recorded = architect_tier(
             ModelRef::openrouter("architect/one"),
             Some(ReasoningEffort::Low),
         );
@@ -1311,11 +1153,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_repeated_failure_of_the_same_step_escalates_the_architect() {
         let dir = tempdir().unwrap();
-        let tier_one = ArchitectTier::new(
+        let tier_one = architect_tier(
             ModelRef::openrouter("architect/one"),
             Some(ReasoningEffort::Low),
         );
-        let tier_two = ArchitectTier::new(
+        let tier_two = architect_tier(
             ModelRef::openrouter("architect/two"),
             Some(ReasoningEffort::High),
         );
@@ -1396,8 +1238,8 @@ mod tests {
     async fn a_repeated_failure_escalates_a_single_model_ladder_by_effort() {
         let dir = tempdir().unwrap();
         let shared = ModelRef::openrouter("architect/shared");
-        let low = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::Low));
-        let high = ArchitectTier::new(shared.clone(), Some(ReasoningEffort::High));
+        let low = architect_tier(shared.clone(), Some(ReasoningEffort::Low));
+        let high = architect_tier(shared.clone(), Some(ReasoningEffort::High));
         PlanStorage::save_plan(
             dir.path(),
             &plan_with(
@@ -1752,12 +1594,7 @@ mod tests {
         assert_eq!(group.implementation.items[0].status, PlanItemStatus::Done);
         // A group that owns a fresh horizon is no longer stopped.
         assert_eq!(group.blocked_reason, None);
-        // The completed horizon closes the finding the group manifests.
         assert_eq!(stored.items[0].status, IssueStatus::Fixed);
-        assert!(stored.items[0]
-            .resolution_notes
-            .as_deref()
-            .is_some_and(|note| note.contains("Resolved by the completed implementation")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1809,6 +1646,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_horizon_write_does_not_clear_group_blocker() {
+        let dir = tempdir().unwrap();
+        ReviewStorage::save_session(dir.path(), &review_session()).unwrap();
+        ReviewStorage::set_group_blocked_reason(
+            dir.path(),
+            REVIEW_ID,
+            GROUP_ID,
+            Some("previous blocker"),
+        )
+        .unwrap();
+        let mut invalid = leaf("s-1", PlanItemStatus::Todo);
+        invalid.depends_on = vec!["s-1".to_string()];
+        let host = ScriptedHost::new(
+            Vec::new(),
+            vec![RefinementResult::Synthesized {
+                items: vec![invalid],
+                tier: ArchitectTier::from(ModelRef::openrouter("architect/one")),
+            }],
+        );
+        let channels = Channels::new();
+        let report = run_scope(
+            dir.path(),
+            ExecutionScope::ReviewGroup {
+                review_id: REVIEW_ID.to_string(),
+                group_id: GROUP_ID.to_string(),
+            },
+            &host,
+            config_with_ladder(vec![tier_entry("architect/one")], 2),
+            &channels,
+        )
+        .await;
+        assert!(matches!(report.stop, PlanImplementationStop::Failed { .. }));
+        let stored = ReviewStorage::load_review(dir.path(), REVIEW_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.groups[0].blocked_reason.as_deref(),
+            Some("previous blocker")
+        );
+        assert!(stored.groups[0].implementation.items.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_single_finding_runs_as_a_degenerate_step_and_closes_itself() {
         let dir = tempdir().unwrap();
         store_review_with_unrelated_finding(dir.path());
@@ -1843,8 +1723,7 @@ mod tests {
         let stored = ReviewStorage::load_review(dir.path(), REVIEW_ID)
             .unwrap()
             .unwrap();
-        // The run states the verdict of the finding it addressed and never
-        // touches a finding of another group.
+        // The application settles the verdict; the executor only records the lifecycle.
         let target = stored
             .find_item(7)
             .expect("the addressed finding is stored");
@@ -1857,13 +1736,13 @@ mod tests {
         assert!(target
             .resolution_notes
             .as_deref()
-            .is_some_and(|note| note.contains("Addressed by the implementation run")));
+            .is_some_and(|note| note.contains("1 of 1")));
         assert_eq!(stored.find_item(8).unwrap().status, IssueStatus::Todo);
         assert!(stored.find_item(8).unwrap().resolution_notes.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_degenerate_finding_reads_in_progress_mid_run_and_fixed_after_settlement() {
+    async fn a_degenerate_finding_reads_in_progress_mid_run_and_settles_once() {
         let dir = tempdir().unwrap();
         store_review_with_unrelated_finding(dir.path());
 
@@ -1894,7 +1773,7 @@ mod tests {
         // the session states what is executing while the model works.
         assert_eq!(host.observed_status(), Some(IssueStatus::InProgress));
 
-        // The verdict itself is stated exactly once, by the settlement.
+        // Settlement completes before the report is returned.
         let stored = ReviewStorage::load_review(dir.path(), REVIEW_ID)
             .unwrap()
             .unwrap();
@@ -1958,11 +1837,10 @@ mod tests {
             .find_item(7)
             .expect("the addressed finding is stored");
         assert_eq!(target.status, IssueStatus::Skipped);
-        assert!(
-            target.resolution_notes.as_deref().is_some_and(
-                |note| note.contains("the parser guard cannot be introduced as approved")
-            )
-        );
+        assert!(target
+            .resolution_notes
+            .as_deref()
+            .is_some_and(|note| note.contains("parser guard")));
         assert_eq!(stored.find_item(8).unwrap().status, IssueStatus::Todo);
         // The degenerate horizon owns no stored graph, so no wave is spent.
         assert!(host.refinements().is_empty());

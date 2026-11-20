@@ -5,6 +5,8 @@ use crate::api::{
     ReviewObserver, ReviewSynthesisExecutionConfig, ReviewSynthesisObserver,
     ReviewSynthesisPreparationError, UsageTotalsSnapshot,
 };
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+use crate::application::plan_horizon::ArchitectScope;
 use std::{path::Path, sync::Arc, time::Duration};
 use tauqe_core::models::{ModelRef, ModelRole, ModelSelection};
 use tauqe_core::providers::{ModelUsageInfo, StreamEvent};
@@ -170,11 +172,13 @@ impl Application {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
+            let environment = PlanExecutionEnvironment::new(self.configuration().await, &operation);
             let resolved = self
-                .resolve_review_preset(name, input.model.as_ref())
+                .resolve_review_preset(&environment, name, input.model.as_ref())
                 .await?;
             let root = self.repository_root().await;
             let session = self.prepare_preset_review(&operation, &resolved, input.prompt)?;
+            let selection = resolved.selection;
             let id = operation.publication_id();
             let publication = Arc::new(ReviewPublication {
                 observer,
@@ -190,6 +194,7 @@ impl Application {
                 use crate::api::PresetReviewExecutionError;
                 let result = application
                     .execute_preset_review(
+                        (&environment, &selection),
                         operation.clone(),
                         &root,
                         session,
@@ -211,17 +216,30 @@ impl Application {
             });
             return Ok(id);
         }
-        let resolved = self.resolve_review_synthesis(input.model.as_ref()).await;
-        let provider = self
-            .resolve_provider(resolved.model.provider, &resolved.config)
-            .await
-            .map_err(|error| ReviewStartError::Provider(error.to_string()))?;
+        let selection = input
+            .model
+            .clone()
+            .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, &operation);
+        let resolved = Self::resolve_review_synthesis_from_config(
+            environment.config().clone(),
+            Some(&selection),
+        );
         let window = self
             .prepare_review_synthesis_window(&resolved, &input.path_patterns)
             .await?;
         let prepared = self
             .prepare_review_synthesis_request(&operation, &resolved, &window.files, input.prompt)
             .map_err(|_| ReviewStartError::Busy)?;
+        let execution = environment
+            .for_reviewer_structured(
+                self,
+                &operation,
+                &selection,
+                &ArchitectScope::Review(prepared.id().to_string()),
+            )
+            .await
+            .map_err(|error| ReviewStartError::Provider(error.to_string()))?;
         let id = format!("op-{}", crate::api::next_operation_id());
         let publication = Arc::new(ReviewPublication {
             observer,
@@ -239,7 +257,7 @@ impl Application {
                     &operation,
                     &window.root,
                     prepared,
-                    provider,
+                    &execution,
                     publication.clone(),
                     ReviewSynthesisExecutionConfig {
                         operation_id: publication.id.clone(),
@@ -279,8 +297,10 @@ impl Application {
             observer,
             id: operation.publication_id(),
         });
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, &operation);
         self.run_review_analysis(
             &operation,
+            &environment,
             &root,
             &session,
             model.as_ref(),
@@ -295,6 +315,7 @@ impl Application {
     pub(crate) async fn run_review_analysis(
         &self,
         operation: &OperationGuard,
+        environment: &PlanExecutionEnvironment,
         root: &Path,
         session: &ReviewSession,
         model: Option<&ModelSelection>,
@@ -303,12 +324,17 @@ impl Application {
         deadline: Duration,
     ) -> Result<ReviewSession, AnalyzeReviewError> {
         let prepared = self
-            .prepare_review_post_analysis(operation, root, session, model)
+            .prepare_review_post_analysis(operation, environment, root, session, model)
             .await
             .map_err(ReviewAnalysisExecutionError::from)?;
         let model = prepared.tier.model.clone();
-        let provider = self
-            .resolve_provider(model.provider, &prepared.config)
+        let execution = environment
+            .for_review_post_analysis(
+                self,
+                operation,
+                &prepared.tier,
+                &ArchitectScope::Review(session.id.clone()),
+            )
             .await
             .map_err(|error| AnalyzeReviewError::Provider(error.to_string()))?;
         publication.observer.publish(
@@ -337,7 +363,7 @@ impl Application {
                 operation,
                 root,
                 &prepared,
-                provider,
+                &execution,
                 publication.clone(),
                 deadline,
             )
@@ -364,8 +390,10 @@ impl Application {
             observer,
             id: operation.publication_id(),
         });
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, operation);
         self.run_review_analysis(
             operation,
+            &environment,
             root,
             session,
             model,
@@ -387,23 +415,18 @@ impl Application {
         observer: Arc<dyn ApplicationObserver>,
         deadline: Duration,
     ) -> Result<tauqe_core::workflow::batch::BatchReport, String> {
-        let resolved = self
-            .resolve_review_synthesis(Some(&ModelSelection::Specific(session.model.clone())))
-            .await;
-        let provider = self
-            .resolve_provider(resolved.model.provider, &resolved.config)
-            .await
-            .map_err(|error| error.to_string())?;
+        let environment = PlanExecutionEnvironment::new(self.configuration().await, &operation);
+        let selection = ModelSelection::Specific(session.model.clone());
         let publication = Arc::new(ReviewPublication {
             observer,
             id: operation.publication_id(),
         });
         crate::api::run_group_audits(
             self,
+            (&environment, &selection),
             root,
             session,
             operation,
-            provider,
             publication,
             deadline,
         )

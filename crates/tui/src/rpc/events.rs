@@ -80,6 +80,11 @@ fn mark_files_awaiting_healing(model: &mut ReplView) {
 /// follows a hot-swapped locale instead of freezing the wording it started
 /// with (Conventions §9).
 fn retry_detail(data: &EditFileRetryingEvent) -> String {
+    if data.max_retries == 0 {
+        return active_t("repl.edits_retry_without_limit")
+            .replacen("{}", &data.attempt.to_string(), 1)
+            .replacen("{}", &data.reason, 1);
+    }
     active_t("repl.edits_retry_streaming")
         .replacen("{}", &data.attempt.to_string(), 1)
         .replacen("{}", &data.max_retries.to_string(), 1)
@@ -710,6 +715,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::EDIT_FILE_RETRYING => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileRetryingEvent>(params) {
+                    st.model.edits_active = true;
                     st.model.status = TurnStatus::Editing;
                     let retry_msg = retry_detail(&data);
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
@@ -3579,6 +3585,50 @@ mod tests {
             "the attempt detail must be composed from the catalog template"
         );
         assert!(file.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_first_patch_stages_settles_the_retry_row() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let data = EditFileRetryingEvent {
+            operation_id: "op-stream".into(),
+            path: STREAMED_PATH.into(),
+            attempt: 3,
+            max_retries: 0,
+            reason: "Context did not match".into(),
+        };
+        handle_event(
+            Event {
+                method: events::EDIT_FILE_RETRYING.into(),
+                params: Some(serde_json::to_value(&data).unwrap()),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let detail = state.lock().await.model.files[0]
+            .retry_info
+            .clone()
+            .unwrap();
+        let expected = active_t("repl.edits_retry_without_limit")
+            .replacen("{}", "3", 1)
+            .replacen("{}", &data.reason, 1);
+        assert_eq!(detail, expected);
+
+        handle_event(
+            Event {
+                method: events::MODEL_CANCELLED.into(),
+                params: None,
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Cancelled);
+        assert_eq!(guard.model.files[0].status, FileEditStatus::Error);
+        assert!(guard.model.files[0].retry_info.is_none());
     }
 
     /// The daemon resolves the coordinates of a hunk while it stages the change

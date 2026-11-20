@@ -1,15 +1,14 @@
 //! Application lifecycle of an implementation batch.
 use crate::api::ApplicationEvent;
 use crate::api::{Application, ContextClearScope, OperationGuard};
+use crate::application::implementation_pipeline::{
+    PlanImplementationOptions, PlanImplementationPipeline, PlanImplementationReport,
+};
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
 use std::sync::Arc;
 use tauqe_core::models::ModelSelection;
 use tauqe_core::{
-    plan::storage::PlanStorage,
-    providers::StreamEvent,
-    workflow::implementation::{
-        ExecutionScope, PlanImplementationOptions, PlanImplementationPipeline,
-        PlanImplementationReport,
-    },
+    plan::storage::PlanStorage, providers::StreamEvent, workflow::implementation::ExecutionScope,
 };
 use tokio::sync::mpsc;
 
@@ -324,13 +323,16 @@ impl Application {
         if let Ok(state) = self.clear_context(ContextClearScope::Transient).await {
             observer.publish(&id, ApplicationEvent::Context(state));
         }
-        let config = self.configuration().await.config.clone();
+        let snapshot = self.configuration().await;
+        let config = snapshot.config.clone();
+        let execution = PlanExecutionEnvironment::new(snapshot, operation);
         let host = Arc::new(
             crate::application::implementation_host::ApplicationImplementationHost::new(
                 self.clone(),
                 observer.clone(),
                 operation.clone(),
                 config.clone(),
+                execution,
                 root.clone(),
             ),
         );
@@ -341,6 +343,7 @@ impl Application {
                 plan_id: plan_id.to_string(),
                 step_id: options.step_id.clone(),
             },
+            self,
             host.as_ref(),
             config,
             PlanImplementationOptions {

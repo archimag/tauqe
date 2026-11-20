@@ -12,9 +12,13 @@ use crate::config::project::ProjectConfig;
 use crate::workflow::PatchStrategy;
 
 mod decode;
+mod preview;
 mod regime;
 mod rules;
 mod schema;
+
+#[allow(unused_imports)] // The preview filter will consume this projection in a later step.
+pub(crate) use preview::{preview_routes, PreviewCondition, PreviewRoute, PreviewRouteKind};
 
 pub(crate) struct PromptRenderContext<'a> {
     _editable_paths: &'a [String],

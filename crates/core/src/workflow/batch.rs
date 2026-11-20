@@ -72,7 +72,7 @@ pub struct BatchStepOutcome {
     /// Failure diagnostic reported for a failed step, when present.
     pub error: Option<String>,
     /// Block reason reported for a blocked step, when present.
-    pub(crate) blocked_reason: Option<String>,
+    pub blocked_reason: Option<String>,
 }
 
 impl BatchStepOutcome {
@@ -97,7 +97,7 @@ impl BatchStepOutcome {
     }
 
     /// Reports a step that cannot proceed, carrying the coder's block report.
-    pub(crate) fn blocked(reason: impl Into<String>) -> Self {
+    pub fn blocked(reason: impl Into<String>) -> Self {
         Self {
             status: BatchStepStatus::Blocked,
             usage: None,
@@ -200,16 +200,13 @@ impl BatchUsage {
 }
 
 /// Interruption observed before starting the next member of an ordered run.
-pub(crate) enum QueueInterruption {
+pub enum QueueInterruption {
     Cancelled,
     Stopped,
 }
 
 impl QueueInterruption {
-    pub(crate) fn before_next(
-        cancelled: bool,
-        soft_stop: Option<&watch::Receiver<bool>>,
-    ) -> Option<Self> {
+    pub fn before_next(cancelled: bool, soft_stop: Option<&watch::Receiver<bool>>) -> Option<Self> {
         if cancelled {
             Some(Self::Cancelled)
         } else if soft_stop.is_some_and(|rx| *rx.borrow()) {

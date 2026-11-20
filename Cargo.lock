@@ -977,6 +977,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-skimmer"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a17c31d2be00a974a679e9947a02ad81c485b492694f797ce7e174f02bd08ec1"
+
+[[package]]
 name = "jsonwebtoken"
 version = "9.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1978,6 +1984,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "indexmap",
+ "json-skimmer",
  "jsonwebtoken",
  "regex",
  "reqwest",

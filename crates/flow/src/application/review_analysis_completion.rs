@@ -81,6 +81,7 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::infrastructure::execution::PlanExecutionEnvironment;
     use tauqe_core::config::{AppConfig, ModelsConfig};
     use tauqe_core::history::entry::HistoryEntry;
     use tauqe_core::models::{ModelEntry, ModelRef};
@@ -121,7 +122,8 @@ mod tests {
             ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
-        app.prepare_review_post_analysis(operation, root, &session, None)
+        let environment = PlanExecutionEnvironment::new(app.configuration().await, operation);
+        app.prepare_review_post_analysis(operation, &environment, root, &session, None)
             .await
             .unwrap()
     }

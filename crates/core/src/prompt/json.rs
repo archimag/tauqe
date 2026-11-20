@@ -8,7 +8,7 @@
 
 use crate::config::project::ProjectConfig;
 
-use crate::capabilities::{decode_capability_expr, PromptRenderContext};
+use crate::capabilities::{decode_capability_expr, preview_routes, PromptRenderContext};
 use crate::edits::protocol::structured::{
     resolve_decoded_edits, StructuredEditProtocol, StructuredPayload,
 };
@@ -55,6 +55,13 @@ impl PromptProtocol for JsonPromptProtocol {
         Box::new(Self {
             capabilities: self.capabilities.clone(),
             project,
+        })
+    }
+
+    fn with_capabilities(&self, capabilities: CapabilityTree) -> Box<dyn PromptProtocol> {
+        Box::new(Self {
+            capabilities,
+            project: self.project.clone(),
         })
     }
 
@@ -160,10 +167,10 @@ impl PromptProtocol for JsonPromptProtocol {
         staged_contents: std::collections::HashMap<String, String>,
         strategy: PatchStrategy,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
+        let routes = preview_routes(&self.capabilities, strategy);
         Box::new(
-            JsonStreamFilter::new(editable_paths, repo_root)
-                .with_staged_contents(staged_contents)
-                .with_changes_preview(strategy != PatchStrategy::ApplyPatch),
+            JsonStreamFilter::with_routes(editable_paths, repo_root, routes)
+                .with_staged_contents(staged_contents),
         )
     }
 
@@ -173,8 +180,11 @@ impl PromptProtocol for JsonPromptProtocol {
         repo_root: std::path::PathBuf,
         staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        Box::new(
-            JsonStreamFilter::new(editable_paths, repo_root).with_staged_contents(staged_contents),
+        self.create_stream_filter_with_strategy(
+            editable_paths,
+            repo_root,
+            staged_contents,
+            PatchStrategy::SearchReplace,
         )
     }
 }
@@ -628,6 +638,64 @@ mod tests {
                 regex: "fn prompt".to_string(),
             }))
         );
+    }
+
+    #[test]
+    fn structured_stream_keeps_research_payload_out_of_the_answer() {
+        use crate::providers::StreamEvent;
+
+        let protocol = JsonPromptProtocol::new(dialogue(true, false));
+        let action = r#"","action":{"kind":"research","context_requests":[{"access":"read_only","path":"docs/core-flow-architecture.md"}]}}"#;
+        for (input, preview_text, decoded_text) in [
+            (action.to_owned(), "", ""),
+            (
+                r#""Reading docs" is a status."#.to_owned(),
+                "",
+                r#""Reading docs" is a status."#,
+            ),
+            (
+                format!(r#"{{"message":"Reading docs{action}"#),
+                "Reading docs",
+                "Reading docs",
+            ),
+            (
+                format!("\u{feff}```json\n{{\"message\":\"{action}\n```"),
+                "",
+                "",
+            ),
+        ] {
+            for strategy in [PatchStrategy::ApplyPatch, PatchStrategy::SearchReplace] {
+                let mut filter = protocol.create_stream_filter_with_strategy(
+                    Vec::new(),
+                    std::env::temp_dir(),
+                    Default::default(),
+                    strategy,
+                );
+                let mut text = String::new();
+                for ch in input.chars() {
+                    for event in filter.push_chunk(ch.encode_utf8(&mut [0; 4])) {
+                        if let StreamEvent::TextDelta(delta) = event {
+                            text.push_str(&delta);
+                        }
+                    }
+                }
+                for event in filter.finish() {
+                    if let StreamEvent::TextDelta(delta) = event {
+                        text.push_str(&delta);
+                    }
+                }
+                assert_eq!(text, preview_text, "{strategy:?}: {input}");
+            }
+            let text: String = protocol
+                .decode(&input, &[])
+                .into_iter()
+                .filter_map(|command| match command {
+                    LlmCommand::Text(text) => Some(text.content),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, decoded_text, "{input}");
+        }
     }
 
     #[test]

@@ -5,7 +5,6 @@ use crate::api::{Application, ContextClearScope, HistoryError, OperationGuard};
 use tauqe_core::control::outcome::{LoopResult, SystemError};
 use tauqe_core::control::repl::ReplArtifact;
 use tauqe_core::edits::EditOutcome;
-use tauqe_core::edits::VerificationVerdict;
 use tauqe_core::history::HistoryFileChange;
 use tauqe_core::llm::ModelResult;
 use tauqe_core::plan::PlanRejection;
@@ -25,7 +24,10 @@ pub fn classify_interactive_completion(
     streamed_text: String,
 ) -> InteractiveTurnCompletion {
     let (artifact, error) = match result {
-        Ok(LoopResult::Success(success)) => (Some(success.value), None),
+        Ok(LoopResult::Success(success)) => {
+            let error = success.value.commit_error.clone();
+            (Some(success.value), error)
+        }
         Ok(LoopResult::Diverged(_)) => (None, Some("Execution diverged".to_string())),
         Ok(LoopResult::Exhausted(report)) => (None, Some(report.reason)),
         Err(error) => (None, Some(error.to_string())),
@@ -57,11 +59,11 @@ pub fn classify_interactive_completion(
                     edits: Vec::new(),
                     proposal: None,
                     outcome: EditOutcome {
-                        applied: true,
-                        error: None,
+                        applied: artifact.commit_error.is_none(),
+                        error: artifact.commit_error,
                         changed_files: artifact.modified_paths,
                         commit_hash: artifact.commit_hash,
-                        verification: Some(VerificationVerdict::Passed),
+                        verification: artifact.verification,
                     },
                 }
             };
@@ -104,7 +106,7 @@ impl Application {
             ModelResult::Answer { .. } => (None, None, Vec::new()),
             ModelResult::Edit {
                 summary, outcome, ..
-            } => (
+            } if outcome.applied => (
                 outcome.commit_hash.clone(),
                 Some(summary.clone()),
                 outcome
@@ -114,11 +116,12 @@ impl Application {
                     .map(HistoryFileChange::plain)
                     .collect(),
             ),
+            ModelResult::Edit { .. } => (None, None, Vec::new()),
         };
         let persisted = self
             .record_history_response(completion.history_response.clone(), commit, summary, files)
             .await;
-        if matches!(completion.result, ModelResult::Edit { .. }) {
+        if matches!(&completion.result, ModelResult::Edit { outcome, .. } if outcome.applied) {
             let _ = self.clear_context(ContextClearScope::Transient).await;
             self.reset_session_uuid().await;
         }
@@ -131,6 +134,7 @@ mod tests {
     use super::*;
     use tauqe_core::context::ContextAccess;
     use tauqe_core::control::outcome::{FailureReport, LoopSuccess, ResponseEnvelope};
+    use tauqe_core::edits::VerificationVerdict;
     use tauqe_core::history::entry::HistoryEntry;
 
     fn artifact(message: Option<&str>, paths: Vec<String>) -> ReplArtifact {
@@ -143,6 +147,9 @@ mod tests {
             review_decisions_applied: Vec::new(),
             envelope: ResponseEnvelope::default(),
             commit_hash: None,
+            verification: None,
+            commit_error: None,
+            rounds_spent: 1,
         }
     }
 
@@ -235,6 +242,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edit_completion_preserves_actual_verification_and_finalization_failure() {
+        let mut value = artifact(Some("Updated"), vec!["discovered.rs".into()]);
+        value.verification = Some(VerificationVerdict::NotConfigured);
+        value.commit_error = Some("Git finalization failed".into());
+        let completion = completed(value, "");
+        assert_eq!(completion.error.as_deref(), Some("Git finalization failed"));
+        let ModelResult::Edit { outcome, .. } = completion.result else {
+            panic!("expected edit outcome");
+        };
+        assert!(!outcome.applied);
+        assert!(outcome.commit_hash.is_none());
+        assert_eq!(outcome.error.as_deref(), Some("Git finalization failed"));
+        assert_eq!(
+            outcome.verification,
+            Some(VerificationVerdict::NotConfigured)
+        );
+    }
+
     #[tokio::test]
     async fn edit_completion_records_the_full_reply_and_releases_transient_context_without_git() {
         let root = tempfile::tempdir().unwrap();
@@ -249,10 +275,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let identity = app.session_uuid().await;
-        let completion = completed(
-            artifact(Some("Full developer reply"), vec!["discovered.rs".into()]),
-            "",
-        );
+        let mut value = artifact(Some("Full developer reply"), vec!["discovered.rs".into()]);
+        value.verification = Some(VerificationVerdict::Passed);
+        let completion = completed(value, "");
         match &completion.result {
             ModelResult::Edit { outcome, .. } => {
                 assert!(outcome.applied);

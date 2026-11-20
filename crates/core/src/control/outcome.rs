@@ -37,7 +37,7 @@ pub struct ResponseEnvelope {
 
 impl ResponseEnvelope {
     /// Constructs an envelope by cloning a slice of decoded semantic commands.
-    pub(crate) fn from_commands(commands: &[LlmCommand]) -> Self {
+    pub fn from_commands(commands: &[LlmCommand]) -> Self {
         Self {
             items: commands.to_vec(),
             raw_text: String::new(),
@@ -52,7 +52,7 @@ impl ResponseEnvelope {
     }
 
     /// Drains and returns all commands matching the specified capability.
-    pub(crate) fn take(&mut self, capability: LlmCapability) -> Vec<LlmCommand> {
+    pub fn take(&mut self, capability: LlmCapability) -> Vec<LlmCommand> {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
@@ -67,7 +67,7 @@ impl ResponseEnvelope {
     }
 
     /// Drains and returns all commands matching any of the specified capabilities.
-    pub(crate) fn take_any(&mut self, capabilities: &[LlmCapability]) -> Vec<LlmCommand> {
+    pub fn take_any(&mut self, capabilities: &[LlmCapability]) -> Vec<LlmCommand> {
         let mut matched = Vec::new();
         let mut remaining = Vec::with_capacity(self.items.len());
         for cmd in self.items.drain(..) {
@@ -89,7 +89,7 @@ impl ResponseEnvelope {
     }
 
     /// Returns the unique set of capabilities remaining in the envelope.
-    pub(crate) fn remaining_capabilities(&self) -> Vec<LlmCapability> {
+    pub fn remaining_capabilities(&self) -> Vec<LlmCapability> {
         let mut caps: Vec<_> = self
             .items
             .iter()
@@ -113,7 +113,7 @@ impl ResponseEnvelope {
     }
 
     /// Returns a slice of the commands currently remaining in the envelope.
-    pub(crate) fn commands(&self) -> &[LlmCommand] {
+    pub fn commands(&self) -> &[LlmCommand] {
         &self.items
     }
 }

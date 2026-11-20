@@ -376,21 +376,22 @@ pub fn compute_model_lines_with_file_rows(
                 Span::styled(cursor_prefix, engine.fg(palette.status_info)),
                 op_badge,
                 Span::styled(file.path.clone(), Style::default().bold()),
-                Span::raw(" "),
-                Span::styled(format!("({})", hunk_label), engine.fg(palette.text_muted)),
-                Span::raw(" "),
-                Span::styled(status_icon, status_style),
             ];
+            if hunk_count > 0 || !matches!(file.op_type, EditOp::Replace) {
+                file_spans.push(Span::raw(" "));
+                file_spans.push(Span::styled(
+                    format!("({hunk_label})"),
+                    engine.fg(palette.text_muted),
+                ));
+            }
+            file_spans.push(Span::raw(" "));
+            file_spans.push(Span::styled(status_icon, status_style));
 
             if file.status != FileEditStatus::Ok {
                 if let Some(retry) = &file.retry_info {
                     file_spans.push(Span::raw(" "));
                     file_spans.push(Span::styled(
-                        crate::i18n::active_t("repl.edits_retry_label").replacen(
-                            "{}",
-                            retry.as_str(),
-                            1,
-                        ),
+                        format!("({retry})"),
                         engine.fg(palette.status_warning).bold(),
                     ));
                 }

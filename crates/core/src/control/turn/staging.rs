@@ -43,6 +43,8 @@ pub struct StagingState {
     pub(crate) failed: HashMap<String, EditError>,
     /// Paths the model stopped retrying, paired with the error that refused them.
     pub(crate) abandoned: HashMap<String, EditError>,
+    /// Exact document whose line numbers the last atomic patch refusal addresses.
+    pub(crate) refused_patch: Option<String>,
     /// Number of staging attempts the turn spent.
     pub(crate) attempts: usize,
 }
@@ -76,6 +78,7 @@ pub(crate) fn execute_staging_step(
     state.attempts += 1;
     let (result, patch_batches) = if let [LlmCommand::ApplyPatch { patch }] = commands.as_slice() {
         state.failed.clear();
+        state.refused_patch = None;
         match crate::edits::stage_apply_patch(
             ctx.repo_root,
             ctx.context_manager,
@@ -87,7 +90,13 @@ pub(crate) fn execute_staging_step(
                 (result, Some(batches))
             }
             Err(error) => {
-                state.failed.insert("patch".to_string(), error);
+                state.refused_patch = Some(patch.clone());
+                let path = error.patch_path().map_or_else(String::new, |path| {
+                    ctx.context_manager
+                        .normalize_path(path)
+                        .unwrap_or_else(|_| path.to_owned())
+                });
+                state.failed.insert(path, error);
                 return StagingStep {
                     addressed: true,
                     refusals: render_failures(&state.failed, ctx.prompt_builder.patch_strategy),

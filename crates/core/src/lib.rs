@@ -12,7 +12,7 @@ pub mod control;
 pub mod discussion;
 pub(crate) mod docs;
 pub mod edits;
-pub(crate) mod escape;
+pub mod escape;
 pub mod git;
 pub mod history;
 pub mod llm;

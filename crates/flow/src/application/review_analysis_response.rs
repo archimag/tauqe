@@ -1,13 +1,11 @@
 //! Stream decoding and completion classification for review post-analysis.
 
-use tauqe_core::providers::StreamEvent;
+use crate::application::infrastructure::structured_task::StructuredTaskError;
+use tauqe_core::control::structured::StructuredError;
 use tauqe_core::review::analysis::{
-    parse_post_analysis, PostAnalysisOutput, PostAnalysisRegrouping, PostAnalysisRegroupingError,
+    PostAnalysisOutput, PostAnalysisRegrouping, PostAnalysisRegroupingError,
 };
-use tauqe_core::review::stream::{ReviewStream, ReviewStreamError};
 use tauqe_core::review::ReviewSession;
-
-pub use tauqe_core::review::stream::ReviewStreamUpdate as ReviewAnalysisUpdate;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewAnalysisCompletionError {
@@ -23,48 +21,53 @@ pub enum ReviewAnalysisCompletionError {
     Schema(#[from] PostAnalysisRegroupingError),
 }
 
-impl ReviewAnalysisCompletionError {
-    /// Only cancellation and provider failures terminate the provider task.
-    pub(crate) fn requires_abort(&self) -> bool {
-        matches!(self, Self::Cancelled(_) | Self::Provider(_))
-    }
-}
-
-#[derive(Default)]
-pub struct ReviewAnalysisResponse {
-    stream: ReviewStream<PostAnalysisOutput>,
-}
+pub struct ReviewAnalysisResponse;
 
 impl ReviewAnalysisResponse {
-    pub fn observe(&mut self, event: StreamEvent) -> ReviewAnalysisUpdate {
-        self.stream.observe(event)
-    }
-
     /// Classify after usage is flushed. Cancellation precedes provider errors,
     /// which precede decoding and schema validation, preserving failure priority.
     pub fn finish(
-        self,
+        result: Result<PostAnalysisOutput, StructuredTaskError>,
         session: &ReviewSession,
         cancelled: bool,
     ) -> Result<PostAnalysisRegrouping, ReviewAnalysisCompletionError> {
-        let filter = self.stream.finish(cancelled).map_err(|error| match error {
-            ReviewStreamError::Cancelled => {
-                ReviewAnalysisCompletionError::Cancelled(session.id.clone())
-            }
-            ReviewStreamError::Provider(message) => {
-                ReviewAnalysisCompletionError::Provider(message)
-            }
-        })?;
-        let raw = filter.buffer().to_string();
-        if raw.trim().is_empty() {
-            return Err(ReviewAnalysisCompletionError::EmptyResponse(
-                session.id.clone(),
-            ));
+        if cancelled {
+            return Err(ReviewAnalysisCompletionError::Cancelled(session.id.clone()));
         }
-        let output = match filter.finish() {
+        let output = match result {
             Ok(output) => output,
-            Err(_) => parse_post_analysis(&raw)
-                .map_err(|error| ReviewAnalysisCompletionError::Parse(format!("{error:#}")))?,
+            Err(
+                StructuredTaskError::Cancelled
+                | StructuredTaskError::Request(StructuredError::Cancelled),
+            ) => return Err(ReviewAnalysisCompletionError::Cancelled(session.id.clone())),
+            Err(StructuredTaskError::Request(StructuredError::Empty)) => {
+                return Err(ReviewAnalysisCompletionError::EmptyResponse(
+                    session.id.clone(),
+                ))
+            }
+            Err(StructuredTaskError::Request(StructuredError::Decode(message))) => {
+                return Err(ReviewAnalysisCompletionError::Parse(message))
+            }
+            Err(
+                StructuredTaskError::Stream(message)
+                | StructuredTaskError::Task(message)
+                | StructuredTaskError::Request(StructuredError::Failed(message)),
+            ) => return Err(ReviewAnalysisCompletionError::Provider(message)),
+            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
+                return Err(ReviewAnalysisCompletionError::Provider(
+                    "Structured request closed without Done".into(),
+                ))
+            }
+            Err(StructuredTaskError::ForeignOperation) => {
+                return Err(ReviewAnalysisCompletionError::Provider(
+                    "review post-analysis requires an active operation for this session".into(),
+                ))
+            }
+            Err(StructuredTaskError::Orphaned) => {
+                return Err(ReviewAnalysisCompletionError::Provider(
+                    "review post-analysis task did not stop within its exit deadline".into(),
+                ))
+            }
         };
         PostAnalysisRegrouping::prepare(session, &output).map_err(Into::into)
     }
@@ -73,7 +76,10 @@ impl ReviewAnalysisResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_core::providers::ModelUsageInfo;
+
+    fn decode(raw: &str) -> PostAnalysisOutput {
+        tauqe_core::review::analysis::parse_post_analysis(raw).unwrap()
+    }
 
     fn session() -> ReviewSession {
         ReviewSession {
@@ -91,113 +97,73 @@ mod tests {
     }
 
     #[test]
-    fn streams_only_decoded_summary_and_accepts_channel_closure_without_done() {
-        let mut response = ReviewAnalysisResponse::default();
-        let mut text = String::new();
-        for ch in payload("Boundary\n\"quoted\"").chars() {
-            if let ReviewAnalysisUpdate::Content(delta) =
-                response.observe(StreamEvent::TextDelta(ch.to_string()))
-            {
-                text.push_str(&delta);
-            }
-        }
-        assert_eq!(text, "Boundary\n\"quoted\"");
-        let prepared = response.finish(&session(), false).unwrap();
-        assert!(prepared.history_response().ends_with(&text));
-    }
-
-    #[test]
-    fn retry_resets_partial_json_but_keeps_usage_visible() {
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::TextDelta(
-            "{\"summary\":\"discarded prefix".into(),
-        ));
-        let usage = ModelUsageInfo {
-            total_tokens: 17,
-            cost: Some(0.25),
-            ..Default::default()
-        };
-        assert!(
-            matches!(response.observe(StreamEvent::Usage(usage)), ReviewAnalysisUpdate::Usage(report) if report.total_tokens == 17)
-        );
-        assert!(matches!(
-            response.observe(StreamEvent::ResetStream),
-            ReviewAnalysisUpdate::Reset
-        ));
-        assert!(
-            matches!(response.observe(StreamEvent::TextDelta(payload("Fresh verdict"))), ReviewAnalysisUpdate::Content(delta) if delta == "Fresh verdict")
-        );
-        assert!(matches!(
-            response.observe(StreamEvent::Done),
-            ReviewAnalysisUpdate::Finished
-        ));
-        let prepared = response.finish(&session(), false).unwrap();
-        assert!(prepared.history_response().ends_with("Fresh verdict"));
-        assert!(!prepared.history_response().contains("discarded"));
-    }
-
-    #[test]
     fn cancellation_and_provider_errors_precede_decoding_failures() {
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::Error("provider failed".into()));
-        let error = response.finish(&session(), true).err().unwrap();
+        let error = ReviewAnalysisResponse::finish(
+            Err(StructuredTaskError::Stream("provider failed".into())),
+            &session(),
+            true,
+        )
+        .err()
+        .unwrap();
         assert!(matches!(error, ReviewAnalysisCompletionError::Cancelled(_)));
-        assert!(error.requires_abort());
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::Error("provider failed".into()));
         assert!(
-            matches!(response.finish(&session(), false), Err(ReviewAnalysisCompletionError::Provider(message)) if message == "provider failed")
+            matches!(ReviewAnalysisResponse::finish(Err(StructuredTaskError::Stream("provider failed".into())), &session(), false), Err(ReviewAnalysisCompletionError::Provider(message)) if message == "provider failed")
         );
-        let mut response = ReviewAnalysisResponse::default();
         assert!(matches!(
-            response.observe(StreamEvent::Cancelled),
-            ReviewAnalysisUpdate::Finished
-        ));
-        assert!(matches!(
-            response.finish(&session(), false),
+            ReviewAnalysisResponse::finish(Err(StructuredTaskError::Cancelled), &session(), false),
             Err(ReviewAnalysisCompletionError::Cancelled(_))
         ));
     }
 
     #[test]
     fn decoding_keeps_tolerant_fallback_and_typed_parse_and_schema_refusals() {
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::TextDelta(format!(
-            "Wrapper {{\"summary\": 42}} then {}",
-            payload("Recovered verdict")
-        )));
-        assert!(response
-            .finish(&session(), false)
-            .unwrap()
-            .history_response()
-            .ends_with("Recovered verdict"));
+        assert!(ReviewAnalysisResponse::finish(
+            Ok(decode(&format!(
+                "Wrapper {{\"summary\": 42}} then {}",
+                payload("Recovered verdict")
+            ))),
+            &session(),
+            false
+        )
+        .unwrap()
+        .history_response()
+        .ends_with("Recovered verdict"));
         assert!(matches!(
-            ReviewAnalysisResponse::default().finish(&session(), false),
+            ReviewAnalysisResponse::finish(
+                Err(StructuredTaskError::Request(StructuredError::Empty)),
+                &session(),
+                false
+            ),
             Err(ReviewAnalysisCompletionError::EmptyResponse(_))
         ));
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::TextDelta("not JSON".into()));
-        let error = response.finish(&session(), false).err().unwrap();
+        let error = ReviewAnalysisResponse::finish(
+            Err(StructuredTaskError::Request(StructuredError::Decode(
+                "not JSON".into(),
+            ))),
+            &session(),
+            false,
+        )
+        .err()
+        .unwrap();
         assert!(matches!(error, ReviewAnalysisCompletionError::Parse(_)));
-        assert!(!error.requires_abort());
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::TextDelta(payload(" ")));
         assert!(matches!(
-            response.finish(&session(), false),
+            ReviewAnalysisResponse::finish(Ok(decode(&payload(" "))), &session(), false),
             Err(ReviewAnalysisCompletionError::Schema(
                 PostAnalysisRegroupingError::MissingSummary
             ))
         ));
-        let mut response = ReviewAnalysisResponse::default();
-        response.observe(StreamEvent::TextDelta(
-            serde_json::json!({
-                "summary": "Foreign reference", "triage": [],
-                "independent_issues": ["foreign"], "architectural_groups": [],
-            })
-            .to_string(),
-        ));
         assert!(matches!(
-            response.finish(&session(), false),
+            ReviewAnalysisResponse::finish(
+                Ok(decode(
+                    &serde_json::json!({
+                        "summary": "Foreign reference", "triage": [],
+                        "independent_issues": ["foreign"], "architectural_groups": [],
+                    })
+                    .to_string()
+                )),
+                &session(),
+                false
+            ),
             Err(ReviewAnalysisCompletionError::Schema(
                 PostAnalysisRegroupingError::InvalidReference(_)
             ))

@@ -53,8 +53,8 @@ coder = [
 ]
 
 architect = [
-  "GLM",
-  { model = "GPT Astra",  level_up = false },
+  { model = "GPT Astra", effort = "high" },
+  { model = "GLM", level_up = false },
   { model = "Gemini Flash", level_up = false }
 ]
 

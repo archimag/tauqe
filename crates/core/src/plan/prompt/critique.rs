@@ -11,10 +11,13 @@
 //! and the `plan_refinement` schema; only the user prompt differs, because it
 //! carries the audit ([`build_plan_reconciliation_prompt`]).
 
+use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::escape::{escape_xml_text, single_line};
 use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
+use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use super::refine::PlanRefinementOutput;
 
@@ -182,6 +185,25 @@ pub fn plan_critique_response_schema_definition() -> serde_json::Value {
         "strict": true,
         "schema": plan_critique_response_schema()
     })
+}
+
+/// Binds the audit's instructions, schema, decoder and silent streaming policy.
+pub fn plan_critique_contract() -> StructuredContract<PlanCritiqueOutput> {
+    let definition = plan_critique_response_schema_definition();
+    StructuredContract {
+        instructions: build_plan_critique_system_prompt(),
+        format: ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaDefinition {
+                name: "plan_critique".into(),
+                description: definition["description"].as_str().map(str::to_owned),
+                schema: Cow::Owned(plan_critique_response_schema()),
+                strict: Some(true),
+            },
+        },
+        decode: |raw| parse_plan_critique_output(raw).map_err(|error| error.to_string()),
+        visibility: StructuredVisibility::Silent,
+        require_done: true,
+    }
 }
 
 /// Builds the system prompt of the independent critique phase.

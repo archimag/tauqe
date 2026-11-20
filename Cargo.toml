@@ -79,6 +79,7 @@ base64 = "0.22"
 ring = "0.17"
 jsonwebtoken = { version = "9", default-features = false }
 struson = { version = "0.5", features = ["serde"] }
+json-skimmer = "=1.0.0"
 unicode-width = "0.2"
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }

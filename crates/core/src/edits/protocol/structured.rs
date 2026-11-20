@@ -355,7 +355,10 @@ pub struct StructuredPayload {
 impl StructuredPayload {
     pub(crate) fn parse(raw_text: &str) -> Self {
         let trimmed = raw_text.trim();
-        let parsed = if let Some(obj_str) =
+        let parsed = if crate::edits::stream::json::decode::starts_with_detached_json_field(trimmed)
+        {
+            None
+        } else if let Some(obj_str) =
             crate::edits::stream::json::decode::first_json_object_str(trimmed)
         {
             serde_json::from_str::<serde_json::Value>(obj_str).ok()
@@ -408,7 +411,14 @@ impl StructuredPayload {
     }
 
     pub(crate) fn clean_text(&self) -> String {
-        let trimmed = self.raw_text.trim();
+        use crate::edits::stream::json::decode::{
+            starts_with_detached_json_field, starts_with_json_object, trim_response_start,
+        };
+
+        if starts_with_detached_json_field(&self.raw_text) {
+            return String::new();
+        }
+        let trimmed = trim_response_start(&self.raw_text).trim_end();
         let mut messages = Vec::new();
         let mut rest = trimmed;
         let mut all_json = true;
@@ -438,12 +448,15 @@ impl StructuredPayload {
         if all_json && (!messages.is_empty() || trimmed.starts_with('{')) {
             return messages.join("\n\n");
         }
-        if let Some(val) = &self.parsed {
-            if let Some(message) = conversational_message(val) {
-                if trimmed.starts_with('{') && trimmed.ends_with('}') {
-                    return message.to_string();
-                }
-            }
+        if starts_with_json_object(trimmed)
+            || trimmed.starts_with("```json")
+            || trimmed.starts_with('{')
+        {
+            return self
+                .root()
+                .and_then(conversational_message)
+                .unwrap_or_default()
+                .to_owned();
         }
         self.raw_text.clone()
     }
@@ -1078,6 +1091,21 @@ mod tests {
         // never fires and the explanation survives verbatim.
         let prose = "A silent round is {\"message\":\"\",\"changes\":[]} in the journal.";
         assert_eq!(clean_raw_json_or_text(prose), prose);
+    }
+
+    #[test]
+    fn malformed_structured_payload_never_becomes_conversational_text() {
+        for raw in [
+            r#"{"message":"Preview","scratchpad":"private""#,
+            r#"{"message":false,"action":{"kind":"answer""#,
+            "```json\n{\"message\":\"Preview\"",
+        ] {
+            assert_eq!(clean_raw_json_or_text(raw), "", "{raw}");
+        }
+        assert_eq!(
+            clean_raw_json_or_text(r#"{"message":"Typed","action":{"kind":"answer"}}"#),
+            "Typed"
+        );
     }
 
     #[test]

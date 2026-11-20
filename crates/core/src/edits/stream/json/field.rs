@@ -1,33 +1,26 @@
 //! Generic single-field streaming filter for JSON Structured Output payloads.
 //!
-//! It accumulates raw provider chunks, decodes the requested string field
-//! (`message`, `summary`, ...) on the fly without leaking JSON syntax to the
-//! user, and, once streaming ends, deserializes the full buffered payload into a
-//! strictly typed structure `T`. The byte-level scanners are owned by
-//! [`super::decode`], so escape decoding, UTF-16 surrogate pairing and code
-//! fence tolerance stay identical to the edit streaming contour.
+//! json_skimmer routes only the requested string field (`message`, `summary`,
+//! ...) for live preview. The original chunks are accumulated independently
+//! for final serde decoding, which retains compatible wrapper handling.
 
 use std::marker::PhantomData;
 
 use serde::Deserialize;
 
-use super::decode::{extract_streamed_string_field, prepare_json_payload, StringFieldCursor};
+use super::decode::prepare_json_payload;
+use super::events::{key_path, PreviewEvents};
 
 /// Generic streaming filter for a single top-level string field of a JSON
 /// Structured Output payload.
 ///
-/// The filter accumulates raw provider chunks, decodes the requested string
-/// field (`message`, `summary`, ...) on the fly without leaking JSON syntax to
-/// the user, and, once streaming ends, deserializes the full buffered payload
-/// into a strictly typed structure `T`. Reusing
-/// [`decode::extract_streamed_string_field`] keeps escape decoding, UTF-16
-/// surrogate pairing and code fence tolerance identical to the edit streaming
-/// contour.
+/// json_skimmer selects string fragments at the exact root path without
+/// extracting JSON from prose or markdown wrappers for live preview. The
+/// buffered original response belongs to the independent final decoder;
+/// previewed fragments do not establish that the document is valid.
 pub struct JsonFieldStreamFilter<T> {
-    target_field: String,
     buffer: String,
-    cursor: StringFieldCursor,
-    finished: bool,
+    preview: PreviewEvents,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -37,11 +30,10 @@ where
 {
     /// Creates a filter that streams the top-level string field `target_field`.
     pub fn new(target_field: impl Into<String>) -> Self {
+        let target_field = target_field.into();
         Self {
-            target_field: target_field.into(),
             buffer: String::new(),
-            cursor: StringFieldCursor::new(),
-            finished: false,
+            preview: PreviewEvents::new(key_path(&[&target_field])),
             _marker: PhantomData,
         }
     }
@@ -49,21 +41,12 @@ where
     /// Appends a raw chunk and returns the freshly decoded text of the target
     /// field, or `None` when no new readable text is available.
     ///
-    /// Empty deltas are filtered out. Once the closing quote of the target
-    /// field has streamed in, no further deltas are produced, yet the raw
-    /// buffer keeps accumulating so [`finish`](Self::finish) can deserialize
-    /// the complete payload.
+    /// The raw buffer keeps accumulating independently so [`finish`](Self::finish)
+    /// can deserialize the complete payload even when preview is invalid.
     pub fn push_chunk(&mut self, chunk: &str) -> Option<String> {
         self.buffer.push_str(chunk);
-        if self.finished {
-            return None;
-        }
-        let (delta, is_finished) =
-            extract_streamed_string_field(&self.buffer, &self.target_field, &mut self.cursor);
-        if is_finished {
-            self.finished = true;
-        }
-        delta
+        let text = self.preview.push(chunk.as_bytes()).concat();
+        (!text.is_empty()).then_some(text)
     }
 
     /// Returns the accumulated raw JSON buffer received so far.
@@ -84,6 +67,8 @@ where
     /// to the outermost balanced JSON object, so wrapper prose around the
     /// payload does not break decoding.
     pub fn finish(self) -> Result<T, serde_json::Error> {
+        let mut preview = self.preview;
+        preview.finish();
         let payload = prepare_json_payload(&self.buffer);
         serde_json::from_str(&payload)
     }
@@ -154,7 +139,7 @@ mod tests {
                 streamed.push_str(&delta);
             }
         }
-        assert_eq!(streamed, "ok");
+        assert_eq!(streamed, "");
         let decoded = filter.finish().expect("fenced payload must deserialize");
         assert_eq!(decoded.message, "ok");
         assert_eq!(decoded.count, 5);
@@ -171,14 +156,12 @@ mod tests {
         assert_eq!(filter.buffer(), json);
     }
     #[test]
-    fn json_field_stream_filter_reads_the_field_inside_the_operational_branch() {
-        // The conversational field travels inside the operational branch, so the
-        // filter streams it at the depth the envelope gives it and never lets the
-        // change set reach the text channel.
+    fn json_field_stream_filter_only_previews_the_root_field() {
         let json = concat!(
             "{\"action\":{\"kind\":\"edit\",\"changes\":[{\"op\":\"create\",",
             "\"path\":\"a.rs\",\"content\":\"let message = \\\"message\\\";\\n\"}],",
-            "\"message\":\"Branch answer\"},\"count\":7}"
+            "\"message\":\"Branch answer\"},\"metadata\":{\"message\":\"Hidden\"},",
+            "\"message\":\"Root answer\",\"count\":7}"
         );
         let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
         let mut streamed = String::new();
@@ -187,8 +170,61 @@ mod tests {
                 streamed.push_str(&delta);
             }
         }
-        assert_eq!(streamed, "Branch answer");
+        assert_eq!(streamed, "Root answer");
         assert!(!streamed.contains("let message"), "{streamed}");
         assert_eq!(filter.raw_buffer(), json);
+    }
+
+    #[test]
+    fn json_field_stream_filter_invalid_and_unfinished_attempts() {
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        assert_eq!(
+            filter.push_chunk("{\"message\":\"Hi \\uD83D"),
+            Some("Hi ".into())
+        );
+        assert_eq!(filter.push_chunk("\\uDE00"), Some("😀".into()));
+        assert_eq!(filter.push_chunk("!"), Some("!".into()));
+        assert_eq!(filter.push_chunk("\",\"count\":1}"), None);
+        assert_eq!(filter.finish().unwrap().message, "Hi 😀!");
+
+        let mut invalid = JsonFieldStreamFilter::<FieldSample>::new("message");
+        assert_eq!(
+            invalid.push_chunk("{\"message\":\"before\",!"),
+            Some("before".into())
+        );
+        assert_eq!(invalid.push_chunk("\"message\":\"after\"}"), None);
+    }
+
+    #[test]
+    fn json_field_stream_filter_does_not_preview_wrapped_json() {
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        assert_eq!(
+            filter.push_chunk("```json\n{\"message\":\"wrapped\",\"count\":2}\n```"),
+            None
+        );
+        assert_eq!(filter.finish().unwrap().message, "wrapped");
+    }
+
+    #[test]
+    fn prose_wrapper_is_final_decoder_only() {
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let wrapped = "Here is the result: {\"message\":\"accepted\",\"count\":3}";
+        for chunk in wrapped.as_bytes().chunks(4) {
+            assert_eq!(filter.push_chunk(std::str::from_utf8(chunk).unwrap()), None);
+        }
+        let result = filter.finish().expect("final decoder accepts the wrapper");
+        assert_eq!(result.message, "accepted");
+        assert_eq!(result.count, 3);
+    }
+
+    #[test]
+    fn previewed_fragment_does_not_accept_invalid_full_payload() {
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        assert_eq!(
+            filter.push_chunk("{\"message\":\"visible\""),
+            Some("visible".into())
+        );
+        assert_eq!(filter.push_chunk(",\"count\":\"wrong\"}"), None);
+        assert!(filter.finish().is_err());
     }
 }

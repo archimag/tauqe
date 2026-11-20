@@ -16,8 +16,21 @@ pub enum EditError {
     #[error("Invalid apply_patch document: {0}")]
     InvalidPatch(String),
 
-    #[error("In file '{path}': patch context was not found uniquely: {context}")]
-    PatchContext { path: String, context: String },
+    #[error("In file '{path}': invalid apply_patch section at patch line {line}: {reason}")]
+    InvalidPatchSection {
+        path: String,
+        line: usize,
+        reason: &'static str,
+    },
+
+    #[error("In file '{path}': hunk {hunk} ({section}) matched {count} locations: {context}")]
+    PatchContext {
+        path: String,
+        hunk: usize,
+        section: &'static str,
+        context: String,
+        count: usize,
+    },
 
     #[error("File '{0}' is not in context. Only files explicitly in context can be edited.")]
     NotInContext(String),
@@ -120,4 +133,26 @@ pub enum EditError {
         "Directory move '{from}' -> '{to}' names the source directory itself or a directory inside it. A directory cannot be moved into its own subtree."
     )]
     DirMoveIntoSelf { from: String, to: String },
+}
+
+impl EditError {
+    /// Returns the affected file for refusals from the atomic patch applier.
+    pub fn patch_path(&self) -> Option<&str> {
+        match self {
+            Self::InvalidPatchSection { path, .. }
+            | Self::PatchContext { path, .. }
+            | Self::InvalidConfig { path, .. }
+            | Self::ParentNotDirectory { path, .. } => Some(path),
+            Self::NotInContext(path)
+            | Self::FileNotFound(path)
+            | Self::DestinationExists(path)
+            | Self::InvalidPath(path, _)
+            | Self::Io(path, _)
+            | Self::IgnoredByGit(path)
+            | Self::MockupsNotIgnored(path)
+            | Self::IgnoreProbeFailed { path, .. }
+            | Self::ProtectedPath(path) => Some(path),
+            _ => None,
+        }
+    }
 }

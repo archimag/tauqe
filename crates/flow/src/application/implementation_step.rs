@@ -1,6 +1,7 @@
 //! Prepare one implementation attempt before provider execution.
 
 use crate::api::{Application, ContextClearScope, OperationGuard, OuterDocsRefusal};
+use crate::application::infrastructure::execution::CompactionEnvironment;
 use std::path::Path;
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextState;
@@ -34,7 +35,16 @@ impl Application {
         request: &StepTurnRequest,
         publish: impl Fn(ContextState) + Send,
     ) -> Result<String, StepPreparationError> {
-        self.prepare_implementation_step(operation, root, config, request, publish)
+        let compaction =
+            crate::application::infrastructure::execution::PlanExecutionEnvironment::new(
+                crate::application::configuration::ConfigurationSnapshot {
+                    config: config.clone(),
+                    selection: config.default_selection(),
+                },
+                operation,
+            )
+            .compaction_environment();
+        self.prepare_implementation_step(operation, root, config, &compaction, request, publish)
             .await
     }
 
@@ -45,16 +55,14 @@ impl Application {
         operation: &OperationGuard,
         root: &Path,
         config: &AppConfig,
+        compaction: &CompactionEnvironment,
         request: &StepTurnRequest,
         on_context: impl Fn(ContextState) + Send,
     ) -> Result<String, StepPreparationError> {
         if !self.owns_operation(operation) {
             return Err(StepPreparationError::OperationNotOwned);
         }
-        if let Err(error) = self
-            .compact_history(operation, config, request.cancel_rx.clone())
-            .await
-        {
+        if let Err(error) = self.compact_history(operation, compaction).await {
             tracing::warn!(error = %error, "session history is unavailable for compaction");
         }
         if let Ok(snapshot) = self.clear_context(ContextClearScope::Transient).await {
@@ -104,6 +112,7 @@ fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::infrastructure::execution::PlanExecutionEnvironment;
     use std::sync::Mutex;
     use tauqe_core::context::{ContextAccess, ContextLayer};
     use tauqe_core::models::{ModelRef, ModelSelection};
@@ -207,10 +216,17 @@ mod tests {
         let identity = app.session_uuid().await;
         let updates = Mutex::new(Vec::new());
         let operation = app.try_begin_operation().unwrap();
+        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
+            .compaction_environment();
         let prompt = app
-            .prepare_implementation_step(&operation, dir.path(), &config, &request, |snapshot| {
-                updates.lock().unwrap().push(snapshot)
-            })
+            .prepare_implementation_step(
+                &operation,
+                dir.path(),
+                &config,
+                &compaction,
+                &request,
+                |snapshot| updates.lock().unwrap().push(snapshot),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -257,11 +273,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app, config, request) = fixture(dir.path(), &["vendor", "refused"]);
         let operation = app.try_begin_operation().unwrap();
+        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
+            .compaction_environment();
         let updates = Mutex::new(Vec::new());
         let error = app
-            .prepare_implementation_step(&operation, dir.path(), &config, &request, |snapshot| {
-                updates.lock().unwrap().push(snapshot)
-            })
+            .prepare_implementation_step(
+                &operation,
+                dir.path(),
+                &config,
+                &compaction,
+                &request,
+                |snapshot| updates.lock().unwrap().push(snapshot),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, StepPreparationError::Documentation(_)));
@@ -292,13 +315,20 @@ mod tests {
         let other = Application::default();
         let foreign = other.try_begin_operation().unwrap();
         let _own = app.try_begin_operation().unwrap();
+        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &_own)
+            .compaction_environment();
         let identity = app.session_uuid().await;
         let before = app.context_state().await;
         let updates = Mutex::new(Vec::new());
         let error = app
-            .prepare_implementation_step(&foreign, dir.path(), &config, &request, |snapshot| {
-                updates.lock().unwrap().push(snapshot)
-            })
+            .prepare_implementation_step(
+                &foreign,
+                dir.path(),
+                &config,
+                &compaction,
+                &request,
+                |snapshot| updates.lock().unwrap().push(snapshot),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, StepPreparationError::OperationNotOwned));
@@ -318,8 +348,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app, config, request) = fixture(dir.path(), &["missing"]);
         let operation = app.try_begin_operation().unwrap();
+        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
+            .compaction_environment();
         let prompt = app
-            .prepare_implementation_step(&operation, dir.path(), &config, &request, |_| {})
+            .prepare_implementation_step(
+                &operation,
+                dir.path(),
+                &config,
+                &compaction,
+                &request,
+                |_| {},
+            )
             .await
             .unwrap();
         let directives = prompt.find("## Developer Directives:").unwrap();

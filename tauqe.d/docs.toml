@@ -53,3 +53,13 @@ source = "https://openrouter.ai/docs/api/api-reference/models/list-all-models-an
 id = "openai"
 title = "OpenAI Docs"
 source = "https://developers.openai.com/llms.txt"
+
+[[outer_docs]]
+id = "streamson_lib"
+title = "streamson_lib Doc"
+source = "https://docs.rs/streamson-lib/latest/streamson_lib/index.html"
+
+[[outer_docs]]
+id = " json_skimmer"
+title = " json_skimmer Doc"
+source = "https://docs.rs/json-skimmer/latest/json_skimmer/index.html"

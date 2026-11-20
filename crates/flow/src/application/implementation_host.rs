@@ -4,16 +4,26 @@ use crate::api::{
 };
 use crate::api::{ApplicationEvent, ApplicationObserver};
 use crate::application::architect::publish_architect_started;
+use crate::application::infrastructure::execution::PlanExecutionEnvironment;
+use crate::application::plan_horizon::ArchitectScope;
 use crate::application::step_dispatch::{StepLoopBody, StepLoopReport};
 use async_trait::async_trait;
 use std::{path::PathBuf, sync::Arc};
 use tauqe_core::config::AppConfig;
 use tauqe_core::workflow::implementation::{
-    classify_refinement, classify_step_turn, ExecutionScope, ImplementationHost, RefinementRequest,
-    RefinementResult, StepFailure, StepTurnRequest, StepTurnResult,
+    classify_refinement, classify_step_turn, ExecutionScope, RefinementRequest, RefinementResult,
+    StepFailure, StepTurnRequest, StepTurnResult,
 };
 
-/// Turn seam between the engine's implementation machinery and the daemon.
+/// Model execution seam of the implementation workflow. Durable state is owned
+/// directly by Application, not by a model-result substitute.
+#[async_trait]
+pub(crate) trait ImplementationHost: Send + Sync {
+    async fn run_step(&self, request: StepTurnRequest) -> StepTurnResult;
+    async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult;
+}
+
+/// Turn seam between the application workflow and its execution machinery.
 ///
 /// The host borrows the operation that owns the whole run, so the batch slot
 /// never lapses between members and a single cancellation reaches every step and
@@ -24,6 +34,7 @@ pub(crate) struct ApplicationImplementationHost {
     operation: Arc<OperationGuard>,
     /// Configuration snapshot of the run, taken when the batch started.
     config: AppConfig,
+    execution: PlanExecutionEnvironment,
     repo_root: PathBuf,
 }
 
@@ -34,6 +45,7 @@ impl ApplicationImplementationHost {
         observer: Arc<dyn ApplicationObserver>,
         operation: Arc<OperationGuard>,
         config: AppConfig,
+        execution: PlanExecutionEnvironment,
         repo_root: PathBuf,
     ) -> Self {
         Self {
@@ -41,6 +53,7 @@ impl ApplicationImplementationHost {
             observer,
             operation,
             config,
+            execution,
             repo_root,
         }
     }
@@ -55,6 +68,7 @@ impl ImplementationHost for ApplicationImplementationHost {
                 &self.operation,
                 &self.repo_root,
                 &self.config,
+                &self.execution.compaction_environment(),
                 &request,
                 |context| {
                     self.observer
@@ -105,6 +119,7 @@ impl ImplementationHost for ApplicationImplementationHost {
                     marker,
                     session_id,
                     operation: Arc::clone(&self.operation),
+                    execution: Some(self.execution.clone()),
                     plan_context,
                     work_context,
                     body: StepLoopBody::Single(prompt),
@@ -131,7 +146,15 @@ impl ImplementationHost for ApplicationImplementationHost {
     async fn run_refinement(&self, request: RefinementRequest) -> RefinementResult {
         let prepared = match self
             .application
-            .prepare_implementation_refinement(&self.repo_root, &self.config, &request)
+            .prepare_implementation_refinement(
+                &self.repo_root,
+                self.execution.models(),
+                request
+                    .selection
+                    .as_ref()
+                    .map(|selection| self.execution.resolve_architect_model(selection)),
+                &request,
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -144,25 +167,31 @@ impl ImplementationHost for ApplicationImplementationHost {
         };
         let PreparedImplementationRefinement {
             tier,
-            options,
             task,
             intro_header,
             budget_hint,
         } = prepared;
         let op_id = self.operation.publication_id();
+        let scope = match &request.scope {
+            ExecutionScope::Plan { plan_id, .. } => ArchitectScope::Plan(plan_id.clone()),
+            ExecutionScope::ReviewGroup { review_id, .. }
+            | ExecutionScope::ReviewFinding { review_id, .. } => {
+                ArchitectScope::Review(review_id.clone())
+            }
+        };
 
         publish_architect_started(self.observer.as_ref(), &op_id, &tier, true);
         let context = self.application.context_for_turn().await;
         let (contour, summary) = self
             .application
-            .run_architect_contour(
+            .run_architect_contour_with_environment(
                 &self.operation,
+                &self.execution,
                 PlanHorizonContour {
                     operation_id: op_id.clone(),
                     task,
                     context,
-                    options,
-                    models_config: self.config.models.clone(),
+                    scope,
                     tier: tier.clone(),
                     intro_header,
                     budget_hint,

@@ -31,7 +31,7 @@ pub(crate) use refine::{
     parse_plan_refinement_output, plan_refine_response_schema,
     plan_refine_response_schema_definition,
 };
-pub(crate) use step::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
+pub use step::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 
 pub use architect::{format_architect_escalation_note, format_architect_tier};
 

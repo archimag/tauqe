@@ -6,12 +6,11 @@ use crate::handlers::common::emit;
 use crate::state::{AppState, OperationGuard};
 #[cfg(test)]
 use crate::usage::UsageGuard;
-use tauqe_core::config::{AppConfig, ModelsConfig};
+use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::control::refine::StructuredRefineOutcome;
 use tauqe_core::models::ArchitectTier;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
-use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::events;
 #[cfg(test)]
 use tokio::sync::mpsc;
@@ -46,8 +45,6 @@ pub(crate) async fn run_contour_synthesis(
     op_id: &str,
     task: String,
     context: ContextManager,
-    options: WorkflowOptions,
-    models: ModelsConfig,
     tier: ArchitectTier,
     intro_header: String,
     budget_hint: String,
@@ -60,8 +57,7 @@ pub(crate) async fn run_contour_synthesis(
                 operation_id: op_id.to_string(),
                 task,
                 context,
-                options,
-                models_config: models,
+                scope: tauqe_flow::api::ArchitectScope::Plan("test".into()),
                 tier,
                 intro_header,
                 budget_hint,
@@ -332,7 +328,6 @@ mod tests {
         let config = state.application.configuration().await.config.clone();
         let models = config.models.clone();
         let tier = models.architect_tier(0);
-        let options = WorkflowOptions::from_app_config(&config);
 
         // The adapter hands the contour a snapshot of the shared context, so the
         // synthesis works on its own clone and reports the result back.
@@ -358,8 +353,6 @@ mod tests {
             "op-skeleton",
             "Synthesize the unfinished horizon".to_string(),
             snapshot,
-            options,
-            models,
             tier,
             String::new(),
             String::new(),
