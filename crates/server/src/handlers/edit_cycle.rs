@@ -42,12 +42,11 @@ mod tests {
     use tauqe_core::edits::{EditOutcome, VerificationVerdict};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    const ALL: [EditTermination; 7] = [
+    const ALL: [EditTermination; 6] = [
         EditTermination::Answered,
         EditTermination::StagingRefused,
         EditTermination::Cancelled,
         EditTermination::Withdrawn,
-        EditTermination::ProviderError,
         EditTermination::ProtocolFailure,
         EditTermination::Aborted,
     ];
@@ -86,7 +85,7 @@ mod tests {
         assert!(!cycle.open(), "opening an open cycle is a no-op");
 
         assert!(cycle.close_unapplied(EditTermination::Cancelled, Vec::new(), None));
-        assert!(!cycle.close_unapplied(EditTermination::ProviderError, Vec::new(), None));
+        assert!(!cycle.close_unapplied(EditTermination::Aborted, Vec::new(), None));
         assert!(!cycle.close_outcome(EditTermination::Answered, EditOutcome::default()));
 
         let events = drain(&mut rx);

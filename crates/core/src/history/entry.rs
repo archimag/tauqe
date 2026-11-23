@@ -64,14 +64,11 @@ pub enum HistoryEntry {
     },
 }
 
-#[cfg(test)]
 /// Tag that opens the turn-local working-memory channel inside an answer.
 const SCRATCHPAD_OPEN: &str = "<scratchpad>";
-#[cfg(test)]
 /// Tag that closes the turn-local working-memory channel.
 const SCRATCHPAD_CLOSE: &str = "</scratchpad>";
 
-#[cfg(test)]
 /// Removes the working-memory channel from text about to be recorded.
 ///
 /// The scratchpad is turn-local by contract: it is memory, never part of what a
@@ -84,7 +81,7 @@ const SCRATCHPAD_CLOSE: &str = "</scratchpad>";
 /// included, and the surrounding whitespace is trimmed so the recorded message
 /// does not begin or end with an empty line. An unterminated channel belongs to
 /// a truncated answer, so the text from its opening tag onward is dropped.
-fn sanitize_round_message(raw: &str) -> String {
+pub fn sanitize_round_message(raw: &str) -> String {
     let mut cleaned = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(open) = rest.find(SCRATCHPAD_OPEN) {
@@ -102,8 +99,6 @@ fn sanitize_round_message(raw: &str) -> String {
     cleaned.trim().to_string()
 }
 
-#[cfg(test)]
-#[cfg(test)]
 /// Builds the durable record of one intermediate round of a turn.
 ///
 /// The constructor is the single place a round enters the journal, so the

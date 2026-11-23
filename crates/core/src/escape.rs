@@ -10,7 +10,7 @@
 ///
 /// `&` is escaped first so that the entities introduced for the remaining
 /// characters are not themselves re-escaped.
-pub fn escape_xml_attr(value: &str) -> String {
+pub(crate) fn escape_xml_attr(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('"', "&quot;")
@@ -33,7 +33,7 @@ pub fn escape_xml_text(value: &str) -> String {
 ///
 /// Used for single-line headers and labels, where an embedded newline would
 /// break the line-oriented structure of the rendered prompt.
-pub fn single_line(value: &str) -> String {
+pub(crate) fn single_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ").trim().to_string()
 }
 

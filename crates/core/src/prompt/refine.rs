@@ -6,7 +6,7 @@
 //! the typed wire surface of that contour, so a caller asks the protocol for its
 //! response schema and its instructions instead of assembling either by hand.
 //!
-//! The advertised surface is the synthesis tree of the Architect control loop:
+//! The advertised surface is the capability grant of the synthesis contract:
 //! the Architect reads context, searches the repository, requests symbol contours,
 //! consults the documentation, records working notes, and reports a terminal
 //! status. It never edits a file, so no file-edit capability belongs to it. A
@@ -38,11 +38,10 @@ use crate::workflow::EditProtocolKind;
 use crate::workflow::PatchStrategy;
 
 use crate::edits::stream::discussion::DiscussionStreamFilter;
-use crate::edits::stream::json::decode::first_json_object_str;
 use crate::edits::stream::EditStreamFilter;
 use crate::plan::prompt::{
-    parse_plan_refinement_output, plan_refine_response_schema,
-    plan_refine_response_schema_definition,
+    architect_synthesis_capability_expr, parse_round, plan_refine_response_schema,
+    plan_refine_response_schema_definition, PlanRefinementOutput, RoundStatus,
 };
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -54,6 +53,13 @@ pub struct PlanRefinePromptProtocol {
     capabilities: CapabilityTree,
 }
 
+/// Typed payload and commands from the same synthesis decision.
+pub struct PlanRefineRound {
+    pub output: PlanRefinementOutput,
+    pub status: RoundStatus,
+    pub commands: Vec<LlmCommand>,
+}
+
 impl Default for PlanRefinePromptProtocol {
     fn default() -> Self {
         Self::new()
@@ -62,9 +68,9 @@ impl Default for PlanRefinePromptProtocol {
 
 impl PlanRefinePromptProtocol {
     /// Creates the protocol bound to the architect research surface.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
-            capabilities: crate::control::refine::architect_synthesis_capability_expr(),
+            capabilities: architect_synthesis_capability_expr(),
         }
     }
 
@@ -110,6 +116,16 @@ impl PlanRefinePromptProtocol {
     /// restating any of them here.
     fn instructions(&self) -> String {
         refinement_output_contract()
+    }
+
+    pub fn decode_round(raw_text: &str) -> Result<PlanRefineRound, String> {
+        let (output, status) = parse_round(raw_text)?;
+        let commands = refinement_commands(&output, &status);
+        Ok(PlanRefineRound {
+            output,
+            status,
+            commands,
+        })
     }
 }
 
@@ -159,54 +175,6 @@ fn contract_values(schema: &serde_json::Value, pointer: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reports why a synthesis payload cannot be honored as a horizon.
-///
-/// Horizon synthesis owns the unfinished horizon alone: the plan payload is the
-/// mutation vehicle of the plan dialogue, so a `plan_update` field in a synthesis
-/// round lies outside the contract of this contour. The payload is therefore
-/// refused through the typed defect channel instead of decoding into a horizon
-/// that silently dropped the mutation the model attempted.
-///
-/// Detection reads the very object the payload parser reads, so a fenced or
-/// prose-wrapped payload is inspected identically. A `null` field is the idle
-/// representation of an untouched plan and is not a defect.
-pub(crate) fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(raw_text.trim())
-        .ok()
-        .or_else(|| {
-            first_json_object_str(raw_text).and_then(|object| serde_json::from_str(object).ok())
-        })?;
-    if value.get("plan_update")?.is_null() {
-        return None;
-    }
-    Some(
-        "The payload carries a `plan_update` field, and the plan refinement contract accepts no plan mutation: the horizon is synthesized here, while plan mutations belong to the plan discussion. Regenerate the payload without `plan_update`."
-            .to_string(),
-    )
-}
-
-/// Normalizes the payload of an active abort.
-///
-/// A report that states no reason still stops the turn, so the deterministic
-/// defaults the edit contour uses for a blank field stand in for an empty
-/// `reason` and `recommendation` instead of leaving the abort without a cause or
-/// without a next step.
-fn abort_payload(reason: &str, recommendation: &str) -> (String, String) {
-    let reason = reason.trim();
-    let reason = if reason.is_empty() {
-        "Execution aborted"
-    } else {
-        reason
-    };
-    let recommendation = recommendation.trim();
-    let recommendation = if recommendation.is_empty() {
-        "No recommendation was stated."
-    } else {
-        recommendation
-    };
-    (reason.to_string(), recommendation.to_string())
-}
-
 impl PromptProtocol for PlanRefinePromptProtocol {
     fn name(&self) -> &'static str {
         "plan_refinement"
@@ -224,90 +192,12 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         Box::new(self.clone())
     }
     fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
-        // A synthesis round never mutates the plan, so the payload is refused
-        // before it is decoded: a horizon that silently dropped the mutation
-        // would report a success the developer never asked for.
-        if let Some(reason) = unsupported_plan_update_reason(raw_text) {
-            return vec![LlmCommand::ProtocolError { message: reason }];
+        match Self::decode_round(raw_text) {
+            Ok(round) => round.commands,
+            Err(error) => vec![LlmCommand::ProtocolError {
+                message: format!("Failed to decode the plan refinement payload: {error}"),
+            }],
         }
-        let output = match parse_plan_refinement_output(raw_text) {
-            Ok(output) => output,
-            Err(err) => {
-                return vec![LlmCommand::ProtocolError {
-                    message: format!("Failed to decode the plan refinement payload: {err}"),
-                }];
-            }
-        };
-
-        let mut commands = Vec::new();
-        let explanation = output.explanation.trim().to_string();
-        if !explanation.is_empty() {
-            commands.push(LlmCommand::Text(TextCommand {
-                content: explanation.clone(),
-            }));
-        }
-
-        // An active abort supersedes the declared status: the round reports work
-        // the harness cannot perform at all, so no horizon, blocker, or research
-        // request is decoded beside it. A blank payload keeps the deterministic
-        // defaults the edit contour uses, so an abort always states a cause.
-        if let Some(abort) = output.abort.as_ref().filter(|abort| abort.is_aborted) {
-            let (reason, recommendation) = abort_payload(&abort.reason, &abort.recommendation);
-            commands.push(LlmCommand::Abort(AbortCommand {
-                reason,
-                recommendation,
-            }));
-            return commands;
-        }
-
-        match output.status.as_str() {
-            "needs_context" => {
-                // The horizon is not synthesized yet: the round names the evidence
-                // it still needs, so the caller widens the context and asks again.
-                for path in &output.context_requests {
-                    commands.push(LlmCommand::ContextRequest(ContextRequestCommand {
-                        path: path.clone(),
-                        access: ContextAccess::ReadOnly,
-                    }));
-                }
-                for search in &output.repo_searches {
-                    commands.push(LlmCommand::RepoSearch(RepoSearchCommand {
-                        path: search.path.clone(),
-                        regex: search.regex.clone(),
-                    }));
-                }
-                for path in &output.repo_maps {
-                    commands.push(LlmCommand::RepoMap(RepoMapCommand { path: path.clone() }));
-                }
-            }
-            "blocked" => {
-                // The Architect refuses to plan, so the required decision travels
-                // as a semantic blocker instead of an improvised horizon.
-                let reason = output
-                    .reason
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| explanation.clone());
-                let details = if explanation.is_empty() {
-                    String::new()
-                } else {
-                    explanation.clone()
-                };
-                commands.push(LlmCommand::Blocked(BlockedCommand { reason, details }));
-            }
-            "success" => {
-                commands.push(LlmCommand::CommitMessage(CommitMessageCommand {
-                    commit_message: explanation.clone(),
-                }));
-            }
-            other => commands.push(LlmCommand::ProtocolError {
-                message: format!("Unsupported plan refinement status '{other}'"),
-            }),
-        }
-
-        commands
     }
 
     fn system_instructions(
@@ -339,6 +229,53 @@ impl PromptProtocol for PlanRefinePromptProtocol {
     }
 }
 
+fn refinement_commands(output: &PlanRefinementOutput, status: &RoundStatus) -> Vec<LlmCommand> {
+    let mut commands = Vec::new();
+    let explanation = output.explanation.trim().to_string();
+    if !explanation.is_empty() {
+        commands.push(LlmCommand::Text(TextCommand {
+            content: explanation.clone(),
+        }));
+    }
+
+    match status {
+        RoundStatus::NeedsContext => {
+            for path in &output.context_requests {
+                commands.push(LlmCommand::ContextRequest(ContextRequestCommand {
+                    path: path.clone(),
+                    access: ContextAccess::ReadOnly,
+                }));
+            }
+            for search in &output.repo_searches {
+                commands.push(LlmCommand::RepoSearch(RepoSearchCommand {
+                    path: search.path.clone(),
+                    regex: search.regex.clone(),
+                }));
+            }
+            for path in &output.repo_maps {
+                commands.push(LlmCommand::RepoMap(RepoMapCommand { path: path.clone() }));
+            }
+        }
+        RoundStatus::Blocked(reason) => commands.push(LlmCommand::Blocked(BlockedCommand {
+            reason: reason.clone(),
+            details: explanation,
+        })),
+        RoundStatus::Success => commands.push(LlmCommand::CommitMessage(CommitMessageCommand {
+            commit_message: explanation,
+        })),
+        RoundStatus::Aborted(report) => commands.push(LlmCommand::Abort(AbortCommand {
+            reason: report.reason.clone(),
+            recommendation: report.recommendation.clone(),
+        })),
+        RoundStatus::PlanUpdateRefused(message) => {
+            return vec![LlmCommand::ProtocolError {
+                message: message.clone(),
+            }];
+        }
+    }
+    commands
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +300,7 @@ mod tests {
         assert_eq!(protocol.kind(), EditProtocolKind::Structured);
         assert_eq!(
             protocol.capability_expr(),
-            crate::control::refine::architect_synthesis_capability_expr()
+            architect_synthesis_capability_expr()
         );
         assert!(protocol.supports(LlmCapability::ContextRequest));
         assert!(protocol.supports(LlmCapability::PlanUpdate));

@@ -1,8 +1,7 @@
 //! Decode a single audit and materialize its review session.
 
-use crate::edits::stream::json::JsonFieldStreamFilter;
 use crate::models::ModelRef;
-use crate::review::parser::{decode_single_review, ReviewFindingsOutput, SingleReviewOutput};
+use crate::review::parser::SingleReviewOutput;
 use crate::review::uuid::generate_uuid_v7;
 use crate::review::{ReviewIssue, ReviewItem, ReviewSession};
 
@@ -18,49 +17,6 @@ pub struct ReviewSynthesisMetadata {
 #[derive(Debug, thiserror::Error)]
 #[error("Model returned an empty review")]
 pub struct EmptyReviewResponse;
-
-pub struct ReviewSynthesisResponse {
-    filter: JsonFieldStreamFilter<ReviewFindingsOutput>,
-}
-
-impl Default for ReviewSynthesisResponse {
-    fn default() -> Self {
-        Self {
-            filter: JsonFieldStreamFilter::new("summary"),
-        }
-    }
-}
-
-impl ReviewSynthesisResponse {
-    pub fn from_filter(filter: JsonFieldStreamFilter<ReviewFindingsOutput>) -> Self {
-        Self { filter }
-    }
-
-    #[cfg(test)]
-    fn push_chunk(&mut self, chunk: &str) -> Option<String> {
-        self.filter.push_chunk(chunk)
-    }
-
-    #[cfg(test)]
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Preserve tolerant parsing, title fallback, and original provider text.
-    /// Only a wholly empty response is refused; unstructured text remains a finding.
-    pub fn finish(
-        self,
-        metadata: ReviewSynthesisMetadata,
-    ) -> Result<ReviewSession, EmptyReviewResponse> {
-        let raw_buffer = self.filter.buffer().to_string();
-        if raw_buffer.trim().is_empty() {
-            return Err(EmptyReviewResponse);
-        }
-        self.filter.finish().ok();
-        let decoded = decode_single_review(&raw_buffer).map_err(|_| EmptyReviewResponse)?;
-        Ok(materialize_review(metadata, decoded))
-    }
-}
 
 /// Project a decoded audit into a session without interpreting provider JSON.
 pub fn materialize_review(
@@ -124,6 +80,7 @@ fn with_finding_identities(issues: Vec<ReviewIssue>) -> Vec<ReviewItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::parser::decode_single_review;
     use crate::review::uuid::is_valid_uuid_v7;
     use crate::review::{IssueStatus, IssueType};
 
@@ -195,15 +152,10 @@ mod tests {
                 "recommendations": ["Use a reference"], "readonly_files": []}]
         })
         .to_string();
-        let mut response = ReviewSynthesisResponse::default();
-        let mut streamed = String::new();
-        for ch in raw.chars() {
-            if let Some(delta) = response.push_chunk(&ch.to_string()) {
-                streamed.push_str(&delta);
-            }
-        }
-        assert_eq!(streamed, " Summary\n\"quoted\" ");
-        let review = response.finish(metadata(Some("Prompt fallback"))).unwrap();
+        let review = materialize_review(
+            metadata(Some("Prompt fallback")),
+            decode_single_review(&raw).unwrap(),
+        );
         assert_eq!(review.id, "launch-review");
         assert_eq!(review.created_at, 42);
         assert_eq!(review.model, ModelRef::openrouter("test/reviewer"));
@@ -222,41 +174,28 @@ mod tests {
     #[test]
     fn title_and_description_fallback_keep_first_line_and_unicode_limits() {
         let prompt = format!("  {}  \nIgnored second line", "界".repeat(70));
-        let mut response = ReviewSynthesisResponse::default();
-        response.push_chunk(r#"{"title":" ","summary":" ","findings":[]}"#);
-        let review = response.finish(metadata(Some(&prompt))).unwrap();
+        let review = materialize_review(
+            metadata(Some(&prompt)),
+            decode_single_review(r#"{"title":" ","summary":" ","findings":[]}"#).unwrap(),
+        );
         assert_eq!(review.title, "界".repeat(60));
         assert_eq!(review.description.as_deref(), Some(prompt.as_str()));
-        let mut response = ReviewSynthesisResponse::default();
-        response.push_chunk(r#"{"findings":[]}"#);
-        let review = response
-            .finish(metadata(Some("  \nDo not use the second line")))
-            .unwrap();
+        let review = materialize_review(
+            metadata(Some("  \nDo not use the second line")),
+            decode_single_review(r#"{"findings":[]}"#).unwrap(),
+        );
         assert_eq!(review.title, "Review 42");
         assert!(review.items.is_empty());
     }
 
     #[test]
-    fn reset_discards_partial_json_and_nonempty_unstructured_output_stays_a_finding() {
-        let mut response = ReviewSynthesisResponse::default();
-        response.push_chunk("{\"summary\":\"abandoned prefix");
-        response.reset();
+    fn nonempty_unstructured_output_stays_a_finding() {
         let raw = "A non-JSON review that must remain visible.";
-        response.push_chunk(raw);
-        let review = response.finish(metadata(None)).unwrap();
+        let review = materialize_review(metadata(None), decode_single_review(raw).unwrap());
         assert_eq!(review.raw_markdown, raw);
         assert_eq!(review.items.len(), 1);
         assert!(review.items[0].body.contains(raw));
         assert!(is_valid_uuid_v7(review.items[0].uuid.as_deref().unwrap()));
-        assert!(!review.raw_markdown.contains("abandoned"));
-    }
-
-    #[test]
-    fn empty_response_retains_its_existing_refusal() {
-        let mut response = ReviewSynthesisResponse::default();
-        response.push_chunk(" \n ");
-        let error = response.finish(metadata(None)).unwrap_err();
-        assert_eq!(error.to_string(), "Model returned an empty review");
     }
 
     #[test]

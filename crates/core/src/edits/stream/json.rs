@@ -23,7 +23,7 @@ use super::{
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
-pub mod decode;
+pub(crate) mod decode;
 pub mod events;
 pub mod field;
 pub mod string;
@@ -1329,7 +1329,7 @@ mod tests {
             vec![path.to_string()],
             root,
             crate::capabilities::preview_routes(
-                &crate::control::turn::turn_capability_expr(),
+                &crate::llm::step::turn_capability_expr(),
                 crate::workflow::PatchStrategy::SearchReplace,
             ),
         )
@@ -1441,7 +1441,7 @@ mod tests {
             vec![path.to_string()],
             root,
             crate::capabilities::preview_routes(
-                &crate::control::turn::turn_capability_expr(),
+                &crate::llm::step::turn_capability_expr(),
                 crate::workflow::PatchStrategy::SearchReplace,
             ),
         );

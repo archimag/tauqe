@@ -19,33 +19,16 @@ pub use batch::{
 pub use git_policy::GitTransactionPolicy;
 pub use policy::{ApplyPolicy, DirectApplyPolicy};
 
-use crate::workflow::research::ResearchLimits;
-
-/// Execution options and token budgets for edit workflows.
+/// Round budget for bounded workflows.
 #[derive(Debug, Clone)]
 pub struct WorkflowOptions {
-    pub(crate) max_turn_rounds: usize,
-    pub(crate) token_budget: usize,
-    pub(crate) repomap_token_budget: usize,
-    /// Operational caps the Research phase applies to one round.
-    pub(crate) research_limits: ResearchLimits,
-    /// Provider session identifier that binds this turn to a warm prompt-prefix
-    /// cache on the provider side.
-    ///
-    /// The caller owns the affinity scope: an interactive dialogue, a plan
-    /// execution, or a review audit each pass their own identifier. `None`
-    /// disables affinity and the provider serves every round statelessly.
-    pub session_id: Option<String>,
+    max_turn_rounds: usize,
 }
 
 impl Default for WorkflowOptions {
     fn default() -> Self {
         Self {
             max_turn_rounds: crate::config::DEFAULT_MAX_TURN_ROUNDS,
-            token_budget: crate::config::DEFAULT_TOKEN_BUDGET,
-            repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
-            research_limits: ResearchLimits::default(),
-            session_id: None,
         }
     }
 }
@@ -54,24 +37,11 @@ impl WorkflowOptions {
     pub fn max_turn_rounds(&self) -> usize {
         self.max_turn_rounds
     }
-    pub fn token_budget(&self) -> usize {
-        self.token_budget
-    }
-    pub fn repomap_token_budget(&self) -> usize {
-        self.repomap_token_budget
-    }
-    pub fn research_limits(&self) -> ResearchLimits {
-        self.research_limits
-    }
 
     /// Constructs workflow options from the unified application configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
         Self {
             max_turn_rounds: config.repl.max_turn_rounds,
-            token_budget: config.context.token_budget,
-            repomap_token_budget: config.context.repomap_token_budget,
-            research_limits: ResearchLimits::from_context_config(&config.context),
-            session_id: None,
         }
     }
 }

@@ -2044,6 +2044,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "serde_json",
+ "syn 2.0.119",
  "tauqe-core",
  "tauqe-flow",
  "tauqe-protocol",

@@ -52,15 +52,16 @@ pub fn format_session_id(prefix: &str, identifier: &str) -> String {
 /// A single model invocation, independent of the provider's HTTP representation.
 #[derive(Debug, Clone)]
 pub struct LlmRequest<'a> {
-    pub model: &'a str,
-    pub messages: Vec<ChatMessage>,
-    pub response_format: Option<ResponseFormat>,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub session_id: Option<&'a str>,
+    pub(crate) model: &'a str,
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) response_format: Option<ResponseFormat>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) session_id: Option<&'a str>,
 }
 
 impl<'a> LlmRequest<'a> {
-    pub fn new(model: &'a str, messages: Vec<ChatMessage>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(model: &'a str, messages: Vec<ChatMessage>) -> Self {
         Self {
             model,
             messages,

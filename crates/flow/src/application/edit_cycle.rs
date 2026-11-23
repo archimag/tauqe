@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauqe_core::edits::{EditOutcome, VerificationVerdict};
+use tauqe_core::providers::StreamEvent;
 
 pub enum EditCycleEvent {
     Started,
@@ -26,8 +27,6 @@ pub enum EditTermination {
     Cancelled,
     /// The streamed attempt was withdrawn and its edits are void.
     Withdrawn,
-    /// The model provider failed before the change set was applied.
-    ProviderError,
     /// The model output violated the protocol, so no change set was applied.
     ///
     /// Built from the typed protocol-failure fact of the turn, never from the
@@ -51,7 +50,6 @@ impl EditTermination {
             Self::Withdrawn => {
                 "The streamed attempt was withdrawn, so its proposed edits were discarded."
             }
-            Self::ProviderError => "The model provider failed before the edits could be applied.",
             Self::ProtocolFailure => {
                 "The model response violated the edit protocol, so no change set was applied."
             }
@@ -67,6 +65,19 @@ pub struct EditCycle {
 }
 
 impl EditCycle {
+    /// Observe provisional edit events. The owning scenario closes the terminal outcome.
+    pub(crate) fn observe(&self, event: &StreamEvent) {
+        match event {
+            StreamEvent::EditStarted | StreamEvent::EditFileStarted { .. } => {
+                self.open();
+            }
+            StreamEvent::ResetStream => {
+                self.close_unapplied(EditTermination::Withdrawn, Vec::new(), None);
+            }
+            _ => {}
+        }
+    }
+
     /// Creates a handle whose cycle is not open yet.
     pub fn new(publish: impl Fn(EditCycleEvent) + Send + Sync + 'static) -> Self {
         Self {

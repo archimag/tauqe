@@ -90,6 +90,20 @@ pub(crate) fn run_git_with_deadline(
     args: &[&str],
     deadline: &GitDeadline,
 ) -> Result<String> {
+    run_git_bytes(dir, args, deadline).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads a blob without text conversion or checkout filters.
+pub fn read_blob(dir: &Path, revision: &str, path: &str) -> Result<Vec<u8>> {
+    let object = format!("{revision}:{path}");
+    run_git_bytes(
+        Some(dir),
+        &["cat-file", "blob", "--", &object],
+        &GitDeadline::default(),
+    )
+}
+
+fn run_git_bytes(dir: Option<&Path>, args: &[&str], deadline: &GitDeadline) -> Result<Vec<u8>> {
     // Shelling out to `git` can block for hundreds of milliseconds on a large
     // repository. Run it through the blocking helper so the async worker pool
     // keeps its capacity instead of stalling other tasks.
@@ -99,7 +113,7 @@ pub(crate) fn run_git_with_deadline(
             bail!("{reason}");
         }
         match outcome.code {
-            Some(0) => Ok(String::from_utf8_lossy(&outcome.stdout).to_string()),
+            Some(0) => Ok(outcome.stdout),
             _ => bail!(
                 "git command failed: {}",
                 String::from_utf8_lossy(&outcome.stderr)

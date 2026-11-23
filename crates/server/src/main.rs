@@ -113,6 +113,17 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .ok(),
                 },
+                HistoryMutation::Updated {
+                    item,
+                    estimated_tokens,
+                } => Event {
+                    method: events::HISTORY_ENTRY_UPDATED.into(),
+                    params: serde_json::to_value(HistoryEntryAddedEvent {
+                        item: handlers::history::history_item_dto(item),
+                        estimated_tokens: Some(estimated_tokens),
+                    })
+                    .ok(),
+                },
                 HistoryMutation::Compacted {
                     summary,
                     tail_ids,

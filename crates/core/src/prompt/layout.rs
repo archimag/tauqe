@@ -351,7 +351,7 @@ mod tests {
     ) -> Vec<ChatMessage> {
         assembly(files, records).assemble_chat_messages(
             task,
-            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+            &JsonPromptProtocol::new(crate::llm::repl::dialogue_capability_expr(false, false)),
         )
     }
     #[test]
@@ -486,7 +486,7 @@ mod tests {
 
         let messages = assembly.assemble_chat_messages(
             "Go",
-            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+            &JsonPromptProtocol::new(crate::llm::repl::dialogue_capability_expr(false, false)),
         );
         let head = &messages[0].content;
         assert!(head.contains("## Repository Map"));

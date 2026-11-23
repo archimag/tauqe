@@ -549,7 +549,7 @@ impl ModelsConfig {
     ///
     /// Out-of-range indices clamp to the last rung, so escalation never panics
     /// once the ladder is exhausted.
-    pub(crate) fn coder_tier(&self, idx: usize) -> ModelEntry {
+    fn coder_tier(&self, idx: usize) -> ModelEntry {
         let ladder = self.coder_ladder();
         let last = ladder.len().saturating_sub(1);
         ladder

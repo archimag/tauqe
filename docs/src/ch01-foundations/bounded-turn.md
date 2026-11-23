@@ -5,11 +5,10 @@ loops that carry one stated objective through research, proposal, staging,
 verification, and healing, and then either commit the result or restore the
 repository.
 
-The loops live in `crates/core/src/control/` and compose by direct call:
-`run_repl_loop` and the plan executors drive `run_turn_loop`, and `run_turn_loop`
-drives the step functions of its phases — `execute_research_step`,
-`execute_staging_step`, and `execute_edit_step`. No stage asks the model which
-stage runs next.
+The REPL and isolated plan and review steps share `TurnWorkflow` in
+`crates/flow/src/workflows/`. It drives `RoundWorkflow` for model requests and
+uses the Core research, staging, and edit mechanisms for deterministic work.
+No stage asks the model which stage runs next.
 
 ---
 
@@ -52,34 +51,12 @@ known recovery path.
 
 ### 3.2.1 The control loops and the capability tree
 
-Every turn runs in exactly one regime, and the regime is declared by the loop
-function that runs it rather than by a value handed in from outside:
-
-- `run_repl_loop` (`control/repl.rs`) — interactive dialogue started from the REPL,
-  including a dialogue anchored on a plan or on a review finding;
-- `run_turn_loop` (`control/turn.rs`) — the body of one turn: the opening round, the
-  research rounds, and the edit phase;
-The phases inside `run_turn_loop` are step functions rather than loops:
-`execute_research_step` (`control/turn/research.rs`) executes one discovery round,
-`execute_staging_step` (`control/turn/staging.rs`) applies one change set to the
-virtual tree, and `execute_edit_step` (`control/turn/edit.rs`) runs one application
-and verification pass. Each of them returns a typed result to the turn loop, which
-alone decides whether the turn asks again or concludes.
-- `run_plan_step_loop` (`control/plan/step.rs`) — one leaf of a plan driven through
-  the coder ladder until it reaches a terminal state;
-- `run_plan_sequence_loop` (`control/plan/sequence.rs`) — an ordered sequence of
-  leaves observing the soft-stop boundary between them;
-- `run_fixed_plan_loop` (`control/plan/fixed.rs`) — every `Todo` leaf of one plan
-  collected in preorder, executed as a sequence, followed by the container refresh;
-- `run_structured_refine` (`control/refine.rs`) — the Architect reprojects the
-  unfinished horizon of a plan from repository evidence.
-
-Each of those functions owns the tree of its own surface and hands it to the shared
-execution context through `LoopContext::capabilities`. `repl_capability_expr` in
-`control/repl.rs`, `turn_capability_expr` in `control/turn.rs`, and the synthesis
-tree in `control/refine.rs` are the only declarations of a capability surface:
-nothing else constructs one, and no enumeration of turn intents exists to be
-consulted instead.
+The caller supplies the capability tree for its scenario. A REPL dialogue,
+including a discussion anchored on a plan or review finding, uses the tree in
+`core::llm::repl`. An isolated Coder step uses `core::llm::step`. The separate
+Architect synthesis uses its research and synthesis grant in `core::plan::prompt::refine`.
+The shared request executor binds the supplied grant to each request rather than
+inferring the scenario from the prompt.
 
 The dialogue tree is two ambient channels beside one union of branches. The turn
 scratchpad and the single conversational message accompany every round, so they
@@ -110,7 +87,7 @@ than close on prose. A step therefore reasons about one objective, edits the
 tree, discovers material, and reports its change set through the ambient
 message; it never writes a plan document.
 
-The Architect synthesis declares its own tree in `control/refine.rs`. Its surface
+The Architect synthesis declares its own tree alongside the horizon response schema. Its surface
 is the architect research profile — research, plan creation, plan update, the
 scratchpad, and the abort escape hatch — with no file-edit capability and no
 toolchain gate, because a synthesis produces a horizon rather than a patch. The
@@ -317,7 +294,7 @@ it produced, the files it changed, and the first line of the reason or summary
 it reported. The full reply of the model is never recorded for a step: the
 chronicle needs the outcome of the step, not a transcript of it. Because a batch
 may execute many steps, a step turn passes through the same budgeted compaction
-as a dialogue (`compact_history_if_needed_with_budget` in `control/history.rs`,
+as a dialogue (`Application::compact_history` in `flow`,
 bound by `history.budget_tokens`), so the journal is bounded by the configured
 budget rather than by the length of the batch.
 
@@ -348,7 +325,7 @@ rollback or a compaction drops the rounds together with the attempt they belong 
 ```text
       objective
           |
-   run_turn_loop — one pool of provider calls: repl.max_turn_rounds
+   TurnWorkflow — one pool of provider calls: repl.max_turn_rounds
           |
           |  every iteration is one physical model call
           v
@@ -365,6 +342,7 @@ rollback or a compaction drops the rounds together with the attempt they belong 
                           clean                    escalated coder
                              v                          v
                        finalize commit  <--or-->  roll back to checkpoint
+```
 
 ### 3.3.1 Research
 
@@ -581,7 +559,7 @@ under the same storage lock and off the async executor thread, and it writes
 neither a plan document nor the active-plan marker. Because both contracts run one
 barrier, the verdict of the probe is the verdict of the application it predicts. A
 refusal typed as a payload defect then buys a bounded corrective round: the typed
-reasons compose a directive, `run_repl_loop` asks the model for the corrected
+reasons compose a directive, the REPL workflow asks the model for the corrected
 document through the single feedback slot of its transcript, and the corrected
 payload replaces the refused one. The budget is `repl.max_plan_corrections`, and
 once it is spent the refusal travels to the developer as a visible notice instead
@@ -630,38 +608,18 @@ masquerades as a trailing append and a compaction never masquerades as a message
 The machine is decomposed into plain async functions, so each layer owns one reason
 to change, which is what makes it testable without a network:
 
-| Loop | Module | Responsibility |
+| Owner | Module | Responsibility |
 | --- | --- | --- |
-| `run_repl_loop` | `control/repl.rs` | the dialogue surface, one turn, and the plan and review payloads of the round |
-| `run_fixed_plan_loop` | `control/plan/fixed.rs` | every `Todo` leaf of one plan in preorder, then the container refresh |
-| `run_plan_sequence_loop` | `control/plan/sequence.rs` | an ordered sequence of leaves, the soft-stop boundary, and cancellation precedence |
-| `run_plan_step_loop` | `control/plan/step.rs` | one leaf: its context, its lifecycle transitions, and the coder ladder |
-| `run_turn_loop` | `control/turn.rs` | the single loop of one turn: discovery, staging, application, and healing alternating under one round pool |
-| `execute_research_step` | `control/turn/research.rs` | one discovery round and the turn research journal |
-| `execute_staging_step` | `control/turn/staging.rs` | one virtual staging attempt and the retry it opens |
-| `execute_edit_step` | `control/turn/edit.rs` | one disk application, formatting, post-hook, and verification pass |
+| REPL workflow | `flow::workflows::repl` | dialogue and settlement of plan and review payloads |
+| `StepAttempt` | `flow::workflows::step` | one isolated Coder attempt |
+| `TurnWorkflow` | `flow::workflows::turn` | discovery, staging, application, and healing under one round budget |
+| `RoundWorkflow` | `flow::workflows::round` | one request admission and registration of a valid response |
+| Core mechanisms | `core::workflow::research::step`, `core::edits` | repository discovery, virtual staging, disk application, and verification |
 
-The composition is call nesting over one mutable `LoopContext`: a sequence drives
-its leaves one at a time, a leaf drives one turn per coder rung, and a turn drives
-its step functions. Control flow is composed functionally through direct
-asynchronous calls, never through a single-method execution trait or a boxed
-dynamic dispatcher, and ambient state is reborrowed (`reborrow_with_capabilities`,
-`reborrow_extending_capabilities`) so a child narrows or widens the surface
-without owning the context.
-
-The lifecycle belongs to the loop that drives it. `run_plan_step_loop_with` and
-`run_plan_sequence_loop_with` take a `StepPersistence` adapter, which is why one
-implementation of the step lifecycle serves a local plan, an architectural review
-group, and the degenerate one-step horizon of a single review finding: only the
-document that records the statuses differs.
-
-The Architect synthesis is not one of those loops. `run_structured_refine` in
-`control/refine.rs` keeps its own reassembly through `execute_rebuilt_round` and
-its own scratchpad injection, adds Schema Healing of an unparsable answer,
-escalation along the architect ladder, and typed terminal outcomes — a synthesized
-horizon, a blocker, an abort, an exceeded context budget, or a cancellation.
-Routing that contour through the transcript of a turn is a separate decision; until
-it is taken, the synthesis keeps the reassembly it declares.
+Plan and review scenarios decide which steps run and how their outcomes affect
+the documents. Architect synthesis in Flow has a separate request lifecycle:
+it retains the research journal and uses `PromptExecutor` to prepare requests
+without replaying an edit-turn transcript or opening a transaction.
 
 A scripted provider satisfies this contract without a network call, so multi-round
 scenarios — discovery, a compiler failure, a successful healing patch, a
@@ -677,12 +635,9 @@ surface as distinct terminal statuses.
 ### 3.3.10 The turn transcript across rounds
 
 Every round re-sends one growing message sequence, and providers cache the longest
-unchanged token prefix. The live sequence is the `TurnTranscript` the turn context
-carries behind an `Arc<Mutex<_>>`, so a reborrowed child context appends the rounds it
-exchanges to the very sequence its parent holds. The transcript stores four values and
-nothing else: the rendered head up to the task, the frozen task message, the
-assistant/feedback pairs already exchanged, and the capability tree the head was seeded
-with.
+unchanged token prefix. `TurnState` owns the live `TurnTranscript`. It retains the
+rendered prefix, the frozen task, accepted replies and feedback, original file
+snapshots, and the grant and history used to render the prefix.
 
 The first round seeds it, and every round after that appends exactly one pair — the
 answer it received and the feedback the next request carries — so the request of round

@@ -356,6 +356,96 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
     assert!(!state.is_operation_active());
 }
 
+#[tokio::test]
+async fn preset_preview_and_launch_use_the_same_ordered_audit_windows() {
+    use super::super::handle_review_start;
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_core::review::ReviewStorage;
+    use tauqe_protocol::events;
+
+    let dir = TestDir::new();
+    init_repo_with_files(
+        &dir,
+        &[
+            ("alpha/a.rs", TARGET_FILE),
+            ("beta/b.rs", TARGET_FILE),
+            ("beta/c.rs", TARGET_FILE),
+        ],
+    );
+    let mut config = test_config();
+    config.review = serde_json::from_value(serde_json::json!({
+        "presets": [{"name": " layered ", "groups": [
+            {"name": "Beta", "paths": ["beta/"]},
+            {"name": "Alpha", "paths": ["alpha/"]}
+        ]}]
+    }))
+    .unwrap();
+    let (out, mut rx) = OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().into(), history, out);
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(r#"{"findings":[]}"#),
+        MockResponse::text(r#"{"findings":[]}"#),
+    ]));
+    state.application.test_set_provider(provider.clone()).await;
+    let params = serde_json::json!({"preset": " layered ", "path_patterns": ["not-used"]});
+    let preview = projection(handle_review_preview(preview_request(params.clone()), &state).await);
+    assert!(provider.requests().is_empty());
+    assert!(ReviewStorage::load_latest(dir.path()).unwrap().is_none());
+
+    let response = handle_review_start(
+        Request {
+            id: RequestId::Number(2),
+            method: methods::REVIEW_START.into(),
+            params: Some(params),
+        },
+        &state,
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let audited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut audited = Vec::new();
+        loop {
+            let raw = rx.recv().await.unwrap();
+            let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            match event["method"].as_str() {
+                Some(events::REVIEW_GROUP_STARTED) => {
+                    audited.push(event["params"]["files_count"].as_u64().unwrap() as usize)
+                }
+                Some(events::REVIEW_FINISHED) => break audited,
+                Some(events::REVIEW_ERROR | events::REVIEW_BATCH_FINISHED) => {
+                    panic!("unexpected event: {raw}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let stored = ReviewStorage::load_latest(dir.path()).unwrap().unwrap();
+    assert_eq!(
+        stored
+            .groups
+            .iter()
+            .map(|group| group.title.as_str())
+            .collect::<Vec<_>>(),
+        preview
+            .groups
+            .iter()
+            .map(|group| group.title.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        audited,
+        preview
+            .groups
+            .iter()
+            .map(|group| group.window.selected_files)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(provider.requests().len(), 2);
+}
+
 /// The price of a file is its content plus the wrapper its own `<file>` element
 /// renders, so identical content behind a longer path costs more and the budget
 /// measures what the audit actually reads (#c-2).

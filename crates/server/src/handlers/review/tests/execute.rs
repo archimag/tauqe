@@ -1,7 +1,6 @@
 //! `review/execute`: request validation and queue resolution before any turn.
 //!
-//! Every refusal asserted here happens before the batch claims the operation
-//! slot, so a rejected request can never leave a finding half executed.
+//! Refusals happen before a member starts and leave no operation registered.
 
 use super::{architectural_session, test_item, test_session, test_state, TestDir};
 
@@ -11,8 +10,59 @@ use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{errors, Request};
 
+pub(super) async fn execute_and_collect(
+    state: &std::sync::Arc<crate::state::AppState>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    request: Request,
+) -> Vec<tauqe_protocol::Event> {
+    use tauqe_protocol::{events, Event};
+
+    let response = handle_review_execute(request, state).await;
+    assert!(
+        response.error.is_none(),
+        "review execution refused: {response:?}"
+    );
+    let result = response.result.expect("review execution is acknowledged");
+    let operation_id = result["operation_id"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut published = Vec::new();
+        loop {
+            let raw = rx
+                .recv()
+                .await
+                .expect("the review event channel remains open");
+            let event: Event = serde_json::from_str(&raw).unwrap();
+            let finished = event.method == events::REVIEW_BATCH_FINISHED;
+            if finished {
+                assert_eq!(event.params.as_ref().unwrap()["operation_id"], operation_id);
+            }
+            published.push(event);
+            if finished {
+                break;
+            }
+        }
+        while state.is_operation_active() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        while let Ok(raw) = rx.try_recv() {
+            published.push(serde_json::from_str(&raw).unwrap());
+        }
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| event.method == events::REVIEW_BATCH_FINISHED)
+                .count(),
+            1,
+            "the batch publishes exactly one terminal event"
+        );
+        published
+    })
+    .await
+    .expect("the review batch must finish and release its operation")
+}
+
 /// Builds a `review/execute` request carrying the given payload.
-fn execute_request(params: serde_json::Value) -> Request {
+pub(super) fn execute_request(params: serde_json::Value) -> Request {
     Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
@@ -326,6 +376,6 @@ async fn execute_refuses_a_group_that_still_poses_an_open_question() {
     }
     assert!(
         !state.is_operation_active(),
-        "a refused request never claims the operation slot"
+        "a refused request releases the operation slot"
     );
 }

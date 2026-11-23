@@ -33,7 +33,7 @@ pub enum ContextClearScope {
     All,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ContextSession {
     state: Arc<RwLock<ContextManager>>,
 }
@@ -45,26 +45,18 @@ impl ContextSession {
             state: Arc::new(RwLock::new(manager)),
         }
     }
-}
-
-impl Application {
     /// Detached turn-local state; mutations become shared only through an
     /// explicit merge. No application lock escapes this boundary.
-    pub async fn context_for_turn(&self) -> ContextManager {
-        self.context_session().state.read().await.clone()
+    pub(crate) async fn context_for_turn(&self) -> ContextManager {
+        self.state.read().await.clone()
     }
 
-    pub async fn context_state(&self) -> ContextState {
-        self.context_session().state.read().await.get_state()
+    pub(crate) async fn context_state(&self) -> ContextState {
+        self.state.read().await.get_state()
     }
 
-    pub async fn repository_root(&self) -> PathBuf {
-        self.context_session()
-            .state
-            .read()
-            .await
-            .repo_root()
-            .to_path_buf()
+    pub(crate) async fn repository_root(&self) -> PathBuf {
+        self.state.read().await.repo_root().to_path_buf()
     }
 
     /// Keep the write guard in the worker even if its caller is cancelled.
@@ -74,12 +66,43 @@ impl Application {
         F: FnOnce(&mut ContextManager) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let mut guard = Arc::clone(&self.context_session().state)
-            .write_owned()
-            .await;
+        let mut guard = Arc::clone(&self.state).write_owned().await;
         tauqe_core::blocking::run_blocking_async(move || mutate(&mut guard))
             .await
             .map_err(|error| ContextError::Offload(error.to_string()))
+    }
+
+    pub(crate) async fn merge_turn_context(
+        &self,
+        context: ContextManager,
+    ) -> Result<ContextState, ContextError> {
+        self.mutate_context(move |shared| {
+            shared.merge_turn_context(&context);
+            shared.get_state()
+        })
+        .await
+    }
+}
+
+impl Application {
+    pub async fn context_for_turn(&self) -> ContextManager {
+        self.context_session().context_for_turn().await
+    }
+
+    pub async fn context_state(&self) -> ContextState {
+        self.context_session().context_state().await
+    }
+
+    pub async fn repository_root(&self) -> PathBuf {
+        self.context_session().repository_root().await
+    }
+
+    pub(crate) async fn mutate_context<T, F>(&self, mutate: F) -> Result<T, ContextError>
+    where
+        F: FnOnce(&mut ContextManager) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.context_session().mutate_context(mutate).await
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -90,7 +113,9 @@ impl Application {
     {
         self.mutate_context(mutate).await
     }
+}
 
+impl ContextSession {
     pub(crate) async fn preload_declared_context(
         &self,
         root: PathBuf,
@@ -159,24 +184,9 @@ impl Application {
         .await
     }
 
-    pub(crate) async fn merge_turn_context(
+    pub(crate) async fn clear_context(
         &self,
-        context: ContextManager,
-    ) -> Result<ContextState, ContextError> {
-        self.mutate_context(move |shared| {
-            shared.merge_turn_context(&context);
-            shared.get_state()
-        })
-        .await
-    }
-
-    pub(crate) async fn rebind_context(&self, root: PathBuf) -> Result<(), ContextError> {
-        self.mutate_context(move |context| context.set_repo_root(root))
-            .await
-    }
-
-    pub async fn clear_context(
-        &self,
+        dialogue: &super::dialogue::DialogueSession,
         scope: ContextClearScope,
     ) -> Result<ContextState, ContextError> {
         let (removed, snapshot) = self
@@ -195,9 +205,25 @@ impl Application {
             })
             .await?;
         if removed {
-            self.reset_session_uuid().await;
+            dialogue.reset().await;
         }
         Ok(snapshot)
+    }
+}
+
+impl Application {
+    pub(crate) async fn rebind_context(&self, root: PathBuf) -> Result<(), ContextError> {
+        self.mutate_context(move |context| context.set_repo_root(root))
+            .await
+    }
+
+    pub async fn clear_context(
+        &self,
+        scope: ContextClearScope,
+    ) -> Result<ContextState, ContextError> {
+        self.context_session()
+            .clear_context(self.dialogue_session(), scope)
+            .await
     }
 
     pub(crate) async fn release_cached_documents(
@@ -283,7 +309,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let merged = app.merge_turn_context(local).await.unwrap();
+        let merged = app
+            .context_session()
+            .merge_turn_context(local)
+            .await
+            .unwrap();
         assert!(merged.items.iter().any(|item| item.path == "local.rs"));
         assert!(merged.items.iter().any(|item| item.path == "shared.rs"));
         assert_eq!(peer.context_state().await.revision, merged.revision);

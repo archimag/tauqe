@@ -28,8 +28,8 @@ use crate::review::IssueStatus;
 
 use std::borrow::Cow;
 
-use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::balanced_object_end;
+use crate::execution::structured::{StructuredContract, StructuredVisibility};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 use crate::review::prompt::build_post_analysis_system_prompt;
 

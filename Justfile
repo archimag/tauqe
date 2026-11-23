@@ -37,7 +37,7 @@ loc-no-tests:
     (cd "$tmp" && tokei crates)
 
 [group('tauqe')]
-[doc('Verify the change set with Clippy, tests, and doctests')]
+[doc('Verify the change set with Clippy, tests, doctests, and a rustdoc build')]
 [metadata('timeout', '1200')]
 verify:
     rust-script scripts/verify.rs
@@ -73,10 +73,15 @@ test-binaries *args="--workspace":
 test-doc *args="-p tauqe-flow -p tauqe-core -p tauqe-protocol -p tauqe-tools":
     cargo test --doc {{args}}
 
+rustdoc *args="--workspace":
+    cargo doc --no-deps {{args}}
+
 [group('tauqe')]
 [doc('Lint every workspace target, denying warnings')]
 [metadata('timeout', '600')]
 clippy *args="--workspace":
+    # Lint normal builds before test targets enable test-support via dev-dependencies.
+    cargo clippy {{args}} -- -D warnings
     cargo clippy {{args}} --all-targets -- -D warnings
 
 [group('tauqe')]

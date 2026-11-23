@@ -11,8 +11,6 @@ pub(crate) mod configuration;
 
 pub(crate) mod execution;
 
-pub(crate) mod step_run;
-
 pub(crate) mod structured_task;
 
 pub(crate) mod system_status;

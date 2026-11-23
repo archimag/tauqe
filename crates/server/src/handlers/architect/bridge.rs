@@ -8,8 +8,8 @@ use crate::state::{AppState, OperationGuard};
 use crate::usage::UsageGuard;
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
-use tauqe_core::control::refine::StructuredRefineOutcome;
 use tauqe_core::models::ArchitectTier;
+use tauqe_core::plan::prompt::StructuredRefineOutcome;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_protocol::events;
 #[cfg(test)]
@@ -80,8 +80,8 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use tauqe_core::control::refine::StructuredRefineStatus;
     use tauqe_core::models::{ModelRef, ModelRole, ReasoningEffort};
+    use tauqe_core::plan::prompt::StructuredRefineStatus;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ModelUsageInfo;
     use tauqe_core::workflow::turn::TurnPhase;
@@ -386,6 +386,62 @@ mod tests {
 
         drop(operation);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_new_contour_does_not_inherit_research_or_schema_feedback() {
+        let (state, _events, root) = test_state("independent");
+        tauqe_core::git::init_repository(Some(&root), true).unwrap();
+        std::fs::write(root.join("a.txt"), "First synthesis evidence").unwrap();
+        tauqe_core::git::cmd::stage_files(&root, &["a.txt".into()]).unwrap();
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(
+                r#"{"status":"needs_context","explanation":"Inspect evidence","context_requests":["a.txt","missing.txt"]}"#,
+            ),
+            MockResponse::text("not JSON"),
+            MockResponse::text(success_payload("First horizon")),
+            MockResponse::text(success_payload("Independent horizon")),
+        ]));
+        state.application.test_set_provider(provider.clone()).await;
+        let tier = state
+            .application
+            .configuration()
+            .await
+            .config
+            .models
+            .architect_tier(0);
+        for id in ["first", "second"] {
+            let operation = state.try_begin_operation().unwrap();
+            let (outcome, _) = run_contour_synthesis(
+                &state,
+                &operation,
+                id,
+                "Synthesize the horizon".into(),
+                state.context_snapshot().await,
+                tier.clone(),
+                String::new(),
+                String::new(),
+            )
+            .await;
+            assert_eq!(outcome.unwrap().status, StructuredRefineStatus::Synthesized);
+        }
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        for marker in [
+            "First synthesis evidence",
+            "missing.txt",
+            "did not satisfy the response schema",
+        ] {
+            assert!(requests[2]
+                .messages
+                .iter()
+                .any(|message| message.content.contains(marker)));
+            assert!(!requests[3]
+                .messages
+                .iter()
+                .any(|message| message.content.contains(marker)));
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Sink that records everything the outbound writer publishes, so a pacing

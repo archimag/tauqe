@@ -127,6 +127,7 @@ impl CacheProbe {
             request_id,
             model = %current.model,
             input_messages = current.messages.len(),
+            assistant_messages = body["input"].as_array().map(|items| items.iter().filter(|item| item["role"] == "assistant").count()),
             previous_input_messages = ?previous.map(|p| p.messages.len()),
             common_prefix_messages = ?common.map(|(count, _)| count),
             common_prefix_content_bytes = ?common.map(|(_, bytes)| bytes),
@@ -437,10 +438,15 @@ mod tests {
             vec![
                 ChatMessage::system("contract"),
                 ChatMessage::user("task"),
+                ChatMessage::assistant("Loading the first pair."),
                 ChatMessage::user("feedback"),
             ],
         ));
         body["text"] = json!({"format": {"type": "json_schema", "name": "first"}});
+        assert_eq!(
+            body["input"][2],
+            json!({"role": "assistant", "content": "Loading the first pair."})
+        );
         let extended = RequestShape::from_body(&body, &hasher);
         assert_eq!(extended.common_prefix(&original), (2, 12));
         assert_eq!(extended.format, original.format);

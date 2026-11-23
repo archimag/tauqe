@@ -1,11 +1,17 @@
 //! Application-owned stored-document operations and selection policy.
+
+mod execution;
+
 use crate::api::{Application, ApplicationEvent, ApplicationObserver};
 use std::path::{Path, PathBuf};
 use tauqe_core::discussion::DiscussionTarget;
 use tauqe_core::plan::{
     find_duplicate_item_ids, storage::PlanStorage, Plan, PlanItem, PlanItemStatus, PlanSummary,
 };
-use tauqe_core::review::{storage::ReviewStorage, IssueStatus, ReviewIssue, ReviewSession};
+use tauqe_core::review::{
+    storage::{GroupCompletion, ReviewStorage},
+    IssueStatus, ReviewIssue, ReviewSession,
+};
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
     #[error("Plan ID must be non-empty and must not contain path separators")]
@@ -21,7 +27,6 @@ pub enum DocumentError {
 }
 #[derive(Clone)]
 pub struct Documents {
-    application: Application,
     root: PathBuf,
 }
 #[derive(Debug, thiserror::Error)]
@@ -58,10 +63,7 @@ impl From<String> for DocumentError {
 }
 impl Application {
     pub(crate) fn documents_at(&self, root: &Path) -> Documents {
-        Documents {
-            application: self.clone(),
-            root: root.to_path_buf(),
-        }
+        Documents::new(root)
     }
 }
 impl Application {
@@ -129,10 +131,14 @@ impl Application {
         let _operation = self
             .try_begin_operation()
             .map_err(|_| DocumentError::Busy)?;
-        self.repository_documents()
-            .await
-            .delete_plan(id, observer)
-            .await
+        let documents = self.repository_documents().await;
+        let deleted = documents.delete_plan(id).await?;
+        if deleted {
+            self.release_document_focus(&DiscussionTarget::Plan { id: id.into() }, observer)
+                .await;
+            documents.publish_plan_list(observer).await;
+        }
+        Ok(deleted)
     }
 
     pub async fn set_active_plan(
@@ -165,10 +171,14 @@ impl Application {
         let _operation = self
             .try_begin_operation()
             .map_err(|_| DocumentError::Busy)?;
-        self.repository_documents()
-            .await
-            .delete_review(id, observer)
-            .await
+        let documents = self.repository_documents().await;
+        let deleted = documents.delete_review(id).await?;
+        if deleted {
+            self.release_document_focus(&DiscussionTarget::Review { id: id.into() }, observer)
+                .await;
+            documents.publish_review_list(observer).await;
+        }
+        Ok(deleted)
     }
 
     pub async fn update_review_item(
@@ -190,6 +200,12 @@ impl Application {
 }
 
 impl Documents {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
     async fn publish_plan(&self, plan: &Plan, is_save: bool, observer: &dyn ApplicationObserver) {
         observer.publish(
             "",
@@ -213,6 +229,17 @@ impl Documents {
         }
     }
 
+    pub(crate) async fn publish_review_snapshot(
+        &self,
+        id: &str,
+        observer: &dyn ApplicationObserver,
+    ) {
+        if let Ok(Some(session)) = self.review(id).await {
+            observer.publish("", ApplicationEvent::ReviewDocument(session));
+        }
+        self.publish_review_list(observer).await;
+    }
+
     pub async fn plans(&self) -> Result<Vec<Plan>, String> {
         let root = self.root.clone();
         read(move || PlanStorage::load_all(&root)).await
@@ -229,6 +256,12 @@ impl Documents {
         let root = self.root.clone();
         let id = id.to_string();
         read(move || PlanStorage::load_plan(&root, &id)).await
+    }
+
+    /// Records the marker without publishing or claiming another operation.
+    pub(crate) async fn write_active_plan(&self, id: Option<String>) -> Result<(), String> {
+        let root = self.root.clone();
+        read(move || PlanStorage::save_active_id(&root, id.as_deref())).await
     }
     pub async fn plan_list(&self) -> Result<(Vec<Plan>, Option<String>), String> {
         let root = self.root.clone();
@@ -309,36 +342,19 @@ impl Documents {
         }
         Ok(plan)
     }
-    async fn delete_plan(
-        &self,
-        id: &str,
-        observer: &dyn ApplicationObserver,
-    ) -> Result<bool, DocumentError> {
+    async fn delete_plan(&self, id: &str) -> Result<bool, DocumentError> {
         let root = self.root.clone();
         let id = id.to_string();
-        let deleted = read({
-            let id = id.clone();
-            move || PlanStorage::delete_plan(&root, &id)
-        })
-        .await?;
-        if deleted {
-            self.application
-                .release_document_focus(&DiscussionTarget::Plan { id }, observer)
-                .await;
-            self.publish_plan_list(observer).await;
-        }
-        Ok(deleted)
+        read(move || PlanStorage::delete_plan(&root, &id))
+            .await
+            .map_err(DocumentError::Storage)
     }
     async fn set_active_plan(
         &self,
         id: Option<String>,
         observer: &dyn ApplicationObserver,
     ) -> Result<(), DocumentError> {
-        let root = self.root.clone();
-        let stored = id.clone();
-        read(move || PlanStorage::save_active_id(&root, stored.as_deref()))
-            .await
-            .map_err(DocumentError::Storage)?;
+        self.write_active_plan(id.clone()).await?;
         if let Ok(plans) = self.plans().await {
             observer.publish(
                 "",
@@ -354,6 +370,33 @@ impl Documents {
         let root = self.root.clone();
         read(move || ReviewStorage::load_all(&root)).await
     }
+
+    pub(crate) async fn save_review(&self, session: &ReviewSession) -> Result<(), String> {
+        let root = self.root.clone();
+        let session = session.clone();
+        read(move || ReviewStorage::save_session(&root, &session)).await
+    }
+
+    pub(crate) async fn persist_review_regrouping(
+        &self,
+        regrouping: tauqe_core::review::analysis::PostAnalysisRegrouping,
+    ) -> Result<Option<ReviewSession>, String> {
+        let root = self.root.clone();
+        read(move || regrouping.persist(&root)).await
+    }
+
+    pub(crate) async fn append_review_group_findings(
+        &self,
+        review_id: &str,
+        group_id: &str,
+        findings: Vec<ReviewIssue>,
+    ) -> Result<Option<ReviewSession>, String> {
+        let root = self.root.clone();
+        let review_id = review_id.to_owned();
+        let group_id = group_id.to_owned();
+        read(move || ReviewStorage::append_group_findings(&root, &review_id, &group_id, findings))
+            .await
+    }
     pub async fn review_list(&self) -> Result<(Vec<ReviewSession>, Option<String>), String> {
         let reviews = self.reviews().await?;
         let active = self.active_review_id().await.ok().flatten();
@@ -362,6 +405,85 @@ impl Documents {
     pub async fn active_review_id(&self) -> Result<Option<String>, String> {
         let root = self.root.clone();
         read(move || ReviewStorage::load_active_id(&root)).await
+    }
+
+    pub(crate) async fn write_active_review(&self, id: &str) -> Result<(), String> {
+        let root = self.root.clone();
+        let id = id.to_owned();
+        read(move || ReviewStorage::save_active_id(&root, Some(&id))).await
+    }
+
+    pub(crate) async fn close_review_group(
+        &self,
+        review_id: &str,
+        group_id: &str,
+    ) -> Result<GroupCompletion, String> {
+        let root = self.root.clone();
+        let review = review_id.to_owned();
+        let group = group_id.to_owned();
+        read(move || {
+            ReviewStorage::close_group_implementation(
+                &root,
+                &review,
+                &group,
+                "Resolved by the completed implementation horizon of the review group",
+            )
+        })
+        .await
+        .map_err(|err| format!("Failed to persist review group '{group_id}' completion: {err}"))
+    }
+
+    pub(crate) async fn block_review_group(
+        &self,
+        review_id: &str,
+        group_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let root = self.root.clone();
+        let review = review_id.to_owned();
+        let group = group_id.to_owned();
+        let reason = reason.to_owned();
+        read(move || ReviewStorage::set_group_blocked_reason(&root, &review, &group, Some(&reason)))
+            .await
+            .map_err(|err| format!("Failed to persist review group '{group_id}' blocker: {err}"))?
+            .map(|_| ())
+            .ok_or_else(|| format!("Review group '{group_id}' not found in session '{review_id}'"))
+    }
+
+    pub(crate) async fn complete_review_finding(
+        &self,
+        review_id: &str,
+        item_id: u32,
+        note: &str,
+    ) -> Result<(), String> {
+        self.write_review_finding_verdict(review_id, item_id, note, ReviewStorage::complete_finding)
+            .await
+    }
+
+    pub(crate) async fn skip_review_finding(
+        &self,
+        review_id: &str,
+        item_id: u32,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.write_review_finding_verdict(review_id, item_id, reason, ReviewStorage::skip_finding)
+            .await
+    }
+
+    async fn write_review_finding_verdict(
+        &self,
+        review_id: &str,
+        item_id: u32,
+        note: &str,
+        write: impl FnOnce(&Path, &str, u32, &str) -> anyhow::Result<Option<()>> + Send + 'static,
+    ) -> Result<(), String> {
+        let root = self.root.clone();
+        let review = review_id.to_owned();
+        let note = note.to_owned();
+        read(move || write(&root, &review, item_id, &note))
+            .await
+            .map_err(|err| format!("Failed to persist review finding #{item_id} verdict: {err}"))?
+            .ok_or_else(|| format!("Review finding #{item_id} not found in session '{review_id}'"))
     }
     pub async fn review(&self, id: &str) -> Result<Option<ReviewSession>, String> {
         let root = self.root.clone();
@@ -389,25 +511,12 @@ impl Documents {
             None => Ok(None),
         }
     }
-    async fn delete_review(
-        &self,
-        id: &str,
-        observer: &dyn ApplicationObserver,
-    ) -> Result<bool, DocumentError> {
+    async fn delete_review(&self, id: &str) -> Result<bool, DocumentError> {
         let root = self.root.clone();
         let id = id.to_string();
-        let deleted = read({
-            let id = id.clone();
-            move || ReviewStorage::delete_review(&root, &id)
-        })
-        .await?;
-        if deleted {
-            self.application
-                .release_document_focus(&DiscussionTarget::Review { id }, observer)
-                .await;
-            self.publish_review_list(observer).await;
-        }
-        Ok(deleted)
+        read(move || ReviewStorage::delete_review(&root, &id))
+            .await
+            .map_err(DocumentError::Storage)
     }
     async fn update_review_item(
         &self,
@@ -441,9 +550,7 @@ impl Documents {
         .await
         .map_err(DocumentError::Storage)?;
         if item.is_some() {
-            self.application
-                .publish_review_snapshot(&self.root, &id, observer)
-                .await;
+            self.publish_review_snapshot(&id, observer).await;
         }
         Ok(item)
     }

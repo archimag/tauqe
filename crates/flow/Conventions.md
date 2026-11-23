@@ -28,6 +28,16 @@ review criteria, not an inventory of current RPC routes or event fields.
 
 ## Scenario boundaries
 
+- Pass session services and typed inputs to plan and review workflows at entry.
+  Neither these workflows nor their shared execution paths may hold or call
+  back into `Application`, directly or through a host or closure. Observers
+  receive events; they do not execute parts of the scenario.
+- Migrated scenarios must not fall back to legacy execution. Keep admission,
+  continuation and accepted-round registration with workflows; a technical
+  executor freezes and executes one request without choosing its successor.
+- Preserve the same task state and budget across technical and document
+  corrections. Settle the technical transaction before document correction,
+  and finish recovery and terminal publication before releasing ownership.
 - Reuse core execution mechanisms instead of copying turn logic into each
   scenario. The scenario determines its target, permissions, continuation,
   and durable result; the engine executes the prepared work.

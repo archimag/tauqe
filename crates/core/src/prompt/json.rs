@@ -138,6 +138,14 @@ impl PromptProtocol for JsonPromptProtocol {
         )
     }
 
+    fn accepts_empty_response(&self, raw_text: &str) -> bool {
+        StructuredPayload::parse(raw_text)
+            .root()
+            .and_then(|root| root.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    }
+
     fn response_format(
         &self,
         editable_paths: &[String],
@@ -207,9 +215,9 @@ fn is_edit_capability(capability: Option<LlmCapability>) -> bool {
 mod tests {
     use super::*;
     use crate::context::ContextAccess;
-    use crate::control::turn::turn_capability_expr;
     use crate::edits::EditOperation;
     use crate::edits::EditReplace;
+    use crate::llm::step::turn_capability_expr;
     use crate::llm::{
         AbortCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
         DirListCommand, DocRequestCommand, OuterDocRequestCommand, RepoDirsCommand, RepoMapCommand,
@@ -218,7 +226,7 @@ mod tests {
 
     /// Capability tree of a dialogue contour, as the control loops declare it.
     fn dialogue(plan_update: bool, review_decision: bool) -> CapabilityTree {
-        crate::control::repl::dialogue_capability_expr(plan_update, review_decision)
+        crate::llm::repl::dialogue_capability_expr(plan_update, review_decision)
     }
 
     /// Lifts the operational branch envelope of a composed schema into one surface.
@@ -561,7 +569,7 @@ mod tests {
             dialogue(false, false),
             dialogue(true, false),
             dialogue(false, true),
-            crate::control::turn::turn_capability_expr(),
+            turn_capability_expr(),
         ] {
             let protocol = JsonPromptProtocol::new(tree);
             let crate::providers::ResponseFormat::JsonSchema { json_schema } = protocol

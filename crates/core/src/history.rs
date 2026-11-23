@@ -37,6 +37,11 @@ pub enum HistoryMutation {
         item: HistoryItem,
         estimated_tokens: u64,
     },
+    /// The existing turn now carries its completed rounds.
+    Updated {
+        item: HistoryItem,
+        estimated_tokens: u64,
+    },
     /// The summarized prefix was replaced by `summary`, preserving `tail_ids`.
     Compacted {
         summary: HistoryItem,
@@ -318,6 +323,27 @@ impl HistoryManager {
         self.journal_bytes = self.journal_bytes.saturating_add(written);
         self.notify_entry(&entry, HistoryEntryStatus::Active);
         Ok(entry)
+    }
+
+    pub fn set_turn_rounds(&mut self, id: u64, completed: Vec<TurnRoundRecord>) -> Result<()> {
+        let mut entries = self.storage.read_entries()?;
+        let entry = entries.iter_mut().find(|entry| entry.id() == Some(id));
+        let Some(turn @ HistoryEntry::Turn { .. }) = entry else {
+            anyhow::bail!("History turn {id} is missing");
+        };
+        if let HistoryEntry::Turn { rounds, .. } = turn {
+            *rounds = completed;
+        }
+        let mut item = Self::entry_to_history_item(id, turn);
+        item.status = HistoryEntryStatus::Active;
+        self.journal_bytes = self.storage.rewrite_entries(&entries)?;
+        if let Some(listener) = &self.listener {
+            (listener.0)(HistoryMutation::Updated {
+                item,
+                estimated_tokens: self.estimated_tokens(),
+            });
+        }
+        Ok(())
     }
 
     pub fn record_response(

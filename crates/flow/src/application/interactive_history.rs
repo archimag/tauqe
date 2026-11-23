@@ -3,10 +3,9 @@
 use crate::api::{Application, HistoryError, OperationGuard};
 use tauqe_core::history::HistorySnapshot;
 
-#[derive(Default)]
 pub struct InteractiveHistoryStart {
-    pub turn_id: Option<u64>,
-    pub history: Option<HistorySnapshot>,
+    pub turn_id: u64,
+    pub history: HistorySnapshot,
 }
 
 impl Application {
@@ -91,13 +90,18 @@ mod tests {
             .prepare_interactive_history(&operation, "Current request".into())
             .await
             .unwrap();
-        assert!(started.turn_id.is_some());
-        let before = started.history.unwrap();
+        let before = started.history;
         assert_eq!(before.entries().len(), 1);
         assert!(
             matches!(&before.entries()[0], HistoryEntry::Turn { prompt, .. } if prompt == "Previous request")
         );
-        let after = app.history_for_turn().await.unwrap().snapshot().unwrap();
+        let after = app
+            .history_session()
+            .clone_for_turn()
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
         match after.entries().last().unwrap() {
             HistoryEntry::Turn {
                 id,
@@ -106,7 +110,7 @@ mod tests {
                 context_watermark,
                 ..
             } => {
-                assert_eq!(*id, started.turn_id);
+                assert_eq!(*id, Some(started.turn_id));
                 assert_eq!(prompt, "Current request");
                 assert_eq!(context, &vec!["kept.rs".to_string()]);
                 assert_eq!(*context_watermark, watermark);
@@ -125,25 +129,30 @@ mod tests {
             .prepare_interactive_history(&operation, "Empty context".into())
             .await
             .unwrap();
-        assert!(started.history.unwrap().is_empty());
-        let snapshot = app.history_for_turn().await.unwrap().snapshot().unwrap();
+        assert!(started.history.is_empty());
+        let snapshot = app
+            .history_session()
+            .clone_for_turn()
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
         assert!(
             matches!(&snapshot.entries()[0], HistoryEntry::Turn { context, context_watermark: None, .. } if context.is_empty())
         );
     }
 
     #[tokio::test]
-    async fn unwritable_journal_keeps_the_existing_empty_snapshot_without_a_turn_id() {
+    async fn unwritable_journal_refuses_to_start_the_turn() {
         let root = tempfile::tempdir().unwrap();
         let app = application(root.path());
         std::fs::create_dir_all(root.path().join(".tauqe/history.jsonl")).unwrap();
         let operation = app.try_begin_operation().unwrap();
-        let started = app
-            .prepare_interactive_history(&operation, "Request".into())
-            .await
-            .unwrap();
-        assert_eq!(started.turn_id, None);
-        assert!(started.history.unwrap().is_empty());
+        assert!(matches!(
+            app.prepare_interactive_history(&operation, "Request".into())
+                .await,
+            Err(HistoryError::Storage(message)) if message.contains("history.jsonl")
+        ));
         assert!(app.try_begin_operation().is_err());
     }
 
@@ -162,7 +171,13 @@ mod tests {
                 .await,
             Err(HistoryError::OperationNotOwned)
         ));
-        let snapshot = app.history_for_turn().await.unwrap().snapshot().unwrap();
+        let snapshot = app
+            .history_session()
+            .clone_for_turn()
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
         assert_eq!(snapshot.entries().len(), 1);
         assert!(
             matches!(&snapshot.entries()[0], HistoryEntry::Turn { prompt, .. } if prompt == "Existing")

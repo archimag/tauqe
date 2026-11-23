@@ -1,14 +1,67 @@
 use crate::models::ArchitectTier;
-use crate::plan::{PlanImplementation, PlanItem};
+use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 use crate::review::{
-    IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession, DEFAULT_REVIEW_GROUP_ID,
+    IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession, ReviewUpdateProposal,
+    DEFAULT_REVIEW_GROUP_ID,
 };
 use anyhow::Result;
 use std::path::Path;
 
+use super::items::{is_open_finding, record_resolution};
 use super::ReviewStorage;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum GroupCompletion {
+    Missing,
+    Incomplete,
+    Closed(usize),
+}
+
 impl ReviewStorage {
+    /// Applies a leaf transition to the current stored group horizon.
+    ///
+    /// Lookup, domain validation, and persistence share one storage lock.
+    /// A refusal leaves the document untouched; an idempotent transition
+    /// returns the current horizon without rewriting the file.
+    pub fn transition_group_leaf(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        step_id: &str,
+        status: PlanItemStatus,
+        blocked_reason: Option<&str>,
+        commit: Option<&str>,
+    ) -> Result<PlanImplementation> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            let (path, mut session) = Self::resolve_session_file_unlocked(repo_root, review_id)?
+                .ok_or_else(|| anyhow::anyhow!("Review session '{}' is not stored", review_id))?;
+            let group = find_group_mut(&mut session, group_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Review group '{}' of session '{}' is not stored",
+                    group_id,
+                    review_id
+                )
+            })?;
+            let changed = group
+                .implementation
+                .transition_leaf(step_id, status, blocked_reason, commit)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Review group '{}' of session '{}' does not store step '{}'",
+                        group_id,
+                        review_id,
+                        step_id
+                    )
+                })?;
+            let implementation = group.implementation.clone();
+            if changed {
+                Self::write_session_unlocked(repo_root, &path, &session)?;
+            }
+            Ok(implementation)
+        })
+    }
+
     /// Replaces the unified remediation subplan of one review group's
     /// architectural root cause while preserving the immutable `Done`
     /// foundation.
@@ -255,9 +308,9 @@ impl ReviewStorage {
         group_id: &str,
         reason: Option<&str>,
     ) -> Result<Option<ReviewGroup>> {
-        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
-            Some(session) => session,
-            None => return Ok(None),
+        let Some((path, mut session)) = Self::resolve_session_file_unlocked(repo_root, review_id)?
+        else {
+            return Ok(None);
         };
 
         let Some(group) = find_group_mut(&mut session, group_id) else {
@@ -269,86 +322,10 @@ impl ReviewStorage {
             .map(str::to_string);
         let updated = group.clone();
 
-        Self::save_session_unlocked(repo_root, &session)?;
+        Self::write_session_unlocked(repo_root, &path, &session)?;
         Ok(Some(updated))
     }
 
-    /// Records the decision that resolves the architectural fork of one review
-    /// group and publishes it to the findings the group collects.
-    ///
-    /// A decision ends the blocker: the group stores the resolution once and
-    /// clears `blocked_reason`, and every finding of the group receives the
-    /// same note, because the findings of an architectural group are symptoms
-    /// of the one cause the decision settled. The whole transition is a single
-    /// read-modify-write cycle under the process-global storage lock, so the
-    /// group and its findings can never disagree about the decision, and a
-    /// repeated decomposition reads the recorded resolution through
-    /// `resolution_notes` instead of reopening the fork.
-    ///
-    /// The decision must carry its own reasoning: a blank note is rejected,
-    /// because recording that something was decided without saying what would
-    /// leave the next decomposition with a blocker it cannot interpret.
-    /// Findings of other groups are never touched, and a group the session does
-    /// not declare resolves to `None` without any write.
-    #[cfg(test)]
-    pub(crate) fn apply_group_decision(
-        repo_root: &Path,
-        review_id: &str,
-        group_id: &str,
-        note: &str,
-    ) -> Result<Option<ReviewGroup>> {
-        crate::blocking::run_blocking(move || {
-            let _guard = Self::lock();
-            Self::apply_group_decision_unlocked(repo_root, review_id, group_id, note)
-        })
-    }
-
-    /// Lock-free core of [`Self::apply_group_decision`]; the caller must hold
-    /// the storage lock.
-    #[cfg(test)]
-    fn apply_group_decision_unlocked(
-        repo_root: &Path,
-        review_id: &str,
-        group_id: &str,
-        note: &str,
-    ) -> Result<Option<ReviewGroup>> {
-        let resolution = note.trim();
-        if resolution.is_empty() {
-            anyhow::bail!(
-                "Cannot record a decision for review group '{group_id}': the resolution note is empty"
-            );
-        }
-
-        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
-            Some(session) => session,
-            None => return Ok(None),
-        };
-
-        let updated = {
-            let Some(group) = find_group_mut(&mut session, group_id) else {
-                return Ok(None);
-            };
-            group.blocked_reason = None;
-            group.resolution_notes = Some(resolution.to_string());
-            group.clone()
-        };
-
-        for item in &mut session.items {
-            if !finding_in_group(item, group_id) {
-                continue;
-            }
-
-            // Mutate the finding through the canonical `ReviewIssue` model, so
-            // the persisted record and the analytical view can never disagree
-            // about the fields they share.
-            let mut issue = ReviewIssue::from(item.clone());
-            issue.note = Some(resolution.to_string());
-            *item = ReviewItem::from(issue);
-        }
-
-        Self::save_session_unlocked(repo_root, &session)?;
-        Ok(Some(updated))
-    }
     /// Closes the implementation horizon of one review group.
     ///
     /// A group whose horizon reached the aggregate `Done` status has completed
@@ -366,16 +343,15 @@ impl ReviewStorage {
     /// findings that carry no note of their own, and a note a finding already
     /// carries is never rewritten.
     ///
-    /// Returns the number of findings the completion closed. `None` when the
-    /// named session does not exist or declares no group with that identifier; a
-    /// declared group with no open finding resolves to `Some(0)` and performs no
-    /// write.
+    /// A missing target or an empty or incomplete horizon leaves the session
+    /// untouched. Completion returns the number of newly closed findings and
+    /// writes only if a finding or the group blocker changed.
     pub fn close_group_implementation(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
         note: &str,
-    ) -> Result<Option<usize>> {
+    ) -> Result<GroupCompletion> {
         crate::blocking::run_blocking(move || {
             let _guard = Self::lock();
             Self::close_group_implementation_unlocked(repo_root, review_id, group_id, note)
@@ -389,20 +365,22 @@ impl ReviewStorage {
         review_id: &str,
         group_id: &str,
         note: &str,
-    ) -> Result<Option<usize>> {
-        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
-            Some(session) => session,
-            None => return Ok(None),
+    ) -> Result<GroupCompletion> {
+        let Some((path, mut session)) = Self::resolve_session_file_unlocked(repo_root, review_id)?
+        else {
+            return Ok(GroupCompletion::Missing);
         };
 
-        // A group the session does not declare has no members to close, so the
-        // completion reports that it changed nothing instead of inferring an
-        // implicit membership the session never stated.
-        if !session.groups.iter().any(|group| group.id == group_id) {
-            return Ok(None);
+        let Some(group) = find_group_mut(&mut session, group_id) else {
+            return Ok(GroupCompletion::Missing);
+        };
+        if group.implementation.items.is_empty()
+            || group.implementation.status() != PlanItemStatus::Done
+        {
+            return Ok(GroupCompletion::Incomplete);
         }
+        let cleared_blocker = group.blocked_reason.take().is_some();
 
-        let completion = note.trim();
         let mut closed = 0usize;
         for item in &mut session.items {
             if !finding_in_group(item, group_id) || !is_open_finding(item.status) {
@@ -413,28 +391,38 @@ impl ReviewStorage {
             // the persisted record and the analytical view can never disagree
             // about the fields they share.
             let mut issue = ReviewIssue::from(item.clone());
-            issue.status = IssueStatus::Fixed;
-            if !completion.is_empty() && !carries_note(issue.note.as_deref()) {
-                issue.note = Some(completion.to_string());
-            }
+            record_resolution(&mut issue, IssueStatus::Fixed, note);
             *item = ReviewItem::from(issue);
             closed += 1;
         }
 
-        // The blocker belongs to the group that reported it, so the same write
-        // clears it: the finding verdicts and the group state are never published
-        // apart.
-        let mut writes = closed > 0;
-        if let Some(group) = find_group_mut(&mut session, group_id) {
-            writes |= group.blocked_reason.take().is_some();
+        if closed > 0 || cleared_blocker {
+            Self::write_session_unlocked(repo_root, &path, &session)?;
         }
 
-        if writes {
-            Self::save_session_unlocked(repo_root, &session)?;
-        }
-
-        Ok(Some(closed))
+        Ok(GroupCompletion::Closed(closed))
     }
+}
+
+/// Applies an admitted group decision, returning false if the group is absent.
+pub(super) fn apply_group_decision(
+    session: &mut ReviewSession,
+    group_id: &str,
+    decision: &ReviewUpdateProposal,
+) -> bool {
+    let Some(group) = find_group_mut(session, group_id) else {
+        return false;
+    };
+    group.blocked_reason = None;
+    group.resolution_notes = Some(decision.note.trim().to_string());
+    for item in &mut session.items {
+        if finding_in_group(item, group_id) {
+            let mut issue = ReviewIssue::from(item.clone());
+            issue.apply_decision(decision);
+            *item = ReviewItem::from(issue);
+        }
+    }
+    true
 }
 
 /// Resolves the review group of a session by id.
@@ -456,29 +444,9 @@ fn find_group_mut<'a>(
 /// as the grouped session view and the post-analysis layer resolve it, so every
 /// group-scoped primitive observes one membership rule instead of re-deriving
 /// it.
-fn finding_in_group(item: &ReviewItem, group_id: &str) -> bool {
+pub(super) fn finding_in_group(item: &ReviewItem, group_id: &str) -> bool {
     match item.group.as_deref() {
         Some(group) => group == group_id,
         None => group_id == DEFAULT_REVIEW_GROUP_ID,
     }
-}
-
-/// Whether a finding still awaits the completion of its group.
-///
-/// Only a finding the remediation has not concluded is open: a verdict the
-/// developer stated (`Skipped`, `Rejected`) and a finding already `Fixed` are
-/// terminal outcomes the completion never rewrites.
-fn is_open_finding(status: IssueStatus) -> bool {
-    matches!(
-        status,
-        IssueStatus::Discussion | IssueStatus::Todo | IssueStatus::InProgress
-    )
-}
-
-/// Whether a finding already carries a resolution note.
-///
-/// A note the developer stated is never rewritten by a completion: the note of
-/// the completion is recorded only on a finding that carries none.
-fn carries_note(note: Option<&str>) -> bool {
-    note.map(str::trim).is_some_and(|text| !text.is_empty())
 }

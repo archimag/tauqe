@@ -1,203 +1,282 @@
-# Execution and scenario ownership
+# Execution architecture: executor and workflows
 
-This document describes the implemented execution boundary. The dependency direction is
-`server → flow → core → tools`; the server also uses `protocol` for RPC. The
-boundary is defined by ownership of decisions, not by whether an object is
-mutable, technically complex, or shared by several scenarios. Flow may later
-split into separate scenario crates without changing that boundary.
+The REPL and isolated plan and review steps share a bounded edit turn.
+Architect research and one-off structured requests use the same provider
+transport without entering an edit turn. The dependency direction is
+`server → flow → core → tools`; `protocol` is the RPC contract with the TUI.
+The boundaries below are about who makes a decision, not where a type happens
+to be defined or whether an object is mutable.
 
-## Who owns a decision?
+## Two kinds of decisions
 
-Before a workflow starts, the environment has already selected technical
-dependencies such as the provider, edit format, application policy, verification
-machinery, and their configuration. A factory assembles these into a prompt
-executor. Workflows do not reconstruct this wiring or choose a convenient
-substitute for a configured policy.
+**Core implements technical execution.** Before a particular workflow runs,
+the application binds the configured provider, model transport, edit format,
+application policy, verification machinery, request transport, and their
+configuration. A workflow cannot silently replace these dependencies. Core
+provides the mechanisms for constructing coherent prompts, streaming requests,
+decoding results, and executing admitted technical operations. It does not
+decide which scenario to run or what the scenario should do with a result.
 
-During execution, the workflow owns the decisions it may change: which context
-and history to use, the model's available capabilities, what work to request
-next, and how to interpret and persist the result. `ContextManager`,
-`HistoryManager`, and `CapabilityTree` can be objects supplied to the factory
-and then operated on by the workflow. Their concrete ownership and borrowing
-rules are an implementation concern; the important property is that the
-workflow can explicitly change their relevant state before the next request.
-Using history at all is a scenario decision, not an executor default.
+**Flow owns workflows.** A workflow decides its task, context, available model
+capabilities, whether to include history, which request comes next, how to
+interpret an outcome, and when to persist or publish it. `ContextManager`,
+`CapabilityTree`, and other changing inputs belong to the workflow even if
+their types and deterministic operations are implemented in core. A workflow
+may change them between requests; it must not mutate an in-flight request.
+Flow also owns operation admission, cancellation policy, scenario transitions,
+and durable plan or review decisions. Server translates RPC to application
+operations and projects their events; it does not run workflows.
 
-Mutability alone does not imply flow ownership: the executor's internal cache
-changes, but its contents do not constitute a workflow decision. Conversely,
-the technical implementation of a workflow-owned capability tree may live in
-core. The test is: **who is authorized to decide its value, and can that
-decision change during this workflow?**
+## PromptExecutor
 
-The executor implements the decision: prompt assembly, coherent request
-construction, caching, provider streaming, schema and decoder selection,
-technical retries, bounded research and edit verification as applicable. It
-returns typed outcomes, including refusal, cancellation, and infrastructure
-failure; it does not schedule the next plan step, close a review finding, or
-silently alter a workflow's permissions. Flow owns those transitions and the
-durable effects that follow them. The server projects results onto RPC and
-handles transport, logging setup, and final error translation.
+The application factory binds the technical environment and gives a workflow
+a `PromptExecutor`. This is the common execution capability for a model
+request, not a workflow in disguise. The workflow supplies the current task,
+context, optional history, capabilities or other typed request contract, and
+semantic model selection. The executor freezes a **coherent snapshot** for
+each request: instructions, advertised capabilities, response schema, stream
+filter, and decoder must agree with the same grant. Changing or revoking a
+capability takes effect on the next request, including a continuation; it
+cannot leave an old decoder or instruction in place.
 
-## Factory and request boundary
+The executor streams provisional user-visible events and returns a typed
+outcome: decoded response, semantic refusal, exhaustion, cancellation, or
+infrastructure failure. It owns request construction, caching, provider
+streaming and technical retries. A workflow never needs to assemble a
+provider request or read raw provider JSON to decide its next step. The
+executor never schedules that step, applies a plan decision, or chooses a
+scenario-specific fallback. The factory resolves technical dependencies from
+the operation's frozen environment; changing the selected model rung is
+workflow intent, while resolving its provider and effort is factory work.
 
-The factory lives in `crates/flow/src/application/infrastructure/execution.rs`.
-`ExecutionFactory::bind` freezes configuration and dialogue identity under an
-admitted operation for interactive and single-step calls. A
-`PlanExecutionEnvironment` shares one configuration snapshot across plan waves,
-steps and review batches; auxiliary Scribe work uses that snapshot or an
-operation-bound `CompactionEnvironment`. Provider kind, credentials, model
-parameters, effort and session affinity are resolved from semantic selection
-under the operation lease, including when a later rung changes providers.
-The factory is configured independently of any particular workflow.
-The workflow supplies its controllable entities to create an executor; it
-does not pass a provider, edit policy, or application policy through its own
-scenario code. Where two execution shapes need different contracts, the
-factory can expose distinct typed creation methods rather than one bag of
-optional flags.
+The interface must support both one-off structured requests and requests
+inside a bounded turn without requiring every workflow to adopt the turn
+lifecycle. Different typed request contracts are legitimate; different
+provider paths and inconsistent rules for freezing inputs are not. The
+executor can maintain a request cache, but it does not own the workflow's
+context, history, or permissions.
 
-Each call to the executor uses a **coherent snapshot** of workflow-controlled
-state. The advertised capabilities, instructions, response schema, decoder,
-and stream filter must describe that same snapshot. A change to context,
-history, or capabilities while a call is in flight cannot partially change
-that call; it affects the next call. This matters even if an implementation
-constructs a protocol before the request. `DialogueExecution` rebuilds its
-protocol for each grant, including corrective continuations; `EditExecution`
-binds the step grant to its protocol. A read-only `StructuredContract` binds
-instructions, response format, decoder, visible field filter and completion
-rule for a structured request.
+## Workflows compose workflows
 
-An executor call may itself contain bounded technical rounds (research,
-rejected-patch retry, verification healing). These rounds implement one
-requested unit of work. Whether to ask for another unit, switch capabilities,
-advance a plan, or save a review belongs to the workflow. A scenario should
-not need to know how cache entries, provider requests, or retries are made.
+Flow's execution logic is organized around explicit, reusable scenarios,
+not around a large `Application` facade or a collection of provider wrappers:
 
-## Implemented units and scenario owners
+```text
+Application::ask → workflows::repl::run
+  └─ TurnWorkflow
+       └─ RoundWorkflow ── PromptExecutor ── provider
 
-- `DialogueExecution` calls core `ExecutionUnit::execute_bounded`; flow's
-  `interactive_dialogue` interprets its commands and uses `continue_round` on
-  the same unit after a rejected plan payload. Flow controls focus, context,
-  optional history, permissions and durable plan or review decisions.
-- Each isolated plan or review leaf obtains an `EditExecution` with a fresh
-  `ExecutionUnit`. Flow's implementation pipeline owns readiness, coder ladder,
-  replan budget, step status, commit association and review settlement. The
-  step's technical rounds share a transcript and budget, but neighboring leaves
-  never share staging. Isolated steps do not inherit dialogue history.
-- `StructuredExecution` runs one read-only `StructuredContract` through core's
-  shared request mechanism. `structured_task` supervises the operation-bound
-  task and delivers filtered events; flow accounts for usage and interprets the
-  typed result. Review audits, post-analysis, independent critique, locale,
-  squash-message generation and compaction each retain their own acceptance
-  policy.
-- `ArchitectResearchExecution` holds a core `StructuredResearchUnit` across
-  research rounds. Flow's `architect_synthesis` owns the round limit, schema
-  healing, tier escalation, terminal verdict and transient-context cleanup;
-  core retains its research journal and request cache, not plan transitions.
+Application::{execute_plan, execute_plan_pipeline}
+  └─ PlanResources → plan batch → PlanAttempts → StepResources
 
-## Decision ownership and execution contract
+Application::execute_review
+  └─ ReviewResources → review batch → ReviewSequence → StepResources
 
-| Decision or resource | Owner | Boundary rule |
+StepResources → StepAttempt → TurnWorkflow → RoundWorkflow → PromptExecutor
+
+Application::synthesize_plan → plan synthesis → Architect contour
+  └─ PromptExecutor → PreparedPrompt::execute_decoded → shared request transport
+
+Application::{preview_review, start_review, analyze_review} → review::{audit, analysis}
+  └─ preview reads the audit window; audit and analysis use bound model requests
+
+One-off structured request → StructuredExecution::run
+  └─ core::execution::structured::execute → shared request transport
+```
+
+The interactive route includes plan creation/modification and review decisions
+inside a discussion. Standalone plan and review scenarios keep their entry
+points and reach the same bounded turn through an isolated step attempt.
+
+| Owner | Lifetime and responsibility | Does not own |
 | --- | --- | --- |
-| Operation admission, task supervision, hard cancel, soft-stop boundary, usage and publication | Flow application infrastructure | Keep the operation claimed through recovery and terminal publication; a batch keeps the claim between members. The server only translates and publishes RPC. |
-| Provider client, credentials, configured model parameters, session affinity, edit format, apply policy, verification and technical channels | Application execution factory | Resolve from one environment snapshot and the operation lease; no workflow passes `LlmProvider`, `PromptProtocol`, `ApplyPolicy`, patch strategy, or the whole `AppConfig` to shared execution. Preserve explicit configured strategies. |
-| Semantic model selection and escalation decision | Flow workflow | Pass a role, explicit selection, or selected ladder rung as intent. The factory resolves the provider (including a change of provider on promotion), effort and affinity for each selected rung; the workflow does not rebuild a client or a protocol. |
-| Context, optional history, capability tree, task and next unit of work | Flow workflow | Prepare and change these between calls; an isolated step has no dialogue history by default. Context admission and capability validation remain deterministic core operations, not a reason for core to select the next plan step. |
-| One provider request or bounded technical unit | Core executor | Assemble coherent requests, bind the model-facing contract to its grant, stream and decode typed results, and perform allowed research, patch retry, verification healing and rollback. Internal cache and transcript are implementation state, not workflow decisions. |
-| Readiness, domain correction, review verdict, document and history writes | Flow workflow | Interpret typed outcomes, decide whether to continue or replan, and persist only after the required verification/recovery boundary. Core may retain pure domain models, parsers and validators. |
+| `Application` | Public entry points, binding of session services, and interactive admission | Plan/review phases, next model request or batch verdict |
+| Plan and review workflows | Operation admission, readiness, continuation, document decisions and terminal publication | Provider transport or shared edit-turn mechanics |
+| Shared leaf queue and `StepResources` | Queue and attempt mechanics, step supervision and recovery | Plan or review status and batch policy |
+| `workflows::repl::run` | Supervision of one interactive task, receipt settlement, history and terminal publication | Provider transport |
+| `TurnWorkflow` | Technical continuation, staging/edit state and transaction settlement | Plan/review persistence decisions |
+| `RoundWorkflow` | One admission, budget charge and accepted-response registration | Research execution or retries |
+| `PromptExecutor` / `PreparedPrompt` | Technical cache and one frozen, single-use request | Mutable turn state, budget or continuation |
+| Server | RPC decoding, error translation and event projection | Scenario execution |
 
-The workflow supplies context, an *optional* history snapshot, capabilities,
-semantic selection and task under an operation identity. The factory supplies
-the frozen technical configuration. It binds dialogue and edit-capable bounded
-units, structured single requests and persistent structured research separately;
-it is not a universal bag of flags. A call returns decoded commands
-or a typed payload with its verification/change-set metadata and the context it
-actually widened, or a distinct semantic refusal, exhaustion, cancellation or
-infrastructure failure. It must not turn a provider failure into a blocker or
-publish an uncommitted edit as success. Flow interprets the payload and decides
-which context layers to adopt or release, how to record history, and when to
-publish the terminal result. A failed or cancelled call still reports usage and
-recoverable research; an aborted task cannot discard the last shared context
-snapshot or bypass transaction recovery.
+The edit-turn routes compose three workflow layers between application admission
+and the executor. The infrastructure factory binds collaborators; it does not
+decide when a scenario continues.
 
-In Rust, a workflow can own `ContextManager` and a capability value and pass
-exclusive reborrows into a call; history may be a borrowed immutable snapshot.
-The executor must finish borrowing before flow changes them for the next call.
-When a task must be spawned, it can own the context snapshot and return it with
-the outcome for flow to merge under the operation lease. `Arc<Mutex<_>>` is not
-required for every entity; synchronization is needed only at actual concurrent
-ownership boundaries. Changing permissions between calls must rebuild the
-entire model-facing contract from the new tree, including revocation, rather
-than merely changing a mutable field beside an old protocol.
+`RoundWorkflow` prepares and admits one request from workflow-owned inputs,
+uses the executor, and registers only a completed, structurally valid response.
+It does not execute commands or decide whether to continue.
+`TurnWorkflow` composes rounds into one bounded unit: research, rejected-patch
+retry, verification healing, transcript, budget, staging, and transaction
+settlement have one explicit lifetime. The supervised REPL task owns its
+`TurnState`, focus, document interpretation and corrective continuations.
+`repl::run` relays provisional events, then waits for a report containing the
+task outcome and the independently settled disk and document writes. It chooses
+whether to record a completed response or an interruption before publishing the
+terminal outcome. A normal answer is recorded once before `Finished`. A plan
+storage refusal produces a diagnostic, not a correction request or a saved plan
+notification for the refused write. Cancellation takes precedence without hiding
+writes that already completed. The workflow flushes usage and publishes settled
+writes before terminal publication, while still holding the operation. History
+failures suppress `Result` and `Finished`, not an already finalized commit. If
+Git finalization fails after verification, the accepted reply stays among the
+rounds and the response records the Git diagnostic, not a commit or a rollback.
+Plan and review entry points pass scoped resources, not `Application` or a
+callback to it. The scenarios retain readiness, escalation, status changes and
+persistence. An isolated step starts a fresh turn with its own grant and no
+dialogue history. Other scenarios can use
+a single round or a typed structured request without adopting the turn lifecycle.
 
-There are three different lifetimes:
+Composition is about contracts, not inheritance or mandatory names for Rust
+types. Each workflow must have recognizable inputs, outcomes, and ownership of
+its lifecycle. `Application` admits and supervises scenarios; it should not
+be where their decision logic is scattered. Moving files into directories
+without consolidating these decisions does not establish this architecture.
 
-1. **Single request:** freeze the context version, optional history, model
-   selection and capability tree for this provider call. A structured request
-   uses its own typed contract and completion rule instead of a turn grant.
-   Research admitted by a turn grant may widen context *between* rounds, never mutate an
-   in-flight request. Count a physical provider call only when admitted, not on
-   a rejected request; a transport retry inside one call is not another round.
-2. **Continuation of the same unit:** after a domain payload refusal or a
-   patch/verification correction, retain the unit's transcript, research and
-   round budget, including any staged bytes only within the active edit
-   transaction. A changed capability grant takes effect on the next request
-   with a matching protocol; it does not reset the budget or replay stale
-   permissions. Technical retry and healing budgets remain scoped to their
-   respective operations.
-3. **New isolated unit:** a new step or independent audit gets a fresh
-   transcript, round budget, research journal and staging state. It may share
-   the operation lease, selected provider session affinity, and approved
-   workflow context, but never inherits another step's unverified staging.
-   The batch owns scheduling and soft stop between units; hard cancel takes
-   precedence everywhere. A workflow-level ladder or replan budget spans the
-   units the workflow explicitly groups, not an accidental executor lifetime.
+## Reading the plan and review execution paths
 
-## Production routes and completion policies
+The public `tauqe_flow::api::Application` methods are the same entry points
+used by the RPC adapter. Both launches claim the exclusive operation before
+resolving the requested work and running preflight. The claim stays held
+through attempts, recovery, gaps between queue members, and terminal
+publication. Hard cancellation takes precedence over soft stop; soft stop
+lets active work settle without undoing verified commits.
 
-Every production provider call reaches `core/control/request.rs`: bounded turns
-use `ExecutionUnit`, structured calls use `structured::execute`, and Architect
-research uses `StructuredResearchUnit`. The following routes identify the flow
-scenario that makes each domain decision, rather than a second provider path.
+### Plan execution
 
-| Scenario | Technical route and flow-owned result |
+1. Start at `Application::execute_plan` or `Application::execute_plan_pipeline`
+   in [`application/plan_batch.rs`](../crates/flow/src/application/plan_batch.rs).
+   [`workflows/plan.rs`](../crates/flow/src/workflows/plan.rs) resolves the plan
+   scope or the ordered list of plans against stored documents. The
+   [pipeline](../crates/flow/src/workflows/plan/queue.rs) runs each plan under
+   the same operation and advances only after completion without interruption.
+2. [`workflows/plan/run.rs`](../crates/flow/src/workflows/plan/run.rs) chooses
+   ready leaves using core's dependency rules and sends them through the shared
+   leaf queue. [`PlanAttempts`](../crates/flow/src/workflows/plan/attempt.rs)
+   prepares each isolated attempt. When the queue
+   returns, the plan scenario decides whether to reload the saved scope and
+   continue, request an Architect refinement and save the replacement horizon,
+   or stop. An explicitly targeted step or subtree cannot trigger replanning
+   of the rest of the plan.
+3. After the attempt settles its Git transaction, the plan scenario requests
+   the leaf status and any confirmed commit or blocker through `Documents`.
+   At batch end it reloads the stored plan for publication, publishes the
+   plan and list snapshots when available, then emits `PlanBatchFinished`.
+
+### Review execution
+
+1. Start at `Application::execute_review` in
+   [`application/review_batch.rs`](../crates/flow/src/application/review_batch.rs).
+   [`workflows/review.rs`](../crates/flow/src/workflows/review.rs) determines
+   which findings or groups are eligible and builds the member queue. A
+   group runs its own stored implementation horizon, not the plan scenario.
+2. [`workflows/review/sequence.rs`](../crates/flow/src/workflows/review/sequence.rs)
+   runs the member's leaves through the same queue and attempt machinery. The
+   review sequence keeps one model publication and usage window across the member's
+   leaves and retries. Settled leaf writes record group progress or a finding's
+   confirmed commit through `Documents`; recording a commit does not mark a
+   finding `Fixed`.
+3. [`workflows/review/member.rs`](../crates/flow/src/workflows/review/member.rs)
+   interprets the sequence stop. Completion requests closure; for a group,
+   core checks the stored horizon before closing its findings. A partial run
+   preserves earlier commits without declaring the member fixed. A local
+   block or exhausted retry budget can leave the member unresolved while the
+   batch continues; an infrastructure failure stops it. The workflow publishes
+   a stored review snapshot after settling the member verdict. `ReviewResources`
+   publishes `ReviewBatchFinished` from the settled batch report.
+
+Both routes use `workflows::step::{queue, attempts}` for leaf sequencing and
+retry mechanics. Both converge at
+[`StepResources::execute_prepared_single_step`](../crates/flow/src/workflows/step/run.rs)
+and the same `StepAttempt → TurnWorkflow → RoundWorkflow` path. That path
+settles repository edits; it does not decide whether to write `Done` or `Fixed`.
+
+Plan creation, refinement and replanning enter
+[`plan/synthesis.rs`](../crates/flow/src/workflows/plan/synthesis.rs). Review
+preview and launch enter [`review/audit.rs`](../crates/flow/src/workflows/review/audit.rs);
+the same audit window rules serve preview and execution. Post-analysis enters
+[`review/analysis.rs`](../crates/flow/src/workflows/review/analysis.rs) explicitly
+or from a preset audit. These paths can use Architect research and one-off
+structured requests without entering an edit transaction.
+
+The application-owned [`Documents`](../crates/flow/src/application/documents.rs)
+service handles document reads and writes, including
+[execution-specific writes](../crates/flow/src/application/documents/execution.rs).
+Scenarios address documents by ID. Core owns the transition checks and domain
+projections, and its `PlanStorage` and `ReviewStorage` own document paths and
+file persistence. SQLite is a possible future replacement for file persistence
+behind this boundary, not an implemented backend.
+
+## Lifetimes and invariants
+
+1. **Request:** freeze the supplied context version, optional history, grant,
+   and model selection for one provider call. Only an admitted physical call
+   spends its request budget; transport retries are not new rounds. Streaming
+   previews are provisional until the final typed response is decoded.
+2. **Continuation:** the same turn retains its transcript, original file
+   snapshots, research, round budget, and active transaction. The workflow
+   supplies updated inputs and feedback; the executor rebuilds the entire
+   request contract. A refused payload does not create a fresh turn or reset
+   its budget. Staged bytes never escape an unverified transaction.
+3. **New unit:** a new step or independent audit starts with a fresh transcript,
+   budget, research journal, and staging state. The workflow may deliberately
+   share approved context and an operation identity, never another unit's
+   unverified work. Cancellation and failure must settle the active operation
+   before ownership is released or success is published.
+
+## Shared mechanisms and non-edit requests
+
+Architect synthesis owns its context, research journal, and feedback for the
+duration of one run. It prepares each request with the Architect grant and
+decodes it with `PlanRefinePromptProtocol`. Model changes rebind the executor
+without losing its technical cache. Flow decides whether to admit research,
+retry an empty response, heal a schema error, escalate, or stop. No dialogue
+history, staging, edit-turn registration, or disk transaction is involved.
+
+One-off requests such as history compaction supply a `StructuredContract` to
+the bound runner. Core uses the contract's schema, preview policy, completion
+policy, and decoder without building a repository prompt or scheduling another
+request. Both this runner and `PreparedPrompt` call `core::execution::request`
+for provider streaming and event delivery.
+
+The interactive workflow owns one `TurnState` across technical and document
+corrections. After transaction settlement, a defective plan payload is retried
+directly through `RoundWorkflow`, with only its original plan operation,
+message, scratchpad, blocked and abort capabilities. These requests spend the
+same budget and retain the accepted transcript. The supervisor retains a narrow
+history reader before task launch and reads it after join and recovery.
+
+`execution::transcript`
+stores originals, accepted rounds, discoveries, feedback and bounded private
+notes, and provides a read-only accepted-history recovery handle.
+`workflow::research::step` executes one research operation against explicit
+context, journal, configuration and cancellation inputs. `edits::staging`
+owns cumulative virtual staging and reports new destinations for the caller
+to record in its transcript. `edits::execution` applies and verifies one
+change set and resolves diagnostic file candidates without authorizing context
+expansion. `edits::transaction` settles finalization or rollback through the
+existing apply policy, preserving an explicit commit error on failure.
+
+Flow owns edit-turn continuation, research progress and healing admission;
+none of these mechanisms decides the scenario's next request.
+
+| Mechanism | Authoritative location |
 | --- | --- |
-| REPL and focused discussion | `Application::ask` → `start_interactive_execution` → `interactive_dialogue::run` → `DialogueExecution`. Flow applies plan/review commands and corrective continuation on the same turn. |
-| Plan steps and review repair | Flow's `PlanImplementationPipeline` and `review_sequence::run` schedule leaves through `implementation_host` / `step_run` and a fresh `EditExecution` per leaf. Flow persists step and review transitions; core verifies the bounded edit. |
-| Plan synthesis and replan | `plan_two_phase` / `plan_horizon` call `architect_synthesis` through `ArchitectResearchExecution`; independent critique uses `StructuredExecution` and `structured_task`. Flow orders waves, escalation and plan writes. |
-| Review creation, groups and post-analysis | `review_synthesis_execution`, `review_groups` and `review_analysis_execution` call `structured_task` with separate review contracts. Flow owns windows, findings, regrouping, publication and storage. |
-| Auxiliary Scribe work | `locale_generation`, `git_squash` and `history_compaction` call `StructuredExecution`; flow owns validation, fallback or journal adoption. The later `apply_squash` Git rewrite makes no model request. |
+| Request construction and provider transport | `core::execution::{executor, request}` |
+| Cancellation, semantic event sink, response envelope | `core::execution::{support, outcome}` |
+| Original files, accepted rounds, discoveries, feedback and recovery reader | `core::execution::transcript` |
+| Research commands and feedback journal | `core::workflow::research` and `core::workflow::research::journal` |
+| Research step in an edit turn | `core::workflow::research::step` |
+| One-off structured request | `core::execution::structured` |
+| Virtual staging | `core::edits::staging` |
+| Application and verification | `core::edits::execution` |
+| Transaction settlement | `core::edits::transaction` and the existing apply policies |
+| Deterministic patch, filesystem and Git operations | `tools` |
 
-The shared request transport is **not** a shared acceptance policy:
-
-| Consumer | Completion and fallback |
-| --- | --- |
-| Single review | `single_review_contract` does not require `Done`. Empty output is refused; nonempty unstructured prose becomes an informational finding. Usage is published before the session is persisted. |
-| Group review | `group_review_contract` also permits close without `Done`, but requires parseable findings: prose and empty output are local group failures; stream or task failure stops the batch. Completed groups remain saved. |
-| Post-analysis | The typed regrouping validates identities and references after decoding; empty, parse and schema failures are distinct, and no regrouping write follows them. Usage precedes persistence. |
-| Independent critique | Its silent contract requires `Done`; empty, incomplete or unreadable payloads spend the selected rung's schema-healing attempts and block issuance when exhausted. Provider failure and cancellation do not issue the draft. |
-| Locale | Its silent contract requires `Done`. A completed empty or unusable translation map falls back per catalog key to width-checked English; incomplete streams and provider failures are errors, not fallback. |
-| Squash message | Its silent contract requires `Done`. An unavailable provider or completed response without a usable message falls back to the first commit subject (or `Squashed commits`); an incomplete or failed started request is an error. Only started requests open a usage window. |
-| History compaction | Its silent contract requires `Done`. The application compacts only an over-budget journal with a usable summary; empty, incomplete, cancelled or failed requests leave the journal unchanged. |
-
-## Existing verification anchors
-
-| Guarantee to retain | Existing tests |
-| --- | --- |
-| Protocol tracks the declared grant, frozen inputs and revocation on continuation | `crates/flow/src/application/turn_execution/tests.rs` (`protocol_starts_with_the_declared_contour_tree`, `compare_repl_and_plan_request_prefixes`, `dialogue_continuation_uses_its_new_capability_grant`); `crates/core/src/control/prompt.rs` (`changed_bytes_travel_after_the_frozen_context`). |
-| Frozen configuration, provider promotion and operation admission | `crates/flow/src/application/infrastructure/execution.rs` (`frozen_credentials_and_affinity_survive_reload`, `next_rung_switches_provider_kind_without_reusing_the_previous_client`, `plan_environment_keeps_configuration_across_steps_and_provider_changes`, `reviewer_selection_preserves_the_exact_tier_and_review_affinity`); `crates/flow/src/application/turn_execution/tests.rs` (`foreign_interactive_and_step_operations_do_not_reach_the_provider`). |
-| Continuation preserves its unit; neighboring steps isolate staging | `crates/flow/src/application/turn_execution/tests.rs` (`dialogue_continuation_uses_its_new_capability_grant`, `neighboring_step_units_do_not_inherit_failed_staging`, `failed_step_retains_research_without_dialogue_history`); `crates/core/src/control/prompt.rs` (`only_admitted_calls_publish_rounds_before_provider_deltas`). |
-| Domain failure differs from infrastructure failure; soft stop retains completed work | `crates/core/src/control/turn/step_outcome_tests.rs` (`semantic_block_and_abort_keep_their_precedence_and_messages_in_both_loop_outcomes`, `commit_failure_takes_precedence_and_stops_the_run_as_infrastructure_failure`); `crates/flow/src/application/implementation_pipeline.rs` (`the_replanning_budget_is_bounded`, `a_soft_stop_requested_mid_run_keeps_the_completed_step`). |
-| Completion policy and accounting stay with each scenario | `crates/core/src/control/structured.rs` (`completion_policy_and_empty_payload_are_distinct`); `crates/core/src/review/parser.rs` (`contracts_distinguish_single_fallback_from_group_json`); `crates/flow/src/application/review_synthesis_response.rs` (`empty_output_is_refused_and_nonempty_unstructured_output_is_retained`); `crates/flow/src/application/review_analysis_response.rs` (`decoding_keeps_tolerant_fallback_and_typed_parse_and_schema_refusals`); `crates/flow/src/application/review_synthesis_execution.rs` (`headless_execution_keeps_accounting_publication_and_history_order`); `crates/flow/src/application/review_analysis_execution.rs` (`headless_execution_accounts_before_persistence_and_records_history`). |
-| Auxiliary fallback and no-write failures | `crates/core/src/locale.rs` (`translation_contract_is_silent_and_requires_completion`); `crates/core/src/prompt.rs` (`squash_contract_extracts_an_optional_message_from_the_existing_format`, `compaction_contract_requires_done_and_extracts_only_a_nonempty_summary`); `crates/flow/src/application/history_compaction.rs` (`provider_resolution_or_stream_failure_keeps_the_journal_unchanged`, `empty_incomplete_and_cancelled_summaries_leave_history_unchanged`). |
-| No scenario provider bypass or RPC boundary leak | `crates/server/tests/architecture_tests.rs` (`scenarios_do_not_wire_provider_requests`, `core_provider_calls_use_the_shared_request_mechanism`, `workspace_dependencies_follow_module_boundaries`, `server_production_sources_use_application_ports_for_domain_io_and_mutations`). |
-
-## Migration criterion
-
-The boundary is established by production callers, not by the existence of a
-factory facade. Reading a flow scenario must reveal its domain decisions and
-state transitions; reading the core executor must not reveal plan scheduling,
-review settlement or scenario-specific fallback. All production model requests
-use the shared technical request mechanism, while configuration and task
-supervision remain in flow infrastructure. Changing the next request's grant
-must rebuild its model-facing contract without overriding the frozen environment
-or losing the state of an intentional continuation.
+Application integration contracts cover repeated research, verification
+healing and plan-payload correction against captured requests, semantic events,
+usage, durable history and repository state. RPC cancellation coverage preserves
+an accepted research round while excluding the unfinished attempt and private
+scratchpad. Lower-level tests retain forced-abort recovery, budget admission,
+grant reseeding and rollback coverage; existing plan, review, and structured
+request tests protect their production paths.

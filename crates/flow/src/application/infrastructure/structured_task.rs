@@ -4,11 +4,11 @@ use crate::api::{
     abort_and_reap_with_deadline, await_with_deadline, Application, Awaited, OperationGuard,
     TaskExit,
 };
-use crate::application::infrastructure::execution::StructuredExecution;
+use crate::application::infrastructure::execution::{ExecutionSession, StructuredExecution};
 use std::future::Future;
 use std::time::Duration;
-use tauqe_core::control::context::{CancellationToken, EventSink};
-use tauqe_core::control::structured::{StructuredContract, StructuredError};
+use tauqe_core::execution::structured::{StructuredContract, StructuredError};
+use tauqe_core::execution::{CancellationToken, EventSink};
 use tauqe_core::providers::{ChatMessage, StreamEvent};
 
 /// Technical outcome of a single request, before scenario-specific interpretation.
@@ -34,6 +34,35 @@ pub(crate) async fn run<T, F, Fut>(
     messages: Vec<ChatMessage>,
     operation_id: &str,
     deadline: Duration,
+    deliver: F,
+) -> Result<T, StructuredTaskError>
+where
+    T: Send + 'static,
+    F: FnMut(StreamEvent) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    run_with_session(
+        &application.execution_session(),
+        operation,
+        execution,
+        contract,
+        messages,
+        operation_id,
+        deadline,
+        deliver,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_session<T, F, Fut>(
+    resources: &ExecutionSession,
+    operation: &OperationGuard,
+    execution: &StructuredExecution,
+    contract: StructuredContract<T>,
+    messages: Vec<ChatMessage>,
+    operation_id: &str,
+    deadline: Duration,
     mut deliver: F,
 ) -> Result<T, StructuredTaskError>
 where
@@ -41,7 +70,7 @@ where
     F: FnMut(StreamEvent) -> Fut,
     Fut: Future<Output = ()>,
 {
-    if !application.owns_operation(operation) {
+    if !resources.owns(operation) {
         return Err(StructuredTaskError::ForeignOperation);
     }
     let mut cancel_rx = operation.cancel_receiver();

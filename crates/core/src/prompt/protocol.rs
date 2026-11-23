@@ -93,6 +93,12 @@ pub trait PromptProtocol: Send + Sync {
         self.decode(raw_text, context_paths)
     }
 
+    /// Whether a completed payload with no semantic commands is nevertheless
+    /// a response. The wire decoder, not the executor, recognizes this case.
+    fn accepts_empty_response(&self, _raw_text: &str) -> bool {
+        false
+    }
+
     /// Renders protocol-specific instructions appended to the system prompt.
     ///
     /// The active protocol renders its own guidance directly, so prompt assembly

@@ -184,31 +184,31 @@ mod tests {
 
     /// Builds the capability surface of a free interactive dialogue.
     fn repl_surface() -> CapabilityTree {
-        crate::control::repl::repl_capability_expr(None)
+        crate::llm::repl::repl_capability_expr(None)
     }
 
     /// Builds the capability surface of a plan-anchored dialogue.
     fn plan_discussion_surface() -> CapabilityTree {
-        crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
+        crate::llm::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
             id: "p-1".to_string(),
         }))
     }
 
     /// Builds the capability surface of a review-anchored dialogue.
     fn review_discussion_surface() -> CapabilityTree {
-        crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Review {
+        crate::llm::repl::repl_capability_expr(Some(&DiscussionTarget::Review {
             id: "r-1".to_string(),
         }))
     }
 
     /// Builds the capability surface of one isolated step.
     fn step_surface() -> CapabilityTree {
-        crate::control::turn::turn_capability_expr()
+        crate::llm::step::turn_capability_expr()
     }
 
     /// Builds the capability surface of an Architect horizon synthesis.
     fn architect_surface() -> CapabilityTree {
-        crate::control::refine::architect_synthesis_capability_expr()
+        crate::plan::prompt::architect_synthesis_capability_expr()
     }
 
     /// Builds the shared trunk for one capability surface.

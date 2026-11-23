@@ -78,6 +78,11 @@ pub struct ReviewUpdateProposal {
 impl ReviewUpdateProposal {
     pub(crate) const ITEM_ID_MINIMUM: u32 = u32::MIN;
     pub(crate) const ITEM_ID_MAXIMUM: u32 = u32::MAX;
+
+    /// Returns the group targeted by this decision, if it is not finding-only.
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
+    }
 }
 
 #[cfg(test)]

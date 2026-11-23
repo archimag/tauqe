@@ -83,6 +83,404 @@ async fn test_state_with_provider(
     state
 }
 
+#[cfg(unix)]
+struct PlanExecutionFixture {
+    dir: TestDir,
+    state: Arc<AppState>,
+    events: tokio::sync::mpsc::UnboundedReceiver<String>,
+    initial_head: String,
+}
+
+#[cfg(unix)]
+impl PlanExecutionFixture {
+    async fn new(verify: &str, leaves: usize, provider: Arc<MockLlmProvider>) -> Self {
+        let items = (1..=leaves)
+            .map(|id| public_plan_leaf(&id.to_string()))
+            .collect();
+        Self::with_items(verify, items, provider).await
+    }
+
+    async fn with_items(
+        verify: &str,
+        items: Vec<tauqe_core::plan::PlanItem>,
+        provider: Arc<MockLlmProvider>,
+    ) -> Self {
+        use tauqe_core::git::{cmd, init_repository};
+        let dir = TestDir::new();
+        let root = dir.path();
+        init_repository(Some(root), true).unwrap();
+        std::fs::write(root.join("source.txt"), "original\n").unwrap();
+        std::fs::write(root.join("helper.txt"), "Reference for the coder\n").unwrap();
+        std::fs::write(
+            root.join("tauqe.toml"),
+            format!("[models]\nrepl = ['openrouter:coder/one']\n[project.verify]\ncommand = 'sh'\nargs = ['-c', '''{verify}''']\n"),
+        )
+        .unwrap();
+        cmd::stage_files(
+            root,
+            &[
+                "source.txt".into(),
+                "helper.txt".into(),
+                "tauqe.toml".into(),
+            ],
+        )
+        .unwrap();
+        cmd::commit_with_developer_author(root, "Add plan fixtures", false).unwrap();
+        let initial_head = cmd::run_git(Some(root), &["rev-parse", "HEAD"]).unwrap();
+        let plan = Plan::from_parts(
+            "public-run".into(),
+            "Public run".into(),
+            None,
+            1,
+            1,
+            vec![],
+            items,
+        );
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let mut config = tauqe_core::config::AppConfig {
+            repl: serde_json::from_value(serde_json::json!({
+                "workflow": "git", "patch_strategy": "apply_patch", "max_turn_rounds": 4
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        config.models.auto_level_up = true;
+        config.models.coder = Some(vec![
+            tier_with_attempts("coder/one", 1),
+            tier_with_attempts("coder/two", 1),
+        ]);
+        config.context.include_repo_map = false;
+        let (out, events) = OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, root.to_path_buf(), history, out);
+        state.application.test_set_provider(provider).await;
+        Self {
+            dir,
+            state,
+            events,
+            initial_head,
+        }
+    }
+
+    async fn start(&self) -> String {
+        self.start_scope(None).await["operation_id"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+
+    async fn start_scope(&self, step_id: Option<&str>) -> serde_json::Value {
+        let response = handle_plan_execute(
+            Request {
+                id: tauqe_protocol::RequestId::Number(1),
+                method: tauqe_protocol::methods::PLAN_EXECUTE.into(),
+                params: Some(serde_json::json!({"plan_id": "public-run", "step_id": step_id})),
+            },
+            &self.state,
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        response.result.unwrap()
+    }
+
+    async fn finish(&mut self, operation_id: &str, status: &str) -> Vec<serde_json::Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut observed = Vec::new();
+            loop {
+                let raw = self.events.recv().await.expect("plan event channel closed");
+                let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let terminal = event["method"] == events::PLAN_BATCH_FINISHED;
+                if terminal {
+                    assert_eq!(event["params"]["operation_id"], operation_id);
+                    assert_eq!(event["params"]["summary"]["status"], status, "{event}");
+                }
+                observed.push(event);
+                if terminal {
+                    return observed;
+                }
+            }
+        })
+        .await
+        .expect("the plan batch must settle")
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        tauqe_core::git::cmd::run_git(Some(self.dir.path()), args).unwrap()
+    }
+
+    fn leaf(&self, id: &str) -> tauqe_core::plan::PlanItem {
+        PlanStorage::load_plan(self.dir.path(), "public-run")
+            .unwrap()
+            .unwrap()
+            .implementation
+            .find_item(id)
+            .unwrap()
+            .clone()
+    }
+
+    fn assert_committed(&self) -> String {
+        let leaf = self.leaf("1");
+        assert_eq!(leaf.status, PlanItemStatus::Done);
+        let hash = leaf.commit.unwrap();
+        assert_eq!(
+            self.git(&["rev-parse", &hash]),
+            self.git(&["rev-parse", "HEAD"])
+        );
+        assert_eq!(self.git(&["rev-parse", "HEAD^"]), self.initial_head);
+        assert_eq!(self.git(&["show", "HEAD:source.txt"]).trim(), "verified");
+        hash
+    }
+}
+
+#[cfg(unix)]
+fn public_plan_leaf(id: &str) -> tauqe_core::plan::PlanItem {
+    let mut item = test_item(id, PlanItemStatus::Todo);
+    item.files = vec!["source.txt".into()];
+    item
+}
+
+#[cfg(unix)]
+fn plan_patch(old: &str, new: &str) -> MockResponse {
+    MockResponse::text(serde_json::json!({
+        "message": "Update source",
+        "action": {
+            "kind": "edit",
+            "patch": format!("*** Begin Patch\n*** Update File: source.txt\n@@\n-{old}\n+{new}\n*** End Patch"),
+            "commit_message": "fix(source): update source",
+            "error_message": "",
+            "reason": ""
+        }
+    }).to_string())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_plan_executes_only_the_addressed_subtree() {
+    let provider = Arc::new(MockLlmProvider::scripted([
+        plan_patch("original", "first"),
+        plan_patch("first", "second"),
+    ]));
+    let branch = tauqe_core::plan::PlanItem {
+        children: vec![public_plan_leaf("2.1"), public_plan_leaf("2.2")],
+        ..test_item("2", PlanItemStatus::Todo)
+    };
+    let mut run = PlanExecutionFixture::with_items(
+        "true",
+        vec![public_plan_leaf("1"), branch],
+        provider.clone(),
+    )
+    .await;
+
+    let started = run.start_scope(Some("2")).await;
+    assert_eq!(started["step_ids"], serde_json::json!(["2.1", "2.2"]));
+    let id = started["operation_id"].as_str().unwrap();
+    let observed = run.finish(id, "completed").await;
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event["method"] == events::MODEL_STARTED)
+            .count(),
+        2
+    );
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(run.leaf("2.1").status, PlanItemStatus::Done);
+    assert_eq!(run.leaf("2.2").status, PlanItemStatus::Done);
+    let sibling = run.leaf("1");
+    assert_eq!(sibling.status, PlanItemStatus::Todo);
+    assert!(sibling.commit.is_none());
+    assert_eq!(run.git(&["show", "HEAD:source.txt"]).trim(), "second");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_plan_repairs_and_verifies_in_one_turn_before_committing() {
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(r#"{"message":"Read helper","action":{"kind":"research","context_requests":[{"path":"helper.txt","access":"read_only"}]}}"#),
+        plan_patch("no matching line", "temporary"),
+        plan_patch("original", "temporary"),
+        plan_patch("temporary", "verified"),
+    ].map(|response| response.with_usage(tauqe_core::providers::ModelUsageInfo {
+        prompt_tokens: 3,
+        completion_tokens: 4,
+        total_tokens: 7,
+        ..Default::default()
+    }))));
+    let mut run = PlanExecutionFixture::new(
+        "grep -qx original source.txt || grep -qx verified source.txt",
+        1,
+        provider.clone(),
+    )
+    .await;
+    let id = run.start().await;
+    let observed = run.finish(&id, "completed").await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request.model == "coder/one"
+        && request.session_id.as_deref() == Some("tauqe-plan-public-run")));
+    assert!(
+        round_text(&requests[0].messages).contains("<file path=\"source.txt\" access=\"editable\"")
+    );
+    assert!(!round_text(&requests[0].messages).contains("Reference for the coder"));
+    assert!(round_text(&requests[1].messages).contains("Reference for the coder"));
+    assert!(round_text(&requests[2].messages).contains("no matching line"));
+    assert!(round_text(&requests[3].messages).contains("Code verification failed"));
+    assert!(requests
+        .windows(2)
+        .all(|pair| pair[1].messages.starts_with(&pair[0].messages)));
+
+    let rounds: Vec<_> = observed
+        .iter()
+        .filter(|event| event["method"] == events::TURN_ROUND_STARTED)
+        .map(|event| &event["params"])
+        .collect();
+    assert_eq!(rounds.len(), 4);
+    for (index, round) in rounds.iter().enumerate() {
+        assert_eq!(round["round"], index + 1);
+        assert_eq!(round["max_rounds"], 4);
+        assert_eq!(round["operation_id"], rounds[0]["operation_id"]);
+    }
+    let verification: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["method"] == events::TOOLCHAIN_FINISHED)
+        .map(|(index, event)| (index, event["params"]["success"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        verification
+            .iter()
+            .map(|(_, passed)| *passed)
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+    let edits: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["method"] == events::EDIT_FINISHED)
+        .collect();
+    assert_eq!(edits.len(), 1);
+    assert!(verification[1].0 < edits[0].0);
+    let hash = run.assert_committed();
+    assert_eq!(edits[0].1["params"]["commit_hash"], hash);
+    assert_eq!(
+        std::fs::read(run.dir.path().join("source.txt")).unwrap(),
+        b"verified\n"
+    );
+    let usage = run.state.application.usage_snapshot().await;
+    assert!(usage.cur.is_none());
+    assert_eq!(usage.prev.total_tokens, 28);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_plan_finalization_refusal_is_terminal_without_claiming_rollback() {
+    let provider = Arc::new(MockLlmProvider::scripted([plan_patch(
+        "original", "verified",
+    )]));
+    let mut run = PlanExecutionFixture::new(
+        "grep -qx original source.txt || (grep -qx verified source.txt && touch .git/index.lock)",
+        1,
+        provider.clone(),
+    )
+    .await;
+    let id = run.start().await;
+    let observed = run.finish(&id, "failed").await;
+    let terminal = observed.last().unwrap();
+    let reason = terminal["params"]["summary"]["error"].as_str().unwrap();
+    assert!(reason.contains("index.lock"), "{reason}");
+    assert!(!reason.to_lowercase().contains("rolled back"), "{reason}");
+    assert_eq!(provider.requests().len(), 1);
+    assert!(observed
+        .iter()
+        .all(|event| event["method"] != events::MODEL_ESCALATED));
+    let edit = observed
+        .iter()
+        .find(|event| event["method"] == events::EDIT_FINISHED)
+        .unwrap();
+    assert_eq!(edit["params"]["applied"], false);
+    assert!(edit["params"]["commit_hash"].is_null());
+    assert!(edit["params"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("index.lock"));
+    assert_eq!(run.leaf("1").status, PlanItemStatus::Todo);
+    assert!(run.leaf("1").commit.is_none());
+    assert_eq!(
+        std::fs::read(run.dir.path().join("source.txt")).unwrap(),
+        b"verified\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_plan_stops_the_queue_only_after_the_applied_step_settles() {
+    use std::time::Duration;
+
+    for hard in [true, false] {
+        let provider = Arc::new(MockLlmProvider::scripted([plan_patch(
+            "developer work",
+            "verified",
+        )]));
+        let mut run = PlanExecutionFixture::new(
+            "if grep -qx verified source.txt; then touch .git/verify-entered; \
+             for attempt in $(seq 1 200); do test ! -f .git/verify-release || exit 0; sleep 0.1; done; exit 1; fi",
+            2,
+            provider.clone(),
+        )
+        .await;
+        let file = run.dir.path().join("source.txt");
+        std::fs::write(&file, "developer work\n").unwrap();
+        let id = run.start().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !run.dir.path().join(".git/verify-entered").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first step must reach verification after temporary application");
+        assert_eq!(std::fs::read(&file).unwrap(), b"verified\n");
+        assert!(run.state.is_operation_active());
+        assert_eq!(run.leaf("1").status, PlanItemStatus::InProgress);
+        assert_eq!(run.leaf("2").status, PlanItemStatus::Todo);
+
+        if hard {
+            run.state.hard_cancel_active_operation();
+        } else {
+            run.state.soft_stop_active_operation();
+            assert!(run.state.is_operation_active());
+            assert_eq!(provider.requests().len(), 1);
+            std::fs::write(run.dir.path().join(".git/verify-release"), "").unwrap();
+        }
+        let observed = run
+            .finish(&id, if hard { "cancelled" } else { "stopped" })
+            .await;
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event["method"] == events::MODEL_STARTED)
+                .count(),
+            1
+        );
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(run.leaf("2").status, PlanItemStatus::Todo);
+        assert!(!run
+            .dir
+            .path()
+            .join(".tauqe/active-transaction.json")
+            .exists());
+        if hard {
+            assert_eq!(std::fs::read(&file).unwrap(), b"developer work\n");
+            assert_eq!(run.git(&["rev-parse", "HEAD"]), run.initial_head);
+            let leaf = run.leaf("1");
+            assert_eq!(leaf.status, PlanItemStatus::Todo);
+            assert!(leaf.commit.is_none());
+        } else {
+            assert_eq!(std::fs::read(&file).unwrap(), b"verified\n");
+            run.assert_committed();
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_plan_batch_fail_fast_resets_status() {
     let dir = TestDir::new();
@@ -1161,6 +1559,80 @@ async fn test_plan_refine_binds_the_architect_session() {
 }
 
 #[tokio::test]
+async fn test_plan_batch_retries_model_error_then_accepts_explicit_skip_without_commit() {
+    let dir = TestDir::new();
+    let root = dir.path();
+    tauqe_core::git::init_repository(Some(root), true).unwrap();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    std::fs::write(root.join("src.rs"), source).unwrap();
+    tauqe_core::git::cmd::stage_files(root, &["src.rs".into()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(root, "Initial", false).unwrap();
+    let head = || tauqe_core::git::cmd::run_git(Some(root), &["rev-parse", "HEAD"]).unwrap();
+    let initial_head = head();
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.files = vec!["src.rs".into()];
+    let plan = Plan::from_parts(
+        "skip-leaf".into(),
+        "Skip leaf".into(),
+        None,
+        1,
+        1,
+        vec![],
+        vec![item],
+    );
+    PlanStorage::save_plan(root, &plan).unwrap();
+
+    let mut config = tauqe_core::config::AppConfig {
+        repl: serde_json::from_value(serde_json::json!({
+            "workflow": "git", "patch_strategy": "search_replace", "max_turn_rounds": 1
+        }))
+        .unwrap(),
+        ..Default::default()
+    };
+    config.models.auto_level_up = false;
+    config.models.coder = Some(vec![tier_with_attempts("coder/one", 2)]);
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(
+            r#"{"message":"Could not finish","action":{"kind":"edit","changes":[],"commit_message":"","error_message":"Could not finish","reason":""}}"#,
+        ),
+        MockResponse::text(
+            r#"{"message":"Already satisfied","action":{"kind":"edit","changes":[],"commit_message":"","error_message":"","reason":"The requested value is already present"}}"#,
+        ),
+    ]));
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    let operation = Arc::new(state.try_begin_operation().unwrap());
+    let outcome = run_plan_batch(
+        &state,
+        "skip-leaf",
+        vec!["1".into()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the second attempt has a fresh one-round budget"
+    );
+    assert!(requests.iter().all(|request| request.model == "coder/one"));
+    assert!(requests[1]
+        .messages
+        .iter()
+        .all(|message| message.role != "assistant"));
+    let stored = PlanStorage::load_plan(root, "skip-leaf").unwrap().unwrap();
+    let leaf = stored.implementation.find_item("1").unwrap();
+    assert_eq!(leaf.status, PlanItemStatus::Done);
+    assert!(leaf.commit.is_none());
+    assert_eq!(head(), initial_head);
+    assert_eq!(
+        std::fs::read_to_string(root.join("src.rs")).unwrap(),
+        source
+    );
+}
+
+#[tokio::test]
 async fn test_plan_step_binds_the_plan_session() {
     let dir = TestDir::new();
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
@@ -1346,6 +1818,66 @@ async fn test_handle_plan_refine_preloads_all_existing_step_files() {
 }
 
 #[tokio::test]
+async fn plan_creation_runs_only_the_requested_phases_and_publishes_once() {
+    for skip_critique in [false, true] {
+        let dir = TestDir::new();
+        let (out, mut events_rx) = OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(Default::default(), dir.path().to_path_buf(), history, out);
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(
+                r#"{"status":"success","explanation":"Drafted","items":[{"id":"1","title":"Draft","status":"todo","files":["src.rs"],"readonly_files":[],"concept_refs":[],"depends_on":[],"children":[]}]}"#,
+            ),
+            MockResponse::text(
+                r#"{"verdict":"approved","summary":"Ready to issue","findings":[]}"#,
+            ),
+        ]));
+        state.application.test_set_provider(provider.clone()).await;
+        let response = super::two_phase::handle_plan_create_pipeline(
+            Request {
+                id: tauqe_protocol::RequestId::Number(1),
+                method: tauqe_protocol::methods::PLAN_CREATE_PIPELINE.into(),
+                params: Some(serde_json::json!({
+                    "directives": "Create a sample plan",
+                    "planner_model": tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("planner/model")),
+                    "critic_model": tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("critic/model")),
+                    "skip_critique": skip_critique
+                })),
+            },
+            &state,
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let PlanRefineResult::Success { plan, .. } =
+            serde_json::from_value(response.result.unwrap()).unwrap()
+        else {
+            panic!("creation must return the stored plan");
+        };
+        let requests = provider.requests();
+        let models: Vec<_> = requests
+            .iter()
+            .map(|request| request.model.as_str())
+            .collect();
+        if skip_critique {
+            assert_eq!(models, ["planner/model"]);
+        } else {
+            assert_eq!(models, ["planner/model", "critic/model"]);
+        }
+        let stored = PlanStorage::load_plan(dir.path(), &plan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.implementation.items[0].title, "Draft");
+        let updates: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok())
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).unwrap())
+            .filter(|event| event["method"] == events::PLAN_UPDATED)
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["params"]["is_save"], true);
+        assert!(!state.is_operation_active());
+    }
+}
+
+#[tokio::test]
 async fn test_plan_horizon_synthesis_history_transactionality() {
     let dir = TestDir::new();
     let plan = Plan::from_parts(
@@ -1385,8 +1917,10 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
         cyclic_output.to_string(),
     )]));
 
-    let config = tauqe_core::config::AppConfig::default();
-    let state = test_state_with_provider(&dir, config, mock_provider).await;
+    let (out, mut events_rx) = OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(Default::default(), dir.path().to_path_buf(), history, out);
+    state.application.test_set_provider(mock_provider).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -1398,6 +1932,10 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
     let err = res.error.expect("should fail due to dependency cycle");
     assert_eq!(err.code, errors::PLAN_SAVE_FAILED);
     assert!(err.message.contains("Dependency cycle detected"));
+    assert!(std::iter::from_fn(|| events_rx.try_recv().ok()).all(|raw| {
+        let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        event["method"] != events::PLAN_UPDATED && event["method"] != events::PLAN_LIST_CHANGED
+    }));
 
     // Strict history transactionality invariant: no assistant response was recorded
     // into session history because persistence failed.
@@ -2201,6 +2739,85 @@ async fn test_plan_pipeline_blocked_by_failed_preflight() {
         .all(|i| i.status == PlanItemStatus::Todo));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn public_pipeline_soft_stop_preserves_the_commit_and_does_not_start_the_next_plan() {
+    use std::time::Duration;
+
+    let provider = Arc::new(MockLlmProvider::scripted([plan_patch(
+        "original", "verified",
+    )]));
+    let mut run = PlanExecutionFixture::new(
+        "if grep -qx verified source.txt; then touch .git/verify-entered; \
+         for attempt in $(seq 1 200); do test ! -f .git/verify-release || exit 0; sleep 0.1; done; exit 1; fi",
+        2,
+        provider.clone(),
+    ).await;
+    let root = run.dir.path().to_path_buf();
+    let next = Plan::from_parts(
+        "next-plan".into(),
+        "Next plan".into(),
+        None,
+        1,
+        1,
+        vec![],
+        vec![public_plan_leaf("1")],
+    );
+    PlanStorage::save_plan(&root, &next).unwrap();
+    let response = handle_plan_execute_pipeline(
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_EXECUTE_PIPELINE.into(),
+            params: Some(serde_json::json!({"plan_ids": ["public-run", "next-plan"]})),
+        },
+        &run.state,
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    let operation_id = result["operation_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.join(".git/verify-entered").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first plan must reach verification");
+    run.state.soft_stop_active_operation();
+    std::fs::write(root.join(".git/verify-release"), "").unwrap();
+    let observed = run.finish(operation_id, "stopped").await;
+    let hash = run.assert_committed();
+    let snapshot = observed
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|event| event["method"] == events::PLAN_UPDATED)
+        .unwrap();
+    assert!(snapshot.to_string().contains(&hash));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while run.state.is_operation_active() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stopped pipeline must release admission");
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(
+        PlanStorage::load_active_id(&root).unwrap().as_deref(),
+        Some("public-run")
+    );
+    assert_eq!(
+        PlanStorage::load_plan(&root, "next-plan")
+            .unwrap()
+            .unwrap()
+            .implementation
+            .find_item("1")
+            .unwrap()
+            .status,
+        PlanItemStatus::Todo
+    );
+}
+
 #[tokio::test]
 async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
     let dir = TestDir::new();
@@ -2286,6 +2903,82 @@ async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
 }
 
 #[tokio::test]
+async fn test_plan_refine_loads_requested_file_and_saves_horizon_without_edits() {
+    const REFERENCE: &str = "Unique horizon reference text";
+    let dir = TestDir::new();
+    let root = dir.path();
+    tauqe_core::git::init_repository(Some(root), true).unwrap();
+    std::fs::write(root.join(".gitignore"), "/.tauqe/\n").unwrap();
+    std::fs::write(root.join("reference.txt"), REFERENCE).unwrap();
+    tauqe_core::git::cmd::stage_files(root, &[".gitignore".into(), "reference.txt".into()])
+        .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(root, "Add reference", false).unwrap();
+    let head = || tauqe_core::git::cmd::run_git(Some(root), &["rev-parse", "HEAD"]).unwrap();
+    let initial_head = head();
+    let plan = Plan::from_parts(
+        "refine-file".into(),
+        "Refine File".into(),
+        None,
+        1,
+        1,
+        vec![],
+        vec![],
+    );
+    PlanStorage::save_plan(root, &plan).unwrap();
+    let initial_worktree = tauqe_core::git::state::snapshot_worktree(root);
+
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(
+            r#"{"status":"needs_context","explanation":"Read the reference","reason":null,"context_requests":["reference.txt"],"repo_searches":[],"repo_maps":[],"items":[]}"#,
+        ),
+        MockResponse::text(
+            r#"{"status":"success","explanation":"Reference reviewed","reason":null,"context_requests":[],"repo_searches":[],"repo_maps":[],"items":[{"id":"1","title":"Use the reference","status":"todo","files":["source.rs"],"readonly_files":["reference.txt"],"concept_refs":[],"depends_on":[],"children":[]}]}"#,
+        ),
+    ]));
+    let state = test_state_with_provider(&dir, Default::default(), provider.clone()).await;
+    let response = handle_plan_refine(
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_REFINE.into(),
+            params: Some(serde_json::json!({"plan_id": "refine-file"})),
+        },
+        &state,
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert!(matches!(
+        serde_json::from_value::<PlanRefineResult>(response.result.unwrap()).unwrap(),
+        PlanRefineResult::Success { .. }
+    ));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!round_text(&requests[0].messages).contains(REFERENCE));
+    assert!(requests[1].messages.iter().any(|message| {
+        message
+            .content
+            .contains("<file path=\"reference.txt\" access=\"read_only\"")
+            && message.content.contains(REFERENCE)
+    }));
+    let stored = PlanStorage::load_plan(root, "refine-file")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.implementation.find_item("1").unwrap().title,
+        "Use the reference"
+    );
+    assert_eq!(head(), initial_head);
+    assert_eq!(
+        tauqe_core::git::state::snapshot_worktree(root),
+        initial_worktree
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("reference.txt")).unwrap(),
+        REFERENCE
+    );
+}
+
+#[tokio::test]
 async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disabled() {
     let dir = TestDir::new();
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
@@ -2357,8 +3050,13 @@ async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disable
 }
 
 #[tokio::test]
-async fn test_plan_refine_regenerates_round_after_unparsable_response() {
+async fn test_plan_refine_heals_the_schema_then_loads_evidence() {
+    const EVIDENCE: &str = "Unique evidence requested after schema healing";
     let dir = TestDir::new();
+    let root = dir.path();
+    tauqe_core::git::init_repository(Some(root), true).unwrap();
+    std::fs::write(root.join("evidence.txt"), EVIDENCE).unwrap();
+    tauqe_core::git::cmd::stage_files(root, &["evidence.txt".into()]).unwrap();
     let plan = Plan::from_parts(
         "parse-retry".to_string(),
         "Parse Retry".to_string(),
@@ -2370,7 +3068,7 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    // The first round is cut off mid-JSON, the second one is complete.
+    // The first response is cut off mid-JSON. The correction requests evidence.
     let truncated = "{\"status\": \"success\", \"explanation\": \"Decomposed";
     let complete = serde_json::json!({
         "status": "success",
@@ -2394,6 +3092,9 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
     });
     let mock_provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(truncated),
+        MockResponse::text(
+            r#"{"status":"needs_context","explanation":"Read the evidence","context_requests":["evidence.txt","missing-evidence.txt"]}"#,
+        ),
         MockResponse::text(complete.to_string()),
     ]));
 
@@ -2411,9 +3112,27 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
     let res = handle_plan_refine(req, &state).await;
     assert!(res.error.is_none(), "refine failed: {:?}", res.error);
 
-    // An interrupted structured payload regenerates the round instead of
-    // aborting the whole synthesis on its first occurrence.
-    assert_eq!(mock_provider.requests().len(), 2);
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 3);
+    let correction = round_text(&requests[1].messages);
+    assert!(correction.contains("did not satisfy the response schema"));
+    assert!(!correction.contains("The research round limit is exhausted"));
+    assert!(!correction.contains(EVIDENCE));
+    assert!(requests[1]
+        .messages
+        .iter()
+        .all(|message| message.role != "assistant"));
+    let continuation = round_text(&requests[2].messages);
+    // Loaded files arrive as file messages; the missing path produces feedback.
+    assert!(continuation.contains("<context_feedback>"));
+    assert!(continuation.contains("missing-evidence.txt"));
+    assert!(!continuation.contains("did not satisfy the response schema"));
+    assert!(requests[2].messages.iter().any(|message| {
+        message
+            .content
+            .contains("<file path=\"evidence.txt\" access=\"read_only\"")
+            && message.content.contains(EVIDENCE)
+    }));
 
     let reloaded = PlanStorage::load_plan(dir.path(), "parse-retry")
         .unwrap()
@@ -2573,6 +3292,13 @@ async fn test_plan_refine_blocks_after_the_tier_budget_is_spent() {
 #[tokio::test]
 async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budget() {
     let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(
+        dir.path().join("reference.txt"),
+        "Evidence retained across tiers",
+    )
+    .unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["reference.txt".into()]).unwrap();
     let plan = Plan::from_parts(
         "architect-ladder".to_string(),
         "Architect Ladder".to_string(),
@@ -2584,8 +3310,7 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    // The first rung is cut off mid-JSON and spends its single attempt, so the
-    // round continues on the next rung, which answers with a complete horizon.
+    // After discovery, two defective answers exhaust their respective tiers.
     let truncated = "{\"status\": \"success\", \"explanation\": \"Decomposed";
     let complete = serde_json::json!({
         "status": "success",
@@ -2608,13 +3333,23 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
         ]
     });
     let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(
+            r#"{"status":"needs_context","explanation":"Check the evidence","context_requests":["reference.txt","not-present.txt"]}"#,
+        ),
+        MockResponse::text(truncated),
         MockResponse::text(truncated),
         MockResponse::text(complete.to_string()),
     ]));
 
-    let mut config = tauqe_core::config::AppConfig::default();
+    let mut config = tauqe_core::config::AppConfig {
+        repl: serde_json::from_value(serde_json::json!({"max_turn_rounds": 1})).unwrap(),
+        ..Default::default()
+    };
+    let mut deeper = tier_with_attempts("planner/one", 1);
+    deeper.effort = Some(tauqe_core::models::ReasoningEffort::High);
     config.models.architect = Some(vec![
         tier_with_attempts("planner/one", 1),
+        deeper,
         tier_with_attempts("planner/two", 1),
     ]);
 
@@ -2635,9 +3370,25 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
     // The spent rung hands the round to the next rung of the ladder, so the
     // regeneration runs on a stronger configuration instead of the failed one.
     let requests = mock_provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].model, "planner/one");
-    assert_eq!(requests[1].model, "planner/two");
+    assert_eq!(requests[1].model, "planner/one");
+    assert_eq!(requests[2].model, "planner/one");
+    assert_eq!(
+        requests[2].reasoning_effort,
+        Some(tauqe_core::models::ReasoningEffort::High)
+    );
+    assert_eq!(requests[1].session_id, requests[2].session_id);
+    assert_eq!(requests[3].model, "planner/two");
+    assert_ne!(requests[2].session_id, requests[3].session_id);
+    for request in &requests[1..] {
+        let prompt = round_text(&request.messages);
+        assert!(prompt.contains("Evidence retained across tiers"));
+        assert!(prompt.contains("<context_feedback>"));
+        assert!(prompt.contains("not-present.txt"));
+        assert!(prompt.contains("The research round limit is exhausted"));
+    }
+    assert!(round_text(&requests[3].messages).contains("did not satisfy the response schema"));
 
     // The transition is published, so the developer sees which rung answered.
     let mut emitted = Vec::new();
@@ -3079,12 +3830,19 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     })
     .to_string();
     let provider = Arc::new(MockLlmProvider::scripted([
-        MockResponse::text("The step looks complete."),
+        MockResponse::text(
+            r#"{"scratchpad":"Private first attempt marker","message":"Inspect the source","action":{"kind":"research","context_requests":[{"path":"src.rs","access":"editable"}]}}"#,
+        ),
         MockResponse::text(success),
     ]));
 
-    let mut config = tauqe_core::config::AppConfig::default();
-    config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
+    let mut config = tauqe_core::config::AppConfig {
+        repl: serde_json::from_value(serde_json::json!({
+            "workflow": "naive", "max_turn_rounds": 1
+        }))
+        .unwrap(),
+        ..Default::default()
+    };
     config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3122,6 +3880,15 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     assert_eq!(requests[0].model, "coder/mid");
     // ...and the retry escalates above it instead of restarting at the base.
     assert_eq!(requests[1].model, "coder/strong");
+    assert_eq!(requests[0].session_id, requests[1].session_id);
+    assert!(requests[1]
+        .messages
+        .iter()
+        .all(|message| message.role != "assistant"));
+    let retry = round_text(&requests[1].messages);
+    assert!(retry.contains("Turn round budget exhausted"));
+    assert!(!retry.contains("Private first attempt marker"));
+    assert!(!retry.contains("<context_feedback>"));
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),

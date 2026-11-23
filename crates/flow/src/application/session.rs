@@ -1,24 +1,15 @@
 //! Shared state and lifecycle of one application session.
 
-#[cfg(any(test, feature = "test-support"))]
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use super::configuration::{
     ConfigurationChange, ConfigurationError, ConfigurationPatch, ConfigurationSnapshot,
     ReloadSelection,
 };
-use super::events::{ApplicationEvent, ApplicationObserver};
+use super::events::ApplicationObserver;
+use super::focus::{FocusSession, FocusUpdate};
 use super::operation::{OperationGuard, OperationInProgress};
 use tauqe_core::discussion::{DiscussionFocus, DiscussionTarget};
-
-/// Result and change notification of one atomic focus mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FocusUpdate {
-    pub(crate) focus: DiscussionFocus,
-    pub(crate) changed: bool,
-}
 
 #[derive(Clone, Default)]
 pub struct Application {
@@ -33,14 +24,12 @@ struct Session {
     context: super::context::ContextSession,
     history: super::history::HistorySession,
     configuration: super::configuration::Configuration,
-    dialogue: super::dialogue::DialogueSession,
+    dialogue: Arc<super::dialogue::DialogueSession>,
     transaction: Arc<std::sync::atomic::AtomicBool>,
     operations: Arc<super::operation::OperationRegistry>,
-    focus: Mutex<DiscussionFocus>,
+    focus: FocusSession,
     #[cfg(any(test, feature = "test-support"))]
-    provider_override: Mutex<
-        HashMap<tauqe_core::models::ProviderKind, Arc<dyn tauqe_core::providers::LlmProvider>>,
-    >,
+    provider_override: super::infrastructure::execution::ProviderOverrides,
 }
 
 impl Application {
@@ -63,7 +52,7 @@ impl Application {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn test_set_provider_for(
+    pub(crate) async fn test_set_provider_for(
         &self,
         kind: tauqe_core::models::ProviderKind,
         provider: Arc<dyn tauqe_core::providers::LlmProvider>,
@@ -75,28 +64,42 @@ impl Application {
             .insert(kind, provider);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn scripted_provider(
-        &self,
-        kind: tauqe_core::models::ProviderKind,
-    ) -> Option<Arc<dyn tauqe_core::providers::LlmProvider>> {
-        self.session
-            .provider_override
-            .lock()
-            .await
-            .get(&kind)
-            .cloned()
+    pub(crate) fn execution_session(&self) -> super::infrastructure::execution::ExecutionSession {
+        super::infrastructure::execution::ExecutionSession {
+            operations: self.session.operations.clone(),
+            transaction: self.session.transaction.clone(),
+            login: self.chatgpt_login.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            provider_override: self.session.provider_override.clone(),
+        }
+    }
+
+    pub(crate) fn step_resources(&self) -> crate::workflows::step::run::StepResources {
+        crate::workflows::step::run::StepResources {
+            context: self.context_session().clone(),
+            usage: self.usage_session().clone(),
+            execution: self.execution_session(),
+        }
+    }
+
+    pub(crate) fn focus_session(&self) -> &FocusSession {
+        &self.session.focus
+    }
+
+    pub(crate) fn configuration_session(&self) -> &super::configuration::Configuration {
+        &self.session.configuration
+    }
+
+    pub(crate) fn dialogue_session(&self) -> &Arc<super::dialogue::DialogueSession> {
+        &self.session.dialogue
     }
 
     pub async fn discussion_focus(&self) -> DiscussionFocus {
-        self.session.focus.lock().await.clone()
+        self.focus_session().current().await
     }
 
     pub async fn set_discussion_focus(&self, focus: DiscussionFocus) -> FocusUpdate {
-        let mut current = self.session.focus.lock().await;
-        let changed = *current != focus;
-        *current = focus.clone();
-        FocusUpdate { focus, changed }
+        self.focus_session().set(focus).await
     }
 
     pub async fn set_focus(
@@ -109,7 +112,7 @@ impl Application {
     }
 
     pub(crate) async fn clear_discussion_focus(&self) -> FocusUpdate {
-        self.set_discussion_focus(DiscussionFocus::None).await
+        self.focus_session().clear().await
     }
 
     /// Releases a deleted document's focus before its scenario publishes the new list.
@@ -118,42 +121,13 @@ impl Application {
         target: &DiscussionTarget,
         observer: &dyn ApplicationObserver,
     ) -> bool {
-        let update = self.release_discussion_focus(target).await;
+        let update = self.focus_session().release(target).await;
         let changed = update.changed;
         if changed {
             tracing::info!("Cleared the discussion focus anchored on the deleted entity");
         }
         update.publish("", observer);
         changed
-    }
-
-    /// Compare and clear under one lock so releasing a deleted entity cannot
-    /// clear a focus installed on another entity concurrently.
-    async fn release_discussion_focus(&self, anchor: &DiscussionTarget) -> FocusUpdate {
-        let mut current = self.session.focus.lock().await;
-        let changed =
-            matches!(&*current, DiscussionFocus::Focused { target, .. } if target == anchor);
-        if changed {
-            *current = DiscussionFocus::None;
-        }
-        FocusUpdate {
-            focus: current.clone(),
-            changed,
-        }
-    }
-}
-
-impl FocusUpdate {
-    /// Publishes this transition at the point selected by its owning scenario.
-    pub(crate) fn publish(
-        self,
-        operation_id: &str,
-        observer: &dyn ApplicationObserver,
-    ) -> DiscussionFocus {
-        if self.changed {
-            observer.publish(operation_id, ApplicationEvent::Focus(self.focus.clone()));
-        }
-        self.focus
     }
 }
 
@@ -210,15 +184,15 @@ mod tests {
         ] {
             let expected = focus(survivor);
             app.set_discussion_focus(expected.clone()).await;
-            let update = app.release_discussion_focus(&deleted).await;
+            let update = app.focus_session().release(&deleted).await;
             assert!(!update.changed);
             assert_eq!(update.focus, expected);
         }
         app.set_discussion_focus(focus(deleted.clone())).await;
-        let update = app.release_discussion_focus(&deleted).await;
+        let update = app.focus_session().release(&deleted).await;
         assert!(update.changed);
         assert_eq!(update.focus, DiscussionFocus::None);
-        assert!(!app.release_discussion_focus(&deleted).await.changed);
+        assert!(!app.focus_session().release(&deleted).await.changed);
     }
 
     #[tokio::test]
@@ -332,17 +306,6 @@ mod operation_tests {
 }
 
 impl Application {
-    /// Build the turn policy against this session's transaction activity.
-    pub(crate) fn git_transaction_policy(
-        &self,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> tauqe_core::workflow::git_policy::GitTransactionPolicy {
-        tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard_and_cancel(
-            Arc::clone(&self.session.transaction),
-            cancel,
-        )
-    }
-
     pub(crate) fn transaction_is_active(&self) -> bool {
         self.session
             .transaction

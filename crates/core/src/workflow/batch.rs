@@ -138,7 +138,7 @@ impl BatchStepOutcome {
 
     /// Whether the outcome represents a successful step.
     #[cfg(test)]
-    pub(crate) fn is_success(&self) -> bool {
+    fn is_success(&self) -> bool {
         matches!(self.status, BatchStepStatus::Succeeded)
     }
 }

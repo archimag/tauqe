@@ -62,7 +62,7 @@ fn json_edit_response(content: &str) -> String {
             "kind": "edit",
             "patch": format!("*** Begin Patch\n*** Update File: src/target.rs\n@@\n-pub fn target() {{}}\n+{content}\n*** End Patch"),
             "commit_message": "Fix architecture issue",
-            "message": "",
+            "error_message": "",
             "reason": ""
         },
         "scratchpad": ""
@@ -155,6 +155,29 @@ async fn batch_stops_gracefully_on_a_soft_stop() {
         stored_statuses(&dir, "rev-soft-stop"),
         vec![IssueStatus::Todo, IssueStatus::Todo]
     );
+}
+
+#[tokio::test]
+async fn batch_prioritizes_hard_cancellation_over_soft_stop() {
+    let dir = TestDir::new();
+    let review_id = "rev-cancel-priority";
+    save_session(&dir, review_id, &[IssueStatus::Todo, IssueStatus::Todo]);
+    let state = test_state(&dir);
+    let operation = Arc::new(state.try_begin_operation().unwrap());
+    state.soft_stop_active_operation();
+    state.cancel_active_operation();
+
+    let outcome =
+        run_review_batch(&state, review_id, make_tasks(review_id, &[1, 2]), operation).await;
+
+    assert_eq!(
+        outcome,
+        BatchOutcome::Cancelled {
+            completed: 0,
+            telemetry: BatchTelemetry::default()
+        }
+    );
+    assert_eq!(stored_statuses(&dir, review_id), vec![IssueStatus::Todo; 2]);
 }
 
 /// A group member is decoded as a group and executed through the unified
@@ -643,27 +666,25 @@ async fn batch_publishes_the_skipped_verdict_of_an_exhausted_run() {
         vec!["rev-exhausted:1".to_string()],
         None,
         0,
-        None,
+        Some(tauqe_core::models::ModelSelection::Role(
+            tauqe_core::models::ModelRole::Coder,
+        )),
         None,
         operation,
     )
     .await;
 
-    match outcome {
-        BatchOutcome::Failed {
-            completed, member, ..
-        } => {
-            assert_eq!(completed, 0);
-            assert_eq!(
-                member,
-                FailedMember::Finding {
-                    session_id: "rev-exhausted".to_string(),
-                    item_id: 1,
-                }
-            );
+    assert_eq!(
+        outcome,
+        BatchOutcome::Completed {
+            items: 1,
+            telemetry: BatchTelemetry {
+                fixed: 0,
+                deferred: 0,
+                failed: 1
+            },
         }
-        other => panic!("Expected Failed, got {:?}", other),
-    }
+    );
 
     // The settled verdict is the last state the batch publishes for the
     // session: every lifecycle transition of the member precedes it.

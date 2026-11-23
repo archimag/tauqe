@@ -26,11 +26,14 @@ pub use model::{
 };
 mod apply;
 pub(crate) mod atomic;
+pub mod execution;
 pub mod protocol;
 mod stage;
+pub mod staging;
 pub(crate) mod strategy;
 pub mod stream;
 mod substrate;
+pub mod transaction;
 
 #[cfg(test)]
 pub(crate) use apply::apply_edit_proposal;
@@ -43,7 +46,6 @@ pub(crate) use stage::{
 };
 pub use tauqe_tools::edits::anchor;
 pub use tauqe_tools::edits::fuzzy;
-pub use tauqe_tools::edits::staging;
 pub use tauqe_tools::edits::{EditError, FailedFileEdit, StagedEditsState};
 
 pub(crate) use tauqe_tools::edits::fuzzy::apply_replace;

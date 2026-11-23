@@ -2,9 +2,12 @@ mod groups;
 mod items;
 mod post_analysis;
 
+pub use groups::GroupCompletion;
+pub use items::ReviewDecisionOutcome;
 pub use post_analysis::FindingAssignment;
 
 use anyhow::{Context, Result};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::review::ReviewSession;
@@ -194,14 +197,28 @@ impl ReviewStorage {
         Ok(reviews)
     }
 
-    /// Reads and decodes the review session stored at `path`.
-    ///
-    /// A file that is absent, unreadable, or undecodable yields `None`: resolving a
-    /// session id treats every one of them as "this file does not carry the
-    /// session", exactly as the storage listing skips them.
-    fn read_session_file(path: &Path) -> Option<ReviewSession> {
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str::<ReviewSession>(&content).ok()
+    /// Reads a candidate, distinguishing a free default name from a failed read.
+    fn read_session_candidate(path: &Path, is_default: bool) -> Result<Option<ReviewSession>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Err(error) if is_default && error.kind() == ErrorKind::NotFound => return Ok(None),
+            result => result,
+        }
+        .with_context(|| format!("Failed to inspect review path at {}", path.display()))?;
+        let metadata = if metadata.is_symlink() {
+            std::fs::metadata(path)
+                .with_context(|| format!("Failed to inspect review file at {}", path.display()))?
+        } else {
+            metadata
+        };
+        if !metadata.is_file() {
+            anyhow::ensure!(!is_default, "Expected a review file at {}", path.display());
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read review file at {}", path.display()))?;
+        let session = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse review JSON at {}", path.display()))?;
+        Ok(Some(session))
     }
 
     /// Resolves the on-disk file that currently stores the review session identified
@@ -218,34 +235,68 @@ impl ReviewStorage {
     ///
     /// Lock-free; the caller must hold the storage lock.
     fn find_session_file_unlocked(repo_root: &Path, id: &str) -> Option<(PathBuf, ReviewSession)> {
+        Self::resolve_session_file_unlocked(repo_root, id)
+            .ok()
+            .flatten()
+    }
+
+    /// Shares the lookup order and ID matching with the tolerant callers, but
+    /// reports an incomplete search when no matching session could be read.
+    fn resolve_session_file_unlocked(
+        repo_root: &Path,
+        id: &str,
+    ) -> Result<Option<(PathBuf, ReviewSession)>> {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let default_target = dir.join(format!("{safe_id}.json"));
 
-        if let Some(session) = Self::read_session_file(&default_target) {
-            if session.id.eq_ignore_ascii_case(id) {
-                return Some((default_target, session));
+        let mut first_error = match Self::read_session_candidate(&default_target, true) {
+            Ok(Some(session)) if session.id.eq_ignore_ascii_case(id) => {
+                return Ok(Some((default_target, session)));
             }
-        }
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
 
-        let entries = std::fs::read_dir(&dir).ok()?;
-        for entry in entries.flatten() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return first_error.map_or(Ok(None), Err);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to read reviews directory at {}", dir.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = match entry.with_context(|| {
+                format!(
+                    "Failed to read an entry in reviews directory at {}",
+                    dir.display()
+                )
+            }) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             let path = entry.path();
-            if path == default_target
-                || !path.is_file()
-                || path.extension().and_then(|s| s.to_str()) != Some("json")
-            {
+            if path == default_target || path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let session = match Self::read_session_file(&path) {
-                Some(session) => session,
-                None => continue,
-            };
-            if session.id.eq_ignore_ascii_case(id) {
-                return Some((path, session));
+            match Self::read_session_candidate(&path, false) {
+                Ok(Some(session)) if session.id.eq_ignore_ascii_case(id) => {
+                    return Ok(Some((path, session)));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        None
+        first_error.map_or(Ok(None), Err)
     }
 
     /// Loads a specific review session by ID.
@@ -320,9 +371,18 @@ impl ReviewStorage {
                 default_target
             }
         };
+        Self::write_session_unlocked(repo_root, &target_file, session)
+    }
+
+    /// Writes to the resolved path while the caller holds the storage lock.
+    fn write_session_unlocked(
+        repo_root: &Path,
+        target_file: &Path,
+        session: &ReviewSession,
+    ) -> Result<()> {
         let json = serde_json::to_string_pretty(session)
             .context("Failed to serialize review session to JSON")?;
-        write_atomic(&target_file, json.as_bytes())?;
+        write_atomic(target_file, json.as_bytes())?;
 
         // If no active review is set, make this session active
         if let Ok(None) = Self::load_active_id_unlocked(repo_root) {

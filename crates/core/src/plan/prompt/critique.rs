@@ -11,9 +11,9 @@
 //! and the `plan_refinement` schema; only the user prompt differs, because it
 //! carries the audit ([`build_plan_reconciliation_prompt`]).
 
-use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::escape::{escape_xml_text, single_line};
+use crate::execution::structured::{StructuredContract, StructuredVisibility};
 use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 use serde::{Deserialize, Serialize};

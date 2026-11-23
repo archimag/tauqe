@@ -6,7 +6,7 @@ use crate::application::infrastructure::execution::{
 use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::control::structured::StructuredError;
+use tauqe_core::execution::structured::StructuredError;
 use tauqe_core::locale::{locale_translation_contract, LocaleGenerateParams, LocaleGenerateResult};
 use tauqe_core::models::{ModelRole, ModelSelection};
 use tauqe_core::providers::{ChatMessage, StreamEvent};

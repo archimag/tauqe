@@ -169,9 +169,9 @@ fn strip_access_prefix<'a>(spec: &'a str, prefix: &str) -> Option<&'a str> {
 /// to ensure immediate streaming output to TUI clients while supporting strict structured validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DiscussionResponse {
-    pub(crate) message: String,
+    message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) plan_update: Option<DiscussionPlanUpdate>,
+    plan_update: Option<DiscussionPlanUpdate>,
     /// Decision recorded for one finding of the discussed review session.
     ///
     /// The dialogue is where an engineer actually decides what a finding is
@@ -184,33 +184,33 @@ pub struct DiscussionResponse {
     /// the ordinary finding workflow and owns the transition to `fixed`. Null
     /// when the turn recorded no decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) review_update: Option<ReviewUpdateProposal>,
+    review_update: Option<ReviewUpdateProposal>,
     #[serde(
         default,
         deserialize_with = "deserialize_context_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub(crate) context_requests: Vec<DiscussionContextRequest>,
+    context_requests: Vec<DiscussionContextRequest>,
     #[serde(
         default,
         deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub(crate) repo_searches: Vec<RepoSearchRequest>,
+    repo_searches: Vec<RepoSearchRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) repo_dirs: Option<bool>,
+    repo_dirs: Option<bool>,
     #[serde(
         default,
         deserialize_with = "deserialize_repo_map_paths",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub(crate) repo_maps: Vec<String>,
+    repo_maps: Vec<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_dir_list_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub(crate) dir_lists: Vec<DirListRequest>,
+    dir_lists: Vec<DirListRequest>,
     /// Decode diagnosis of a `plan_update` payload the DTO could not honor.
     ///
     /// The structured stream filter rebuilds this response from a partially
@@ -220,12 +220,12 @@ pub struct DiscussionResponse {
     /// it. It is a harness-side diagnostic rather than a model-authored field, so
     /// it stays out of the strict wire schema and is omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) plan_update_error: Option<String>,
+    plan_update_error: Option<String>,
 }
 
 impl DiscussionResponse {
     #[cfg(test)]
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             plan_update: None,
@@ -240,7 +240,7 @@ impl DiscussionResponse {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
+    fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
         self.repo_maps = paths
             .iter()
             .filter_map(|path| normalize_repo_map_path(path))

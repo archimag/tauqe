@@ -3,7 +3,9 @@ use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanRejection};
 use std::path::Path;
 use std::time::SystemTime;
 
-use super::{PlanApplicationOutcome, PlanBatchSnapshot, PlanMutationMode, PlanStorage};
+use super::{
+    PlanApplicationOutcome, PlanBatchSnapshot, PlanMutationMode, PlanPreparationError, PlanStorage,
+};
 
 /// Contract of one applied mutation of a plan batch.
 #[derive(Debug, Clone, Copy)]
@@ -32,16 +34,14 @@ impl MutationCommit {
         repo_root: &Path,
         snapshot: &mut PlanBatchSnapshot,
         plan: &Plan,
-    ) -> anyhow::Result<Plan> {
-        match self {
-            Self::Persist => PlanStorage::save_plan_in_snapshot_unlocked(repo_root, snapshot, plan),
-            #[cfg(test)]
-            Self::Probe => {
-                let prepared = PlanStorage::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
-                snapshot.remember(prepared.plan.clone(), prepared.target_file);
-                Ok(prepared.plan)
-            }
+    ) -> Result<Plan, PlanPreparationError> {
+        let prepared = PlanStorage::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
+        if self.persists() {
+            PlanStorage::ensure_plans_dir(repo_root)?;
+            PlanStorage::write_plan_document_unlocked(&prepared)?;
         }
+        snapshot.remember(prepared.plan.clone(), prepared.target_file);
+        Ok(prepared.plan)
     }
 }
 
@@ -193,6 +193,7 @@ impl PlanStorage {
             .collect();
         let mut applied = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        let mut storage_error = None;
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -281,16 +282,18 @@ impl PlanStorage {
                     plan.updated_at = now;
                     match commit.commit(repo_root, snapshot, &plan) {
                         Ok(stored) => {
-                            if commit.persists() {
-                                applied.push(stored);
-                            }
+                            applied.push(stored);
                             warnings.append(&mut tag_warnings);
                         }
-                        Err(err) => {
+                        Err(PlanPreparationError::Payload(err)) => {
                             errors.push(PlanRejection::payload_defect(format!(
                                 "Failed to save plan '{}': {:#}",
                                 plan.id, err
                             )));
+                        }
+                        Err(PlanPreparationError::Storage(err)) => {
+                            storage_error = Some(format!("{err:#}"));
+                            break;
                         }
                     }
                 }
@@ -309,7 +312,11 @@ impl PlanStorage {
                                 continue;
                             }
                             crate::plan::matcher::PlanResolution::NotFound => {
-                                Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
+                                crate::plan::matcher::resolve_plan_id_exact(
+                                    &tag.id,
+                                    snapshot.plans(),
+                                )
+                                .cloned()
                             }
                         };
 
@@ -422,16 +429,18 @@ impl PlanStorage {
                         plan.updated_at = now;
                         match commit.commit(repo_root, snapshot, &plan) {
                             Ok(stored) => {
-                                if commit.persists() {
-                                    applied.push(stored);
-                                }
+                                applied.push(stored);
                                 warnings.append(&mut tag_warnings);
                             }
-                            Err(err) => {
+                            Err(PlanPreparationError::Payload(err)) => {
                                 errors.push(PlanRejection::payload_defect(format!(
                                     "Failed to save updated plan '{}': {:#}",
                                     plan.id, err
                                 )));
+                            }
+                            Err(PlanPreparationError::Storage(err)) => {
+                                storage_error = Some(format!("{err:#}"));
+                                break;
                             }
                         }
                     } else {
@@ -463,6 +472,7 @@ impl PlanStorage {
             applied,
             errors,
             warnings,
+            storage_error,
         }
     }
 
@@ -480,7 +490,8 @@ impl PlanStorage {
     }
 
     /// Applies a batch of structured discussion updates under the explicitly chosen
-    /// mutation mode, returning one typed outcome per update in input order.
+    /// mutation mode, returning outcomes in input order up to the first storage
+    /// failure. A final marker failure is reported on the last outcome.
     pub fn apply_discussion_plan_updates_with_mode(
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],
@@ -488,7 +499,12 @@ impl PlanStorage {
     ) -> Vec<PlanApplicationOutcome> {
         crate::blocking::run_blocking(move || {
             let _guard = Self::lock();
-            Self::apply_discussion_plan_updates_unlocked(repo_root, updates, mode)
+            Self::apply_discussion_plan_updates_unlocked(
+                repo_root,
+                updates,
+                mode,
+                MutationCommit::Persist,
+            )
         })
     }
 
@@ -496,42 +512,82 @@ impl PlanStorage {
         repo_root: &Path,
         updates: &[DiscussionPlanUpdate],
         mode: PlanMutationMode,
+        commit: MutationCommit,
     ) -> Vec<PlanApplicationOutcome> {
         if updates.is_empty() {
             return Vec::new();
         }
-        let mut snapshot = PlanBatchSnapshot::load_unlocked(repo_root).unwrap_or_default();
+        let mut snapshot = match PlanBatchSnapshot::load_unlocked(repo_root, true) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return vec![PlanApplicationOutcome {
+                    storage_error: Some(format!("{error:#}")),
+                    ..Default::default()
+                }]
+            }
+        };
         let mut outcomes = Vec::with_capacity(updates.len());
-        let mut last_applied: Option<Plan> = None;
+        let mut first_applied = None;
+        let mut last_applied = None;
         for update in updates {
+            let explicit_id = update
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let active_id = if explicit_id.is_none() {
+                match Self::load_active_id_unlocked(repo_root) {
+                    Ok(active_id) => active_id.or_else(|| first_applied.clone()),
+                    Err(error) => {
+                        outcomes.push(PlanApplicationOutcome {
+                            storage_error: Some(format!("{error:#}")),
+                            ..Default::default()
+                        });
+                        return outcomes;
+                    }
+                }
+            } else {
+                None
+            };
             let resolved =
-                Self::resolve_discussion_update_unlocked(repo_root, update, snapshot.plans());
+                Self::resolve_discussion_update(update, explicit_id, active_id, snapshot.plans());
             let mutation_tag = match resolved {
                 Ok(tag) => tag,
                 Err(rejection) => {
                     outcomes.push(PlanApplicationOutcome {
-                        applied: Vec::new(),
                         errors: vec![rejection],
-                        warnings: Vec::new(),
+                        ..Default::default()
                     });
                     continue;
                 }
             };
-            let outcome = Self::apply_tags_with_snapshot_unlocked(
+            let mut outcome = Self::apply_tags_with_snapshot_unlocked(
                 repo_root,
                 &mut snapshot,
                 vec![mutation_tag],
                 Vec::new(),
                 mode,
-                MutationCommit::Persist,
+                commit,
             );
             if let Some(plan) = outcome.applied.last() {
-                last_applied = Some(plan.clone());
+                first_applied.get_or_insert_with(|| plan.id.clone());
+                last_applied = Some(plan.id.clone());
             }
+            if !commit.persists() {
+                outcome.applied.clear();
+            }
+            let failed = outcome.storage_error.is_some();
             outcomes.push(outcome);
+            if failed {
+                return outcomes;
+            }
         }
-        if let Some(plan) = last_applied {
-            let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
+        if commit.persists() {
+            if let (Some(id), Some(last)) = (last_applied, outcomes.last_mut()) {
+                if let Err(error) = Self::save_active_id_unlocked(repo_root, Some(&id)) {
+                    last.storage_error = Some(format!("{error:#}"));
+                }
+            }
         }
         outcomes
     }
@@ -565,51 +621,27 @@ impl PlanStorage {
         updates: &[DiscussionPlanUpdate],
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
-        if updates.is_empty() {
-            return PlanApplicationOutcome::default();
+        let mut outcome = PlanApplicationOutcome::default();
+        for probe in Self::apply_discussion_plan_updates_unlocked(
+            repo_root,
+            updates,
+            mode,
+            MutationCommit::Probe,
+        ) {
+            outcome.errors.extend(probe.errors);
+            outcome.warnings.extend(probe.warnings);
+            outcome.storage_error = probe.storage_error;
         }
-        let mut snapshot = PlanBatchSnapshot::load_unlocked(repo_root).unwrap_or_default();
-        let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        for update in updates {
-            let mutation_tag =
-                match Self::resolve_discussion_update_unlocked(repo_root, update, snapshot.plans())
-                {
-                    Ok(tag) => tag,
-                    Err(rejection) => {
-                        errors.push(rejection);
-                        continue;
-                    }
-                };
-            let probe = Self::apply_tags_with_snapshot_unlocked(
-                repo_root,
-                &mut snapshot,
-                vec![mutation_tag],
-                Vec::new(),
-                mode,
-                MutationCommit::Probe,
-            );
-            errors.extend(probe.errors);
-            warnings.extend(probe.warnings);
-        }
-        PlanApplicationOutcome {
-            applied: Vec::new(),
-            errors,
-            warnings,
-        }
+        outcome
     }
 
-    fn resolve_discussion_update_unlocked(
-        repo_root: &Path,
+    fn resolve_discussion_update(
         update: &DiscussionPlanUpdate,
+        explicit_id: Option<&str>,
+        active_id: Option<String>,
         all_plans: &[Plan],
     ) -> std::result::Result<PlanMutationTag, PlanRejection> {
-        let active_id = Self::load_active_id_unlocked(repo_root).ok().flatten();
-        let plan_id = update
-            .id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
+        let plan_id = explicit_id
             .map(String::from)
             .or_else(|| {
                 crate::plan::matcher::resolve_plan_id("", all_plans, active_id.as_deref())
@@ -618,13 +650,7 @@ impl PlanStorage {
             .or(active_id)
             .unwrap_or_else(|| "default".to_string());
 
-        let action = if update.action == DiscussionPlanAction::Update
-            && all_plans.is_empty()
-            && Self::load_plan_unlocked(repo_root, &plan_id)
-                .ok()
-                .flatten()
-                .is_none()
-        {
+        let action = if update.action == DiscussionPlanAction::Update && all_plans.is_empty() {
             "save".to_string()
         } else {
             update.action.to_string()

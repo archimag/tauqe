@@ -24,9 +24,7 @@ mod repl;
 mod review;
 
 pub use context::ContextConfig;
-pub(crate) use context::{
-    DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_TOKEN_BUDGET,
-};
+pub(crate) use context::DEFAULT_MAX_SCRATCHPAD_CHARS;
 #[cfg(test)]
 pub(crate) use context::{
     DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
@@ -226,7 +224,7 @@ impl AppConfig {
 
     /// Resolves a [`ModelRole`] to a concrete [`ModelRef`] using the
     /// deterministic fallback chain.
-    pub fn resolve_role(&self, role: ModelRole) -> ModelRef {
+    fn resolve_role(&self, role: ModelRole) -> ModelRef {
         let fallback = self.configured_models().into_iter().next();
         self.models.resolve_role_with_fallback(role, fallback)
     }
@@ -504,6 +502,7 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::context::DEFAULT_TOKEN_BUDGET;
     use crate::review::PostAnalysisMode;
     use crate::workflow::WorkflowKind;
     #[test]
@@ -771,7 +770,10 @@ repomap_token_budget = 6000
     #[test]
     fn test_include_repo_map_defaults_and_override() {
         let default_cfg = ContextConfig::default();
-        assert_eq!(default_cfg.include_repo_map, DEFAULT_INCLUDE_REPO_MAP);
+        assert_eq!(
+            default_cfg.include_repo_map,
+            context::DEFAULT_INCLUDE_REPO_MAP
+        );
         assert!(default_cfg.include_repo_map);
 
         let absent: AppConfig =

@@ -297,6 +297,25 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
         }
+        events::HISTORY_ENTRY_UPDATED => {
+            if let Some(data) = ev
+                .params
+                .and_then(|params| serde_json::from_value::<HistoryEntryAddedEvent>(params).ok())
+            {
+                if let Some(total) = data.estimated_tokens {
+                    st.history_view.estimated_tokens = total;
+                }
+                if let Some(existing) = st
+                    .history_view
+                    .items
+                    .iter_mut()
+                    .rev()
+                    .find(|item| item.id == data.item.id)
+                {
+                    *existing = data.item;
+                }
+            }
+        }
         events::HISTORY_COMPACTED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<HistoryCompactedEvent>(params) {

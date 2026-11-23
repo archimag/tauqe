@@ -2,20 +2,27 @@
 
 use crate::api::{Application, OperationGuard};
 
+use crate::workflows::repl::{
+    documents::{DocumentSettlement, DocumentWorker},
+    ReplResult,
+};
+use crate::workflows::turn::{DiskSettlement, DiskWorker};
 use std::future::Future;
 use std::sync::Arc;
 use tauqe_core::context::ContextManager;
-use tauqe_core::control::outcome::{LoopResult, SystemError};
-use tauqe_core::control::repl::ReplArtifact;
+use tauqe_core::execution::ExecutionError as SystemError;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct InteractiveExecution {
     lock: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) document_write_gate:
+        Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 pub struct InteractiveTaskOutcome {
-    pub result: Result<LoopResult<ReplArtifact>, SystemError>,
+    pub(crate) result: Result<ReplResult, SystemError>,
     pub context: ContextManager,
 }
 
@@ -25,12 +32,21 @@ pub enum InteractiveTaskError {
     OperationNotOwned,
     #[error("{0}")]
     TaskFailed(String),
+    #[error("{0}")]
+    Interrupted(#[source] tokio::task::JoinError),
+}
+
+pub(crate) struct InteractiveTaskReport {
+    pub(crate) task: Result<InteractiveTaskOutcome, InteractiveTaskError>,
+    pub(crate) disk: Option<DiskSettlement>,
+    pub(crate) documents: DocumentSettlement,
 }
 
 pub struct InteractiveTask {
-    application: Application,
     operation: Arc<OperationGuard>,
     task: tokio::task::JoinHandle<InteractiveTaskOutcome>,
+    disk: Option<DiskWorker>,
+    documents: Option<DocumentWorker>,
 }
 
 impl Application {
@@ -43,7 +59,7 @@ impl Application {
         F: FnOnce(ContextManager) -> R + Send + 'static,
         R: Future<Output = InteractiveTaskOutcome> + Send + 'static,
     {
-        if !self.owns_operation(&operation) {
+        if !self.owns_operation(&operation) || !operation.reserve_supervisor_release() {
             return Err(InteractiveTaskError::OperationNotOwned);
         }
         let application = self.clone();
@@ -54,30 +70,42 @@ impl Application {
         });
         operation.set_abort_handle(task.abort_handle());
         Ok(InteractiveTask {
-            application: self.clone(),
             operation,
             task,
+            disk: None,
+            documents: None,
         })
     }
 }
 
 impl InteractiveTask {
-    /// Keep stream consumption outside this await. A control error is a normal
-    /// task outcome; only an aborted or panicked task triggers recovery.
-    pub async fn join(
-        self,
-        operation_id: &str,
-    ) -> Result<InteractiveTaskOutcome, InteractiveTaskError> {
-        let joined = self.task.await;
+    pub(crate) fn with_disk_worker(mut self, worker: DiskWorker) -> Self {
+        self.disk = Some(worker);
+        self
+    }
+
+    pub(crate) fn with_document_worker(mut self, worker: DocumentWorker) -> Self {
+        self.documents = Some(worker);
+        self
+    }
+
+    /// Consume the stream separately. Drain admitted writes even if the task
+    /// was destroyed before it could receive their results.
+    pub(crate) async fn join(self) -> InteractiveTaskReport {
+        let task = self.task.await.map_err(InteractiveTaskError::Interrupted);
         self.operation.clear_abort_handle();
-        match joined {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => {
-                self.application
-                    .unwind_abandoned_transaction(operation_id)
-                    .await;
-                Err(InteractiveTaskError::TaskFailed(error.to_string()))
-            }
+        let disk = match self.disk {
+            Some(worker) => Some(worker.finish().await),
+            None => None,
+        };
+        let documents = match self.documents {
+            Some(worker) => worker.finish().await,
+            None => DocumentSettlement::default(),
+        };
+        InteractiveTaskReport {
+            task,
+            disk,
+            documents,
         }
     }
 }
@@ -103,7 +131,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let app = application(root.path());
         let operation = Arc::new(app.try_begin_operation().unwrap());
-        let (sink, mut events) = tauqe_core::control::context::EventSink::channel();
+        let (sink, mut events) = tauqe_core::execution::EventSink::channel();
         let task = app
             .start_interactive_task(Arc::clone(&operation), move |mut context| async move {
                 context
@@ -119,7 +147,7 @@ mod tests {
         assert!(
             matches!(events.recv().await.unwrap(), tauqe_core::providers::StreamEvent::TextDelta(text) if text == "Reply")
         );
-        let outcome = task.join("interactive-control-error").await.unwrap();
+        let outcome = task.join().await.task.unwrap();
         assert!(
             matches!(outcome.result, Err(SystemError::Provider(reason)) if reason == "offline")
         );
@@ -158,7 +186,7 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(lock);
-        let outcome = task.join("interactive-lock").await.unwrap();
+        let outcome = task.join().await.task.unwrap();
         assert!(polled.load(Ordering::SeqCst));
         assert!(outcome.context.contains("discovered.rs").unwrap());
     }
@@ -176,7 +204,7 @@ mod tests {
             .start_interactive_task(Arc::clone(&operation), panicking_task)
             .unwrap();
         assert!(
-            matches!(task.join("interactive-panic").await, Err(InteractiveTaskError::TaskFailed(reason)) if reason.contains("simulated interactive panic"))
+            matches!(task.join().await.task, Err(InteractiveTaskError::Interrupted(cause)) if cause.is_panic() && cause.to_string().contains("simulated interactive panic"))
         );
         assert!(!app.abort_operation(operation.id()));
         assert_eq!(app.active_operation_id(), Some(operation.id()));
@@ -198,12 +226,60 @@ mod tests {
         assert_eq!(app.cancel_active_operation(), Some(operation.id()));
         assert!(app.abort_operation(operation.id()));
         assert!(matches!(
-            task.join("interactive-abort").await,
-            Err(InteractiveTaskError::TaskFailed(_))
+            task.join().await.task,
+            Err(InteractiveTaskError::Interrupted(cause)) if cause.is_cancelled()
         ));
         assert!(*operation.cancel_receiver().borrow());
         assert!(!app.abort_operation(operation.id()));
         assert!(app.try_begin_operation().is_err());
+    }
+
+    #[tokio::test]
+    async fn watchdog_cannot_release_registration_while_interactive_supervisor_is_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let app = application(root.path());
+        let operation = Arc::new(app.try_begin_operation().unwrap());
+        let id = operation.id();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = app
+            .start_interactive_task(Arc::clone(&operation), move |_context| async move {
+                started.send(()).unwrap();
+                std::future::pending::<InteractiveTaskOutcome>().await
+            })
+            .unwrap();
+        ready.await.unwrap();
+
+        let deadline = std::time::Duration::from_millis(10);
+        assert_eq!(app.cancel_active_operation(), Some(id));
+        let watchdog_app = app.clone();
+        let watchdog = tokio::spawn(async move {
+            watchdog_app
+                .abort_stalled_operation_with_deadline(id, deadline)
+                .await;
+        });
+        assert!(matches!(
+            task.join().await.task,
+            Err(InteractiveTaskError::Interrupted(cause)) if cause.is_cancelled()
+        ));
+        assert!(!app.abort_operation(id));
+        assert!(app.try_begin_operation().is_err());
+
+        // Keep the supervisor's guard beyond join and the watchdog deadline,
+        // as when recovery has finished but terminal publication is still pending.
+        watchdog.await.unwrap();
+        assert_eq!(app.active_operation_id(), Some(id));
+        assert!(app.try_begin_operation().is_err());
+        drop(operation);
+
+        let next = app.try_begin_operation().unwrap();
+        let next_task = tokio::spawn(std::future::pending::<()>());
+        next.set_abort_handle(next_task.abort_handle());
+        app.abort_stalled_operation_with_deadline(id, deadline)
+            .await;
+        assert_eq!(app.active_operation_id(), Some(next.id()));
+        assert!(!*next.cancel_receiver().borrow());
+        assert!(app.abort_operation(next.id()));
+        assert!(next_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

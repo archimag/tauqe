@@ -1,13 +1,14 @@
 //! Generic single-field streaming filter for JSON Structured Output payloads.
 //!
 //! json_skimmer routes only the requested string field (`message`, `summary`,
-//! ...) for live preview. The original chunks are accumulated independently
-//! for final serde decoding, which retains compatible wrapper handling.
+//! ...) for live preview. The request executor retains the original payload
+//! independently for final decoding.
 
 use std::marker::PhantomData;
 
 use serde::Deserialize;
 
+#[cfg(test)]
 use super::decode::prepare_json_payload;
 use super::events::{key_path, PreviewEvents};
 
@@ -16,9 +17,10 @@ use super::events::{key_path, PreviewEvents};
 ///
 /// json_skimmer selects string fragments at the exact root path without
 /// extracting JSON from prose or markdown wrappers for live preview. The
-/// buffered original response belongs to the independent final decoder;
+/// original response belongs to the independent final decoder;
 /// previewed fragments do not establish that the document is valid.
 pub struct JsonFieldStreamFilter<T> {
+    #[cfg(test)]
     buffer: String,
     preview: PreviewEvents,
     _marker: PhantomData<fn() -> T>,
@@ -29,9 +31,10 @@ where
     T: for<'de> Deserialize<'de>,
 {
     /// Creates a filter that streams the top-level string field `target_field`.
-    pub fn new(target_field: impl Into<String>) -> Self {
+    pub(crate) fn new(target_field: impl Into<String>) -> Self {
         let target_field = target_field.into();
         Self {
+            #[cfg(test)]
             buffer: String::new(),
             preview: PreviewEvents::new(key_path(&[&target_field])),
             _marker: PhantomData,
@@ -40,18 +43,11 @@ where
 
     /// Appends a raw chunk and returns the freshly decoded text of the target
     /// field, or `None` when no new readable text is available.
-    ///
-    /// The raw buffer keeps accumulating independently so [`finish`](Self::finish)
-    /// can deserialize the complete payload even when preview is invalid.
-    pub fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+    pub(crate) fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+        #[cfg(test)]
         self.buffer.push_str(chunk);
         let text = self.preview.push(chunk.as_bytes()).concat();
         (!text.is_empty()).then_some(text)
-    }
-
-    /// Returns the accumulated raw JSON buffer received so far.
-    pub fn buffer(&self) -> &str {
-        &self.buffer
     }
 
     /// Returns the accumulated raw JSON buffer received so far, including any
@@ -66,7 +62,8 @@ where
     /// The buffer is first unwrapped from any markdown code fence and trimmed
     /// to the outermost balanced JSON object, so wrapper prose around the
     /// payload does not break decoding.
-    pub fn finish(self) -> Result<T, serde_json::Error> {
+    #[cfg(test)]
+    fn finish(self) -> Result<T, serde_json::Error> {
         let mut preview = self.preview;
         preview.finish();
         let payload = prepare_json_payload(&self.buffer);
@@ -149,11 +146,9 @@ mod tests {
     fn json_field_stream_filter_accessors_expose_accumulated_buffer() {
         let json = r#"{"message":"abc","count":9}"#;
         let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
-        assert_eq!(filter.buffer(), "");
         assert_eq!(filter.raw_buffer(), "");
         let _ = filter.push_chunk(json);
         assert_eq!(filter.raw_buffer(), json);
-        assert_eq!(filter.buffer(), json);
     }
     #[test]
     fn json_field_stream_filter_only_previews_the_root_field() {

@@ -3,9 +3,9 @@ use std::borrow::Cow;
 use crate::review::{IssueStatus, IssueType, ReviewIssue};
 use serde::Deserialize;
 
-use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::stream::json::decode::balanced_object_end;
 use crate::edits::stream::json::decode::prepare_json_payload;
+use crate::execution::structured::{StructuredContract, StructuredVisibility};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 use crate::review::prompt::build_review_system_prompt;
 
@@ -81,7 +81,7 @@ fn review_findings_response_schema() -> serde_json::Value {
 }
 
 /// Builds the provider [`ResponseFormat`] that enforces the review JSON schema.
-pub fn review_findings_response_format() -> ResponseFormat {
+fn review_findings_response_format() -> ResponseFormat {
     ResponseFormat::JsonSchema {
         json_schema: JsonSchemaDefinition {
             name: "review_findings".to_string(),
@@ -102,9 +102,9 @@ pub fn review_findings_response_format() -> ResponseFormat {
 #[derive(Debug, Deserialize)]
 pub struct ReviewFindingsOutput {
     #[serde(default)]
-    pub(crate) title: String,
+    title: String,
     #[serde(default)]
-    pub(crate) summary: String,
+    summary: String,
     #[serde(default)]
     findings: Vec<ReviewFindingOutput>,
 }
@@ -132,10 +132,10 @@ pub struct ReviewFindingOutput {
 
 /// Decoded single audit, including the exact provider text kept in the session.
 pub struct SingleReviewOutput {
-    pub raw_markdown: String,
-    pub title: Option<String>,
-    pub summary: Option<String>,
-    pub issues: Vec<ReviewIssue>,
+    pub(crate) raw_markdown: String,
+    pub(crate) title: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) issues: Vec<ReviewIssue>,
 }
 
 /// The single audit keeps nonempty unstructured text as an informational finding.
@@ -173,7 +173,7 @@ pub fn decode_single_review(raw: &str) -> Result<SingleReviewOutput, String> {
     })
 }
 
-pub fn decode_group_review(raw: &str) -> Result<Vec<ReviewIssue>, String> {
+fn decode_group_review(raw: &str) -> Result<Vec<ReviewIssue>, String> {
     if raw.trim().is_empty() {
         return Err("Model returned an empty review".into());
     }
@@ -192,7 +192,7 @@ pub fn decode_group_review(raw: &str) -> Result<Vec<ReviewIssue>, String> {
 /// model produced no textual conclusion. When no structured payload can be
 /// recovered, the raw text is preserved as a single informational issue so
 /// review output is never silently discarded.
-pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<ReviewIssue>) {
+fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<ReviewIssue>) {
     match parse_findings_output(raw) {
         Some(output) => issues_from_output(output),
         None => {
@@ -275,7 +275,7 @@ fn issues_from_output(
 /// Compatibility wrapper around [`parse_review_output`] that discards the
 /// session title and the high-level summary.
 #[cfg(test)]
-pub(crate) fn parse_review_findings(raw: &str) -> Vec<ReviewIssue> {
+fn parse_review_findings(raw: &str) -> Vec<ReviewIssue> {
     parse_review_output(raw).2
 }
 

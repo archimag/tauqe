@@ -185,7 +185,7 @@ fn render_custom_tool_list(project: &ProjectConfig) -> String {
 
 /// Closing sentence of the research rule: it states how one round of discovery is
 /// dispatched, and both variants of the rule end with it.
-const RESEARCH_ROUND_DISCIPLINE: &str = "A turn proceeds across autonomous rounds: choosing `research` executes your requests and immediately starts the next round of the same turn with the loaded context; choosing `answer`, `edit`, or `plan` concludes the turn. Operational Action Contract: `message` carries your conversational voice, while `action` dictates the turn state. The `answer` branch carries no payload because it is the completion marker: choose `answer` when your response in `message` is final and completely answers the developer without further context. Zero Promissory Prose Invariant: Never promise in `message` to inspect, search, or read files in the future. If you need context, you MUST populate `context_requests` or `repo_searches` with concrete items in this exact response. Stating that you are loading or searching for files while leaving research arrays empty or selecting `answer` is strictly prohibited. Send every request of a round in one response instead of spreading discovery across multiple turns, and when asked to inspect or modify code that is not in context, dispatch those requests rather than asking the developer for paths or answering with passive advice.";
+const RESEARCH_ROUND_DISCIPLINE: &str = "A turn proceeds across autonomous rounds: choosing `research` executes your requests and immediately starts the next round of the same turn with the loaded context; choosing `answer`, `edit`, or `plan` concludes the turn. Operational Action Contract: `message` carries your conversational voice, while `action` dictates the turn state. The `answer` branch carries no payload because it is the completion marker: choose `answer` when your response in `message` is final and completely answers the developer without further context. Zero Promissory Prose Invariant: Never promise in `message` to inspect, search, or read files in the future. If you need context, you MUST populate `context_requests` or `repo_searches` with concrete items in this exact response. Stating that you are loading or searching for files while leaving research arrays empty or selecting `answer` is strictly prohibited. Treat each context_feedback result as completed work in the same turn. When the developer requests successive batches, use the loaded paths to track which batches are complete and proceed with the remaining task. If loading those batches was the whole request, report completion. Send every request of a round in one response instead of spreading discovery across multiple turns, and when asked to inspect or modify code that is not in context, dispatch those requests rather than asking the developer for paths or answering with passive advice.";
 
 pub fn contract_rule(capability: LlmCapability, ctx: &ContractContext<'_>) -> Option<ContractRule> {
     match capability {
@@ -599,12 +599,12 @@ mod tests {
 
     #[test]
     fn the_plan_action_semantics_travel_in_the_delta_rule() {
-        let repl_expr = crate::control::repl::repl_capability_expr(None);
+        let repl_expr = crate::llm::repl::repl_capability_expr(None);
         let repl_delta =
             delta_rule(LlmCapability::PlanCreation, &repl_expr).expect("repl delta rendered");
         assert!(repl_delta.body.contains("ONLY propose new plans"));
 
-        let disc_expr = crate::control::repl::repl_capability_expr(Some(
+        let disc_expr = crate::llm::repl::repl_capability_expr(Some(
             &crate::discussion::DiscussionTarget::Plan { id: "p1".into() },
         ));
         let disc_delta =
@@ -628,12 +628,12 @@ mod tests {
         let surfaces = [
             (
                 "interactive_repl",
-                crate::control::repl::repl_capability_expr(None),
+                crate::llm::repl::repl_capability_expr(None),
                 ContourKind::Dialogue,
             ),
             (
                 "plan_discussion",
-                crate::control::repl::repl_capability_expr(Some(
+                crate::llm::repl::repl_capability_expr(Some(
                     &crate::discussion::DiscussionTarget::Plan {
                         id: "p-1".to_string(),
                     },
@@ -642,7 +642,7 @@ mod tests {
             ),
             (
                 "review_discussion",
-                crate::control::repl::repl_capability_expr(Some(
+                crate::llm::repl::repl_capability_expr(Some(
                     &crate::discussion::DiscussionTarget::Review {
                         id: "r-1".to_string(),
                     },
@@ -651,12 +651,12 @@ mod tests {
             ),
             (
                 "isolated_step",
-                crate::control::turn::turn_capability_expr(),
+                crate::llm::step::turn_capability_expr(),
                 ContourKind::Step,
             ),
             (
                 "architect_synthesis",
-                crate::control::refine::architect_synthesis_capability_expr(),
+                crate::plan::prompt::architect_synthesis_capability_expr(),
                 ContourKind::Architect,
             ),
         ];

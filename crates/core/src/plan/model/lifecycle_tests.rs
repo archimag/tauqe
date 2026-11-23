@@ -1,4 +1,5 @@
-use super::{Plan, PlanItem, PlanItemStatus};
+use super::implementation::LeafTransitionError;
+use super::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
 fn item(id: &str, title: &str, status: PlanItemStatus, children: Vec<PlanItem>) -> PlanItem {
     PlanItem {
         id: id.into(),
@@ -8,6 +9,74 @@ fn item(id: &str, title: &str, status: PlanItemStatus, children: Vec<PlanItem>) 
         ..Default::default()
     }
 }
+#[test]
+fn test_leaf_transition_clears_blocker_and_can_finish_without_commit() {
+    use PlanItemStatus::{Blocked, Done, InProgress, Todo};
+
+    let mut implementation = PlanImplementation {
+        items: vec![item(
+            "parent",
+            "Parent",
+            Todo,
+            vec![item("Leaf", "Leaf", Todo, vec![])],
+        )],
+        ..Default::default()
+    };
+    assert_eq!(
+        implementation.transition_leaf("missing", Blocked, None, None),
+        Ok(None)
+    );
+    assert_eq!(
+        implementation.transition_leaf("parent", Blocked, None, None),
+        Err(LeafTransitionError::Container("parent".into()))
+    );
+    assert_eq!(
+        implementation.transition_leaf(" leaf ", Blocked, Some(" waiting "), Some("ignored")),
+        Ok(Some(true))
+    );
+    let leaf = implementation.find_item("Leaf").unwrap();
+    assert_eq!(leaf.blocked_reason.as_deref(), Some("waiting"));
+    assert_eq!(leaf.commit, None);
+    assert_eq!(implementation.items[0].status, Blocked);
+
+    assert_eq!(
+        implementation.transition_leaf("Leaf", InProgress, None, None),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        implementation.find_item("Leaf").unwrap().blocked_reason,
+        None
+    );
+    assert_eq!(
+        implementation.transition_leaf("Leaf", InProgress, None, None),
+        Ok(Some(false))
+    );
+    assert_eq!(
+        implementation.transition_leaf("Leaf", Done, None, None),
+        Ok(Some(true))
+    );
+    assert_eq!(implementation.find_item("Leaf").unwrap().commit, None);
+    assert_eq!(implementation.items[0].status, Done);
+
+    let completed = implementation.clone();
+    assert_eq!(
+        implementation.transition_leaf("Leaf", Done, None, None),
+        Ok(Some(false))
+    );
+    assert_eq!(
+        implementation.transition_leaf("Leaf", Done, None, Some("late")),
+        Err(LeafTransitionError::DoneCommit("Leaf".into()))
+    );
+    assert_eq!(
+        implementation.transition_leaf("Leaf", Todo, None, None),
+        Err(LeafTransitionError::DoneStatus {
+            id: "Leaf".into(),
+            status: Todo
+        })
+    );
+    assert_eq!(implementation, completed);
+}
+
 #[test]
 fn test_normalize_lifecycle_provenance_drops_unearned_claims() {
     let mut done = item("1", "Finished", PlanItemStatus::Done, vec![]);

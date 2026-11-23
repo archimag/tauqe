@@ -1,20 +1,34 @@
 //! Best-effort bounded journal compaction owned by the application.
 
+use super::history::HistorySession;
 use crate::api::{Application, HistoryError, OperationGuard};
-use crate::application::infrastructure::execution::CompactionEnvironment;
+use crate::application::infrastructure::execution::{CompactionEnvironment, ExecutionSession};
 use tauqe_core::blocking::run_blocking_async;
-use tauqe_core::control::context::{CancellationToken, EventSink};
+use tauqe_core::execution::{CancellationToken, EventSink};
 use tauqe_core::providers::ChatMessage;
 
 impl Application {
-    /// The caller's operation keeps the history copy and adoption exclusive
-    /// with destructive journal mutations, without locking over provider I/O.
     pub(crate) async fn compact_history(
         &self,
         operation: &OperationGuard,
         environment: &CompactionEnvironment,
     ) -> Result<(), HistoryError> {
-        if !self.owns_operation(operation) {
+        self.history_session()
+            .compact_history(&self.execution_session(), operation, environment)
+            .await
+    }
+}
+
+impl HistorySession {
+    /// The caller's operation keeps the history copy and adoption exclusive
+    /// with destructive journal mutations, without locking over provider I/O.
+    pub(crate) async fn compact_history(
+        &self,
+        resources: &ExecutionSession,
+        operation: &OperationGuard,
+        environment: &CompactionEnvironment,
+    ) -> Result<(), HistoryError> {
+        if !resources.owns(operation) {
             return Err(HistoryError::OperationNotOwned);
         }
         let cancel = operation.cancel_receiver();
@@ -22,7 +36,7 @@ impl Application {
             return Ok(());
         }
         let policy = environment.policy();
-        let history = self.history_for_turn().await?;
+        let history = self.clone_for_turn().await?;
         let budget = policy.budget_tokens;
         if !history.needs_compaction(budget) {
             return Ok(());
@@ -40,10 +54,10 @@ impl Application {
         else {
             return Ok(());
         };
-        if *cancel.borrow() || !self.owns_operation(operation) {
+        if *cancel.borrow() || !resources.owns(operation) {
             return Ok(());
         }
-        let execution = match environment.scribe(self, operation).await {
+        let execution = match environment.scribe(resources, operation).await {
             Ok(execution) => execution,
             Err(error) => {
                 tracing::warn!(error = %error, "session journal stayed over budget: the Scribe provider is unavailable");
@@ -71,13 +85,13 @@ impl Application {
                 return Ok(());
             }
         };
-        if *cancel.borrow() || !self.owns_operation(operation) {
+        if *cancel.borrow() || !resources.owns(operation) {
             return Ok(());
         }
-        let application = self.clone();
+        let operations = resources.operations.clone();
         let operation_id = operation.id();
         let history = run_blocking_async(move || {
-            if *cancel.borrow() || application.active_operation_id() != Some(operation_id) {
+            if *cancel.borrow() || operations.current_id() != Some(operation_id) {
                 return Ok(None);
             }
             let mut history = history;
@@ -99,7 +113,7 @@ impl Application {
                 "compacted the session journal before the turn"
             );
         }
-        self.adopt_turn_history(history).await;
+        self.adopt(history).await;
         Ok(())
     }
 }
@@ -160,14 +174,15 @@ mod tests {
         let (sender, receiver) = mpsc::unbounded_channel();
         let app = Application::for_repository(AppConfig::default(), root, sender);
         for index in 1..=4 {
-            app.record_history_exchange(
-                format!("Task {index}"),
-                Vec::new(),
-                format!("Done {index}"),
-                None,
-            )
-            .await
-            .unwrap();
+            app.history_session()
+                .record_history_exchange(
+                    format!("Task {index}"),
+                    Vec::new(),
+                    format!("Done {index}"),
+                    None,
+                )
+                .await
+                .unwrap();
         }
         let mut config = AppConfig::default();
         config.history.budget_tokens = app.history_token_estimate().await / 2;

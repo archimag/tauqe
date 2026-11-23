@@ -7,7 +7,7 @@ use crate::application::infrastructure::execution::PlanExecutionEnvironment;
 use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::control::structured::StructuredError;
+use tauqe_core::execution::structured::StructuredError;
 use tauqe_core::git::CommitSummary;
 use tauqe_core::models::{ModelRole, ModelSelection};
 use tauqe_core::providers::{ChatMessage, StreamEvent};

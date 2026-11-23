@@ -1,99 +1,58 @@
-//! Classify completed interactive turns and persist their terminal response.
+//! Project completed interactive turns and persist their terminal response.
 
 use crate::api::{Application, ContextClearScope, HistoryError, OperationGuard};
 
-use tauqe_core::control::outcome::{LoopResult, SystemError};
-use tauqe_core::control::repl::ReplArtifact;
 use tauqe_core::edits::EditOutcome;
 use tauqe_core::history::HistoryFileChange;
 use tauqe_core::llm::ModelResult;
 use tauqe_core::plan::PlanRejection;
 
+pub(crate) const REPL_EDIT_SUMMARY: &str = "REPL changes";
+
 pub struct InteractiveTurnCompletion {
     pub result: ModelResult,
     pub(crate) error: Option<String>,
-    pub(crate) plans_applied: bool,
     pub plan_rejections: Vec<PlanRejection>,
     pub plan_warnings: Vec<String>,
-    pub(crate) review_decisions_applied: Vec<u32>,
-    history_response: String,
+    pub(crate) history_response: String,
 }
 
-pub fn classify_interactive_completion(
-    result: Result<LoopResult<ReplArtifact>, SystemError>,
-    streamed_text: String,
-) -> InteractiveTurnCompletion {
-    let (artifact, error) = match result {
-        Ok(LoopResult::Success(success)) => {
-            let error = success.value.commit_error.clone();
-            (Some(success.value), error)
+impl InteractiveTurnCompletion {
+    pub(crate) fn answer(text: String) -> Self {
+        Self {
+            result: ModelResult::Answer { text: text.clone() },
+            error: None,
+            plan_rejections: Vec::new(),
+            plan_warnings: Vec::new(),
+            history_response: text,
         }
-        Ok(LoopResult::Diverged(_)) => (None, Some("Execution diverged".to_string())),
-        Ok(LoopResult::Exhausted(report)) => (None, Some(report.reason)),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let (plans_applied, plan_rejections, plan_warnings, review_decisions_applied) = match &artifact
-    {
-        Some(artifact) => (
-            artifact.plans_applied,
-            artifact.plan_rejections.clone(),
-            artifact.plan_warnings.clone(),
-            artifact.review_decisions_applied.clone(),
-        ),
-        None => (false, Vec::new(), Vec::new(), Vec::new()),
-    };
-    let (result, history_response) = match artifact {
-        Some(artifact) => {
-            let text = artifact.message.unwrap_or_else(|| {
-                if !streamed_text.trim().is_empty() {
-                    streamed_text
-                } else {
-                    "Research completed.".to_string()
-                }
-            });
-            let result = if artifact.modified_paths.is_empty() {
-                ModelResult::Answer { text: text.clone() }
-            } else {
-                ModelResult::Edit {
-                    summary: "REPL changes".to_string(),
-                    edits: Vec::new(),
-                    proposal: None,
-                    outcome: EditOutcome {
-                        applied: artifact.commit_error.is_none(),
-                        error: artifact.commit_error,
-                        changed_files: artifact.modified_paths,
-                        commit_hash: artifact.commit_hash,
-                        verification: artifact.verification,
-                    },
-                }
-            };
-            (result, text)
+    }
+
+    pub(crate) fn failed(error: String) -> Self {
+        Self {
+            error: Some(error.clone()),
+            ..Self::answer(error)
         }
-        None => {
-            let text = if !streamed_text.trim().is_empty() {
-                streamed_text
-            } else {
-                error
-                    .clone()
-                    .unwrap_or_else(|| "Operation failed".to_string())
-            };
-            (ModelResult::Answer { text: text.clone() }, text)
+    }
+
+    pub(crate) fn edit(text: String, outcome: EditOutcome) -> Self {
+        Self {
+            error: outcome.error.clone(),
+            history_response: outcome.error.clone().unwrap_or(text),
+            result: ModelResult::Edit {
+                summary: REPL_EDIT_SUMMARY.into(),
+                edits: Vec::new(),
+                proposal: None,
+                outcome,
+            },
+            plan_rejections: Vec::new(),
+            plan_warnings: Vec::new(),
         }
-    };
-    InteractiveTurnCompletion {
-        result,
-        error,
-        plans_applied,
-        plan_rejections,
-        plan_warnings,
-        review_decisions_applied,
-        history_response,
     }
 }
 
 impl Application {
-    /// Keep the existing cleanup policy even when the journal write fails.
-    /// The adapter publishes edit/Git events before calling this scenario.
+    /// Record the response independently of publishing the settled edit.
     pub(crate) async fn persist_interactive_completion(
         &self,
         operation: &OperationGuard,
@@ -102,13 +61,25 @@ impl Application {
         if !self.owns_operation(operation) {
             return Err(HistoryError::OperationNotOwned);
         }
-        let (commit, summary, files) = match &completion.result {
-            ModelResult::Answer { .. } => (None, None, Vec::new()),
+        let edit = match &completion.result {
+            ModelResult::Answer { .. } => None,
             ModelResult::Edit {
                 summary, outcome, ..
-            } if outcome.applied => (
+            } => Some((outcome, summary.as_str())),
+        };
+        self.record_interactive_response(completion.history_response.clone(), edit)
+            .await
+    }
+
+    pub(crate) async fn record_interactive_response(
+        &self,
+        message: String,
+        edit: Option<(&EditOutcome, &str)>,
+    ) -> Result<(), HistoryError> {
+        let (commit, summary, files) = match edit {
+            Some((outcome, summary)) if outcome.applied => (
                 outcome.commit_hash.clone(),
-                Some(summary.clone()),
+                Some(summary.to_owned()),
                 outcome
                     .changed_files
                     .iter()
@@ -116,16 +87,16 @@ impl Application {
                     .map(HistoryFileChange::plain)
                     .collect(),
             ),
-            ModelResult::Edit { .. } => (None, None, Vec::new()),
+            _ => (None, None, Vec::new()),
         };
-        let persisted = self
-            .record_history_response(completion.history_response.clone(), commit, summary, files)
-            .await;
-        if matches!(&completion.result, ModelResult::Edit { outcome, .. } if outcome.applied) {
-            let _ = self.clear_context(ContextClearScope::Transient).await;
-            self.reset_session_uuid().await;
-        }
-        persisted
+        self.record_history_response(message, commit, summary, files)
+            .await
+    }
+
+    /// An applied edit invalidates transient context even if history is unavailable.
+    pub(crate) async fn clean_up_interactive_edit(&self) {
+        let _ = self.clear_context(ContextClearScope::Transient).await;
+        self.reset_session_uuid().await;
     }
 }
 
@@ -133,33 +104,21 @@ impl Application {
 mod tests {
     use super::*;
     use tauqe_core::context::ContextAccess;
-    use tauqe_core::control::outcome::{FailureReport, LoopSuccess, ResponseEnvelope};
     use tauqe_core::edits::VerificationVerdict;
     use tauqe_core::history::entry::HistoryEntry;
 
-    fn artifact(message: Option<&str>, paths: Vec<String>) -> ReplArtifact {
-        ReplArtifact {
-            message: message.map(str::to_string),
-            modified_paths: paths,
-            plans_applied: false,
-            plan_rejections: Vec::new(),
-            plan_warnings: Vec::new(),
-            review_decisions_applied: Vec::new(),
-            envelope: ResponseEnvelope::default(),
-            commit_hash: None,
-            verification: None,
-            commit_error: None,
-            rounds_spent: 1,
-        }
-    }
-
-    fn completed(artifact: ReplArtifact, streamed: &str) -> InteractiveTurnCompletion {
-        classify_interactive_completion(
-            Ok(LoopResult::Success(LoopSuccess::new(
-                artifact,
-                ResponseEnvelope::default(),
-            ))),
-            streamed.to_string(),
+    fn applied_edit(
+        text: &str,
+        verification: Option<VerificationVerdict>,
+    ) -> InteractiveTurnCompletion {
+        InteractiveTurnCompletion::edit(
+            text.into(),
+            EditOutcome {
+                applied: true,
+                changed_files: vec!["discovered.rs".into()],
+                verification,
+                ..Default::default()
+            },
         )
     }
 
@@ -174,80 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn completion_preserves_message_precedence_and_mutation_metadata() {
-        for (message, streamed, expected) in [
-            (Some("Answer"), "Stream", "Answer"),
-            (Some(""), "Stream", ""),
-            (None, " Stream ", " Stream "),
-            (None, "  ", "Research completed."),
-        ] {
-            let completion = completed(artifact(message, Vec::new()), streamed);
-            assert_eq!(
-                completion.result,
-                ModelResult::Answer {
-                    text: expected.into()
-                }
-            );
-            assert!(completion.error.is_none());
-        }
-        let mut value = artifact(Some("Updated"), Vec::new());
-        value.plans_applied = true;
-        value.plan_rejections = vec![PlanRejection::payload_defect("invalid plan update")];
-        value.plan_warnings = vec!["Adjusted status".into()];
-        value.review_decisions_applied = vec![7];
-        let completion = completed(value, "");
-        assert!(completion.plans_applied);
-        assert_eq!(completion.plan_rejections.len(), 1);
-        assert_eq!(completion.plan_warnings, vec!["Adjusted status"]);
-        assert_eq!(completion.review_decisions_applied, vec![7]);
-    }
-
-    #[test]
-    fn failed_loop_outcomes_preserve_error_and_streamed_answer_fallbacks() {
-        let cases = [
-            (
-                Ok(LoopResult::Diverged(ResponseEnvelope::default())),
-                "Execution diverged",
-            ),
-            (
-                Ok(LoopResult::Exhausted(FailureReport::new(
-                    "round budget",
-                    3,
-                    Vec::new(),
-                ))),
-                "round budget",
-            ),
-            (
-                Err(SystemError::Provider("offline".into())),
-                "provider error: offline",
-            ),
-        ];
-        for (result, expected) in cases {
-            let completion = classify_interactive_completion(result, "Streamed answer".into());
-            assert_eq!(completion.error.as_deref(), Some(expected));
-            assert_eq!(
-                completion.result,
-                ModelResult::Answer {
-                    text: "Streamed answer".into()
-                }
-            );
-        }
-        let completion =
-            classify_interactive_completion(Err(SystemError::Other("failed".into())), "  ".into());
-        assert_eq!(
-            completion.result,
-            ModelResult::Answer {
-                text: "infrastructure error: failed".into()
-            }
-        );
-    }
-
-    #[test]
     fn edit_completion_preserves_actual_verification_and_finalization_failure() {
-        let mut value = artifact(Some("Updated"), vec!["discovered.rs".into()]);
-        value.verification = Some(VerificationVerdict::NotConfigured);
-        value.commit_error = Some("Git finalization failed".into());
-        let completion = completed(value, "");
+        let completion = InteractiveTurnCompletion::edit(
+            "Updated".into(),
+            EditOutcome {
+                verification: Some(VerificationVerdict::NotConfigured),
+                error: Some("Git finalization failed".into()),
+                ..Default::default()
+            },
+        );
         assert_eq!(completion.error.as_deref(), Some("Git finalization failed"));
         let ModelResult::Edit { outcome, .. } = completion.result else {
             panic!("expected edit outcome");
@@ -275,9 +169,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let identity = app.session_uuid().await;
-        let mut value = artifact(Some("Full developer reply"), vec!["discovered.rs".into()]);
-        value.verification = Some(VerificationVerdict::Passed);
-        let completion = completed(value, "");
+        let completion = applied_edit("Full developer reply", Some(VerificationVerdict::Passed));
         match &completion.result {
             ModelResult::Edit { outcome, .. } => {
                 assert!(outcome.applied);
@@ -290,7 +182,14 @@ mod tests {
         app.persist_interactive_completion(&operation, &completion)
             .await
             .unwrap();
-        let history = app.history_for_turn().await.unwrap().snapshot().unwrap();
+        let history = app
+            .history_session()
+            .clone_for_turn()
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        app.clean_up_interactive_edit().await;
         match history.entries().last().unwrap() {
             HistoryEntry::Response {
                 message,
@@ -322,7 +221,7 @@ mod tests {
         .unwrap();
         let identity = app.session_uuid().await;
         let before = app.context_state().await.revision;
-        let completion = completed(artifact(Some("Answer"), Vec::new()), "");
+        let completion = InteractiveTurnCompletion::answer("Answer".into());
         let operation = app.try_begin_operation().unwrap();
         app.persist_interactive_completion(&operation, &completion)
             .await
@@ -343,13 +242,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let identity = app.session_uuid().await;
-        let completion = completed(artifact(None, vec!["discovered.rs".into()]), "");
+        let completion = applied_edit("Edited", None);
         let operation = app.try_begin_operation().unwrap();
         assert!(matches!(
             app.persist_interactive_completion(&operation, &completion)
                 .await,
             Err(HistoryError::Storage(_))
         ));
+        app.clean_up_interactive_edit().await;
         assert!(app.context_state().await.items.is_empty());
         assert_ne!(identity, app.session_uuid().await);
     }
@@ -367,7 +267,7 @@ mod tests {
         let identity = app.session_uuid().await;
         let other = Application::default();
         let foreign = other.try_begin_operation().unwrap();
-        let completion = completed(artifact(None, vec!["discovered.rs".into()]), "");
+        let completion = applied_edit("Edited", None);
         assert!(matches!(
             app.persist_interactive_completion(&foreign, &completion)
                 .await,

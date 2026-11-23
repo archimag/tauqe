@@ -256,7 +256,7 @@ fn capability_schema(
             map.insert(
                 "message".to_string(),
                 string_property(
-                    "Conversational explanation or response to the user, present at every stage of the turn whatever branch the action selects",
+                    "Explain what you are doing and why in every intermediate round. Use earlier assistant messages to avoid repeating yourself. In the final round, give the result.",
                 ),
             );
         }
@@ -1190,7 +1190,7 @@ mod tests {
                     );
                 }
             }
-            let surface = crate::control::repl::repl_capability_expr(None);
+            let surface = crate::llm::repl::repl_capability_expr(None);
             let composed = capability_expr_schema(&surface, &ctx);
             assert_descriptions(&composed, &format!("interactive_repl/{strategy}"), true);
         }
@@ -1307,7 +1307,7 @@ mod tests {
 
         // Full interactive_repl surface composes cleanly with all descriptions.
         let repl_schema =
-            capability_expr_schema(&crate::control::repl::repl_capability_expr(None), &ctx);
+            capability_expr_schema(&crate::llm::repl::repl_capability_expr(None), &ctx);
         assert_descriptions(&repl_schema, "interactive_repl_expr", true);
     }
 
@@ -1316,7 +1316,7 @@ mod tests {
         use crate::discussion::DiscussionTarget;
 
         let ctx = PromptRenderContext::new(&[], None);
-        let focused = crate::control::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
+        let focused = crate::llm::repl::repl_capability_expr(Some(&DiscussionTarget::Plan {
             id: "p-1".into(),
         }));
         let composed = capability_expr_schema(&focused, &ctx);

@@ -9,6 +9,7 @@
 use crate::context::ContextAccess;
 pub mod journal;
 pub mod search;
+pub mod step;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -54,7 +55,7 @@ impl Default for ResearchLimits {
 
 impl ResearchLimits {
     /// Reads the Research caps declared by the project configuration.
-    pub(crate) fn from_context_config(config: &ContextConfig) -> Self {
+    pub fn from_context_config(config: &ContextConfig) -> Self {
         Self {
             max_search_requests_per_round: config.max_search_requests_per_round,
             max_matched_files_per_search: config.max_matched_files_per_search,
@@ -367,11 +368,11 @@ pub struct ResearchRoundOutcome {
     /// Set when context additions would breach the files token budget.
     pub(crate) limit_exceeded: Option<ContextLimitExceeded>,
     /// Files that widened the effective context this round.
-    pub(crate) added_files: Vec<String>,
+    added_files: Vec<String>,
     /// Requested files that do not exist in the repository.
-    pub(crate) missing_files: Vec<String>,
+    missing_files: Vec<String>,
     /// Requested files whose current access already satisfied the request.
-    pub(crate) already_satisfied_files: Vec<String>,
+    already_satisfied_files: Vec<String>,
     /// External documents the OuterDocs layer refused, with the reported reason.
     outer_docs_rejected: Vec<OuterDocsRejection>,
     /// External documents the developer's trust declaration refused.
@@ -390,10 +391,14 @@ pub struct ResearchRoundOutcome {
     /// Targeted repository maps rendered this round.
     repo_maps_loaded: usize,
     /// Feedback blocks to inject into the next proposal round.
-    pub(crate) feedback_blocks: Vec<String>,
+    feedback_blocks: Vec<String>,
 }
 
 impl ResearchRoundOutcome {
+    pub fn limit_exceeded(&self) -> Option<&ContextLimitExceeded> {
+        self.limit_exceeded.as_ref()
+    }
+
     /// Reports whether the round changed what the model can see or taught it
     /// something it has not been told yet.
     ///
@@ -401,7 +406,7 @@ impl ResearchRoundOutcome {
     /// files as progress. The architect loop needs that: the model still
     /// deserves the explanation that those files are already visible, so such a
     /// round must not be mistaken for a dead end.
-    pub(crate) fn has_progress(&self, allow_already_satisfied: bool) -> bool {
+    pub fn has_progress(&self, allow_already_satisfied: bool) -> bool {
         !self.added_files.is_empty()
             || !self.missing_files.is_empty()
             || !self.searches_executed.is_empty()
@@ -423,7 +428,7 @@ impl ResearchRoundOutcome {
     /// is told to report the missing document instead of routing around the
     /// prohibition. A delivery failure addresses the model, which works with
     /// the material it already holds and retries when the source is reachable.
-    pub(crate) fn record_outer_docs_failure(&mut self, path: &str, error: &MaterializeError) {
+    fn record_outer_docs_failure(&mut self, path: &str, error: &MaterializeError) {
         let Some(refusal) = error.trust() else {
             self.record_delivery_failure(path, error.reason());
             return;
@@ -480,7 +485,7 @@ impl ResearchRoundOutcome {
     }
 
     /// Detailed round summary for the architect research banner.
-    pub(crate) fn architect_banner_summary(&self) -> String {
+    pub fn architect_banner_summary(&self) -> String {
         let mut notes = Vec::new();
         if !self.added_files.is_empty() {
             notes.push(format!(
@@ -1064,7 +1069,7 @@ fn cancel_requested(cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> b
 /// abandoned resolves immediately, before the repository file list is read and
 /// before a single handler runs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_research_commands(
+pub async fn execute_research_commands(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     commands: &[LlmCommand],

@@ -202,6 +202,16 @@ pub enum PlanScopeEvaluation {
     NotFound,
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LeafTransitionError {
+    #[error("Cannot update status of step '{0}': the step is a container")]
+    Container(String),
+    #[error("Cannot regress status of completed step '{id}' from DONE to {status}: completed steps are immutable")]
+    DoneStatus { id: String, status: PlanItemStatus },
+    #[error("Cannot modify commit of completed step '{0}': completed steps are immutable")]
+    DoneCommit(String),
+}
+
 /// Collects DISCUSSION markers, executable candidate leaves, and blocked leaves
 /// from an implementation subtree.
 ///
@@ -394,8 +404,8 @@ impl PlanImplementation {
     /// a genuine transition: the method returns `true` only when a leaf item
     /// matched and its status was durably changed. It returns `false` for an
     /// unknown identifier, for a container target, and for a leaf that already
-    /// carries the requested status, so a caller never mistakes a discarded or
-    /// idempotent assignment for a successful update.
+    /// carries the requested status or is already `Done`, so a caller never
+    /// mistakes a refused or idempotent assignment for a status change.
     ///
     /// A no-op assignment leaves the ancestors untouched: the leaf keeps the
     /// value they were already derived from, so no derived status can change.
@@ -403,31 +413,80 @@ impl PlanImplementation {
     /// Protocol has a separate client projection for optimistic UI updates;
     /// durable mutations still pass through the core storage guards.
     pub fn update_item_status(&mut self, item_id: &str, status: PlanItemStatus) -> bool {
-        // Locates the target and classifies it: `Some(true)` for a leaf whose
-        // status actually changes, `Some(false)` for a non-assignable container
-        // or an already-satisfied leaf, `None` when absent.
-        fn walk(items: &mut [PlanItem], target: &str, status: PlanItemStatus) -> Option<bool> {
+        if self
+            .find_item(item_id)
+            .is_some_and(|item| item.status == status)
+        {
+            return false;
+        }
+        matches!(
+            self.transition_leaf(item_id, status, None, None),
+            Ok(Some(true))
+        )
+    }
+
+    /// Applies status and lifecycle provenance to one leaf.
+    ///
+    /// `None` means the identifier was not found; `Some(false)` means the
+    /// assignment was already satisfied. Refusals leave the horizon unchanged.
+    /// A commit is recorded only on entering `Done`. Retrying completion
+    /// without a commit leaves the existing record intact.
+    pub(crate) fn transition_leaf(
+        &mut self,
+        item_id: &str,
+        status: PlanItemStatus,
+        blocked_reason: Option<&str>,
+        commit: Option<&str>,
+    ) -> Result<Option<bool>, LeafTransitionError> {
+        fn find_mut<'a>(items: &'a mut [PlanItem], target: &str) -> Option<&'a mut PlanItem> {
             for item in items {
                 if id_key(&item.id) == target {
-                    if item.is_leaf() && item.status != status {
-                        item.status = status;
-                        return Some(true);
-                    }
-                    return Some(false);
+                    return Some(item);
                 }
-                if let Some(updated) = walk(&mut item.children, target, status) {
-                    return Some(updated);
+                if let Some(found) = find_mut(&mut item.children, target) {
+                    return Some(found);
                 }
             }
             None
         }
 
-        if walk(&mut self.items, &id_key(item_id), status) == Some(true) {
-            self.refresh_parent_statuses();
-            true
-        } else {
-            false
+        let Some(item) = find_mut(&mut self.items, &id_key(item_id)) else {
+            return Ok(None);
+        };
+        if !item.is_leaf() {
+            return Err(LeafTransitionError::Container(item.id.clone()));
         }
+
+        let commit = commit.map(str::trim).filter(|hash| !hash.is_empty());
+        if item.status == PlanItemStatus::Done {
+            if status != PlanItemStatus::Done {
+                return Err(LeafTransitionError::DoneStatus {
+                    id: item.id.clone(),
+                    status,
+                });
+            }
+            if commit.is_some_and(|hash| item.commit.as_deref() != Some(hash)) {
+                return Err(LeafTransitionError::DoneCommit(item.id.clone()));
+            }
+            return Ok(Some(false));
+        }
+
+        let commit = commit.filter(|_| status == PlanItemStatus::Done);
+        let blocked_reason = blocked_reason
+            .map(str::trim)
+            .filter(|reason| status == PlanItemStatus::Blocked && !reason.is_empty());
+        if item.status == status
+            && item.commit.as_deref() == commit
+            && item.blocked_reason.as_deref() == blocked_reason
+        {
+            return Ok(Some(false));
+        }
+
+        item.status = status;
+        item.commit = commit.map(str::to_string);
+        item.blocked_reason = blocked_reason.map(str::to_string);
+        self.refresh_parent_statuses();
+        Ok(Some(true))
     }
 
     /// Evaluates a scope (leaf item, composite subtree, or entire horizon if

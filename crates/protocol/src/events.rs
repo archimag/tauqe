@@ -15,6 +15,7 @@ pub const MODEL_ESCALATED: &str = "model/escalated";
 pub const CONTEXT_CHANGED: &str = "context/changed";
 pub const CONFIG_CHANGED: &str = "config/changed";
 
+pub const HISTORY_ENTRY_UPDATED: &str = "history/entryUpdated";
 pub const HISTORY_ENTRY_ADDED: &str = "history/entryAdded";
 pub const HISTORY_COMPACTED: &str = "history/compacted";
 pub const HISTORY_ENTRY_ROLLED_BACK: &str = "history/entryRolledBack";

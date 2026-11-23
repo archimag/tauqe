@@ -2,38 +2,77 @@
 
 use crate::api::{Application, OperationGuard};
 use crate::application::configuration::ConfigurationSnapshot;
-use crate::application::plan_horizon::ArchitectScope;
-use crate::application::turn_setup::{ResolvedTurnModel, TurnMode, TurnProviderError};
-use std::{path::Path, sync::Arc};
-use tauqe_core::context::ContextManager;
-use tauqe_core::control::context::{CancellationToken, EventSink};
-use tauqe_core::control::execution::{
-    BoundedUnitRequest, ContinuationRequest, ExecutionUnit, TurnExecutionConfig,
+use crate::application::operation::OperationRegistry;
+use crate::application::turn_setup::{ResolvedTurnModel, TurnProviderError};
+use crate::workflows::architect::ArchitectScope;
+use std::sync::Arc;
+use tauqe_core::execution::structured::{self, StructuredContract, StructuredError};
+use tauqe_core::execution::{
+    CancellationToken, EventSink, ExecutionError, PromptExecutor, PromptInput,
 };
-use tauqe_core::control::outcome::ResponseEnvelope;
-use tauqe_core::control::outcome::{LoopResult, SystemError};
-use tauqe_core::control::research_unit::{
-    StructuredResearchError, StructuredResearchProgress, StructuredResearchReply,
-    StructuredResearchUnit,
-};
-use tauqe_core::control::structured::{self, StructuredContract, StructuredError};
-use tauqe_core::control::turn::{TurnArtifact, TurnCompletion, TurnLoopConfig};
-use tauqe_core::history::HistorySnapshot;
 use tauqe_core::llm::CapabilityTree;
-use tauqe_core::llm::LlmCommand;
 use tauqe_core::models::{
     ArchitectTier, ModelRef, ModelRole, ModelSelection, ProviderKind, ReasoningEffort,
 };
-use tauqe_core::prompt::refine::PlanRefinePromptProtocol;
-use tauqe_core::prompt::{json::JsonPromptProtocol, protocol::PromptProtocol, TurnBrief};
+use tauqe_core::prompt::refine::{PlanRefinePromptProtocol, PlanRefineRound};
+use tauqe_core::prompt::{json::JsonPromptProtocol, protocol::PromptProtocol};
 use tauqe_core::providers::{
-    format_session_id, ChatMessage, LlmProvider, SESSION_PREFIX_ARCHITECT, SESSION_PREFIX_REPL,
-    SESSION_PREFIX_REVIEW,
+    format_session_id, ChatMessage, LlmProvider, SESSION_PREFIX_ARCHITECT, SESSION_PREFIX_REVIEW,
 };
 use tauqe_core::workflow::policy::{ApplyPolicy, DirectApplyPolicy};
 use tauqe_core::workflow::WorkflowKind;
-use tauqe_core::workflow::WorkflowOptions;
+use tauqe_core::workflow::{PatchStrategy, WorkflowOptions};
 use tokio::sync::watch;
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) type ProviderOverrides =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<ProviderKind, Arc<dyn LlmProvider>>>>;
+
+/// Session resources needed to bind technical execution without the facade.
+#[derive(Clone)]
+pub(crate) struct ExecutionSession {
+    pub operations: Arc<OperationRegistry>,
+    pub transaction: Arc<std::sync::atomic::AtomicBool>,
+    pub login: Option<Arc<tauqe_core::providers::ChatGptSignIn>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub provider_override: ProviderOverrides,
+}
+
+impl ExecutionSession {
+    pub(crate) fn owns(&self, operation: &OperationGuard) -> bool {
+        operation.belongs_to(&self.operations)
+    }
+
+    fn policy(
+        &self,
+        workflow: WorkflowKind,
+        cancel: watch::Receiver<bool>,
+    ) -> Box<dyn ApplyPolicy> {
+        match workflow {
+            WorkflowKind::Naive => Box::new(DirectApplyPolicy::new()),
+            WorkflowKind::Git => Box::new(
+                tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard_and_cancel(
+                    self.transaction.clone(),
+                    cancel,
+                ),
+            ),
+        }
+    }
+
+    async fn provider(
+        &self,
+        config: &tauqe_core::config::AppConfig,
+        kind: ProviderKind,
+    ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(provider) = self.provider_override.lock().await.get(&kind).cloned() {
+            return Ok(provider);
+        }
+        tauqe_core::providers::create_provider_with_login(kind, config, self.login.clone())
+            .map(Arc::from)
+            .map_err(|error| TurnProviderError::new(error.to_string()))
+    }
+}
 
 /// Frozen environment of an admitted operation. The operation is checked again
 /// at resolution time so a stale guard cannot start work under its successor.
@@ -41,7 +80,6 @@ pub(crate) struct ExecutionFactory<'a> {
     application: &'a Application,
     operation: &'a OperationGuard,
     environment: ExecutionEnvironment,
-    dialogue_id: String,
 }
 
 pub(crate) struct ExecutionEnvironment {
@@ -62,18 +100,17 @@ impl CompactionEnvironment {
 
     pub(crate) async fn scribe(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
     ) -> Result<StructuredExecution, TurnProviderError> {
-        if self.operation_id != operation.id() || !application.owns_operation(operation) {
+        if self.operation_id != operation.id() || !resources.owns(operation) {
             return Err(TurnProviderError::foreign_operation());
         }
         let model = self.environment.snapshot.config.history_model();
-        let provider = self
-            .environment
-            .provider(application, model.provider)
+        let provider = resources
+            .provider(&self.environment.snapshot.config, model.provider)
             .await?;
-        if !application.owns_operation(operation) {
+        if !resources.owns(operation) {
             return Err(TurnProviderError::foreign_operation());
         }
         Ok(StructuredExecution {
@@ -92,19 +129,33 @@ pub(crate) struct PlanExecutionEnvironment {
     operation_id: u64,
 }
 
-/// One Architect research unit; changing the rung retains its journal and cache.
+/// Operation-bound Architect requests. Rebinding preserves the executor's cache.
 pub(crate) struct ArchitectResearchExecution {
     environment: PlanExecutionEnvironment,
-    application: Application,
-    operation_id: u64,
-    provider: Arc<dyn LlmProvider>,
-    unit: StructuredResearchUnit,
+    resources: ExecutionSession,
+    pub(crate) executor: PromptExecutor,
     base_session: String,
     session: String,
     current_model: ModelRef,
 }
 
 impl ArchitectResearchExecution {
+    pub(crate) async fn execute_round(
+        &mut self,
+        input: PromptInput,
+        events: &EventSink,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Result<PlanRefineRound, String>>, ExecutionError> {
+        self.executor
+            .prepare(input)?
+            .execute_decoded(events, cancel, PlanRefinePromptProtocol::decode_round)
+            .await
+    }
+
+    pub(crate) fn config(&self) -> &tauqe_core::config::AppConfig {
+        self.environment.config()
+    }
+
     pub(crate) fn max_turn_rounds(&self) -> usize {
         WorkflowOptions::from_app_config(self.environment.config()).max_turn_rounds()
     }
@@ -117,15 +168,14 @@ impl ArchitectResearchExecution {
         &mut self,
         tier: &ArchitectTier,
     ) -> Result<(), TurnProviderError> {
-        if self.application.active_operation_id() != Some(self.operation_id) {
+        if self.resources.operations.current_id() != Some(self.environment.operation_id) {
             return Err(TurnProviderError::foreign_operation());
         }
-        self.provider = self
-            .environment
-            .environment
-            .provider(&self.application, tier.model.provider)
+        let provider = self
+            .resources
+            .provider(self.config(), tier.model.provider)
             .await?;
-        if self.application.active_operation_id() != Some(self.operation_id) {
+        if self.resources.operations.current_id() != Some(self.environment.operation_id) {
             return Err(TurnProviderError::foreign_operation());
         }
         if tier.model != self.current_model {
@@ -136,62 +186,13 @@ impl ArchitectResearchExecution {
             self.session = format_session_id(&self.base_session, &format!("tier{index}"));
         }
         self.current_model = tier.model.clone();
+        self.executor.rebind(
+            provider,
+            tier.model.name.clone(),
+            tier.effort,
+            Some(self.session.clone()),
+        );
         Ok(())
-    }
-
-    pub(crate) fn feedback(&mut self, text: &str) {
-        self.unit.feedback(text);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn request<T>(
-        &mut self,
-        root: &Path,
-        context: &mut ContextManager,
-        task: &str,
-        tier: &ArchitectTier,
-        grant: CapabilityTree,
-        feedback: Option<&str>,
-        decode: fn(&str) -> Result<T, String>,
-        cancel: &CancellationToken,
-        events: &EventSink,
-    ) -> Result<StructuredResearchReply<T>, StructuredResearchError> {
-        let protocol = PlanRefinePromptProtocol::default();
-        let options = WorkflowOptions::from_app_config(self.environment.config());
-        self.unit
-            .request(
-                TurnExecutionConfig {
-                    repo_root: root,
-                    provider: self.provider.as_ref(),
-                    model: &tier.model,
-                    protocol: &protocol,
-                    config: &self.environment.environment.snapshot.config,
-                    session_id: Some(self.session.clone()),
-                    reasoning_effort: tier.effort,
-                },
-                context,
-                &options,
-                task,
-                grant,
-                feedback,
-                decode,
-                cancel,
-                events,
-            )
-            .await
-    }
-
-    pub(crate) async fn research(
-        &mut self,
-        context: &mut ContextManager,
-        root: &Path,
-        commands: &[LlmCommand],
-        cancel: &CancellationToken,
-    ) -> StructuredResearchProgress {
-        let options = WorkflowOptions::from_app_config(self.environment.config());
-        self.unit
-            .research(context, root, commands, &options, cancel)
-            .await
     }
 }
 
@@ -216,13 +217,13 @@ impl PlanExecutionEnvironment {
 
     pub(crate) async fn for_structured(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         tier: &ArchitectTier,
         scope: &ArchitectScope,
     ) -> Result<StructuredExecution, TurnProviderError> {
         self.structured_execution(
-            application,
+            resources,
             operation,
             tier.model.clone(),
             tier.effort,
@@ -242,13 +243,13 @@ impl PlanExecutionEnvironment {
     /// Bind post-analysis to its review identity without a critique rung suffix.
     pub(crate) async fn for_review_post_analysis(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         tier: &ArchitectTier,
         scope: &ArchitectScope,
     ) -> Result<StructuredExecution, TurnProviderError> {
         self.structured_execution(
-            application,
+            resources,
             operation,
             tier.model.clone(),
             tier.effort,
@@ -260,13 +261,13 @@ impl PlanExecutionEnvironment {
     /// Bind a read-only audit to the selected Reviewer model and review identity.
     pub(crate) async fn for_reviewer_structured(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         selection: &ModelSelection,
         scope: &ArchitectScope,
     ) -> Result<StructuredExecution, TurnProviderError> {
         self.structured_execution(
-            application,
+            resources,
             operation,
             self.config().resolve_model(selection),
             self.config()
@@ -284,7 +285,7 @@ impl PlanExecutionEnvironment {
         selection: &ModelSelection,
     ) -> Result<StructuredExecution, TurnProviderError> {
         self.structured_execution(
-            application,
+            &application.execution_session(),
             operation,
             self.config().resolve_model(selection),
             None,
@@ -295,14 +296,14 @@ impl PlanExecutionEnvironment {
 
     async fn structured_execution(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         model: ModelRef,
         effort: Option<ReasoningEffort>,
         session: Option<String>,
     ) -> Result<StructuredExecution, TurnProviderError> {
         let provider = self
-            .structured_provider(application, operation, model.provider)
+            .structured_provider(resources, operation, model.provider)
             .await?;
         Ok(StructuredExecution {
             provider,
@@ -314,15 +315,15 @@ impl PlanExecutionEnvironment {
 
     async fn structured_provider(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         kind: ProviderKind,
     ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
-        if self.operation_id != operation.id() || !application.owns_operation(operation) {
+        if self.operation_id != operation.id() || !resources.owns(operation) {
             return Err(TurnProviderError::foreign_operation());
         }
-        let provider = self.environment.provider(application, kind).await?;
-        if self.operation_id != operation.id() || !application.owns_operation(operation) {
+        let provider = resources.provider(self.config(), kind).await?;
+        if !resources.owns(operation) {
             return Err(TurnProviderError::foreign_operation());
         }
         Ok(provider)
@@ -330,22 +331,34 @@ impl PlanExecutionEnvironment {
 
     pub(crate) async fn for_architect_research(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         tier: &ArchitectTier,
         scope: &ArchitectScope,
     ) -> Result<ArchitectResearchExecution, TurnProviderError> {
-        let provider = self
-            .structured_provider(application, operation, tier.model.provider)
+        if self.operation_id != operation.id() || !resources.owns(operation) {
+            return Err(TurnProviderError::foreign_operation());
+        }
+        let provider = resources
+            .provider(self.config(), tier.model.provider)
             .await?;
+        if !resources.owns(operation) {
+            return Err(TurnProviderError::foreign_operation());
+        }
+        let session = Self::architect_session(scope);
         Ok(ArchitectResearchExecution {
             environment: self.clone(),
-            application: application.clone(),
-            operation_id: operation.id(),
-            provider,
-            unit: StructuredResearchUnit::new(),
-            base_session: Self::architect_session(scope),
-            session: Self::architect_session(scope),
+            resources: resources.clone(),
+            executor: PromptExecutor::new(
+                provider,
+                Box::new(PlanRefinePromptProtocol::default()),
+                tier.model.name.clone(),
+                tier.effort,
+                Some(session.clone()),
+                self.config().repl.patch_strategy(),
+            ),
+            base_session: session.clone(),
+            session,
             current_model: tier.model.clone(),
         })
     }
@@ -361,7 +374,7 @@ impl PlanExecutionEnvironment {
         selection: Option<ModelSelection>,
     ) -> ResolvedTurnModel {
         self.environment
-            .resolve_model(selection, None, TurnMode::Step)
+            .resolve_model(selection, None, ModelRole::Coder)
     }
     pub(crate) fn new(snapshot: ConfigurationSnapshot, operation: &OperationGuard) -> Self {
         Self {
@@ -370,148 +383,61 @@ impl PlanExecutionEnvironment {
         }
     }
 
-    pub(crate) async fn for_edit_unit(
+    pub(crate) async fn bind_step(
         &self,
-        application: &Application,
+        resources: &ExecutionSession,
         operation: &OperationGuard,
         selection: Option<ModelSelection>,
         effort: Option<ReasoningEffort>,
         session: Option<String>,
         capabilities: CapabilityTree,
-    ) -> Result<EditExecution, TurnProviderError> {
-        if self.operation_id != operation.id() || !application.owns_operation(operation) {
+    ) -> Result<BoundExecution, TurnProviderError> {
+        if self.operation_id != operation.id() {
             return Err(TurnProviderError::foreign_operation());
         }
-        let model = self
-            .environment
-            .resolve_model(selection, effort, TurnMode::Step);
-        let provider = self
-            .environment
-            .provider(application, model.model.provider)
-            .await?;
-        if self.operation_id != operation.id() || !application.owns_operation(operation) {
-            return Err(TurnProviderError::foreign_operation());
-        }
-        let policy = ExecutionFactory::policy(
-            model.config.repl.workflow,
-            operation.cancel_receiver(),
-            application,
-        );
-        let protocol: Box<dyn PromptProtocol> = Box::new(JsonPromptProtocol::new(capabilities));
-        Ok(EditExecution {
-            model,
-            provider,
-            session_id: session,
-            policy,
-            protocol,
-            unit: ExecutionUnit::default(),
-        })
+        self.environment
+            .bind_step(
+                resources,
+                operation,
+                selection,
+                effort,
+                session,
+                capabilities,
+            )
+            .await
     }
 }
 
-/// Technical dependencies stay private to infrastructure; workflow callers
-/// receive the resolved model metadata, not a provider client.
+/// Technical dependencies for a prompt, independent of disk application policy.
+pub(crate) struct BoundPrompt {
+    provider: Arc<dyn LlmProvider>,
+    session_id: Option<String>,
+    protocol: Box<dyn PromptProtocol>,
+}
+
+impl BoundPrompt {
+    pub(crate) fn into_executor(
+        self,
+        model: &ModelRef,
+        effort: Option<ReasoningEffort>,
+        patch_strategy: PatchStrategy,
+    ) -> PromptExecutor {
+        PromptExecutor::new(
+            self.provider,
+            self.protocol,
+            model.name.clone(),
+            effort,
+            self.session_id,
+            patch_strategy,
+        )
+    }
+}
+
+/// Bind one attempt without starting a round or opening a disk transaction.
 pub(crate) struct BoundExecution {
     pub(crate) model: ResolvedTurnModel,
-    provider: Arc<dyn LlmProvider>,
-    session_id: Option<String>,
-    policy: Box<dyn ApplyPolicy>,
-}
-
-/// One isolated edit-capable unit with technical dependencies bound to its operation.
-pub(crate) struct EditExecution {
-    pub(crate) model: ResolvedTurnModel,
-    provider: Arc<dyn LlmProvider>,
-    session_id: Option<String>,
-    policy: Box<dyn ApplyPolicy>,
-    protocol: Box<dyn PromptProtocol>,
-    unit: ExecutionUnit,
-}
-
-/// Technical collaborators for a dialogue, frozen under its operation lease.
-pub(crate) struct DialogueExecution {
-    pub(crate) model: ResolvedTurnModel,
-    provider: Arc<dyn LlmProvider>,
-    session_id: Option<String>,
-    policy: Box<dyn ApplyPolicy>,
-    unit: ExecutionUnit,
-}
-
-impl DialogueExecution {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn execute(
-        &mut self,
-        root: &Path,
-        context: &mut ContextManager,
-        cancel: &CancellationToken,
-        sink: &EventSink,
-        task: String,
-        capabilities: CapabilityTree,
-        history: Option<&HistorySnapshot>,
-    ) -> Result<LoopResult<TurnArtifact>, SystemError> {
-        let protocol = JsonPromptProtocol::new(capabilities.clone());
-        self.unit
-            .execute_bounded(
-                TurnExecutionConfig {
-                    repo_root: root,
-                    provider: self.provider.as_ref(),
-                    model: &self.model.model,
-                    protocol: &protocol,
-                    config: &self.model.config,
-                    session_id: self.session_id.clone(),
-                    reasoning_effort: self.model.effort,
-                },
-                BoundedUnitRequest {
-                    context,
-                    history,
-                    capabilities,
-                    task,
-                    completion: TurnCompletion::AnswerAllowed,
-                    brief: None,
-                },
-                &TurnLoopConfig::from_app_config(&self.model.config),
-                self.policy.as_mut(),
-                cancel,
-                sink,
-            )
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn continue_round(
-        &mut self,
-        root: &Path,
-        context: &mut ContextManager,
-        cancel: &CancellationToken,
-        sink: &EventSink,
-        capabilities: CapabilityTree,
-        history: Option<&HistorySnapshot>,
-        diagnostics: &str,
-    ) -> Result<ResponseEnvelope, SystemError> {
-        let protocol = JsonPromptProtocol::new(capabilities.clone());
-        self.unit
-            .continue_round(
-                TurnExecutionConfig {
-                    repo_root: root,
-                    provider: self.provider.as_ref(),
-                    model: &self.model.model,
-                    protocol: &protocol,
-                    config: &self.model.config,
-                    session_id: self.session_id.clone(),
-                    reasoning_effort: self.model.effort,
-                },
-                ContinuationRequest {
-                    context,
-                    history,
-                    capabilities,
-                    diagnostics,
-                },
-                self.policy.as_mut(),
-                cancel,
-                sink,
-            )
-            .await
-    }
+    pub(crate) prompt: BoundPrompt,
+    pub(crate) policy: Box<dyn ApplyPolicy>,
 }
 
 /// Read-only request bound to the frozen operation environment. Its contract
@@ -546,45 +472,6 @@ impl StructuredExecution {
     }
 }
 
-impl EditExecution {
-    pub(crate) async fn run(
-        &mut self,
-        root: &Path,
-        context: &mut ContextManager,
-        history: Option<&HistorySnapshot>,
-        cancel: &CancellationToken,
-        sink: &EventSink,
-        task: String,
-    ) -> Result<LoopResult<TurnArtifact>, SystemError> {
-        let capabilities = self.protocol.capability_expr();
-        self.unit
-            .execute_bounded(
-                TurnExecutionConfig {
-                    repo_root: root,
-                    provider: self.provider.as_ref(),
-                    model: &self.model.model,
-                    protocol: self.protocol.as_ref(),
-                    config: &self.model.config,
-                    session_id: self.session_id.clone(),
-                    reasoning_effort: self.model.effort,
-                },
-                BoundedUnitRequest {
-                    context,
-                    history,
-                    capabilities,
-                    task,
-                    completion: TurnCompletion::ActionRequired,
-                    brief: Some(TurnBrief::step()),
-                },
-                &TurnLoopConfig::from_app_config(&self.model.config),
-                self.policy.as_mut(),
-                cancel,
-                sink,
-            )
-            .await
-    }
-}
-
 impl<'a> ExecutionFactory<'a> {
     pub(crate) fn compaction_environment(&self) -> CompactionEnvironment {
         CompactionEnvironment {
@@ -593,50 +480,43 @@ impl<'a> ExecutionFactory<'a> {
         }
     }
 
-    pub(crate) async fn for_dialogue(&self) -> Result<DialogueExecution, TurnProviderError> {
-        let BoundExecution {
-            model,
-            provider,
-            session_id,
-            policy,
-        } = self
-            .resolve(None, None, TurnMode::Interactive, None)
-            .await?;
-        Ok(DialogueExecution {
-            model,
-            provider,
-            session_id,
-            policy,
-            unit: ExecutionUnit::default(),
-        })
+    pub(crate) fn selection(&self) -> &ModelSelection {
+        &self.environment.snapshot.selection
     }
 
-    pub(crate) async fn for_edit_unit(
+    pub(crate) fn resolve_model(
         &self,
-        selection: Option<ModelSelection>,
+        selection: ModelSelection,
+        effort_role: ModelRole,
+    ) -> ResolvedTurnModel {
+        self.environment
+            .resolve_model(Some(selection), None, effort_role)
+    }
+
+    pub(crate) async fn bind_prompt(
+        &self,
+        model: &ModelRef,
         effort: Option<ReasoningEffort>,
-        session: Option<String>,
-        capabilities: CapabilityTree,
-    ) -> Result<EditExecution, TurnProviderError> {
-        let BoundExecution {
-            model,
-            provider,
-            session_id,
-            policy,
-        } = self
-            .resolve(selection, effort, TurnMode::Step, session)
+        session_id: Option<String>,
+        patch_strategy: PatchStrategy,
+    ) -> Result<PromptExecutor, TurnProviderError> {
+        let prompt = self
+            .environment
+            .bind_prompt(
+                &self.application.execution_session(),
+                self.operation,
+                model.provider,
+                session_id,
+                CapabilityTree::set([]),
+            )
             .await?;
-        let protocol: Box<dyn PromptProtocol> =
-            Box::new(JsonPromptProtocol::new(capabilities.clone()));
-        debug_assert_eq!(protocol.capability_expr(), capabilities);
-        Ok(EditExecution {
-            model,
-            provider,
-            session_id,
-            policy,
-            protocol,
-            unit: ExecutionUnit::default(),
-        })
+        Ok(prompt.into_executor(model, effort, patch_strategy))
+    }
+
+    pub(crate) fn apply_policy(&self, workflow: WorkflowKind) -> Box<dyn ApplyPolicy> {
+        self.application
+            .execution_session()
+            .policy(workflow, self.operation.cancel_receiver())
     }
 
     pub(crate) async fn bind(
@@ -647,7 +527,6 @@ impl<'a> ExecutionFactory<'a> {
             return Err(TurnProviderError::foreign_operation());
         }
         let snapshot = application.configuration().await;
-        let dialogue_id = application.session_uuid().await;
         if !application.owns_operation(operation) {
             return Err(TurnProviderError::foreign_operation());
         }
@@ -655,56 +534,27 @@ impl<'a> ExecutionFactory<'a> {
             application,
             operation,
             environment: ExecutionEnvironment::new(snapshot),
-            dialogue_id,
         })
     }
 
-    pub(crate) async fn resolve(
+    #[cfg(test)]
+    async fn bind_step(
         &self,
         selection: Option<ModelSelection>,
         effort: Option<ReasoningEffort>,
-        mode: TurnMode,
-        explicit_session: Option<String>,
+        session_id: Option<String>,
+        capabilities: CapabilityTree,
     ) -> Result<BoundExecution, TurnProviderError> {
-        if !self.application.owns_operation(self.operation) {
-            return Err(TurnProviderError::foreign_operation());
-        }
-        let model = self.environment.resolve_model(selection, effort, mode);
-        let provider = self
-            .environment
-            .provider(self.application, model.model.provider)
-            .await?;
-        if !self.application.owns_operation(self.operation) {
-            return Err(TurnProviderError::foreign_operation());
-        }
-        let session_id = explicit_session.or_else(|| match mode {
-            TurnMode::Interactive => {
-                Some(format_session_id(SESSION_PREFIX_REPL, &self.dialogue_id))
-            }
-            TurnMode::Step => None,
-        });
-        let policy = Self::policy(
-            model.config.repl.workflow,
-            self.operation.cancel_receiver(),
-            self.application,
-        );
-        Ok(BoundExecution {
-            model,
-            provider,
-            session_id,
-            policy,
-        })
-    }
-
-    fn policy(
-        workflow: WorkflowKind,
-        cancel: watch::Receiver<bool>,
-        application: &Application,
-    ) -> Box<dyn ApplyPolicy> {
-        match workflow {
-            WorkflowKind::Naive => Box::new(DirectApplyPolicy::new()),
-            WorkflowKind::Git => Box::new(application.git_transaction_policy(cancel)),
-        }
+        self.environment
+            .bind_step(
+                &self.application.execution_session(),
+                self.operation,
+                selection,
+                effort,
+                session_id,
+                capabilities,
+            )
+            .await
     }
 }
 
@@ -713,11 +563,60 @@ impl ExecutionEnvironment {
         Self { snapshot }
     }
 
+    async fn bind_step(
+        &self,
+        resources: &ExecutionSession,
+        operation: &OperationGuard,
+        selection: Option<ModelSelection>,
+        effort: Option<ReasoningEffort>,
+        session_id: Option<String>,
+        capabilities: CapabilityTree,
+    ) -> Result<BoundExecution, TurnProviderError> {
+        let model = self.resolve_model(selection, effort, ModelRole::Coder);
+        let prompt = self
+            .bind_prompt(
+                resources,
+                operation,
+                model.model.provider,
+                session_id,
+                capabilities,
+            )
+            .await?;
+        let policy = resources.policy(model.config.repl.workflow, operation.cancel_receiver());
+        Ok(BoundExecution {
+            model,
+            prompt,
+            policy,
+        })
+    }
+
+    async fn bind_prompt(
+        &self,
+        resources: &ExecutionSession,
+        operation: &OperationGuard,
+        kind: ProviderKind,
+        session_id: Option<String>,
+        capabilities: CapabilityTree,
+    ) -> Result<BoundPrompt, TurnProviderError> {
+        if !resources.owns(operation) {
+            return Err(TurnProviderError::foreign_operation());
+        }
+        let provider = resources.provider(&self.snapshot.config, kind).await?;
+        if !resources.owns(operation) {
+            return Err(TurnProviderError::foreign_operation());
+        }
+        Ok(BoundPrompt {
+            provider,
+            session_id,
+            protocol: Box::new(JsonPromptProtocol::new(capabilities)),
+        })
+    }
+
     pub(crate) fn resolve_model(
         &self,
         selection: Option<ModelSelection>,
         effort: Option<ReasoningEffort>,
-        mode: TurnMode,
+        effort_role: ModelRole,
     ) -> ResolvedTurnModel {
         let config = self.snapshot.config.clone();
         let selection = selection.unwrap_or_else(|| self.snapshot.selection.clone());
@@ -725,10 +624,6 @@ impl ExecutionEnvironment {
         let role = match &selection {
             ModelSelection::Role(role) => Some(*role),
             ModelSelection::Specific(_) | ModelSelection::Tier { .. } => None,
-        };
-        let effort_role = match mode {
-            TurnMode::Interactive => role.unwrap_or(ModelRole::REPL),
-            TurnMode::Step => ModelRole::Coder,
         };
         let effort = effort.or_else(|| config.resolve_selection_effort(effort_role, &selection));
         let alias = config.model_alias(&model).map(str::to_string);
@@ -742,22 +637,16 @@ impl ExecutionEnvironment {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn provider(
         &self,
         application: &Application,
         kind: ProviderKind,
     ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(provider) = application.scripted_provider(kind).await {
-            return Ok(provider);
-        }
-        tauqe_core::providers::create_provider_with_login(
-            kind,
-            &self.snapshot.config,
-            application.chatgpt_login.clone(),
-        )
-        .map(Arc::from)
-        .map_err(|error| TurnProviderError::new(error.to_string()))
+        application
+            .execution_session()
+            .provider(&self.snapshot.config, kind)
+            .await
     }
 }
 
@@ -766,8 +655,11 @@ mod tests {
     use super::*;
     use crate::application::configuration::ReloadSelection;
     use tauqe_core::config::{AppConfig, ModelsConfig, OpenRouterConfig, ProvidersConfig};
+    use tauqe_core::execution::{PromptInput, PromptSequence};
+    use tauqe_core::llm::step::turn_capability_expr;
     use tauqe_core::models::{ModelEntry, ModelRef};
-    use tauqe_core::providers::mock::MockLlmProvider;
+    use tauqe_core::prompt::TurnBrief;
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 
     fn config(key: Option<&str>) -> AppConfig {
         AppConfig {
@@ -794,27 +686,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frozen_credentials_and_affinity_survive_reload() {
+    async fn prompt_binding_uses_frozen_credentials_after_reload() {
         let app = Application::new(config(Some("test-key")));
         let operation = app.try_begin_operation().unwrap();
         let factory = ExecutionFactory::bind(&app, &operation).await.unwrap();
-        let identity = app.session_uuid().await;
+        let model = factory.resolve_model(factory.selection().clone(), ModelRole::REPL);
         app.replace_configuration(config(None), ReloadSelection::Default)
             .await;
-        app.reset_session_uuid().await;
-        let bound = factory
-            .resolve(None, None, TurnMode::Interactive, None)
+        assert!(factory
+            .bind_prompt(
+                &model.model,
+                model.effort,
+                Some("frozen-session".into()),
+                model.config.repl.patch_strategy()
+            )
             .await
-            .unwrap();
-        assert_eq!(
-            bound.session_id.as_deref(),
-            Some(format!("tauqe-repl-{identity}").as_str())
-        );
-        assert_eq!(bound.model.effort, Some(ReasoningEffort::Low));
+            .is_ok());
+        assert_eq!(model.effort, Some(ReasoningEffort::Low));
         assert!(ExecutionFactory::bind(&app, &operation)
             .await
             .unwrap()
-            .resolve(None, None, TurnMode::Step, None)
+            .bind_step(None, None, None, turn_capability_expr())
             .await
             .is_err());
     }
@@ -822,6 +714,9 @@ mod tests {
     #[tokio::test]
     async fn foreign_and_stale_operations_cannot_resolve() {
         let app = Application::new(config(None));
+        let provider = Arc::new(MockLlmProvider::new());
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
         let other = Application::default();
         let foreign = other.try_begin_operation().unwrap();
         assert!(ExecutionFactory::bind(&app, &foreign).await.is_err());
@@ -830,9 +725,10 @@ mod tests {
         assert!(app.release_operation_registration(guard.id()));
         let replacement = app.try_begin_operation().unwrap();
         assert!(factory
-            .resolve(None, None, TurnMode::Step, None)
+            .bind_step(None, None, None, turn_capability_expr())
             .await
             .is_err());
+        assert!(provider.requests().is_empty());
         assert_eq!(app.active_operation_id(), Some(replacement.id()));
     }
 
@@ -848,16 +744,16 @@ mod tests {
         let guard = app.try_begin_operation().unwrap();
         let factory = ExecutionFactory::bind(&app, &guard).await.unwrap();
         let first = factory
-            .resolve(
+            .bind_step(
                 Some(ModelSelection::Role(ModelRole::Coder)),
                 None,
-                TurnMode::Step,
                 None,
+                turn_capability_expr(),
             )
             .await
             .unwrap();
         let second = factory
-            .resolve(
+            .bind_step(
                 Some(ModelSelection::Tier {
                     model: ModelRef {
                         provider: ProviderKind::OpenAI,
@@ -866,32 +762,39 @@ mod tests {
                     effort: Some(ReasoningEffort::Max),
                 }),
                 None,
-                TurnMode::Step,
                 Some("step-affinity".into()),
+                turn_capability_expr(),
             )
             .await
             .unwrap();
         assert!(Arc::ptr_eq(
-            &first.provider,
+            &first.prompt.provider,
             &(router as Arc<dyn LlmProvider>)
         ));
         assert!(Arc::ptr_eq(
-            &second.provider,
+            &second.prompt.provider,
             &(openai as Arc<dyn LlmProvider>)
         ));
         assert_eq!(second.model.effort, Some(ReasoningEffort::Max));
-        assert_eq!(second.session_id.as_deref(), Some("step-affinity"));
+        assert_eq!(second.prompt.session_id.as_deref(), Some("step-affinity"));
     }
 
     #[tokio::test]
     async fn plan_environment_keeps_configuration_across_steps_and_provider_changes() {
         let mut initial = config(Some("test-key"));
-        initial.repl = toml::from_str::<AppConfig>("[repl]\nmax_turn_rounds = 7\n")
-            .unwrap()
-            .repl;
+        initial.repl = toml::from_str::<AppConfig>(
+            "[repl]\nmax_turn_rounds = 7\npatch_strategy = 'search_replace'\n",
+        )
+        .unwrap()
+        .repl;
         let app = Application::new(initial);
-        let router = Arc::new(MockLlmProvider::new());
-        let openai = Arc::new(MockLlmProvider::new());
+        let refusal = || {
+            MockResponse::text(
+                r#"{"message":"Cannot continue","action":{"kind":"blocked","blocked":{"reason":"Missing prerequisite","details":"","is_blocked":true}}}"#,
+            )
+        };
+        let router = Arc::new(MockLlmProvider::scripted([refusal()]));
+        let openai = Arc::new(MockLlmProvider::scripted([refusal()]));
         app.test_set_provider_for(ProviderKind::OpenRouter, router.clone())
             .await;
         app.test_set_provider_for(ProviderKind::OpenAI, openai.clone())
@@ -904,10 +807,10 @@ mod tests {
             .repl;
         app.replace_configuration(changed, ReloadSelection::Default)
             .await;
-        let capabilities = tauqe_core::control::turn::turn_capability_expr();
+        let capabilities = turn_capability_expr();
         let first = frozen
-            .for_edit_unit(
-                &app,
+            .bind_step(
+                &app.execution_session(),
                 &guard,
                 Some(ModelSelection::Role(ModelRole::Coder)),
                 None,
@@ -917,8 +820,8 @@ mod tests {
             .await
             .unwrap();
         let second = frozen
-            .for_edit_unit(
-                &app,
+            .bind_step(
+                &app.execution_session(),
                 &guard,
                 Some(ModelSelection::Tier {
                     model: ModelRef {
@@ -955,46 +858,89 @@ mod tests {
         );
         assert_eq!(first.model.effort, Some(ReasoningEffort::High));
         assert_eq!(second.model.effort, Some(ReasoningEffort::Max));
-        assert_eq!(first.session_id.as_deref(), Some("plan-affinity"));
-        assert_eq!(second.session_id.as_deref(), Some("plan-affinity"));
-        assert!(Arc::ptr_eq(
-            &first.provider,
-            &(router as Arc<dyn LlmProvider>)
-        ));
-        assert!(Arc::ptr_eq(
-            &second.provider,
-            &(openai as Arc<dyn LlmProvider>)
-        ));
+        for (bound, provider, name, effort) in [
+            (first, &router, "base/model", ReasoningEffort::High),
+            (second, &openai, "next/model", ReasoningEffort::Max),
+        ] {
+            let BoundExecution { model, prompt, .. } = bound;
+            let mut executor = prompt.into_executor(
+                &model.model,
+                model.effort,
+                model.config.repl.patch_strategy(),
+            );
+            assert_eq!(executor.patch_strategy(), PatchStrategy::SearchReplace);
+            executor
+                .prepare(PromptInput {
+                    task: "Execute the isolated step".into(),
+                    originals: vec![],
+                    current_files: vec![],
+                    history: None,
+                    capabilities: turn_capability_expr(),
+                    project: Default::default(),
+                    repo_root: Default::default(),
+                    repo_map: None,
+                    repo_dirs: None,
+                    outer_docs: vec![],
+                    brief: Some(TurnBrief::step()),
+                    sequence: PromptSequence::Assemble { continuation: None },
+                    tail: vec![],
+                    excluded_disk_sources: vec![],
+                })
+                .unwrap()
+                .execute(&EventSink::noop(), &CancellationToken::new())
+                .await
+                .unwrap();
+            let request = provider.last_request().unwrap();
+            assert_eq!(request.model, name);
+            assert_eq!(request.reasoning_effort, Some(effort));
+            assert_eq!(request.session_id.as_deref(), Some("plan-affinity"));
+            let schema = serde_json::to_value(request.response_format).unwrap();
+            let branches = schema
+                .pointer("/json_schema/schema/properties/action/anyOf")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            let kinds: Vec<_> = branches
+                .iter()
+                .map(|branch| branch["properties"]["kind"]["enum"][0].as_str().unwrap())
+                .collect();
+            assert_eq!(kinds, ["research", "edit", "blocked", "abort"]);
+            assert!(branches[0]["properties"].get("doc_requests").is_none());
+            assert_eq!(branches[1]["properties"]["changes"]["type"], "array");
+            assert!(branches[1]["properties"].get("patch").is_none());
+        }
 
         let other = Application::default();
         let foreign = other.try_begin_operation().unwrap();
         assert!(frozen
-            .for_edit_unit(
-                &other,
+            .bind_step(
+                &other.execution_session(),
                 &foreign,
                 None,
                 None,
                 None,
-                tauqe_core::control::turn::turn_capability_expr()
+                turn_capability_expr()
             )
             .await
             .is_err());
         assert!(app.release_operation_registration(guard.id()));
         let replacement = app.try_begin_operation().unwrap();
         assert!(frozen
-            .for_edit_unit(
-                &app,
+            .bind_step(
+                &app.execution_session(),
                 &replacement,
                 None,
                 None,
                 None,
-                tauqe_core::control::turn::turn_capability_expr()
+                turn_capability_expr()
             )
             .await
             .is_err());
+        assert_eq!(router.requests().len(), 1);
+        assert_eq!(openai.requests().len(), 1);
         assert!(frozen
             .for_structured(
-                &app,
+                &app.execution_session(),
                 &replacement,
                 &ArchitectTier::from(ModelRef::openrouter("base/model")),
                 &ArchitectScope::Plan("plan".into()),
@@ -1017,7 +963,12 @@ mod tests {
         let mut tier = ArchitectTier::from(ModelRef::openrouter("base/model"));
         tier.effort = Some(ReasoningEffort::High);
         let execution = frozen
-            .for_structured(&app, &guard, &tier, &ArchitectScope::Plan("plan".into()))
+            .for_structured(
+                &app.execution_session(),
+                &guard,
+                &tier,
+                &ArchitectScope::Plan("plan".into()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1063,7 +1014,7 @@ mod tests {
         let scope = ArchitectScope::Review("audit".into());
         let role = frozen
             .for_reviewer_structured(
-                &app,
+                &app.execution_session(),
                 &guard,
                 &ModelSelection::Role(ModelRole::Reviewer),
                 &scope,
@@ -1076,7 +1027,7 @@ mod tests {
 
         let tier = frozen
             .for_reviewer_structured(
-                &app,
+                &app.execution_session(),
                 &guard,
                 &ModelSelection::Tier {
                     model: shared.clone(),
@@ -1126,7 +1077,7 @@ mod tests {
             .is_err());
         assert!(frozen
             .for_reviewer_structured(
-                &app,
+                &app.execution_session(),
                 &replacement,
                 &ModelSelection::Role(ModelRole::Reviewer),
                 &ArchitectScope::Review("audit".into()),
@@ -1149,7 +1100,7 @@ mod tests {
         let scope = ArchitectScope::Review("audit".into());
         let first = ArchitectTier::from(ModelRef::openrouter("base/model"));
         let mut execution = frozen
-            .for_architect_research(&app, &guard, &first, &scope)
+            .for_architect_research(&app.execution_session(), &guard, &first, &scope)
             .await
             .unwrap();
         assert_eq!(execution.session, "tauqe-review-audit");

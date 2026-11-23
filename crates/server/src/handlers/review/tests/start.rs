@@ -134,6 +134,53 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
 }
 
 #[tokio::test]
+async fn review_start_does_not_publish_or_save_success_after_a_provider_error() {
+    let dir = TestDir::new();
+    std::fs::write(dir.path().join("file.rs"), "fn foo() {}\n").unwrap();
+    let (out, mut rx) = OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(Default::default(), dir.path().into(), history, out);
+    state
+        .application
+        .test_set_provider(Arc::new(MockLlmProvider::scripted([MockResponse::error(
+            "audit request failed",
+        )])))
+        .await;
+    state
+        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let response = handle_review_start(
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_START.into(),
+            params: None,
+        },
+        &state,
+    )
+    .await;
+    assert!(response.error.is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let raw = rx.recv().await.unwrap();
+            let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            match event["method"].as_str() {
+                Some(events::REVIEW_ERROR) => break,
+                Some(events::REVIEW_FINISHED | events::REVIEW_UPDATED) => {
+                    panic!("unexpected success: {raw}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ReviewStorage::load_latest(dir.path()).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_handle_review_cancel_soft_keeps_operation_active() {
     let dir = TestDir::new();
     let (out, _rx) = OutChannel::new();

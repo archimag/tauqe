@@ -1,6 +1,6 @@
 //! Materialize declared step documentation and admit it to resident context.
 
-use crate::api::Application;
+use super::context::ContextSession;
 use std::path::Path;
 use tauqe_core::context::ContextState;
 use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
@@ -49,7 +49,7 @@ impl OuterDocsRefusal {
     }
 }
 
-impl Application {
+impl ContextSession {
     /// Trust refusals stop the step; delivery and admission failures remain
     /// diagnostics. Frozen registry and budget inputs belong to the running turn.
     pub(crate) async fn preload_declared_outer_docs(
@@ -140,6 +140,7 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Application;
     #[test]
     fn test_a_trust_refusal_reports_the_declaration_that_authorizes_the_source() {
         let refusal = OuterDocsRefusal {
@@ -214,6 +215,7 @@ mod tests {
             " missing ".into(),
         ];
         let preload = app
+            .context_session()
             .preload_declared_outer_docs(root.path(), &registry(), &declared, usize::MAX, &cancel)
             .await
             .unwrap();
@@ -233,6 +235,7 @@ mod tests {
         assert_eq!(snapshot.revision, app.context_state().await.revision);
         assert_eq!(identity, app.session_uuid().await);
         let repeated = app
+            .context_session()
             .preload_declared_outer_docs(
                 root.path(),
                 &registry(),
@@ -253,6 +256,7 @@ mod tests {
         let app = application(root.path());
         let (_, cancel) = watch::channel(false);
         let preload = app
+            .context_session()
             .preload_declared_outer_docs(root.path(), &registry(), &["vendor".into()], 0, &cancel)
             .await
             .unwrap();
@@ -272,6 +276,7 @@ mod tests {
         let revision = app.context_state().await.revision;
         let (_, cancel) = watch::channel(false);
         let refusal = app
+            .context_session()
             .preload_declared_outer_docs(
                 root.path(),
                 &registry(),

@@ -26,6 +26,7 @@ struct ActiveOperation {
     /// Soft-stop signal observed by a running batch supervisor between members.
     soft_stop_tx: watch::Sender<bool>,
     abort_handle: Option<tokio::task::AbortHandle>,
+    release_by_supervisor: bool,
 }
 
 /// RAII guard owning a registered active operation.
@@ -74,6 +75,17 @@ impl OperationGuard {
     /// does the queue stop before launching the next one.
     pub fn soft_stop_receiver(&self) -> watch::Receiver<bool> {
         self.soft_stop_rx.clone()
+    }
+
+    /// Reserves release for the guard held by the interactive supervisor through
+    /// recovery and terminal publication, independently of the worker handle.
+    pub(crate) fn reserve_supervisor_release(&self) -> bool {
+        let mut slot = self.registry.lock();
+        let Some(op) = slot.as_mut().filter(|op| op.id == self.id) else {
+            return false;
+        };
+        op.release_by_supervisor = true;
+        true
     }
 
     /// Installs the abort handle of the task currently driving this operation.
@@ -143,6 +155,7 @@ impl OperationRegistry {
             cancel_tx,
             soft_stop_tx,
             abort_handle: None,
+            release_by_supervisor: false,
         });
         tracing::info!(operation_slot_id = id, "Registered active operation slot");
         Ok(OperationGuard {
@@ -193,7 +206,10 @@ impl OperationRegistry {
 
     pub(crate) fn release(&self, id: u64) -> bool {
         let mut slot = self.lock();
-        if slot.as_ref().map(|op| op.id) != Some(id) {
+        if !slot
+            .as_ref()
+            .is_some_and(|op| op.id == id && !op.release_by_supervisor)
+        {
             return false;
         }
         *slot = None;

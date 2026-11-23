@@ -218,7 +218,7 @@ impl StructuredEditProtocol {
     /// Extracts ephemeral scratchpad notes from a structured response,
     /// reporting nothing while the field is absent or blank.
     #[cfg(test)]
-    pub(crate) fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let payload = StructuredPayload::parse(raw_text);
         let root = payload.root()?;
         let expr = CapabilityTree::leaf(LlmCapability::Scratchpad);
@@ -244,7 +244,7 @@ impl StructuredEditProtocol {
     /// command is decoded only when the declaration the round observed admits
     /// one.
     #[cfg(test)]
-    pub(crate) fn parse_output(
+    fn parse_output(
         &self,
         expr: &CapabilityTree,
         raw_text: &str,
@@ -448,7 +448,11 @@ impl StructuredPayload {
         if all_json && (!messages.is_empty() || trimmed.starts_with('{')) {
             return messages.join("\n\n");
         }
-        if starts_with_json_object(trimmed)
+        if self
+            .root()
+            .and_then(|root| root.pointer("/action/kind"))
+            .is_some()
+            || starts_with_json_object(trimmed)
             || trimmed.starts_with("```json")
             || trimmed.starts_with('{')
         {
@@ -648,7 +652,7 @@ fn parse_anchor_edits(body: &str, editable_paths: &[String]) -> Result<Vec<EditO
 /// channel, so neither XML control tags nor JSON scaffolding can leak into
 /// conversational text, session history, or the streamed interface.
 #[cfg(test)]
-pub(crate) fn clean_raw_json_or_text(raw: &str) -> String {
+fn clean_raw_json_or_text(raw: &str) -> String {
     StructuredPayload::parse(raw).clean_text()
 }
 
@@ -665,7 +669,7 @@ mod tests {
     /// Builds the capability tree of the interactive REPL profile: the tree
     /// every test below decodes a response against.
     fn repl_expr() -> CapabilityTree {
-        crate::control::repl::dialogue_capability_expr(false, false)
+        crate::llm::repl::dialogue_capability_expr(false, false)
     }
 
     /// Lifts the branch envelope of a composed schema into one surface.
@@ -1370,7 +1374,7 @@ mod tests {
     #[test]
     fn test_review_update_field_follows_the_review_discussion_surface() {
         let review_schema = flattened_surface(&StructuredEditProtocol::schema_for(
-            &crate::control::repl::dialogue_capability_expr(false, true),
+            &crate::llm::repl::dialogue_capability_expr(false, true),
             &render_context(PatchStrategy::SearchReplace),
         ));
         assert!(review_schema["properties"].get("review_update").is_some());

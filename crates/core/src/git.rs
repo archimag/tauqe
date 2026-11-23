@@ -308,6 +308,7 @@ pub mod cmd {
 
     use std::path::Path;
 
+    pub(crate) use tauqe_tools::git::cmd::read_blob;
     pub use tauqe_tools::git::cmd::{
         run_git, run_git_check_ignore, stage_files, DEFAULT_AUTHOR_EMAIL, DEFAULT_AUTHOR_NAME,
     };

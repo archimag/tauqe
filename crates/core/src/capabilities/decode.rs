@@ -119,6 +119,18 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
         }
         LlmCapability::EditReplace if ctx.patch_strategy == PatchStrategy::ApplyPatch => {
             match node.get("patch") {
+                // A terminal declaration without a change set still supplies
+                // the schema's patch field, but has nothing to stage.
+                Some(Value::String(patch))
+                    if patch.trim().is_empty()
+                        && ["reason", "error_message"].into_iter().any(|field| {
+                            node.get(field)
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.trim().is_empty())
+                        }) =>
+                {
+                    Vec::new()
+                }
                 Some(Value::String(patch)) => vec![LlmCommand::ApplyPatch {
                     patch: patch.clone(),
                 }],
@@ -520,6 +532,46 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn apply_patch_terminal_declarations_do_not_propose_an_empty_patch() {
+        let ctx =
+            PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::ApplyPatch);
+        let grant = crate::llm::step::turn_capability_expr();
+        for (action, expected) in [
+            (
+                json!({"kind": "edit", "patch": "", "reason": "Already done"}),
+                LlmCommand::TurnSkip(TurnSkipCommand {
+                    reason: "Already done".into(),
+                }),
+            ),
+            (
+                json!({"kind": "edit", "patch": "", "error_message": "Cannot finish"}),
+                LlmCommand::TurnError(TurnErrorCommand {
+                    error_message: "Cannot finish".into(),
+                }),
+            ),
+        ] {
+            assert_eq!(
+                decode_capability_expr(&grant, &json!({"action": action}), &ctx),
+                vec![expected]
+            );
+        }
+        for action in [
+            json!({"kind": "edit", "reason": "Already done"}),
+            json!({"kind": "edit", "patch": [], "reason": "Already done"}),
+        ] {
+            assert!(
+                decode_capability_expr(&grant, &json!({"action": action}), &ctx)
+                    .iter()
+                    .any(|command| matches!(command, LlmCommand::ProtocolError { .. }))
+            );
+        }
+        let action = json!({"kind": "edit", "patch": "nonempty", "reason": "Already done"});
+        assert!(decode_capability_expr(&grant, &json!({"action": action}), &ctx)
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ApplyPatch { patch } if patch == "nonempty")));
+    }
+
+    #[test]
     fn custom_tool_decoder_omits_only_nulls_for_resolved_defaults() {
         let project: ProjectConfig = serde_json::from_value(json!({
             "commands": {
@@ -724,7 +776,7 @@ mod tests {
     #[test]
     fn decodes_any_of_branches_and_reports_kind_errors() {
         let ctx = PromptRenderContext::new(&[], None);
-        let expr = crate::control::repl::repl_capability_expr(None);
+        let expr = crate::llm::repl::repl_capability_expr(None);
         let schema = capability_expr_schema(&expr, &ctx);
         assert!(schema["properties"]["action"]["anyOf"].is_array());
 
@@ -884,7 +936,7 @@ mod tests {
     #[test]
     fn decodes_the_plan_payload_through_the_plan_action_union() {
         let ctx = PromptRenderContext::new(&[], None);
-        let surface = crate::control::repl::repl_capability_expr(Some(
+        let surface = crate::llm::repl::repl_capability_expr(Some(
             &crate::discussion::DiscussionTarget::Plan { id: "p-1".into() },
         ));
 

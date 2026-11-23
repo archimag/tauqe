@@ -1,4 +1,4 @@
-//! Transport-owned review event pacing and publication.
+//! Review event pacing and publication shared by audit and post-analysis.
 
 use crate::api::UsageTotalsSnapshot;
 use tauqe_core::providers::StreamEvent;

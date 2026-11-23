@@ -10,6 +10,8 @@ pub(crate) use classification::command_capability;
 pub use kind::LlmCapability;
 
 pub mod command;
+pub mod repl;
+pub mod step;
 pub use command::{
     AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, CustomToolCommand,
     DirListCommand, DocRequestCommand, LlmCommand, OuterDocRequestCommand, RepoDirsCommand,

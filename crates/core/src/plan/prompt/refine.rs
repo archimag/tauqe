@@ -1,8 +1,132 @@
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::llm::discussion::normalize_repo_map_path;
 use crate::llm::discussion::RepoSearchRequest;
+use crate::llm::{CapabilityTree, LlmCapability};
+use crate::models::ArchitectTier;
 use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 use serde::{Deserialize, Serialize};
+
+/// Capability grant for Architect horizon synthesis, without edits or verification.
+pub fn architect_synthesis_capability_expr() -> CapabilityTree {
+    CapabilityTree::from_leaves([
+        LlmCapability::TextMessage,
+        LlmCapability::ContextRequest,
+        LlmCapability::RepoSearch,
+        LlmCapability::RepoDirs,
+        LlmCapability::RepoMap,
+        LlmCapability::DirList,
+        LlmCapability::DocRequest,
+        LlmCapability::OuterDocRequest,
+        LlmCapability::PlanCreation,
+        LlmCapability::Scratchpad,
+        LlmCapability::CommitMessage,
+        LlmCapability::TurnError,
+        LlmCapability::TurnSkip,
+        LlmCapability::Blocked,
+        LlmCapability::Abort,
+        LlmCapability::PlanUpdate,
+    ])
+}
+
+/// Host-environment failure that needs an action from the developer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortReport {
+    pub reason: String,
+    pub recommendation: String,
+}
+
+impl AbortReport {
+    pub fn to_message(&self) -> String {
+        format!(
+            "Execution aborted: {}\n\nRecommended action:\n{}",
+            self.reason.trim(),
+            self.recommendation.trim()
+        )
+    }
+}
+
+/// Terminal status of one structured synthesis run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuredRefineStatus {
+    Synthesized,
+    BudgetExceeded { diagnostic: String },
+    Blocked { reason: String },
+    Aborted(AbortReport),
+    Cancelled,
+}
+
+/// Final payload, verdict, and Architect tier that concluded the run.
+#[derive(Debug, Clone)]
+pub struct StructuredRefineOutcome {
+    pub output: Option<PlanRefinementOutput>,
+    pub tier: ArchitectTier,
+    pub status: StructuredRefineStatus,
+}
+
+/// Interpretation of one Architect response, before the scenario acts on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoundStatus {
+    Success,
+    Blocked(String),
+    Aborted(AbortReport),
+    PlanUpdateRefused(String),
+    NeedsContext,
+}
+
+/// Decode a synthesis round without deciding whether to issue another request.
+pub fn parse_round(raw_text: &str) -> Result<(PlanRefinementOutput, RoundStatus), String> {
+    let output = parse_plan_refinement_output(raw_text).map_err(|err| err.to_string())?;
+    let status = if let Some(abort) = output.abort.as_ref().filter(|abort| abort.is_aborted) {
+        RoundStatus::Aborted(AbortReport {
+            reason: nonblank(&abort.reason)
+                .unwrap_or("Execution aborted")
+                .to_string(),
+            recommendation: nonblank(&abort.recommendation)
+                .unwrap_or("No recommendation was stated.")
+                .to_string(),
+        })
+    } else if let Some(reason) = unsupported_plan_update_reason(raw_text) {
+        RoundStatus::PlanUpdateRefused(reason)
+    } else {
+        match output.status.trim().to_ascii_lowercase().as_str() {
+            "success" => RoundStatus::Success,
+            "blocked" => RoundStatus::Blocked(
+                output
+                    .reason
+                    .as_deref()
+                    .and_then(nonblank)
+                    .or_else(|| nonblank(&output.explanation))
+                    .unwrap_or("The Architect reported a blocker without stating a reason.")
+                    .to_string(),
+            ),
+            "needs_context" => RoundStatus::NeedsContext,
+            other => return Err(format!("Unsupported plan refinement status '{other}'")),
+        }
+    };
+    Ok((output, status))
+}
+
+fn nonblank(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// A synthesis may produce a horizon, but only a plan dialogue may mutate a plan.
+/// A null `plan_update` is idle; any non-null mutation is refused explicitly.
+fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw_text.trim())
+        .ok()
+        .or_else(|| {
+            first_json_object_str(raw_text).and_then(|object| serde_json::from_str(object).ok())
+        })?;
+    if value.get("plan_update")?.is_null() {
+        return None;
+    }
+    Some(
+        "The payload carries a `plan_update` field, and the plan refinement contract accepts no plan mutation: the horizon is synthesized here, while plan mutations belong to the plan discussion. Regenerate the payload without `plan_update`."
+            .to_string(),
+    )
+}
 
 /// Host-environment impossibility declared by an Architect synthesis round.
 ///
@@ -659,6 +783,33 @@ mod tests {
     fn test_parse_plan_refinement_output_rejects_garbage() {
         assert!(parse_plan_refinement_output("not json at all").is_err());
         assert!(parse_plan_refinement_output("").is_err());
+    }
+
+    #[test]
+    fn round_status_preserves_abort_precedence_and_host_action() {
+        let mut reply = serde_json::json!({
+            "status": "needs_context",
+            "explanation": "A host action is required",
+            "plan_update": {"action": "update"},
+            "abort": {"is_aborted": true, "reason": " tool missing ", "recommendation": " install tool "}
+        });
+        assert_eq!(
+            parse_round(&reply.to_string()).unwrap().1,
+            RoundStatus::Aborted(AbortReport {
+                reason: "tool missing".into(),
+                recommendation: "install tool".into(),
+            })
+        );
+        reply["abort"]["is_aborted"] = false.into();
+        assert!(matches!(
+            parse_round(&reply.to_string()).unwrap().1,
+            RoundStatus::PlanUpdateRefused(_)
+        ));
+        reply["plan_update"] = serde_json::Value::Null;
+        assert_eq!(
+            parse_round(&reply.to_string()).unwrap().1,
+            RoundStatus::NeedsContext
+        );
     }
 
     #[test]

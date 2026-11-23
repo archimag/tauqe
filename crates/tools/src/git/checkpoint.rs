@@ -6,7 +6,7 @@ use crate::atomic_write::{
     is_process_alive, move_without_replace, staging_backup_sibling, staging_temp_sibling,
     NoReplaceMove, STAGING_BACKUP_MARKER, STAGING_TEMP_MARKER,
 };
-use crate::git::exec::{GitDeadline, TERMINATION_GRACE};
+use crate::git::exec::{run_bounded, GitDeadline, TERMINATION_GRACE};
 use crate::git::GitHooks;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -351,6 +351,27 @@ fn resolve_head(dir: &Path, deadline: &GitDeadline) -> Option<String> {
     .filter(|head| !head.is_empty())
 }
 
+/// Resolves HEAD without treating a failed invocation as an unborn branch.
+fn inspect_head(dir: &Path, deadline: &GitDeadline) -> Result<Option<String>> {
+    let args = ["rev-parse", "--verify", "--quiet", "HEAD"];
+    let output = crate::blocking::run_blocking(|| run_bounded(Some(dir), &args, deadline, None));
+    if let Some(reason) = output.killed_reason(&args, deadline.timeout_secs()) {
+        bail!("{reason}");
+    }
+    match output.code {
+        Some(0) => {
+            let head = std::str::from_utf8(&output.stdout)?.trim();
+            anyhow::ensure!(!head.is_empty(), "Git returned an empty HEAD revision");
+            Ok(Some(head.to_owned()))
+        }
+        Some(1) if output.stderr.is_empty() => Ok(None),
+        _ => bail!(
+            "Failed to resolve HEAD: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
 /// Resolves the parent of one specific commit.
 ///
 /// A repository-root commit and a revision that does not resolve both answer
@@ -602,7 +623,7 @@ fn resolve_pinned_unborn_return(
     dir: &Path,
     deadline: &GitDeadline,
 ) -> Result<Option<PinnedUnbornReturn>> {
-    let Some(head) = resolve_head(dir, deadline) else {
+    let Some(head) = inspect_head(dir, deadline)? else {
         return Ok(None);
     };
     let listing = run_git_with_deadline(
@@ -621,30 +642,33 @@ fn resolve_pinned_unborn_return(
 
 /// Returns the branch to the unborn state an authorization pinned.
 ///
-/// The ref deletion is conditional on the pinned commit, so a `HEAD` that moved
-/// after the paths were listed refuses the rewrite before a single path leaves
-/// the working tree. Only an accepted deletion clears the index and removes the
-/// pinned tree's paths; untracked files the transaction never committed survive,
-/// mirroring what `reset --hard` leaves alone on a born base.
+/// Recheck HEAD before touching the tree. Keep the pinned commit reachable
+/// until the index and tracked paths are cleared so a failed removal can be
+/// retried with the same path list. The final ref deletion is conditional.
 fn return_pinned_to_unborn(
     dir: &Path,
     pinned: &PinnedUnbornReturn,
     deadline: &GitDeadline,
 ) -> Result<()> {
     assert_head_pinned(dir, &pinned.head, deadline)?;
+    run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
+        .context("Failed to clear the index of an unborn base")?;
+    for entry in &pinned.tracked {
+        let target = dir.join(entry);
+        crate::atomic_write::remove_atomic(&target).with_context(|| {
+            format!(
+                "Failed to remove {} while restoring the unborn base",
+                target.display()
+            )
+        })?;
+        crate::atomic_write::prune_empty_parents(dir, &target);
+    }
     run_git_with_deadline(
         Some(dir),
         &["update-ref", "-d", "HEAD", pinned.head.as_str()],
         deadline,
     )
     .context("Failed to delete the branch ref of an unborn base")?;
-    run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
-        .context("Failed to clear the index of an unborn base")?;
-    for entry in &pinned.tracked {
-        let target = dir.join(entry);
-        let _ = std::fs::remove_file(&target);
-        crate::atomic_write::prune_empty_parents(dir, &target);
-    }
     Ok(())
 }
 
@@ -653,10 +677,9 @@ fn return_pinned_to_unborn(
 /// An unborn base has no commit to reset to, so returning the tree to it is its
 /// own operation, resolved and acted on through one pinned identity
 /// ([`resolve_pinned_unborn_return`] and [`return_pinned_to_unborn`]): the paths
-/// the pinned commit's tree tracks are collected, the branch ref is deleted
-/// conditionally on that commit, the index is emptied, exactly those paths are
-/// removed from the working tree, and the directories their removal emptied are
-/// pruned. Untracked files the transaction never committed survive, mirroring
+/// the pinned commit's tree tracks are collected, the index and those paths
+/// are cleared, and then the branch ref is deleted conditionally on that
+/// commit. Untracked files the transaction never committed survive, mirroring
 /// what `reset --hard` leaves alone on a born base.
 ///
 /// A branch that is already unborn changes nothing, so the helper is safe
@@ -1201,7 +1224,7 @@ fn recover_capturing_transaction(
     reclaimed: ReclaimedOrphans,
     deadline: &GitDeadline,
 ) -> Result<RecoveryOutcome> {
-    let pinned = resolve_head(dir, deadline);
+    let pinned = inspect_head(dir, deadline)?;
     recover_capturing_transaction_pinned(dir, checkpoint, pinned.as_deref(), reclaimed, deadline)
 }
 
@@ -1903,17 +1926,12 @@ pub fn create_checkpoint_with_deadline(
     // of committing the API key into a temporary commit.
     ensure_tauqe_ignored_with_deadline(dir, deadline)?;
 
-    let status =
-        run_git_with_deadline(Some(dir), &["status", "--porcelain"], deadline).unwrap_or_default();
+    let status = run_git_with_deadline(Some(dir), &["status", "--porcelain"], deadline)
+        .context("Failed to inspect the working tree before checkpoint capture")?;
     let is_dirty = !status.trim().is_empty();
 
-    // A resolving HEAD names the commit the transaction starts from; a failing
-    // one means the branch is unborn, which the marker records as the typed
-    // unborn state rather than the moving ref `HEAD`.
-    let base = match run_git_with_deadline(Some(dir), &["rev-parse", "HEAD"], deadline) {
-        Ok(head) => TransactionBase::Commit(head.trim().to_string()),
-        Err(_) => TransactionBase::Unborn,
-    };
+    let base =
+        inspect_head(dir, deadline)?.map_or(TransactionBase::Unborn, TransactionBase::Commit);
 
     if !is_dirty {
         let checkpoint = CheckpointInfo {
@@ -1922,7 +1940,8 @@ pub fn create_checkpoint_with_deadline(
             phase: TransactionPhase::Established,
             writer_pid: Some(std::process::id()),
         };
-        write_transaction_marker(dir, &checkpoint)?;
+        write_transaction_marker(dir, &checkpoint)
+            .map_err(|error| report_failed_capture(dir, &checkpoint, None, error, deadline))?;
         return Ok(checkpoint);
     }
 
@@ -1936,37 +1955,84 @@ pub fn create_checkpoint_with_deadline(
         phase: TransactionPhase::Capturing,
         writer_pid: Some(std::process::id()),
     };
-    write_transaction_marker(dir, &capturing)?;
+    let mut established = None;
+    let result = (|| {
+        write_transaction_marker(dir, &capturing)?;
+        run_git_with_deadline(Some(dir), &["add", "-A"], deadline)
+            .context("Failed to stage uncommitted changes for checkpoint")?;
+        commit_with_developer_author_with_deadline(
+            dir,
+            "tauqe-checkpoint: uncommitted user changes",
+            false,
+            hooks,
+            deadline,
+        )?;
 
-    // Stage and commit uncommitted user changes into a checkpoint commit.
-    // Ignored paths (.tauqe, credentials, temporary files) in .git/info/exclude
-    // are automatically skipped by git add -A without argument pathspec errors.
-    run_git_with_deadline(Some(dir), &["add", "-A"], deadline)
-        .context("Failed to stage uncommitted changes for checkpoint")?;
+        let new_head = inspect_head(dir, deadline)?
+            .context("HEAD did not resolve after committing the checkpoint")?;
+        let checkpoint = CheckpointInfo {
+            created_checkpoint_commit: true,
+            base: TransactionBase::Commit(new_head),
+            phase: TransactionPhase::Established,
+            writer_pid: capturing.writer_pid,
+        };
+        // The durability barrier can fail after the marker was published.
+        established = Some(checkpoint.clone());
+        write_transaction_marker(dir, &checkpoint)?;
+        Ok(checkpoint)
+    })();
+    result.map_err(|error| {
+        report_failed_capture(dir, &capturing, established.as_ref(), error, deadline)
+    })
+}
 
-    commit_with_developer_author_with_deadline(
-        dir,
-        "tauqe-checkpoint: uncommitted user changes",
-        false,
-        hooks,
-        deadline,
-    )?;
+/// Settles only the marker this capture attempted to publish. Startup still
+/// refuses a live writer; here the owner itself is settling its failed capture.
+fn report_failed_capture(
+    dir: &Path,
+    initial: &CheckpointInfo,
+    established: Option<&CheckpointInfo>,
+    primary: anyhow::Error,
+    deadline: &GitDeadline,
+) -> anyhow::Error {
+    let recovery = (|| -> Result<bool> {
+        let bytes = match std::fs::read(transaction_marker_path(dir)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).context("Failed to read the checkpoint capture marker")
+            }
+        };
+        let marker: CheckpointInfo = serde_json::from_slice(&bytes)
+            .context("Failed to decode the checkpoint capture marker")?;
+        anyhow::ensure!(
+            &marker == initial || established == Some(&marker),
+            "The checkpoint capture marker no longer matches this attempt"
+        );
+        if initial.phase == TransactionPhase::Capturing {
+            let recovery_deadline = GitDeadline::with_timeout(deadline.timeout_secs());
+            let outcome = recover_capturing_transaction(
+                dir,
+                initial,
+                ReclaimedOrphans::NONE,
+                &recovery_deadline,
+            )?;
+            if let RecoveryOutcome::Skipped { reason } = outcome {
+                bail!("{reason}");
+            }
+        } else {
+            clear_transaction_marker(dir)?;
+        }
+        Ok(true)
+    })();
 
-    let new_head = run_git_with_deadline(Some(dir), &["rev-parse", "HEAD"], deadline)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    // The checkpoint commit exists now, so the branch is born even where it
-    // was unborn before: the recorded base is the checkpoint itself, which
-    // the unwind recognizes as a parentless root commit.
-    let checkpoint = CheckpointInfo {
-        created_checkpoint_commit: true,
-        base: TransactionBase::Commit(new_head),
-        phase: TransactionPhase::Established,
-        writer_pid: Some(std::process::id()),
-    };
-    write_transaction_marker(dir, &checkpoint)?;
-    Ok(checkpoint)
+    match recovery {
+        Ok(false) => primary,
+        Ok(true) => primary.context("The interrupted checkpoint capture was restored"),
+        Err(error) => primary.context(format!(
+            "Checkpoint capture recovery was incomplete: {error:#}"
+        )),
+    }
 }
 
 /// Restores working tree back to pre-checkpoint state (used on workflow failure/cancellation).
@@ -1978,13 +2044,8 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
 /// Restores the working tree to the pre-checkpoint state under the supplied
 /// wall-clock budget.
 ///
-/// The transaction is closed only after the temporary checkpoint commit is
-/// unwound, so a crash between the two steps leaves the marker for the next
-/// startup instead of leaving a checkpoint commit that no marker explains. The
-/// reset has already replaced the pre-turn working tree by the time the unwind
-/// runs, so a refused unwind is reported in the diagnostic instead of aborting
-/// the rollback: the marker survives, and the next recovery resolves the same
-/// state idempotently.
+/// The marker is cleared only after required cleanup and checkpoint unwind
+/// succeed. A failure is reported rather than treated as a completed rollback.
 pub fn restore_checkpoint_with_deadline(
     dir: &Path,
     checkpoint: &CheckpointInfo,
@@ -2000,7 +2061,7 @@ pub fn restore_checkpoint_with_deadline(
         }
         TransactionBase::Unborn => return_to_unborn(dir, deadline)?,
     }
-    let _ = run_git_with_deadline(
+    run_git_with_deadline(
         Some(dir),
         &[
             "clean",
@@ -2013,42 +2074,23 @@ pub fn restore_checkpoint_with_deadline(
             ".credentials.toml",
         ],
         deadline,
-    );
+    )
+    .context("Failed to clean the working tree during checkpoint rollback")?;
 
     // 2. Unwind the temporary checkpoint commit before the transaction is
     //    closed. A crash between the two steps leaves the marker, which the
     //    next startup resolves idempotently, while the opposite order would
     //    clear the marker first and strand a checkpoint commit that nothing
     //    explains.
-    //
-    //    The reset above has already replaced the pre-turn working tree, so a
-    //    refused unwind is reported in the diagnostic instead of aborting the
-    //    rollback: the marker survives, and the next recovery resolves the
-    //    remaining state.
-    let closed = !checkpoint.created_checkpoint_commit
-        || match unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline) {
-            Ok(true) => true,
-            Ok(false) => {
-                tracing::error!(
-                    "The checkpoint commit could not be unwound while rolling the transaction \
-                     back: no commit the marker records sits at HEAD; the transaction marker is \
-                     preserved and a later recovery resolves the remaining state"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to unwind the checkpoint commit while rolling the transaction back: \
-                     {}; the pre-turn work stays recoverable inside the `{CHECKPOINT_PREFIX}` \
-                     commit at HEAD and the transaction marker is preserved for a later recovery",
-                    error
-                );
-                false
-            }
-        };
-    if closed {
-        clear_transaction_marker(dir)?;
+    if checkpoint.created_checkpoint_commit {
+        let unwound = unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)
+            .context("Failed to unwind the temporary checkpoint commit during rollback")?;
+        anyhow::ensure!(
+            unwound,
+            "Could not unwind the temporary checkpoint commit: no matching checkpoint at HEAD"
+        );
     }
+    clear_transaction_marker(dir)?;
 
     cleanup_orphaned_staging_files(dir);
     Ok(())

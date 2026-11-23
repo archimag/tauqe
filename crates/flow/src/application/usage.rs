@@ -1,5 +1,6 @@
 //! Session accounting, window ownership, timing, and typed usage publication.
 
+use super::context::ContextSession;
 use crate::api::{next_operation_id, Application};
 use crate::api::{UsageTotals, UsageTotalsSnapshot};
 use std::path::Path;
@@ -12,24 +13,71 @@ use tokio::time::Instant;
 
 type UsagePublisher = Arc<dyn Fn(&str, &UsageTotalsSnapshot) + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct UsageSession {
-    ledger: Mutex<UsageLedger>,
+    ledger: Arc<Mutex<UsageLedger>>,
 }
 
 impl UsageSession {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
-            ledger: Mutex::new(UsageLedger::new(
+            ledger: Arc::new(Mutex::new(UsageLedger::new(
                 crate::application::infrastructure::usage::load_initial_snapshot(root),
-            )),
+            ))),
         }
+    }
+
+    pub(crate) async fn snapshot(&self) -> UsageTotalsSnapshot {
+        self.ledger.lock().await.snapshot().clone()
+    }
+
+    pub(crate) async fn begin<F>(
+        &self,
+        context: &ContextSession,
+        operation_id: &str,
+        publish: F,
+    ) -> UsageGuard
+    where
+        F: Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static,
+    {
+        self.begin_with_tick(context, operation_id, LIVE_DURATION_TICK, Arc::new(publish))
+            .await
+    }
+
+    async fn begin_with_tick(
+        &self,
+        context: &ContextSession,
+        operation_id: &str,
+        tick: Duration,
+        publisher: UsagePublisher,
+    ) -> UsageGuard {
+        let window = self.ledger.lock().await.begin();
+        let started = Instant::now();
+        let ticker = spawn_live_duration_ticker(
+            self,
+            window,
+            operation_id,
+            started,
+            tick,
+            Arc::clone(&publisher),
+        );
+        let guard = UsageGuard {
+            usage: self.clone(),
+            context: context.clone(),
+            operation_id: operation_id.to_owned(),
+            window,
+            started,
+            ticker,
+            publisher,
+        };
+        guard.publish().await;
+        guard
     }
 }
 
-async fn persist_lifetime(state: &Application, lifetime: &UsageTotals, operations: u64) {
+async fn persist_lifetime(context: &ContextSession, lifetime: &UsageTotals, operations: u64) {
     crate::application::infrastructure::usage::persist_lifetime(
-        state.repository_root().await,
+        context.repository_root().await,
         lifetime,
         operations,
     )
@@ -166,7 +214,8 @@ const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 /// against it under the accounting lock, so the guard can never publish or fold
 /// a scope a successor already replaced.
 pub struct UsageGuard {
-    state: Application,
+    usage: UsageSession,
+    context: ContextSession,
     /// Identifier the window publishes under: the one the caller announces
     /// through its own lifecycle events.
     operation_id: String,
@@ -200,14 +249,14 @@ impl Drop for UsageGuard {
 /// stale "still running" snapshot. The cadence arrives as `tick`, so a test can
 /// compress it without touching the production default.
 fn spawn_live_duration_ticker(
-    state: &Application,
+    usage: &UsageSession,
     window: WindowId,
     operation_id: &str,
     started: Instant,
     tick: Duration,
     publisher: UsagePublisher,
 ) -> tokio::task::JoinHandle<()> {
-    let state = state.clone();
+    let usage = usage.clone();
     let operation_id = operation_id.to_string();
     tokio::spawn(async move {
         loop {
@@ -219,7 +268,7 @@ fn spawn_live_duration_ticker(
             // successor already replaced observes that it no longer owns the
             // in-flight scope and exits without publishing anything — least of
             // all the successor's state under its own identifier and clock.
-            let ledger = state.usage_session().ledger.lock().await;
+            let ledger = usage.ledger.lock().await;
             if !ledger.owns(window) {
                 break;
             }
@@ -248,7 +297,8 @@ impl Application {
     where
         F: Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static,
     {
-        self.begin_usage_with_tick(operation_id, LIVE_DURATION_TICK, Arc::new(publish))
+        self.usage_session()
+            .begin(self.context_session(), operation_id, publish)
             .await
     }
 
@@ -278,49 +328,18 @@ impl Application {
     where
         F: Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static,
     {
-        self.begin_usage_with_tick(operation_id, tick, Arc::new(publish))
+        self.usage_session()
+            .begin_with_tick(
+                self.context_session(),
+                operation_id,
+                tick,
+                Arc::new(publish),
+            )
             .await
     }
 
     pub async fn usage_snapshot(&self) -> UsageTotalsSnapshot {
-        self.usage_session().ledger.lock().await.snapshot().clone()
-    }
-
-    /// Opens a usage accounting window whose heartbeat runs on `tick`.
-    ///
-    /// `Application::begin_usage` passes the production cadence, while a test
-    /// passes a compressed one, so no assertion has to wait a whole production
-    /// tick. The seam is private to this module and never changes the cadence
-    /// the daemon publishes with.
-    async fn begin_usage_with_tick(
-        &self,
-        operation_id: &str,
-        tick: Duration,
-        publisher: UsagePublisher,
-    ) -> UsageGuard {
-        let window = {
-            let mut ledger = self.usage_session().ledger.lock().await;
-            ledger.begin()
-        };
-        let started = Instant::now();
-        let ticker = spawn_live_duration_ticker(
-            self,
-            window,
-            operation_id,
-            started,
-            tick,
-            Arc::clone(&publisher),
-        );
-        let guard = UsageGuard {
-            state: self.clone(),
-            operation_id: operation_id.to_string(),
-            window,
-            started,
-            ticker,
-            publisher,
-        };
-        guard.publish().await;
-        guard
+        self.usage_session().snapshot().await
     }
 
     /// Clears the persisted project lifetime totals.
@@ -344,7 +363,12 @@ impl Application {
             }
             ledger.snapshot().clone()
         };
-        persist_lifetime(self, &snapshot.lifetime, snapshot.lifetime_operations).await;
+        persist_lifetime(
+            self.context_session(),
+            &snapshot.lifetime,
+            snapshot.lifetime_operations,
+        )
+        .await;
         let operation_id = format!("reset-{}", next_operation_id());
         publish_snapshot(self, &operation_id, &publisher).await;
         snapshot
@@ -387,7 +411,7 @@ impl UsageGuard {
     /// the totals installed under the lock belong to its successor.
     pub async fn observe(&self, usage: &ModelUsageInfo) {
         let applied = {
-            let mut ledger = self.state.usage_session().ledger.lock().await;
+            let mut ledger = self.usage.ledger.lock().await;
             ledger.observe(self.window, &UsageTotals::from_usage(usage))
         };
         if applied {
@@ -421,7 +445,7 @@ impl UsageGuard {
         self.ticker.abort();
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         let folded = {
-            let mut ledger = self.state.usage_session().ledger.lock().await;
+            let mut ledger = self.usage.ledger.lock().await;
             match ledger.close(self.window, elapsed_ms) {
                 Some(completed) => {
                     let snapshot = ledger.snapshot_mut();
@@ -445,13 +469,14 @@ impl UsageGuard {
         };
         // Attempt persistence before publication. A failed write remains best
         // effort and does not suppress the terminal in-memory snapshot.
-        persist_lifetime(&self.state, &lifetime, lifetime_operations).await;
+        persist_lifetime(&self.context, &lifetime, lifetime_operations).await;
         self.publish().await;
     }
 
     /// Publishes the current snapshot to the client.
     async fn publish(&self) {
-        publish_snapshot(&self.state, &self.operation_id, &self.publisher).await;
+        let snapshot = self.usage.snapshot().await;
+        (self.publisher)(&self.operation_id, &snapshot);
     }
 }
 

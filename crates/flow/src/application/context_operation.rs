@@ -325,6 +325,7 @@ mod tests {
         assert!(pattern.state.items.is_empty());
         // A workflow preload uses declared files despite the discovery budget.
         let admission = app
+            .context_session()
             .preload_declared_context(
                 root.path().to_path_buf(),
                 vec![" ./target.rs ".into()],

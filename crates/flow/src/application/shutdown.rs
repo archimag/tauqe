@@ -128,7 +128,7 @@ impl Application {
                 tracing::warn!(
                     operation_slot_id = op_id,
                     deadline_ms = exit_deadline.as_millis() as u64,
-                    "task-exit confirmation expired; the aborted task is still running",
+                    "task-exit confirmation expired; the operation is still registered",
                 );
                 return false;
             }
@@ -136,12 +136,11 @@ impl Application {
         }
     }
 
-    /// Releases the registration of `op_id` when its task never confirmed its
-    /// exit.
+    /// Releases an orphaned registration after the exit deadline, unless an
+    /// interactive supervisor owns release through terminal publication.
     ///
-    /// The comparison is the id check an [`OperationGuard`] performs on drop, so
-    /// a registration a newer operation already took over is left untouched and
-    /// a superseded guard that drops later wipes nothing.
+    /// The registry checks both identity and release ownership under its lock,
+    /// so neither a newer registration nor a supervisor's slot is cleared.
     fn release_stale_registration(&self, op_id: u64) {
         let released = self.release_operation_registration(op_id);
         if released {

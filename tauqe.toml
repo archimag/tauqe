@@ -34,11 +34,11 @@ models = [
 ]
 
 [models]
-scribe = "Claude Haiku"
+scribe = "GPT Luna"
 
 repl = [
   "GPT Sol",
-  { model = "GPT Astra", effort = "medium" },
+  { model = "GPT Astra", effort = "high" },
   "DeepSeek Flash",
   "GLM",
   "Gemini Flash",
@@ -47,6 +47,7 @@ repl = [
 
 coder = [
   "GPT Sol",
+  { model = "GPT Astra", effort = "high" },
   { model = "DeepSeek Flash", level_up = false },
   { model = "Gemini Flash", level_up = false },
   { model = "Claude Sonnet", level_up = false }

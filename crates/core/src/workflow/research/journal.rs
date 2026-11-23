@@ -54,7 +54,7 @@ impl TurnResearchJournal {
     /// [`Self::render_round_feedback`] renders that round alone. The cumulative
     /// tail keeps the whole turn's investigation, so the boundary narrows what a
     /// round reports without losing what an earlier round learned.
-    pub(crate) fn begin_round(&mut self, index: usize) {
+    pub fn begin_round(&mut self, index: usize) {
         self.round = RoundSection {
             index: Some(index),
             ..RoundSection::default()
@@ -70,7 +70,7 @@ impl TurnResearchJournal {
     /// Blank blocks carry no knowledge and are dropped. A block identical to one
     /// already recorded is dropped too: the turn tail only ever grows with
     /// genuinely new findings.
-    pub(crate) fn push_block(&mut self, block: impl Into<String>) {
+    pub fn push_block(&mut self, block: impl Into<String>) {
         let block = block.into();
         let block = block.trim();
         if block.is_empty() {
@@ -84,14 +84,14 @@ impl TurnResearchJournal {
     }
 
     /// Records the findings of one round.
-    pub(crate) fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
+    pub fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
             self.push_block(block.as_str());
         }
     }
 
     /// Renders findings from the current round. File versions are delivered by the transcript.
-    pub(crate) fn render_round_feedback(&self) -> String {
+    pub fn render_round_feedback(&self) -> String {
         self.round.blocks.join("\n\n")
     }
 
@@ -103,12 +103,12 @@ impl TurnResearchJournal {
 
     /// Returns the recorded blocks in the order they were learned.
     #[cfg(test)]
-    pub(crate) fn entries(&self) -> &[String] {
+    fn entries(&self) -> &[String] {
         &self.entries
     }
 
     /// Renders the whole journal as one delimited tail, or `None` when empty.
-    pub(crate) fn rendered(&self) -> Option<String> {
+    pub fn rendered(&self) -> Option<String> {
         if self.entries.is_empty() {
             return None;
         }

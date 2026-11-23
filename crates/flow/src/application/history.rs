@@ -28,7 +28,7 @@ pub struct HistoryPage {
     pub estimated_tokens: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct HistorySession {
     state: Arc<Mutex<Option<HistoryManager>>>,
     sender: Option<mpsc::UnboundedSender<HistoryMutation>>,
@@ -86,15 +86,30 @@ impl HistorySession {
         Ok(())
     }
 
-    async fn clone_for_turn(&self) -> Result<HistoryManager, HistoryError> {
+    pub(crate) async fn clone_for_turn(&self) -> Result<HistoryManager, HistoryError> {
         self.state
             .lock()
             .await
             .clone()
             .ok_or(HistoryError::Unavailable)
     }
-    async fn adopt(&self, history: HistoryManager) {
+    pub(crate) async fn adopt(&self, history: HistoryManager) {
         *self.state.lock().await = Some(history);
+    }
+
+    pub(crate) async fn record_history_exchange(
+        &self,
+        prompt: String,
+        paths: Vec<String>,
+        response: String,
+        summary: Option<String>,
+    ) -> Result<(), HistoryError> {
+        self.mutate(move |history| {
+            let _ = history.record_turn(prompt, paths);
+            let _ = history.record_response(response, None, summary, Vec::new());
+            Ok(())
+        })
+        .await
     }
     #[cfg(test)]
     async fn tokens(&self) -> u64 {
@@ -137,13 +152,6 @@ impl Application {
         self.history_session().tokens().await
     }
 
-    /// Private execution copy for compaction; no shared lock crosses provider I/O.
-    pub(crate) async fn history_for_turn(&self) -> Result<HistoryManager, HistoryError> {
-        self.history_session().clone_for_turn().await
-    }
-    pub(crate) async fn adopt_turn_history(&self, history: HistoryManager) {
-        self.history_session().adopt(history).await;
-    }
     pub(crate) async fn rebind_history(&self, root: PathBuf) -> Result<(), HistoryError> {
         self.history_session().rebind(root).await
     }
@@ -153,14 +161,17 @@ impl Application {
         prompt: String,
         files: Vec<String>,
         watermark: Option<u64>,
-    ) -> Result<(Option<u64>, Option<HistorySnapshot>), HistoryError> {
+    ) -> Result<(u64, HistorySnapshot), HistoryError> {
         self.history_session()
             .mutate(move |history| {
-                let snapshot = history.snapshot().ok();
+                let snapshot = history.snapshot().map_err(storage_error)?;
                 let id = history
                     .record_turn_with_watermark(prompt, files, watermark)
-                    .ok()
-                    .and_then(|entry| entry.id());
+                    .map_err(storage_error)?
+                    .id()
+                    .ok_or_else(|| {
+                        HistoryError::Storage("Recorded history turn has no ID".into())
+                    })?;
                 Ok((id, snapshot))
             })
             .await
@@ -179,6 +190,16 @@ impl Application {
             })
             .await
     }
+    pub(crate) async fn set_history_turn_rounds(
+        &self,
+        id: u64,
+        rounds: Vec<tauqe_core::history::TurnRoundRecord>,
+    ) -> Result<(), HistoryError> {
+        self.history_session()
+            .mutate(move |history| history.set_turn_rounds(id, rounds).map_err(storage_error))
+            .await
+    }
+
     pub(crate) async fn record_history_response(
         &self,
         text: String,
@@ -195,6 +216,9 @@ impl Application {
             })
             .await
     }
+}
+
+impl HistorySession {
     pub(crate) async fn record_history_review(
         &self,
         model: String,
@@ -203,30 +227,17 @@ impl Application {
         files: Vec<String>,
         findings: usize,
     ) -> Result<(), HistoryError> {
-        self.history_session()
-            .mutate(move |history| {
-                history
-                    .record_review(model, prompt, summary, files, findings)
-                    .map(|_| ())
-                    .map_err(storage_error)
-            })
-            .await
+        self.mutate(move |history| {
+            history
+                .record_review(model, prompt, summary, files, findings)
+                .map(|_| ())
+                .map_err(storage_error)
+        })
+        .await
     }
-    pub(crate) async fn record_history_exchange(
-        &self,
-        prompt: String,
-        paths: Vec<String>,
-        response: String,
-        summary: Option<String>,
-    ) -> Result<(), HistoryError> {
-        self.history_session()
-            .mutate(move |history| {
-                let _ = history.record_turn(prompt, paths);
-                let _ = history.record_response(response, None, summary, Vec::new());
-                Ok(())
-            })
-            .await
-    }
+}
+
+impl Application {
     pub(crate) async fn rollback_history_entry(
         &self,
         id: u64,
@@ -371,12 +382,12 @@ mod tests {
         app.record_history_turn("First".into(), Vec::new())
             .await
             .unwrap();
-        let mut turn = app.history_for_turn().await.unwrap();
+        let mut turn = app.history_session().clone_for_turn().await.unwrap();
         let turn = tauqe_core::blocking::run_blocking(move || {
             turn.record_turn("Second", Vec::new()).unwrap();
             turn
         });
-        app.adopt_turn_history(turn).await;
+        app.history_session().adopt(turn).await;
         app.record_history_turn("Third".into(), Vec::new())
             .await
             .unwrap();

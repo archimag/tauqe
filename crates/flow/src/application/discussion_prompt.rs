@@ -1,6 +1,8 @@
-//! Preparation of interactive and focused discussion prompts.
+//! Resolve interactive input and its discussion context at admission.
 use crate::api::{Application, DiscussionFocus, DiscussionTarget, FocusUpdate};
 use std::path::Path;
+use tauqe_core::plan::Plan;
+use tauqe_core::review::{ReviewGroup, ReviewItem, ReviewSession};
 
 pub enum ModelAskInput {
     Prompt {
@@ -24,10 +26,33 @@ pub enum DiscussionPromptError {
 }
 
 #[derive(Debug)]
-pub struct PreparedModelAsk {
-    pub prompt: String,
-    pub focus: Option<DiscussionTarget>,
+pub(crate) struct PreparedModelAsk {
+    pub utterance: String,
+    pub discussion: Option<ResolvedDiscussion>,
     pub focus_update: Option<FocusUpdate>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedDiscussion {
+    pub target: DiscussionTarget,
+    pub document: DiscussionDocument,
+}
+
+#[derive(Debug)]
+pub(crate) enum DiscussionDocument {
+    Plan {
+        plan: Box<Plan>,
+        focused_items: Vec<String>,
+    },
+    Review {
+        session: Box<ReviewSession>,
+        focused_items: Vec<u32>,
+    },
+    ReviewGroup {
+        session: Box<ReviewSession>,
+        group: Box<ReviewGroup>,
+        findings: Vec<ReviewItem>,
+    },
 }
 
 impl Application {
@@ -44,17 +69,16 @@ impl Application {
                 focused_items,
                 comment,
             } => {
-                let prompt =
-                    build_discussion_prompt(repo_root, &target, &focused_items, &comment).await?;
+                let discussion = resolve_discussion(repo_root, &target, &focused_items).await?;
                 let update = self
                     .set_discussion_focus(DiscussionFocus::Focused {
-                        target: target.clone(),
+                        target,
                         focused_items,
                     })
                     .await;
                 Ok(PreparedModelAsk {
-                    prompt,
-                    focus: Some(target),
+                    utterance: comment,
+                    discussion: Some(discussion),
                     focus_update: Some(update),
                 })
             }
@@ -64,28 +88,26 @@ impl Application {
                 }
                 match self.discussion_focus().await {
                     DiscussionFocus::None => Ok(PreparedModelAsk {
-                        prompt: text,
-                        focus: None,
+                        utterance: text,
+                        discussion: None,
                         focus_update: None,
                     }),
                     DiscussionFocus::Focused {
                         target,
                         focused_items,
                     } => {
-                        match build_discussion_prompt(repo_root, &target, &focused_items, &text)
-                            .await
-                        {
-                            Ok(prompt) => Ok(PreparedModelAsk {
-                                prompt,
-                                focus: Some(target),
+                        match resolve_discussion(repo_root, &target, &focused_items).await {
+                            Ok(discussion) => Ok(PreparedModelAsk {
+                                utterance: text,
+                                discussion: Some(discussion),
                                 focus_update: None,
                             }),
                             Err(error) => {
                                 tracing::warn!("Discussion focus target could not be loaded ({}); clearing focus", error);
                                 let update = self.clear_discussion_focus().await;
                                 Ok(PreparedModelAsk {
-                                    prompt: text,
-                                    focus: None,
+                                    utterance: text,
+                                    discussion: None,
                                     focus_update: Some(update),
                                 })
                             }
@@ -103,13 +125,12 @@ async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> R
         .map_err(|err| format!("blocking task failed: {}", err))
 }
 
-async fn build_discussion_prompt(
+async fn resolve_discussion(
     repo_root: &Path,
     target: &DiscussionTarget,
     focused_items: &[String],
-    comment: &str,
-) -> Result<String, DiscussionPromptError> {
-    match target {
+) -> Result<ResolvedDiscussion, DiscussionPromptError> {
+    let document = match target {
         DiscussionTarget::Plan { id } => {
             let loaded = {
                 let repo_root = repo_root.to_path_buf();
@@ -128,11 +149,10 @@ async fn build_discussion_prompt(
                 }
                 Err(err) => return Err(DiscussionPromptError::Storage(format!("{:#}", err))),
             };
-            Ok(tauqe_core::plan::prompt::format_plan_discussion_prompt(
-                &plan,
-                focused_items,
-                comment,
-            ))
+            DiscussionDocument::Plan {
+                plan: Box::new(plan),
+                focused_items: focused_items.to_vec(),
+            }
         }
         DiscussionTarget::Review { id } => {
             let loaded = {
@@ -154,15 +174,13 @@ async fn build_discussion_prompt(
                 }
                 Err(err) => return Err(DiscussionPromptError::Storage(format!("{:#}", err))),
             };
-            let focused: Vec<u32> = focused_items
-                .iter()
-                .filter_map(|raw| raw.trim().parse::<u32>().ok())
-                .collect();
-            Ok(
-                tauqe_core::review::prompt::format_review_discussion_prompt_items(
-                    &session, &focused, comment,
-                ),
-            )
+            DiscussionDocument::Review {
+                session: Box::new(session),
+                focused_items: focused_items
+                    .iter()
+                    .filter_map(|raw| raw.trim().parse::<u32>().ok())
+                    .collect(),
+            }
         }
         DiscussionTarget::ReviewGroup {
             session_id,
@@ -204,7 +222,7 @@ async fn build_discussion_prompt(
             // finding that manifests the cause instead of a selection of them.
             // Membership follows the effective group of a finding: a finding
             // that stores no group belongs to the implicit default group.
-            let findings: Vec<tauqe_core::review::ReviewItem> = session
+            let findings = session
                 .items
                 .iter()
                 .filter(|item| {
@@ -216,13 +234,17 @@ async fn build_discussion_prompt(
                 })
                 .cloned()
                 .collect();
-            Ok(
-                tauqe_core::review::prompt::format_review_group_discussion_prompt(
-                    &session, &group, &findings, comment,
-                ),
-            )
+            DiscussionDocument::ReviewGroup {
+                session: Box::new(session),
+                group: Box::new(group),
+                findings,
+            }
         }
-    }
+    };
+    Ok(ResolvedDiscussion {
+        target: target.clone(),
+        document,
+    })
 }
 
 #[cfg(test)]

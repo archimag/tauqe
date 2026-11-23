@@ -53,7 +53,7 @@ where
 }
 
 impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    pub(crate) fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
             content: content.into(),
@@ -87,8 +87,8 @@ pub enum ResponseFormat {
 pub struct JsonSchemaDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub schema: Cow<'static, serde_json::Value>,
+    pub(crate) description: Option<String>,
+    pub(crate) schema: Cow<'static, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }

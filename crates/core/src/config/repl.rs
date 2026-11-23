@@ -27,6 +27,13 @@ pub struct ReplConfig {
     pub max_replans: usize,
 }
 
+impl ReplConfig {
+    /// Configured format for addressing file edits in model requests.
+    pub fn patch_strategy(&self) -> PatchStrategy {
+        self.patch_strategy
+    }
+}
+
 fn default_max_turn_rounds() -> usize {
     DEFAULT_MAX_TURN_ROUNDS
 }

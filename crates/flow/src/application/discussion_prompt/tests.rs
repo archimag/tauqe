@@ -37,8 +37,16 @@ async fn explicit_discussion_loads_before_replacing_focus_and_preserves_repeat_n
     )
     .unwrap();
     let prepared = app.prepare_model_ask(root.path(), request()).await.unwrap();
-    assert!(prepared.prompt.contains("Selected plan"));
-    assert!(prepared.prompt.contains("Keep this comment"));
+    assert_eq!(prepared.utterance, "Keep this comment");
+    let discussion = prepared.discussion.unwrap();
+    assert_eq!(
+        discussion.target,
+        DiscussionTarget::Plan { id: "plan".into() }
+    );
+    assert!(
+        matches!(discussion.document, DiscussionDocument::Plan { plan, focused_items }
+        if plan.title == "Selected plan" && focused_items == ["1", "1"])
+    );
     let update = prepared.focus_update.unwrap();
     assert!(update.changed);
     assert!(
@@ -75,15 +83,16 @@ async fn invalid_text_preserves_focus_and_stale_focus_falls_back_to_exact_text()
         .prepare_model_ask(root.path(), ModelAskInput::Prompt { text: text.into() })
         .await
         .unwrap();
-    assert_eq!(prepared.prompt, text);
-    assert!(prepared.focus.is_none());
+    assert_eq!(prepared.utterance, text);
+    assert!(prepared.discussion.is_none());
     assert!(prepared.focus_update.unwrap().changed);
     assert_eq!(app.discussion_focus().await, DiscussionFocus::None);
     let free = app
         .prepare_model_ask(root.path(), ModelAskInput::Prompt { text: text.into() })
         .await
         .unwrap();
-    assert_eq!(free.prompt, text);
+    assert_eq!(free.utterance, text);
+    assert!(free.discussion.is_none());
     assert!(free.focus_update.is_none());
 }
 
@@ -126,7 +135,8 @@ async fn corrupt_target_is_refused_explicitly_and_dropped_when_implicitly_focuse
         )
         .await
         .unwrap();
-    assert_eq!(fallback.prompt, "Continue");
+    assert_eq!(fallback.utterance, "Continue");
+    assert!(fallback.discussion.is_none());
     assert!(fallback.focus_update.unwrap().changed);
 }
 
@@ -165,10 +175,15 @@ async fn group_discussion_uses_effective_membership_instead_of_focused_item_sele
         )
         .await
         .unwrap();
-    assert!(prepared.prompt.contains("First member"));
-    assert!(prepared.prompt.contains("Second member"));
-    assert!(!prepared.prompt.contains("Foreign member"));
-    assert!(prepared.prompt.contains("Group comment"));
+    assert_eq!(prepared.utterance, "Group comment");
+    let DiscussionDocument::ReviewGroup { findings, .. } = prepared.discussion.unwrap().document
+    else {
+        panic!("expected a resolved review group");
+    };
+    assert_eq!(
+        findings.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [1, 2]
+    );
     let previous = app.discussion_focus().await;
     let error = app
         .prepare_model_ask(

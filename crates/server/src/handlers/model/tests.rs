@@ -1,10 +1,7 @@
 //! Unit tests for the model turn subsystem.
 //!
-//! The tests pin the deterministic decisions taken before any provider request
-//! is launched: which turn intent a typed discussion target establishes and
-//! which commands the selected protocol admits. Every assertion
-//! targets a pure function, so the suite needs no `AppState`, no provider, and
-//! no repository.
+//! Pure capability checks and RPC integration contracts exercise the production
+//! Application route with scripted providers and isolated repositories.
 
 use crate::contracts::Project;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,19 +27,21 @@ use crate::state::AppState;
 use tauqe_flow::api::turn_prompt_protocol as resolve_turn_protocol;
 /// Capability surface of a free interactive dialogue.
 fn dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
-    tauqe_core::control::repl_capabilities(None)
+    tauqe_core::llm::repl::repl_capabilities(None)
 }
 
 /// Capability surface of a plan-anchored dialogue.
 fn plan_dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
-    tauqe_core::control::repl_capabilities(Some(&tauqe_core::discussion::DiscussionTarget::Plan {
-        id: "plan-1".to_string(),
-    }))
+    tauqe_core::llm::repl::repl_capabilities(Some(
+        &tauqe_core::discussion::DiscussionTarget::Plan {
+            id: "plan-1".to_string(),
+        },
+    ))
 }
 
 /// Capability surface of a review-anchored dialogue.
 fn review_dialogue_capabilities() -> tauqe_core::llm::CapabilityTree {
-    tauqe_core::control::repl_capabilities(Some(
+    tauqe_core::llm::repl::repl_capabilities(Some(
         &tauqe_core::discussion::DiscussionTarget::Review {
             id: "review-1".to_string(),
         },
@@ -74,9 +73,8 @@ fn review_discussion_is_authorized_by_its_surface() {
         session_id: "review-1".to_string(),
         group_id: "arch-1".to_string(),
     };
-    assert!(
-        tauqe_core::control::repl_capabilities(Some(&group)).contains(LlmCapability::ReviewUpdate)
-    );
+    assert!(tauqe_core::llm::repl::repl_capabilities(Some(&group))
+        .contains(LlmCapability::ReviewUpdate));
 }
 
 /// A decision recorded for one finding through the Structured Output transport.
@@ -128,7 +126,7 @@ fn the_recorded_decision_never_leaves_the_review_regime() {
     for capabilities in [
         dialogue_capabilities(),
         plan_dialogue_capabilities(),
-        tauqe_core::control::turn::turn_capability_expr(),
+        tauqe_core::llm::step::turn_capability_expr(),
     ] {
         let protocol = resolve_turn_protocol(capabilities);
         let surface = protocol.capability_expr();
@@ -284,7 +282,7 @@ fn interactive_turn_never_carries_plan_mutation() {
 /// bounded-turn FSM narrows the decoder, so the assertion covers the
 /// end-to-end surface of the step.
 fn assert_step_has_no_plan_permission() {
-    let protocol = resolve_turn_protocol(tauqe_core::control::turn::turn_capability_expr());
+    let protocol = resolve_turn_protocol(tauqe_core::llm::step::turn_capability_expr());
     assert!(!protocol
         .capability_expr()
         .contains(LlmCapability::PlanCreation));
@@ -449,6 +447,7 @@ async fn preflight_accepts_a_repository_without_a_declaration() {
 /// Provider that streams one fragment and then parks until the harness cancels
 /// the turn, holding a bounded turn open at a deterministic point.
 struct StallingProvider {
+    first: tauqe_core::providers::MockLlmProvider,
     /// Signals that the provider is suspended mid-stream.
     entered: mpsc::UnboundedSender<()>,
     /// Set while the provider is parked on the cancellation signal.
@@ -461,6 +460,14 @@ impl StallingProvider {
         let (entered, receiver) = mpsc::unbounded_channel();
         (
             Self {
+                first: tauqe_core::providers::MockLlmProvider::scripted([
+                    tauqe_core::providers::mock::MockResponse::text(
+                        r#"{"message":"Accepted research.","scratchpad":"private rpc marker","action":{"kind":"research","context_requests":[{"path":"README.md","access":"read_only"}]}}"#,
+                    ).with_usage(tauqe_core::providers::ModelUsageInfo {
+                        prompt_tokens: 3, completion_tokens: 4, total_tokens: 7,
+                        ..Default::default()
+                    }),
+                ]),
                 entered,
                 parked: Arc::new(AtomicBool::new(false)),
             },
@@ -482,10 +489,33 @@ impl LlmProvider for StallingProvider {
 
     async fn stream(
         &self,
-        _request: tauqe_core::providers::LlmRequest<'_>,
+        request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> tauqe_core::providers::ProviderResult {
+        if self.first.requests().is_empty() {
+            return self.first.stream(request, tx, cancel_rx).await;
+        }
+        // Inspect the public captured request without exposing LlmRequest's
+        // private fields or forwarding the recorder's Done into the live turn.
+        let recorder = tauqe_core::providers::MockLlmProvider::scripted([
+            tauqe_core::providers::mock::MockResponse::text(""),
+        ]);
+        let (capture_tx, _capture_rx) = mpsc::channel(1);
+        recorder
+            .stream(request, capture_tx, cancel_rx.clone())
+            .await?;
+        let request = recorder.last_request().expect("continuation captured");
+        assert!(request
+            .messages
+            .iter()
+            .any(|message| message.role == "assistant"
+                && message.content
+                    == "Accepted research.\n\n<scratchpad>private rpc marker</scratchpad>"));
+        assert!(request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("# scratch")));
         // Stream a fragment first, so the turn is genuinely mid-stream when the
         // test dispatches its requests.
         if tx
@@ -649,24 +679,28 @@ async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
     tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
         .expect("commit the fixture");
 
-    let state = state_over_root(root.clone());
+    let (out, mut published) = crate::transport::OutChannel::new();
+    let (history, _) = mpsc::unbounded_channel();
+    let state = AppState::new(AppConfig::default(), root.clone(), history, out);
     let (provider, mut entered) = StallingProvider::new();
     let provider = Arc::new(provider);
     let injected: Arc<dyn LlmProvider> = provider.clone();
     state.application.test_set_provider(injected).await;
 
-    state
-        .application
-        .ask(
-            tauqe_flow::api::ModelAskInput::Prompt {
-                text: "Explain the repository".into(),
-            },
-            Arc::new(crate::publication::Publisher {
-                out: state.out.clone(),
-            }),
-        )
-        .await
-        .expect("the turn starts");
+    let started = super::handle_model_ask(
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::MODEL_ASK.into(),
+            params: Some(serde_json::json!({"kind":"prompt","text":"Explain the repository"})),
+        },
+        &state,
+    )
+    .await;
+    assert!(started.error.is_none());
+    let operation_id = started.result.unwrap()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     tokio::time::timeout(Duration::from_secs(10), entered.recv())
         .await
@@ -718,6 +752,56 @@ async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
         !provider.is_parked(),
         "the provider must observe the cancellation"
     );
+    let events = published_events(&mut published);
+    let rounds: Vec<_> = events
+        .iter()
+        .filter(|(method, _)| method == tauqe_protocol::events::TURN_ROUND_STARTED)
+        .map(|(_, params)| {
+            assert_eq!(params["operation_id"], operation_id);
+            params["round"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(rounds, [1, 2]);
+    assert!(events
+        .iter()
+        .any(|(method, _)| method == tauqe_protocol::events::MODEL_CANCELLED));
+    assert!(!events.iter().any(|(method, _)| matches!(
+        method.as_str(),
+        tauqe_protocol::events::MODEL_RESULT | tauqe_protocol::events::MODEL_FINISHED
+    )));
+    assert!(!serde_json::to_string(&events)
+        .unwrap()
+        .contains("private rpc marker"));
+    let usage = state.application.usage_snapshot().await;
+    assert!(usage.cur.is_none());
+    assert_eq!(usage.operations, 1);
+    assert_eq!(usage.prev.total_tokens, 7);
+    let reopened = state_over_root(root.clone());
+    let page = reopened.application.history_page(None, None).await.unwrap();
+    assert_eq!(page.total_count, 2);
+    let turn = page
+        .items
+        .iter()
+        .find(|item| item.text == "Explain the repository")
+        .unwrap();
+    assert_eq!(turn.rounds.len(), 1);
+    assert_eq!(turn.rounds[0].index, 1);
+    assert_eq!(turn.rounds[0].message, "Accepted research.");
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|item| item.text == "Operation cancelled")
+            .count(),
+        1
+    );
+    let journal = std::fs::read_to_string(root.join(".tauqe/history.jsonl")).unwrap();
+    assert!(!journal.contains("private rpc marker"));
+    assert!(!journal.contains("Reading the repository"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+        "# scratch\n"
+    );
+    assert!(!root.join(".tauqe/active-transaction.json").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 

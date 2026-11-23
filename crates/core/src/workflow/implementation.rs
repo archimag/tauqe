@@ -20,12 +20,13 @@
 //! this module supplies their shared frame, failure, and request types.
 
 mod turn_outcome;
-pub use turn_outcome::{classify_refinement, classify_step_turn};
+pub use turn_outcome::classify_refinement;
 
 mod scope;
 
 pub use scope::{classify_scope_stall, ExecutionScope, ImplementationFrame};
 
+use crate::edits::EditOutcome;
 use crate::models::{ArchitectTier, ModelSelection, ReasoningEffort};
 use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 use crate::workflow::turn::TurnWorkQueue;
@@ -190,6 +191,28 @@ pub enum StepTurnResult {
     Failed(StepFailure),
 }
 
+/// The turn verdict and the disk receipt, which can outlive the round task.
+pub struct StepTurnSettlement {
+    pub result: StepTurnResult,
+    pub edit: Option<EditOutcome>,
+}
+
+impl StepTurnSettlement {
+    /// A confirmed commit from the disk worker, independently of the verdict.
+    pub fn confirmed_commit(&self) -> Option<&str> {
+        self.edit
+            .as_ref()
+            .filter(|edit| edit.applied && edit.error.is_none())
+            .and_then(|edit| edit.commit_hash.as_deref())
+    }
+}
+
+impl From<StepTurnResult> for StepTurnSettlement {
+    fn from(result: StepTurnResult) -> Self {
+        Self { result, edit: None }
+    }
+}
+
 /// Terminal reason an implementation run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanImplementationStop {
@@ -222,8 +245,6 @@ pub struct LeafTransition {
     pub status: PlanItemStatus,
     pub blocked_reason: Option<String>,
     pub commit: Option<String>,
-    /// The group's current horizon for its whole-horizon storage operation.
-    pub group_items: Vec<PlanItem>,
 }
 
 /// Data returned after a successful durable transition.

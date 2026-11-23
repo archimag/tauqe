@@ -1704,8 +1704,12 @@ fn test_restore_checkpoint_keeps_the_marker_when_the_checkpoint_commit_cannot_be
     write_transaction_marker(path, &checkpoint).unwrap();
     fs::write(path.join("ai_work.txt"), "ai step modification").unwrap();
 
-    restore_checkpoint(path, &checkpoint)
-        .expect("the completed reset must not be aborted by a refused unwind");
+    let error = restore_checkpoint(path, &checkpoint)
+        .expect_err("a refused unwind must not report successful restoration");
+    assert!(
+        error.to_string().contains("no matching checkpoint at HEAD"),
+        "{error:#}"
+    );
 
     // The reset already returned the tree to the recorded base and removed the
     // turn's own file, while the marker survives the refused unwind.

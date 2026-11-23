@@ -1,4 +1,5 @@
 use super::*;
+use crate::discussion::DiscussionTarget;
 use crate::models::ArchitectTier;
 use crate::plan::{PlanImplementation, PlanItem};
 use crate::review::{
@@ -368,6 +369,116 @@ fn test_load_and_delete_respect_sanitized_id_collision() {
 
     let still_exists = ReviewStorage::load_review(root, "team/auth").unwrap();
     assert!(still_exists.is_some());
+}
+
+fn review_focus(id: &str) -> DiscussionTarget {
+    DiscussionTarget::Review { id: id.to_string() }
+}
+
+fn group_focus(session_id: &str, group_id: &str) -> DiscussionTarget {
+    DiscussionTarget::ReviewGroup {
+        session_id: session_id.to_string(),
+        group_id: group_id.to_string(),
+    }
+}
+
+fn decision(item_id: u32) -> crate::review::ReviewUpdateProposal {
+    crate::review::ReviewUpdateProposal {
+        item_id,
+        group_id: None,
+        status: crate::review::ReviewDecisionStatus::Rejected,
+        note: "Already verified".to_string(),
+        recommendations: Vec::new(),
+    }
+}
+
+#[test]
+fn review_decision_distinguishes_missing_session_and_missing_finding() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let reviews = ReviewStorage::reviews_dir(root);
+    let id = "team/auth";
+    assert_eq!(
+        ReviewStorage::apply_decision(root, &review_focus(id), &decision(1)).unwrap(),
+        ReviewDecisionOutcome::MissingSession
+    );
+    assert!(!reviews.exists());
+
+    let session = ReviewSession {
+        id: id.to_string(),
+        title: "Review".to_string(),
+        items: vec![group_finding(1, None)],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+    let path = reviews.join("team-auth.json");
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        ReviewStorage::apply_decision(root, &review_focus("team-auth"), &decision(1)).unwrap(),
+        ReviewDecisionOutcome::MissingSession
+    );
+    assert_eq!(
+        ReviewStorage::apply_decision(root, &review_focus(id), &decision(2)).unwrap(),
+        ReviewDecisionOutcome::MissingFinding
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn review_decision_reports_an_incomplete_lookup_without_writing() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let reviews = ReviewStorage::reviews_dir(root);
+    std::fs::create_dir_all(&reviews).unwrap();
+    let path = reviews.join("review.json");
+    let invalid = b"{ invalid review JSON";
+    std::fs::write(&path, invalid).unwrap();
+    // Neither the default name nor an unreadable fallback candidate can prove
+    // that the requested session is absent.
+    for id in ["review", "REVIEW"] {
+        let error =
+            ReviewStorage::apply_decision(root, &review_focus(id), &decision(1)).unwrap_err();
+        assert!(error.to_string().contains("Failed to parse review JSON"));
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    }
+    assert!(ReviewStorage::list_reviews(root).unwrap().is_empty());
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let sentinel = path.join("keep");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    let error =
+        ReviewStorage::apply_decision(root, &review_focus("review"), &decision(1)).unwrap_err();
+    assert!(error.to_string().contains("Expected a review file"));
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    assert!(!reviews.join("active").exists());
+}
+
+#[test]
+fn review_decision_updates_the_resolved_file_in_place() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let session = ReviewSession {
+        id: "Review One".to_string(),
+        title: "Review".to_string(),
+        items: vec![group_finding(1, None)],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+    let reviews = ReviewStorage::reviews_dir(root);
+    let stored_path = reviews.join("Review-One.json");
+    assert_eq!(
+        ReviewStorage::apply_decision(root, &review_focus("review one"), &decision(1)).unwrap(),
+        ReviewDecisionOutcome::Saved
+    );
+    let stored: ReviewSession =
+        serde_json::from_slice(&std::fs::read(stored_path).unwrap()).unwrap();
+    assert_eq!(stored.items[0].status, IssueStatus::Rejected);
+    assert_eq!(
+        stored.items[0].resolution_notes.as_deref(),
+        Some("Already verified")
+    );
+    assert_eq!(ReviewStorage::list_reviews(root).unwrap().len(), 1);
 }
 
 #[test]
@@ -1329,10 +1440,8 @@ fn test_set_group_blocked_reason_records_and_clears_the_blocker() {
         .is_none());
 }
 
-/// A recorded decision ends the blocker, is stored once on the group, and is
-/// stamped onto every finding the group collects.
 #[test]
-fn test_apply_group_decision_clears_the_blocker_and_stamps_the_members() {
+fn group_decision_changes_only_the_focused_group_and_its_members() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     let review = "rev-group-decision";
@@ -1355,75 +1464,134 @@ fn test_apply_group_decision_clears_the_blocker_and_stamps_the_members() {
         ..Default::default()
     };
     ReviewStorage::save_session(root, &session).unwrap();
+    let other = ReviewSession {
+        id: "other".to_string(),
+        ..session.clone()
+    };
+    ReviewStorage::save_session(root, &other).unwrap();
+    ReviewStorage::save_active_id(root, Some(&other.id)).unwrap();
+    let other_path = ReviewStorage::reviews_dir(root).join("other.json");
+    let other_before = std::fs::read(&other_path).unwrap();
 
-    // A decision must state what was decided: a blank note is rejected and the
-    // stored session keeps its blocker.
-    let rejected = ReviewStorage::apply_group_decision(root, review, "arch-1", "   ");
-    assert!(rejected.is_err(), "a blank decision is rejected");
+    let update = crate::review::ReviewUpdateProposal {
+        group_id: Some("arch-1".to_string()),
+        note: "  The cache owns the lock  ".to_string(),
+        recommendations: vec![
+            "Apply change 1".to_string(),
+            " Extend the guard ".to_string(),
+        ],
+        ..decision(1)
+    };
+    assert_eq!(
+        ReviewStorage::apply_decision(root, &group_focus(review, "arch-1"), &update).unwrap(),
+        ReviewDecisionOutcome::Saved
+    );
+
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
-    assert_eq!(
-        stored.groups[0].blocked_reason.as_deref(),
-        Some("Two symptoms, one undecided cause")
-    );
-    assert!(stored.find_item(1).unwrap().resolution_notes.is_none());
-
-    let decided =
-        ReviewStorage::apply_group_decision(root, review, "arch-1", "  The cache owns the lock  ")
-            .unwrap()
-            .expect("the declared group records its decision");
-    assert!(decided.blocked_reason.is_none());
-    assert_eq!(
-        decided.resolution_notes.as_deref(),
-        Some("The cache owns the lock")
-    );
-    // The horizon belongs to the group and stays out of scope of the decision.
-    assert_eq!(decided.implementation.items.len(), 1);
-
-    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
-    let group = &stored.groups[0];
-    assert!(group.blocked_reason.is_none());
-    assert_eq!(
-        group.resolution_notes.as_deref(),
-        Some("The cache owns the lock")
-    );
-    for item in stored.items.iter().filter(|item| item.id != 3) {
-        assert_eq!(
-            item.resolution_notes.as_deref(),
-            Some("The cache owns the lock"),
-            "the decision is stamped onto every member finding"
-        );
-        // The round-trip through the canonical `ReviewIssue` model must not
-        // rewrite the content of a finding.
-        assert_eq!(item.title, format!("Finding {}", item.id));
-        assert_eq!(item.body, format!("Body {}", item.id));
-        assert_eq!(item.files, vec![format!("src/file_{}.rs", item.id)]);
-        assert_eq!(
-            item.recommendations,
-            vec![format!("Apply change {}", item.id)]
-        );
+    let mut expected_group = session.groups[0].clone();
+    expected_group.blocked_reason = None;
+    expected_group.resolution_notes = Some("The cache owns the lock".to_string());
+    assert_eq!(stored.groups, [expected_group, session.groups[1].clone()]);
+    for (index, mut expected) in session.items.iter().take(2).cloned().enumerate() {
+        expected.status = IssueStatus::Rejected;
+        expected.resolution_notes = Some("The cache owns the lock".to_string());
+        if index == 1 {
+            expected.recommendations.push("Apply change 1".to_string());
+        }
+        expected
+            .recommendations
+            .push("Extend the guard".to_string());
+        assert_eq!(stored.items[index], expected);
     }
+    assert_eq!(stored.items[2], session.items[2]);
+    assert_eq!(std::fs::read(other_path).unwrap(), other_before);
+}
 
-    // A decision settles the architecture; it never starts or finishes the
-    // remediation of the findings, so their lifecycle status stays untouched.
-    let untouched = stored.find_item(3).unwrap();
-    assert!(untouched.resolution_notes.is_none());
-    assert_eq!(untouched.status, IssueStatus::Todo);
-    assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Todo);
+#[test]
+fn out_of_scope_or_blank_group_decisions_leave_the_session_file_untouched() {
+    use ReviewDecisionOutcome::{EmptyGroupNote, MissingFinding, MissingGroup, TargetMismatch};
 
-    // An undeclared group and a missing session change nothing.
-    assert!(
-        ReviewStorage::apply_group_decision(root, review, "arch-9", "anything")
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        ReviewStorage::apply_group_decision(root, "rev-missing", "arch-1", "anything")
-            .unwrap()
-            .is_none()
-    );
-    assert!(ReviewStorage::load_review(root, "rev-missing")
-        .unwrap()
-        .is_none());
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "rev-group-refused";
+    let session = ReviewSession {
+        id: review.to_string(),
+        groups: vec![architectural_group("arch-1"), simple_group("local")],
+        items: vec![
+            group_finding(1, Some("arch-1")),
+            group_finding(2, Some("local")),
+        ],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+    let path = ReviewStorage::reviews_dir(root).join(format!("{review}.json"));
+    let mut before = std::fs::read(&path).unwrap();
+    // A redundant serialization would discard this trailing whitespace.
+    before.push(b'\n');
+    std::fs::write(&path, &before).unwrap();
+
+    for (focus, group_id, item_id, note, expected) in [
+        (
+            review_focus(review),
+            Some("arch-1"),
+            1,
+            "Decision",
+            TargetMismatch,
+        ),
+        (
+            group_focus(review, "arch-1"),
+            Some("local"),
+            2,
+            "Decision",
+            TargetMismatch,
+        ),
+        (
+            group_focus(review, "arch-9"),
+            Some("arch-9"),
+            1,
+            "Decision",
+            MissingGroup,
+        ),
+        (
+            group_focus(review, "arch-1"),
+            Some("arch-1"),
+            2,
+            "Decision",
+            MissingFinding,
+        ),
+        (
+            group_focus(review, "arch-1"),
+            None,
+            2,
+            "Decision",
+            MissingFinding,
+        ),
+        (
+            group_focus(review, "arch-1"),
+            Some("arch-1"),
+            9,
+            "Decision",
+            MissingFinding,
+        ),
+        (
+            group_focus(review, "arch-1"),
+            Some("arch-1"),
+            1,
+            "  ",
+            EmptyGroupNote,
+        ),
+    ] {
+        let update = crate::review::ReviewUpdateProposal {
+            group_id: group_id.map(str::to_string),
+            note: note.to_string(),
+            ..decision(item_id)
+        };
+        assert_eq!(
+            ReviewStorage::apply_decision(root, &focus, &update).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 }
 
 /// Finding of a grouped session whose lifecycle status and note are stated by
@@ -1450,10 +1618,11 @@ fn test_close_group_implementation_closes_only_open_findings() {
     let root = dir.path();
     let review = "rev-group-completion";
 
-    let blocked = ReviewGroup {
+    let mut blocked = ReviewGroup {
         blocked_reason: Some("The lock ordering must be decided first".to_string()),
         ..architectural_group("arch-1")
     };
+    blocked.implementation.items[0].status = crate::plan::PlanItemStatus::Done;
     let session = ReviewSession {
         id: review.to_string(),
         title: "Group Completion".to_string(),
@@ -1463,7 +1632,12 @@ fn test_close_group_implementation_closes_only_open_findings() {
         items: vec![
             finding_with(1, Some("arch-1"), IssueStatus::Discussion, None),
             finding_with(2, Some("arch-1"), IssueStatus::Todo, None),
-            finding_with(3, Some("arch-1"), IssueStatus::InProgress, None),
+            finding_with(
+                3,
+                Some("arch-1"),
+                IssueStatus::InProgress,
+                Some("Developer note"),
+            ),
             finding_with(4, Some("arch-1"), IssueStatus::Skipped, None),
             finding_with(
                 5,
@@ -1489,9 +1663,8 @@ fn test_close_group_implementation_closes_only_open_findings() {
         "arch-1",
         "Resolved by the completed implementation horizon of the review group",
     )
-    .unwrap()
-    .expect("the declared group is closed");
-    assert_eq!(closed, 3, "only the open findings of the group are closed");
+    .unwrap();
+    assert_eq!(closed, GroupCompletion::Closed(3));
 
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
     for id in [1, 2, 3] {
@@ -1499,8 +1672,11 @@ fn test_close_group_implementation_closes_only_open_findings() {
         assert_eq!(item.status, IssueStatus::Fixed, "finding {id}");
         assert_eq!(
             item.resolution_notes.as_deref(),
-            Some("Resolved by the completed implementation horizon of the review group"),
-            "the completion note is recorded on a finding that carries none"
+            Some(if id == 3 {
+                "Developer note"
+            } else {
+                "Resolved by the completed implementation horizon of the review group"
+            }),
         );
         // The round-trip through the canonical `ReviewIssue` model must not
         // rewrite the content of a finding.
@@ -1531,10 +1707,8 @@ fn test_close_group_implementation_closes_only_open_findings() {
 
     // A repeated completion finds nothing left to close and never rewrites the
     // note it already recorded.
-    let again = ReviewStorage::close_group_implementation(root, review, "arch-1", "again")
-        .unwrap()
-        .expect("the declared group accepts a repeated completion");
-    assert_eq!(again, 0);
+    let again = ReviewStorage::close_group_implementation(root, review, "arch-1", "again").unwrap();
+    assert_eq!(again, GroupCompletion::Closed(0));
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
     assert_eq!(
         stored.find_item(1).unwrap().resolution_notes.as_deref(),
@@ -1542,17 +1716,75 @@ fn test_close_group_implementation_closes_only_open_findings() {
     );
 
     // An undeclared group and a missing session change nothing.
-    assert!(
-        ReviewStorage::close_group_implementation(root, review, "arch-9", "x")
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        ReviewStorage::close_group_implementation(root, "rev-missing", "arch-1", "x")
-            .unwrap()
-            .is_none()
-    );
+    for (review, group) in [(review, "arch-9"), ("rev-missing", "arch-1")] {
+        assert_eq!(
+            ReviewStorage::close_group_implementation(root, review, group, "x").unwrap(),
+            GroupCompletion::Missing
+        );
+    }
     assert!(ReviewStorage::load_review(root, "rev-missing")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn an_incomplete_group_cannot_be_closed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut session = ReviewSession {
+        id: "incomplete".into(),
+        groups: vec![architectural_group("arch-1")],
+        items: vec![group_finding(1, Some("arch-1"))],
+        ..Default::default()
+    };
+    session.groups[0].blocked_reason = Some("Existing blocker".into());
+    let path = ReviewStorage::reviews_dir(root).join("incomplete.json");
+    for empty in [false, true] {
+        if empty {
+            session.groups[0].implementation.items.clear();
+        }
+        ReviewStorage::save_session(root, &session).unwrap();
+        let mut before = std::fs::read(&path).unwrap();
+        before.push(b'\n');
+        std::fs::write(&path, &before).unwrap();
+        assert_eq!(
+            ReviewStorage::close_group_implementation(root, &session.id, "arch-1", "done").unwrap(),
+            GroupCompletion::Incomplete
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn settlement_reports_a_failed_atomic_write() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut group = architectural_group("arch-1");
+    group.implementation.items[0].status = crate::plan::PlanItemStatus::Done;
+    let session = ReviewSession {
+        id: "review".into(),
+        groups: vec![group],
+        items: vec![group_finding(1, Some("arch-1"))],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+    let reviews = ReviewStorage::reviews_dir(root);
+    // The existing file can be read, but the staging suffix makes its name too long.
+    let path = reviews.join(format!("{}.json", "r".repeat(250)));
+    std::fs::rename(reviews.join("review.json"), &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    for error in [
+        ReviewStorage::complete_finding(root, "review", 1, "done").unwrap_err(),
+        ReviewStorage::skip_finding(root, "review", 1, "reason").unwrap_err(),
+        ReviewStorage::close_group_implementation(root, "review", "arch-1", "done").unwrap_err(),
+        ReviewStorage::set_group_blocked_reason(root, "review", "arch-1", Some("reason"))
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("Failed to stage content"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }

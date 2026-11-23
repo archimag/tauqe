@@ -2,7 +2,9 @@
 
 use json_skimmer::{Event, Mode, Parser, StringKind};
 
-use crate::capabilities::{PreviewCondition, PreviewRoute, PreviewRouteKind};
+#[cfg(test)]
+use crate::capabilities::PreviewCondition;
+use crate::capabilities::{PreviewRoute, PreviewRouteKind};
 use crate::edits::EditFileOp;
 
 use super::string::StringSegments;
@@ -58,7 +60,7 @@ pub enum PathPart {
     Index(usize),
 }
 
-pub fn key_path(keys: &[&str]) -> Vec<PathPart> {
+pub(crate) fn key_path(keys: &[&str]) -> Vec<PathPart> {
     keys.iter()
         .map(|key| PathPart::Key((*key).into()))
         .collect()
@@ -451,11 +453,11 @@ pub struct PreviewEvents {
 }
 
 impl PreviewEvents {
-    pub fn new(target: Vec<PathPart>) -> Self {
+    pub(crate) fn new(target: Vec<PathPart>) -> Self {
         Self::with_paths(vec![target])
     }
 
-    pub fn with_paths(targets: Vec<Vec<PathPart>>) -> Self {
+    fn with_paths(targets: Vec<Vec<PathPart>>) -> Self {
         Self::with_routes(
             targets
                 .into_iter()
@@ -501,7 +503,8 @@ impl PreviewEvents {
     }
 
     /// Only these arrays contain previewable change entries.
-    pub fn with_edits(mut self, paths: Vec<Vec<PathPart>>) -> Self {
+    #[cfg(test)]
+    fn with_edits(mut self, paths: Vec<Vec<PathPart>>) -> Self {
         self.router
             .routes
             .extend(paths.into_iter().map(|path| PreviewRoute {
@@ -522,7 +525,8 @@ impl PreviewEvents {
     }
 
     /// Require a completed discriminator before previewing branch-owned data.
-    pub fn with_branch(mut self, path: Vec<PathPart>, value: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn with_branch(mut self, path: Vec<PathPart>, value: impl Into<String>) -> Self {
         let condition = PreviewCondition {
             path: path.clone(),
             expected: value.into(),
@@ -543,7 +547,7 @@ impl PreviewEvents {
         self
     }
 
-    pub fn state(&self) -> PreviewState {
+    fn state(&self) -> PreviewState {
         if self.router.invalid {
             PreviewState::Invalid
         } else if self.router.candidate_end {
@@ -553,14 +557,14 @@ impl PreviewEvents {
         }
     }
 
-    pub fn push_updates(&mut self, bytes: &[u8]) -> Vec<PreviewUpdate> {
+    pub(crate) fn push_updates(&mut self, bytes: &[u8]) -> Vec<PreviewUpdate> {
         let mut updates = Vec::new();
         self.parser
             .push(bytes, |event| self.router.event(event, &mut updates));
         updates
     }
 
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.push_updates(bytes)
             .into_iter()
             .filter_map(|update| match update {
@@ -570,13 +574,13 @@ impl PreviewEvents {
             .collect()
     }
 
-    pub fn finish(&mut self) -> PreviewState {
+    pub(crate) fn finish(&mut self) -> PreviewState {
         self.parser
             .finish(|event| self.router.event(event, &mut Vec::new()));
         self.state()
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Self::with_routes(self.router.routes.clone());
     }
 }

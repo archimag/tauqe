@@ -1,10 +1,22 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::discussion::DiscussionTarget;
 use crate::review::ReviewUpdateProposal;
-use crate::review::{IssueStatus, ReviewIssue, ReviewItem};
+use crate::review::{IssueStatus, ReviewIssue, ReviewItem, ReviewSession};
 
+use super::groups::{apply_group_decision, finding_in_group};
 use super::ReviewStorage;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewDecisionOutcome {
+    MissingSession,
+    MissingFinding,
+    MissingGroup,
+    TargetMismatch,
+    EmptyGroupNote,
+    Saved,
+}
 
 impl ReviewStorage {
     /// Updates a review item by id within the explicitly named session.
@@ -42,15 +54,7 @@ impl ReviewStorage {
             None => return Ok(None),
         };
 
-        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id)
-        {
-            let mut issue = ReviewIssue::from(item.clone());
-            updater(&mut issue);
-            *item = ReviewItem::from(issue.clone());
-            Some(issue)
-        } else {
-            None
-        };
+        let updated_issue = update_item(&mut session, item_id, updater);
 
         if updated_issue.is_some() {
             Self::save_session_unlocked(repo_root, &session)?;
@@ -71,38 +75,162 @@ impl ReviewStorage {
         })
     }
 
-    /// Applies a decision recorded in a dialogue for one finding.
-    ///
-    /// The decision is the engineer's own resolution of the finding, so it
-    /// carries the status the finding moves to, the reasoning behind it, and the
-    /// remediation agreed during the discussion. The note is stored under the
-    /// canonical `note` wire name shared with the review DTOs, and a
-    /// recommendation the finding already carries is never duplicated. A finding
-    /// the named session does not hold is reported as absent instead of being
-    /// invented, so a decision can never fabricate a finding.
-    pub fn apply_decision(
+    /// Completes one finding without replacing its recorded commit or developer note.
+    pub fn complete_finding(
         repo_root: &Path,
         review_id: &str,
+        item_id: u32,
+        note: &str,
+    ) -> Result<Option<()>> {
+        Self::settle_finding(repo_root, review_id, item_id, IssueStatus::Fixed, note)
+    }
+
+    /// Records why execution skipped one finding, preserving any existing verdict or note.
+    pub fn skip_finding(
+        repo_root: &Path,
+        review_id: &str,
+        item_id: u32,
+        reason: &str,
+    ) -> Result<Option<()>> {
+        let note = format!("The implementation run could not address this finding: {reason}");
+        Self::settle_finding(repo_root, review_id, item_id, IssueStatus::Skipped, &note)
+    }
+
+    fn settle_finding(
+        repo_root: &Path,
+        review_id: &str,
+        item_id: u32,
+        status: IssueStatus,
+        note: &str,
+    ) -> Result<Option<()>> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let Some((path, mut session)) =
+                Self::resolve_session_file_unlocked(repo_root, review_id)?
+            else {
+                return Ok(None);
+            };
+            let Some(item) = session.items.iter_mut().find(|item| item.id == item_id) else {
+                return Ok(None);
+            };
+            if is_open_finding(item.status) {
+                let mut issue = ReviewIssue::from(item.clone());
+                record_resolution(&mut issue, status, note);
+                *item = ReviewItem::from(issue);
+                Self::write_session_unlocked(repo_root, &path, &session)?;
+            }
+            Ok(Some(()))
+        })
+    }
+
+    /// Applies a dialogue decision within its frozen review focus.
+    /// A group focus scopes even a decision that addresses only one finding.
+    pub fn apply_decision(
+        repo_root: &Path,
+        focus: &DiscussionTarget,
         decision: &ReviewUpdateProposal,
-    ) -> Result<Option<ReviewIssue>> {
-        Self::update_session_item(repo_root, review_id, decision.item_id, |issue| {
-            issue.apply_decision(decision);
+    ) -> Result<ReviewDecisionOutcome> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let (review_id, focused_group) = match focus {
+                DiscussionTarget::Review { id } => (id, None),
+                DiscussionTarget::ReviewGroup {
+                    session_id,
+                    group_id,
+                } => (session_id, Some(group_id.as_str())),
+                DiscussionTarget::Plan { .. } => return Ok(ReviewDecisionOutcome::TargetMismatch),
+            };
+            let proposed_group = decision.group_id.as_deref();
+            if proposed_group.is_some() && proposed_group != focused_group {
+                return Ok(ReviewDecisionOutcome::TargetMismatch);
+            }
+            let Some((path, mut session)) =
+                Self::resolve_session_file_unlocked(repo_root, review_id)?
+            else {
+                return Ok(ReviewDecisionOutcome::MissingSession);
+            };
+            if let Some(group_id) = focused_group {
+                if !session.groups.iter().any(|group| group.id == group_id) {
+                    return Ok(ReviewDecisionOutcome::MissingGroup);
+                }
+                if !session
+                    .find_item(decision.item_id)
+                    .is_some_and(|item| finding_in_group(item, group_id))
+                {
+                    return Ok(ReviewDecisionOutcome::MissingFinding);
+                }
+            }
+            if let Some(group_id) = proposed_group {
+                if decision.note.trim().is_empty() {
+                    return Ok(ReviewDecisionOutcome::EmptyGroupNote);
+                }
+                if !apply_group_decision(&mut session, group_id, decision) {
+                    return Ok(ReviewDecisionOutcome::MissingGroup);
+                }
+            } else if update_item(&mut session, decision.item_id, |issue| {
+                issue.apply_decision(decision);
+            })
+            .is_none()
+            {
+                return Ok(ReviewDecisionOutcome::MissingFinding);
+            }
+            Self::write_session_unlocked(repo_root, &path, &session)?;
+            Ok(ReviewDecisionOutcome::Saved)
         })
     }
 }
 
+pub(super) fn is_open_finding(status: IssueStatus) -> bool {
+    matches!(
+        status,
+        IssueStatus::Discussion | IssueStatus::Todo | IssueStatus::InProgress
+    )
+}
+
+pub(super) fn record_resolution(issue: &mut ReviewIssue, status: IssueStatus, note: &str) {
+    issue.status = status;
+    let note = note.trim();
+    if !note.is_empty()
+        && issue
+            .note
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        issue.note = Some(note.to_string());
+    }
+}
+
+fn update_item(
+    session: &mut ReviewSession,
+    item_id: u32,
+    updater: impl FnOnce(&mut ReviewIssue),
+) -> Option<ReviewIssue> {
+    let item = session.items.iter_mut().find(|item| item.id == item_id)?;
+    let mut issue = ReviewIssue::from(item.clone());
+    updater(&mut issue);
+    *item = ReviewItem::from(issue.clone());
+    Some(issue)
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::discussion::DiscussionTarget;
     use crate::review::{
         IssueStatus, IssueType, ReviewDecisionStatus, ReviewItem, ReviewSession, ReviewSeverity,
         ReviewUpdateProposal,
     };
 
-    use super::ReviewStorage;
+    use super::{ReviewDecisionOutcome, ReviewStorage};
 
     /// Commit recorded on the fixture finding, standing in for the hash the
     /// executor records once it resolves a finding.
     const RESOLVED_COMMIT: &str = "9a8b7c6d5e4f30211203f4e5d6c7b8a99f0e1d2c";
+
+    fn focus() -> DiscussionTarget {
+        DiscussionTarget::Review {
+            id: "rev-decision".to_string(),
+        }
+    }
 
     /// Builds a session whose single finding already carries a recommendation.
     fn session_with_finding() -> ReviewSession {
@@ -145,26 +273,9 @@ mod tests {
                 "Document the ordering".to_string(),
             ],
         };
-        let updated = ReviewStorage::apply_decision(&root, "rev-decision", &decision)
-            .expect("apply the decision")
-            .expect("the finding is present");
-
-        assert_eq!(updated.status, IssueStatus::Rejected);
         assert_eq!(
-            updated.commit.as_deref(),
-            Some(RESOLVED_COMMIT),
-            "the recorded commit survives the decision"
-        );
-        assert_eq!(
-            updated.note.as_deref(),
-            Some("The guard is released after the await")
-        );
-        assert_eq!(
-            updated.recommendations,
-            vec![
-                "Guard the await".to_string(),
-                "Document the ordering".to_string()
-            ]
+            ReviewStorage::apply_decision(&root, &focus(), &decision).unwrap(),
+            ReviewDecisionOutcome::Saved
         );
 
         let stored = ReviewStorage::load_review(&root, "rev-decision")
@@ -180,6 +291,10 @@ mod tests {
         assert_eq!(
             stored.resolution_notes.as_deref(),
             Some("The guard is released after the await")
+        );
+        assert_eq!(
+            stored.recommendations,
+            ["Guard the await", "Document the ordering"]
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -197,11 +312,12 @@ mod tests {
             note: String::new(),
             recommendations: Vec::new(),
         };
-        let applied = ReviewStorage::apply_decision(&root, "rev-decision", &decision)
-            .expect("the write is attempted");
+        let applied =
+            ReviewStorage::apply_decision(&root, &focus(), &decision).expect("apply the decision");
 
-        assert!(
-            applied.is_none(),
+        assert_eq!(
+            applied,
+            ReviewDecisionOutcome::MissingFinding,
             "an absent finding is reported, never invented"
         );
 
@@ -223,10 +339,8 @@ mod tests {
             note: "Not actionable".to_string(),
             recommendations: Vec::new(),
         };
-        let applied = ReviewStorage::apply_decision(&root, "rev-decision", &decision)
-            .unwrap()
-            .unwrap();
-        assert_eq!(applied.status, IssueStatus::Rejected);
+        let applied = ReviewStorage::apply_decision(&root, &focus(), &decision).unwrap();
+        assert_eq!(applied, ReviewDecisionOutcome::Saved);
         assert_eq!(
             ReviewStorage::load_review(&root, "rev-other")
                 .unwrap()

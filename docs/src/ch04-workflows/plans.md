@@ -436,8 +436,8 @@ that owns the horizon and hands one turn request to the seam. The daemon execute
    `files` as editable context and `readonly_files` as read-only reference context, and
    materializes the documents `outer_docs` names, which removes research latency for the
    material the plan already declared;
-2. it runs one streaming bounded turn through `run_turn_loop`, as described in
-   *The Autonomous Bounded Turn FSM*, with the whole concept tree and the completed
+2. it runs one streaming bounded turn through `StepAttempt` and `TurnWorkflow`,
+   as described in *The Autonomous Bounded Turn*, with the whole concept tree and the completed
    milestones injected and the conversational history suppressed, so the turn reasons
    about the plan instead of the chat;
 3. it classifies the terminal outcome into the failure taxonomy: a semantic block

@@ -96,6 +96,18 @@ pub struct ContextConfig {
     pub(crate) max_scratchpad_chars: usize,
 }
 
+impl ContextConfig {
+    /// Token budget used to render the repository map.
+    pub fn repomap_token_budget(&self) -> usize {
+        self.repomap_token_budget
+    }
+
+    /// Character limit for private notes retained by a turn transcript.
+    pub fn max_scratchpad_chars(&self) -> usize {
+        self.max_scratchpad_chars
+    }
+}
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {

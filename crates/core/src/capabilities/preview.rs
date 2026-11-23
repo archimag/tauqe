@@ -132,7 +132,6 @@ fn collect(
 
 /// Project previewable fields from the same tree and strategy as the wire schema.
 /// No route is added for a field that the tree does not declare.
-#[allow(dead_code)] // Connected to the stream filter in the subsequent plan step.
 pub(crate) fn preview_routes(tree: &CapabilityTree, strategy: PatchStrategy) -> Vec<PreviewRoute> {
     let mut routes = Vec::new();
     collect(tree, &[], &[], strategy, &mut routes);

@@ -1,87 +1,95 @@
 //! Read-only document snapshots published after an interactive completion.
-use crate::api::{Application, InteractiveTurnCompletion};
+use crate::api::Application;
+use crate::workflows::repl::documents::DocumentOutcome;
 use std::path::Path;
-use tauqe_core::discussion::DiscussionTarget;
+use std::sync::Arc;
 use tauqe_core::plan::{storage::PlanStorage, Plan};
-use tauqe_core::review::{storage::ReviewStorage, ReviewSession};
+use tauqe_core::review::{
+    storage::{ReviewDecisionOutcome, ReviewStorage},
+    ReviewSession,
+};
 
 pub struct InteractivePlanUpdates {
-    pub(crate) active_plan: Option<Plan>,
-    pub(crate) plans: Vec<Plan>,
-    pub(crate) active_id: Option<String>,
+    pub(crate) saved: Vec<Plan>,
+    pub(crate) listing: Option<(Vec<Plan>, Option<String>)>,
 }
 pub struct InteractiveReviewUpdates {
     pub(crate) session: ReviewSession,
     pub(crate) decisions_applied: usize,
 }
 impl Application {
-    /// Publication is best effort; a failed list read suppresses both plan notices.
+    /// A failed list read cannot suppress documents confirmed by storage.
     pub(crate) async fn interactive_plan_updates(
         &self,
         root: &Path,
-        completion: &InteractiveTurnCompletion,
+        receipts: &[Arc<DocumentOutcome>],
     ) -> Option<InteractivePlanUpdates> {
-        if !completion.plans_applied {
+        let saved: Vec<_> = receipts
+            .iter()
+            .filter_map(|receipt| match receipt.as_ref() {
+                DocumentOutcome::Plans(outcomes) => Some(outcomes),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|outcome| outcome.applied.iter().cloned())
+            .collect();
+        if saved.is_empty() {
             return None;
         }
         let root = root.to_path_buf();
-        let (active_id, plans) = tokio::task::spawn_blocking(move || {
-            let active = PlanStorage::load_active_id(&root).ok().flatten();
-            let plans = PlanStorage::load_all(&root).ok();
-            (active, plans)
+        let listing = tokio::task::spawn_blocking(move || {
+            let plans = PlanStorage::load_all(&root).ok()?;
+            let active_id = PlanStorage::load_active_id(&root).ok().flatten();
+            Some((plans, active_id))
         })
         .await
-        .unwrap_or((None, None));
-        let plans = plans?;
-        let active_plan = active_id
-            .as_ref()
-            .and_then(|id| plans.iter().find(|plan| &plan.id == id))
-            .cloned();
-        Some(InteractivePlanUpdates {
-            active_plan,
-            plans,
-            active_id,
-        })
+        .ok()
+        .flatten();
+        Some(InteractivePlanUpdates { saved, listing })
     }
 
     /// Review and group decisions refresh their owning session once per applied decision.
     pub(crate) async fn interactive_review_updates(
         &self,
         root: &Path,
-        completion: &InteractiveTurnCompletion,
-        focus: Option<&DiscussionTarget>,
-    ) -> Option<InteractiveReviewUpdates> {
-        if completion.review_decisions_applied.is_empty() {
-            return None;
+        receipts: &[Arc<DocumentOutcome>],
+    ) -> Vec<InteractiveReviewUpdates> {
+        let mut sessions = std::collections::BTreeMap::new();
+        for receipt in receipts {
+            if let DocumentOutcome::Review {
+                session_id: Some(id),
+                result: Ok(ReviewDecisionOutcome::Saved),
+                ..
+            } = receipt.as_ref()
+            {
+                *sessions.entry(id.clone()).or_insert(0) += 1;
+            }
         }
-        let review_id = focus?.review_session_id()?;
+        if sessions.is_empty() {
+            return Vec::new();
+        }
         let root = root.to_path_buf();
-        let id = review_id.to_owned();
-        let session = match tokio::task::spawn_blocking(move || {
-            ReviewStorage::load_review(&root, &id)
+        match tokio::task::spawn_blocking(move || {
+            sessions.into_iter().filter_map(|(id, decisions_applied)| {
+                match ReviewStorage::load_review(&root, &id) {
+                    Ok(session) => session.map(|session| InteractiveReviewUpdates { session, decisions_applied }),
+                    Err(error) => {
+                        tracing::warn!(review_id=%id, %error, "review session could not be read");
+                        None
+                    }
+                }
+            }).collect()
         })
         .await
         {
-            Ok(Ok(session)) => session,
-            Ok(Err(error)) => {
-                tracing::warn!(review_id=%review_id,error=%error,"review session could not be read");
-                None
-            }
+            Ok(updates) => updates,
             Err(error) => {
-                let error = format!("blocking task failed: {}", error);
-                tracing::warn!(review_id=%review_id,error=%error,"review session read failed");
-                None
+                tracing::warn!(%error, "review snapshot task failed");
+                Vec::new()
             }
-        }?;
-        Some(InteractiveReviewUpdates {
-            session,
-            decisions_applied: completion.review_decisions_applied.len(),
-        })
+        }
     }
 }
-
-#[cfg(test)]
-mod tests;
 
 impl Application {
     /// Read repository state after commit publication, before edit-cycle closure.

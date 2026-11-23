@@ -94,6 +94,14 @@ pub struct ScratchpadCommand {
     pub(crate) notes: String,
 }
 
+impl ScratchpadCommand {
+    /// Private working memory for the owning workflow's turn transcript.
+    /// This must not enter user-facing events or durable history.
+    pub fn notes(&self) -> &str {
+        &self.notes
+    }
+}
+
 /// Conversational text emitted to the user interface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +140,16 @@ impl BlockedCommand {
 pub struct AbortCommand {
     pub(crate) reason: String,
     pub(crate) recommendation: String,
+}
+
+impl AbortCommand {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn recommendation(&self) -> &str {
+        &self.recommendation
+    }
 }
 
 /// Terminal commit message stated by the model when the turn succeeded.

@@ -11,9 +11,9 @@ use std::collections::HashMap;
 
 use crate::capabilities::{compose_contract_rules, ContractContext, PromptRenderContext};
 use crate::context::ContextFileContent;
-use crate::control::structured::{StructuredContract, StructuredVisibility};
 use crate::edits::anchor::{encode_anchor, ANCHOR_LEN};
 use crate::edits::stream::json::decode::first_json_object_str;
+use crate::execution::support::{StructuredContract, StructuredVisibility};
 use crate::history::HistorySnapshot;
 use crate::plan::Plan;
 use crate::prompt::layout::assemble_chronological_messages;
@@ -51,7 +51,7 @@ pub struct TurnBrief {
 }
 
 impl TurnBrief {
-    pub(crate) fn dialogue() -> Self {
+    fn dialogue() -> Self {
         Self {
             contour: ContourKind::Dialogue,
             intro: DIALOGUE_INTRO.to_string(),
@@ -70,7 +70,7 @@ impl TurnBrief {
     ///
     /// A synthesis reasons about the project rather than about the working tree, so it
     /// opens with the introduction of its own planning role.
-    pub(crate) fn architect() -> Self {
+    pub fn architect() -> Self {
         Self {
             contour: ContourKind::Architect,
             intro: ARCHITECT_INTRO.to_string(),
@@ -183,7 +183,7 @@ fn history_compaction_response_schema() -> serde_json::Value {
     })
 }
 
-pub(crate) fn history_compaction_response_format() -> ResponseFormat {
+fn history_compaction_response_format() -> ResponseFormat {
     ResponseFormat::JsonSchema {
         json_schema: JsonSchemaDefinition {
             name: "history_compaction".to_string(),
@@ -207,7 +207,7 @@ pub fn history_compaction_contract() -> StructuredContract<Option<String>> {
     }
 }
 
-pub(crate) fn parse_compaction_summary(raw: &str) -> Option<String> {
+fn parse_compaction_summary(raw: &str) -> Option<String> {
     extract_json_string_field(raw, "summary")
 }
 
@@ -226,7 +226,7 @@ fn squash_commit_response_schema() -> serde_json::Value {
 }
 
 /// Builds the provider [`ResponseFormat`] that enforces the squash commit schema.
-pub fn squash_commit_response_format() -> ResponseFormat {
+fn squash_commit_response_format() -> ResponseFormat {
     ResponseFormat::JsonSchema {
         json_schema: JsonSchemaDefinition {
             name: "squash_commit".to_string(),
@@ -239,7 +239,7 @@ pub fn squash_commit_response_format() -> ResponseFormat {
 
 /// A completed squash response can carry no usable message. The scenario owns
 /// the fallback; request failures and incomplete streams remain errors.
-pub fn squash_commit_contract() -> crate::control::structured::StructuredContract<Option<String>> {
+pub fn squash_commit_contract() -> StructuredContract<Option<String>> {
     StructuredContract {
         instructions: "You are an expert developer assistant. Return the requested squash commit message as a JSON object with a commit_message string.".into(),
         format: squash_commit_response_format(),
@@ -250,7 +250,7 @@ pub fn squash_commit_contract() -> crate::control::structured::StructuredContrac
 }
 
 /// Extracts the commit message from the Scribe's structured squash output.
-pub fn parse_squash_commit_message(raw: &str) -> Option<String> {
+fn parse_squash_commit_message(raw: &str) -> Option<String> {
     extract_json_string_field(raw, "commit_message")
 }
 
@@ -464,7 +464,7 @@ pub(crate) struct PromptAssembly {
     repo_dirs: Option<String>,
     active_plan: Option<Plan>,
     pub(crate) turn_brief: Option<TurnBrief>,
-    pub(crate) turn_scratchpad: Option<String>,
+    turn_scratchpad: Option<String>,
     max_scratchpad_chars: usize,
     patch_strategy: PatchStrategy,
     project: Option<crate::config::project::ProjectConfig>,
@@ -682,7 +682,7 @@ impl PromptAssembly {
     }
 
     #[cfg(test)]
-    pub(crate) fn assemble_chat_messages(
+    fn assemble_chat_messages(
         &self,
         current_prompt: &str,
         protocol: &dyn PromptProtocol,
@@ -708,20 +708,18 @@ impl PromptAssembly {
 mod tests {
     use super::*;
     use crate::history::HistoryEntry;
+    use crate::llm::repl::{dialogue_capability_expr, repl_capability_expr};
+    use crate::llm::step::turn_capability_expr;
     use crate::llm::CapabilityTree;
     use crate::prompt::json::JsonPromptProtocol;
     /// Structured protocol carrying the shared dialogue surface.
     fn dialogue_protocol() -> Box<dyn PromptProtocol> {
-        Box::new(JsonPromptProtocol::new(
-            crate::control::repl::repl_capability_expr(None),
-        ))
+        Box::new(JsonPromptProtocol::new(repl_capability_expr(None)))
     }
 
     /// Structured protocol carrying the capability surface of one isolated step.
     fn step_protocol() -> Box<dyn PromptProtocol> {
-        Box::new(JsonPromptProtocol::new(
-            crate::control::turn::turn_capability_expr(),
-        ))
+        Box::new(JsonPromptProtocol::new(turn_capability_expr()))
     }
     /// Lifts the operational branch envelope of a composed schema into one surface.
     ///
@@ -819,8 +817,7 @@ mod tests {
             None,
             None,
         );
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Привет", &proto);
         assert!(!messages[0].content.contains("## Language Directive"));
         assert!(messages[0].content.contains("Response Language"));
@@ -851,8 +848,7 @@ mod tests {
             history,
             repo_map,
         );
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
         // The head keeps the contract, the instructions, and the outline; the
         // interaction record and the file body travel through the transcript.
@@ -906,8 +902,7 @@ mod tests {
             None,
             None,
         );
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(true, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(true, false));
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
         // A plan discussion is a dialogue like any other: the rule that
@@ -1060,9 +1055,8 @@ mod tests {
         // transport derives the edit mode and composes the registry schema, where
         // the plan payload is already declared. The conversation-specific mode
         // section is therefore never rendered for it.
-        let protocol = crate::prompt::json::JsonPromptProtocol::new(
-            crate::control::repl::dialogue_capability_expr(true, false),
-        );
+        let protocol =
+            crate::prompt::json::JsonPromptProtocol::new(dialogue_capability_expr(true, false));
         let prompt = assembly.build_system_prompt(&protocol);
         assert_eq!(prompt.matches("Code Modification Protocol").count(), 1);
         assert!(prompt.contains("`patch`"));
@@ -1328,8 +1322,7 @@ mod tests {
             }],
         ));
 
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Do work", &proto);
         let head = &messages[0].content;
         assert_eq!(messages[0].role, "system");
@@ -1390,8 +1383,7 @@ mod tests {
         let mut with_map = base().with_repo_dirs(Some("crate\n  src".to_string()));
         with_map.repo_map = Some("crate\n  pub fn main".to_string());
         assert!(with_map.format_repo_dirs_block().is_some());
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = with_map.assemble_chat_messages("Go", &proto);
         let sys = &messages[0].content;
         assert!(sys.contains("## Repository Map"));
@@ -1452,8 +1444,7 @@ mod tests {
         );
         assert!(assembly.has_eager_repo_map());
 
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
         // The static symbol contours already answer where symbols live, so no
@@ -1483,8 +1474,7 @@ mod tests {
         );
         assert!(!assembly.has_eager_repo_map());
 
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let messages = assembly.assemble_chat_messages("Go", &proto);
         let system = &messages[0].content;
         assert!(!system.contains("## Repository Map"));
@@ -1555,8 +1545,8 @@ mod tests {
         let render = |turn_brief: Option<TurnBrief>| {
             let proto =
                 JsonPromptProtocol::new(match turn_brief.as_ref().map(|brief| brief.contour) {
-                    Some(ContourKind::Step) => crate::control::turn::turn_capability_expr(),
-                    _ => crate::control::repl::dialogue_capability_expr(false, false),
+                    Some(ContourKind::Step) => turn_capability_expr(),
+                    _ => dialogue_capability_expr(false, false),
                 });
             let mut assembly = PromptAssembly::new(
                 None,
@@ -1596,8 +1586,7 @@ mod tests {
 
     #[test]
     fn test_interactive_repl_routes_harness_questions_to_the_documentation() {
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1623,7 +1612,7 @@ mod tests {
         let render =
             PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::SearchReplace);
         let interactive = flattened_surface(&crate::capabilities::capability_expr_schema(
-            &crate::control::repl::repl_capability_expr(None),
+            &repl_capability_expr(None),
             &render,
         ));
         assert!(interactive["properties"].get("context_requests").is_some());
@@ -1636,7 +1625,7 @@ mod tests {
         // that cannot consult the documentation never advertises a field its
         // decoder would reject.
         let step = flattened_surface(&crate::capabilities::capability_expr_schema(
-            &crate::control::turn::turn_capability_expr(),
+            &turn_capability_expr(),
             &render,
         ));
         assert!(step["properties"].get("tauqe_doc_requests").is_none());
@@ -1649,8 +1638,7 @@ mod tests {
 
     #[test]
     fn test_planning_prompt_instructions() {
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         // Develop mode
         let dev_assembly = PromptAssembly::new(
             None,
@@ -1685,7 +1673,7 @@ mod tests {
         // advertises, so the plan-anchored surface of the discussion protocol
         // is what authorizes in-place plan mutation.
         let disc_prompt = disc_assembly.build_system_prompt(&JsonPromptProtocol::new(
-            crate::control::repl::dialogue_capability_expr(true, false),
+            dialogue_capability_expr(true, false),
         ));
         assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
         assert!(disc_prompt.contains("Leaf-Only Files Invariant"));
@@ -1695,8 +1683,7 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_research_instructions() {
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1717,8 +1704,7 @@ mod tests {
     fn test_system_prompt_anchors_project_configuration() {
         use crate::llm::LlmCapability;
 
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let assembly = PromptAssembly::new(
             None,
             1,
@@ -1751,16 +1737,14 @@ mod tests {
             None,
             None,
         );
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(true, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(true, false));
         let prompt = discussion.build_system_prompt(&proto);
         assert!(prompt.contains("tauqe.toml"));
     }
 
     #[test]
     fn test_prompt_assembly_with_turn_scratchpad() {
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let mut assembly = PromptAssembly::new(
             None,
             1,
@@ -1826,8 +1810,7 @@ mod tests {
             None,
         );
 
-        let json =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let json = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
         let json_prompt = assembly.build_system_prompt(&json);
         assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 
@@ -1844,8 +1827,7 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_states_the_proactive_engineering_stance() {
-        let proto =
-            JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false));
+        let proto = JsonPromptProtocol::new(dialogue_capability_expr(false, false));
 
         // Interactive REPL turn: a direct request is executed immediately,
         // while an open or architectural question is answered in prose.
@@ -1895,7 +1877,7 @@ mod tests {
             None,
         );
         let discussion_prompt = discussion.build_system_prompt(&JsonPromptProtocol::new(
-            crate::control::repl::dialogue_capability_expr(true, false),
+            dialogue_capability_expr(true, false),
         ));
         assert!(discussion_prompt.contains("Action Authorization"));
         assert!(!discussion_prompt.contains("Discussion Mode Scope"));
@@ -2171,7 +2153,7 @@ mod tests {
         // working-tree state reaches the model through the context block alone.
         let messages = built.assemble_chat_messages(
             "Go",
-            &JsonPromptProtocol::new(crate::control::repl::dialogue_capability_expr(false, false)),
+            &JsonPromptProtocol::new(dialogue_capability_expr(false, false)),
         );
         let system = &messages[0].content;
         assert!(!system.contains("## Project Metadata"));

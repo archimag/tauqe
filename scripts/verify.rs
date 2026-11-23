@@ -190,8 +190,7 @@ fn main() {
     );
 
     if run_cargo {
-        // Clippy checks the same targets and denies warnings; a separate check
-        // would repeat compilation work before running the gate.
+        // The recipe checks both normal and test-enabled builds with warnings denied.
         let mut clippy_args = vec!["clippy".to_string()];
         clippy_args.extend(cargo_args.iter().cloned());
         run_step("`just clippy`", "just", &clippy_args);
@@ -210,6 +209,10 @@ fn main() {
             }
             run_step("`just test-doc`", "just", &doc_args);
         }
+
+        let mut rustdoc_args = vec!["rustdoc".to_string()];
+        rustdoc_args.extend(cargo_args);
+        run_step("`just rustdoc`", "just", &rustdoc_args);
     }
 
     exit(0);

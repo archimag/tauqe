@@ -85,24 +85,18 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
 #[cfg(test)]
 async fn run_review_post_analysis(
     state: &Arc<AppState>,
-    repo_root: &std::path::Path,
     session: &tauqe_core::review::ReviewSession,
     selection: Option<&tauqe_core::models::ModelSelection>,
-    operation: &crate::state::OperationGuard,
-    is_batch: bool,
 ) -> Result<tauqe_core::review::ReviewSession, ResponseError> {
     let observer = Arc::new(crate::publication::Publisher {
         out: state.out.clone(),
     });
     state
         .application
-        .test_run_review_analysis(
-            operation,
-            repo_root,
-            session,
-            selection,
+        .analyze_review(
+            session.id.clone(),
+            selection.cloned(),
             observer,
-            is_batch,
             task_exit_deadline(),
         )
         .await
@@ -216,16 +210,7 @@ mod tests {
         session: &ReviewSession,
         selection: Option<&ModelSelection>,
     ) -> Result<ReviewSession, ResponseError> {
-        let operation = fixture.state.try_begin_operation().unwrap();
-        run_review_post_analysis(
-            &fixture.state,
-            &fixture.root,
-            session,
-            selection,
-            &operation,
-            false,
-        )
-        .await
+        run_review_post_analysis(&fixture.state, session, selection).await
     }
 
     /// Installs an architect ladder of `entries` over the fixture project.
@@ -774,16 +759,8 @@ mod tests {
         let outbound = fixture.take_events();
 
         let state = Arc::clone(&fixture.state);
-        let root = fixture.root.clone();
-        let analyzed_session = session.clone();
-        let operation = fixture
-            .state
-            .try_begin_operation()
-            .expect("the operation slot is free");
-        let analysis = tokio::spawn(async move {
-            run_review_post_analysis(&state, &root, &analyzed_session, None, &operation, false)
-                .await
-        });
+        let analysis =
+            tokio::spawn(async move { run_review_post_analysis(&state, &session, None).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(

@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use crate::control::structured::{StructuredContract, StructuredVisibility};
+use crate::execution::structured::{StructuredContract, StructuredVisibility};
 use serde::Deserialize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -46,7 +46,7 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 /// terminal column budgeting, key preservation, strict JSON output) rather than
 /// task-specific examples, so the prompt generalizes across target languages
 /// and catalogues.
-pub fn build_locale_system_prompt() -> String {
+fn build_locale_system_prompt() -> String {
     let mut prompt = String::new();
     prompt.push_str("You are a meticulous software localization engine for a terminal application. You translate canonical English interface strings into the requested target language.\n\n");
     prompt.push_str("## Core Contract\n");
@@ -115,7 +115,7 @@ fn locale_response_schema() -> serde_json::Value {
 }
 
 /// Builds the provider [`ResponseFormat`] that enforces the locale schema.
-pub fn locale_response_format() -> ResponseFormat {
+fn locale_response_format() -> ResponseFormat {
     ResponseFormat::JsonSchema {
         json_schema: JsonSchemaDefinition {
             name: "locale_translation".to_string(),
@@ -162,7 +162,7 @@ struct LocaleTranslationEntry {
 /// with a blank key are dropped, and a later entry overrides an earlier one for
 /// the same key. When no structured payload can be recovered, an empty map is
 /// returned so the caller falls back cleanly to English.
-pub fn parse_locale_output(raw: &str) -> BTreeMap<String, String> {
+fn parse_locale_output(raw: &str) -> BTreeMap<String, String> {
     let Some(output) = parse_locale_output_inner(raw) else {
         return BTreeMap::new();
     };

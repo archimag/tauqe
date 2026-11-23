@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::plan::{Plan, PlanItem, PlanItemStatus, PlanRejection, PlanSummary};
+use crate::plan::{Plan, PlanItemStatus, PlanRejection, PlanSummary};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 use tauqe_tools::atomic_write::write_atomic;
@@ -47,6 +47,14 @@ struct PreparedPlan {
     target_file: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PlanPreparationError {
+    #[error(transparent)]
+    Payload(anyhow::Error),
+    #[error(transparent)]
+    Storage(#[from] anyhow::Error),
+}
+
 /// Repository snapshot one plan batch resolves its mutations against.
 ///
 /// The snapshot is read from storage once, under the process-global lock, and
@@ -70,33 +78,51 @@ impl PlanBatchSnapshot {
     /// A missing storage directory is an empty repository, while a directory that
     /// cannot be read is reported: the difference decides whether a batch creates
     /// the first plan or writes over a repository it never saw.
-    fn load_unlocked(repo_root: &Path) -> Result<Self> {
+    fn load_unlocked(repo_root: &Path, strict: bool) -> Result<Self> {
         let dir = PlanStorage::plans_dir(repo_root);
-        if !dir.is_dir() {
+        if !strict && !dir.is_dir() {
             return Ok(Self::default());
         }
 
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("Failed to read plans directory at {}", dir.display()))?;
+        let entries = match std::fs::read_dir(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            result => result,
+        }
+        .with_context(|| format!("Failed to read plans directory at {}", dir.display()))?;
         let mut stored: Vec<(Plan, PathBuf)> = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Err(_) if !strict => continue,
+                result => result.with_context(|| {
+                    format!(
+                        "Failed to read an entry in plans directory at {}",
+                        dir.display()
+                    )
+                })?,
+            };
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str::<Plan>(&content) {
-                    Ok(plan) => stored.push((plan, path)),
-                    Err(err) => tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Skipping corrupted plan file"
-                    ),
-                },
+            let is_file = if strict {
+                path.metadata()
+                    .with_context(|| format!("Failed to inspect plan path at {}", path.display()))?
+                    .is_file()
+            } else {
+                path.is_file()
+            };
+            if !is_file {
+                continue;
+            }
+            match PlanStorage::read_plan_file_unlocked(&path) {
+                Ok(plan) => stored.push((plan, path)),
+                Err(err) if strict => return Err(err),
                 Err(err) => tracing::warn!(
                     path = %path.display(),
                     error = %err,
-                    "Failed to read plan file"
+                    "Skipping unreadable plan file"
                 ),
             }
         }
@@ -277,7 +303,7 @@ impl PlanStorage {
 
     /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
     fn load_all_unlocked(repo_root: &Path) -> Result<Vec<Plan>> {
-        Ok(PlanBatchSnapshot::load_unlocked(repo_root)?.into_plans())
+        Ok(PlanBatchSnapshot::load_unlocked(repo_root, false)?.into_plans())
     }
 
     /// Resolves the on-disk file that currently stores the plan identified by `id`,
@@ -338,24 +364,6 @@ impl PlanStorage {
         Self::write_prepared_unlocked(repo_root, &prepared)
     }
 
-    /// Saves one plan of a batch through the snapshot of that batch.
-    ///
-    /// The snapshot already resolved the stored document and the file that carries
-    /// it, so a mutation writes that file directly instead of scanning the storage
-    /// directory for the plan, and it advances the snapshot with the document that
-    /// reached disk instead of reloading the repository afterwards. The returned
-    /// document is exactly the one a later mutation of the batch resolves against.
-    fn save_plan_in_snapshot_unlocked(
-        repo_root: &Path,
-        snapshot: &mut PlanBatchSnapshot,
-        plan: &Plan,
-    ) -> Result<Plan> {
-        Self::ensure_plans_dir(repo_root)?;
-        let prepared = Self::prepare_plan_unlocked(repo_root, plan, Some(snapshot))?;
-        Self::write_prepared_unlocked(repo_root, &prepared)?;
-        snapshot.remember(prepared.plan.clone(), prepared.target_file);
-        Ok(prepared.plan)
-    }
     /// Creates the plan storage directory.
     fn ensure_plans_dir(repo_root: &Path) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
@@ -371,14 +379,23 @@ impl PlanStorage {
     /// Writes one prepared plan and records the active-plan marker when the
     /// repository has none, so clients always have a marker to render.
     fn write_prepared_unlocked(repo_root: &Path, prepared: &PreparedPlan) -> Result<()> {
-        let json = serde_json::to_string_pretty(&prepared.plan)
-            .context("Failed to serialize plan to JSON")?;
-        write_atomic(&prepared.target_file, json.as_bytes())?;
+        Self::write_plan_document_unlocked(prepared)?;
 
         if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
             let _ = Self::save_active_id_unlocked(repo_root, Some(&prepared.plan.id));
         }
         Ok(())
+    }
+
+    fn write_plan_document_unlocked(prepared: &PreparedPlan) -> Result<()> {
+        let json = serde_json::to_string_pretty(&prepared.plan)
+            .context("Failed to serialize plan to JSON")?;
+        write_atomic(&prepared.target_file, json.as_bytes()).with_context(|| {
+            format!(
+                "Failed to write plan document at {}",
+                prepared.target_file.display()
+            )
+        })
     }
 
     /// Reads and decodes the plan stored at `path`.
@@ -409,7 +426,7 @@ impl PlanStorage {
         repo_root: &Path,
         plan: &Plan,
         snapshot: Option<&PlanBatchSnapshot>,
-    ) -> Result<PreparedPlan> {
+    ) -> Result<PreparedPlan, PlanPreparationError> {
         let dir = Self::plans_dir(repo_root);
         let safe_id = Self::sanitize_id(&plan.id);
         let default_target = dir.join(format!("{safe_id}.json"));
@@ -458,14 +475,15 @@ impl PlanStorage {
 
         if let Some(existing_plan) = existing {
             if !existing_plan.id.eq_ignore_ascii_case(&plan.id) {
-                anyhow::bail!(
+                return Err(PlanPreparationError::Payload(anyhow::anyhow!(
                     "Cannot save plan '{}': storage name '{}.json' is already used by plan '{}'; choose a distinct plan id",
                     plan.id,
                     safe_id,
                     existing_plan.id
-                );
+                )));
             }
-            Self::validate_done_immutability(&existing_plan, &normalized)?;
+            Self::validate_done_immutability(&existing_plan, &normalized)
+                .map_err(PlanPreparationError::Payload)?;
         }
 
         // The single structural barrier of plan persistence: every mutation
@@ -476,11 +494,11 @@ impl PlanStorage {
         // what would be written.
         if let Err(errors) = normalized.validate() {
             let reasons: Vec<String> = errors.iter().map(|error| error.to_string()).collect();
-            anyhow::bail!(
+            return Err(PlanPreparationError::Payload(anyhow::anyhow!(
                 "Cannot save plan '{}': {}",
                 normalized.id,
                 reasons.join("; ")
-            );
+            )));
         }
 
         Ok(PreparedPlan {
@@ -535,11 +553,11 @@ impl PlanStorage {
     /// Lock-free core of [`Self::load_active_id`]; the caller must hold the storage lock.
     fn load_active_id_unlocked(repo_root: &Path) -> Result<Option<String>> {
         let active_file = Self::plans_dir(repo_root).join("active");
-        if !active_file.is_file() {
-            return Ok(None);
+        let content = match std::fs::read_to_string(&active_file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            result => result,
         }
-
-        let content = std::fs::read_to_string(&active_file).with_context(|| {
+        .with_context(|| {
             format!(
                 "Failed to read active plan marker at {}",
                 active_file.display()
@@ -576,7 +594,12 @@ impl PlanStorage {
         let active_file = dir.join("active");
         match id {
             Some(val) if !val.trim().is_empty() => {
-                write_atomic(&active_file, val.trim().as_bytes())?;
+                write_atomic(&active_file, val.trim().as_bytes()).with_context(|| {
+                    format!(
+                        "Failed to write active plan marker at {}",
+                        active_file.display()
+                    )
+                })?;
             }
             _ => {
                 if active_file.is_file() {
@@ -652,7 +675,10 @@ impl PlanStorage {
         }
     }
 
-    /// Updates status of a plan item recursively.
+    /// Updates a plan leaf under the storage lock. An already-satisfied
+    /// transition returns the stored plan without rewriting it.
+    /// Without a status, retain the public operation's existing save behavior
+    /// for any matched item.
     ///
     /// `blocked_reason` carries the diagnostic report of the semantic blocker that
     /// stopped the step. It is persisted only when the step enters
@@ -691,71 +717,28 @@ impl PlanStorage {
             None => return Ok(None),
         };
 
-        fn visit_mut(
-            items: &mut [PlanItem],
-            target_id: &str,
-            status: Option<PlanItemStatus>,
-            blocked_reason: Option<&str>,
-            commit: Option<&str>,
-        ) -> bool {
-            for item in items {
-                if item.id.eq_ignore_ascii_case(target_id) {
-                    if let Some(s) = status {
-                        item.status = s;
-                        // The identifier of the change set that completed the
-                        // step belongs to the completed record: it is stored
-                        // once, together with the transition that finishes the
-                        // step, and is never restated by a later one.
-                        if let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty())
-                        {
-                            item.commit = Some(commit.to_string());
-                        }
-                        // The diagnostic report belongs to the Blocked state
-                        // alone: entering it stores the supplied reason, leaving
-                        // it drops the stale report so a stored plan never keeps
-                        // describing a blocker that has been resolved already.
-                        item.blocked_reason = if s == PlanItemStatus::Blocked {
-                            blocked_reason
-                                .map(str::trim)
-                                .filter(|reason| !reason.is_empty())
-                                .map(str::to_string)
-                        } else {
-                            None
-                        };
-                    }
-                    return true;
-                }
-                if visit_mut(
-                    &mut item.children,
-                    target_id,
-                    status,
-                    blocked_reason,
-                    commit,
-                ) {
-                    return true;
-                }
+        if let Some(status) = status {
+            match plan
+                .implementation
+                .transition_leaf(item_id, status, blocked_reason, commit)?
+            {
+                None => return Ok(None),
+                Some(false) => return Ok(Some(plan)),
+                Some(true) => {}
             }
-            false
+        } else {
+            if plan.implementation.find_item(item_id).is_none() {
+                return Ok(None);
+            }
+            plan.implementation.refresh_parent_statuses();
         }
 
-        let updated = visit_mut(
-            &mut plan.implementation.items,
-            item_id,
-            status,
-            blocked_reason,
-            commit,
-        );
-        if updated {
-            plan.implementation.refresh_parent_statuses();
-            plan.updated_at = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            Self::save_plan_unlocked(repo_root, &plan)?;
-            Ok(Some(plan))
-        } else {
-            Ok(None)
-        }
+        plan.updated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::save_plan_unlocked(repo_root, &plan)?;
+        Ok(Some(plan))
     }
 }
 
@@ -775,13 +758,15 @@ pub struct PlanApplicationOutcome {
     /// channel: a caller that treats `errors` as failures stays accurate while
     /// the repair remains visible.
     pub warnings: Vec<String>,
+    /// A storage failure stops the batch without undoing plans in `applied`.
+    pub storage_error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::PlanRejectionKind;
-    use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate};
+    use crate::plan::{DiscussionPlanAction, DiscussionPlanUpdate, PlanItem};
     use tempfile::tempdir;
 
     /// Renders the reported wording of a batch of typed rejections, so an
@@ -1465,6 +1450,66 @@ mod tests {
             files: vec![file.to_string()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_update_item_preserves_completed_leaf_on_retry_and_refusal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let plan = Plan::from_parts(
+            "transitions".into(),
+            "Transitions".into(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
+                id: "parent".into(),
+                children: vec![plan_leaf("Leaf", "src/leaf.rs")],
+                ..Default::default()
+            }],
+        );
+        PlanStorage::save_plan(root, &plan).unwrap();
+        let update =
+            |id, status, commit| PlanStorage::update_item(root, &plan.id, id, status, None, commit);
+
+        assert!(update("parent", None, Some("ignored")).unwrap().is_some());
+        assert!(update("absent", None, None).unwrap().is_none());
+        assert!(update("parent", Some(PlanItemStatus::InProgress), None).is_err());
+
+        let running = update(" leaf ", Some(PlanItemStatus::InProgress), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            running.implementation.items[0].status,
+            PlanItemStatus::InProgress
+        );
+        assert_eq!(
+            update("Leaf", Some(PlanItemStatus::InProgress), None).unwrap(),
+            Some(running)
+        );
+
+        let done = update("Leaf", Some(PlanItemStatus::Done), Some(" abc1234 "))
+            .unwrap()
+            .unwrap();
+        let file = PlanStorage::plans_dir(root).join("transitions.json");
+        let saved = std::fs::read(&file).unwrap();
+        assert_eq!(done.implementation.items[0].status, PlanItemStatus::Done);
+        assert_eq!(
+            done.implementation
+                .find_item("Leaf")
+                .unwrap()
+                .commit
+                .as_deref(),
+            Some("abc1234")
+        );
+        assert_eq!(
+            update("Leaf", Some(PlanItemStatus::Done), None).unwrap(),
+            Some(done)
+        );
+        assert!(update("Leaf", Some(PlanItemStatus::Done), Some("def5678")).is_err());
+        assert!(update("Leaf", Some(PlanItemStatus::Todo), None).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), saved);
     }
 
     #[test]

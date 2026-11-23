@@ -177,7 +177,7 @@ impl ContextManager {
         &self.repo_root
     }
 
-    pub(crate) fn pinned_patterns(&self) -> &[String] {
+    pub fn pinned_patterns(&self) -> &[String] {
         &self.pinned_patterns
     }
 
