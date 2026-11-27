@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::watch;
+use tauqe_core::stop::{HardCancellation, StopSource, StopToken};
 
 static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -22,11 +22,52 @@ pub(crate) struct OperationRegistry {
 
 struct ActiveOperation {
     id: u64,
-    cancel_tx: watch::Sender<bool>,
-    /// Soft-stop signal observed by a running batch supervisor between members.
-    soft_stop_tx: watch::Sender<bool>,
+    stop: StopSource,
     abort_handle: Option<tokio::task::AbortHandle>,
     release_by_supervisor: bool,
+    publication_holds: usize,
+    guard_dropped: bool,
+}
+
+/// Keeps registration alive while a supervisor finishes context publication.
+pub(crate) struct PublicationHold {
+    registry: Arc<OperationRegistry>,
+    id: u64,
+}
+
+impl PublicationHold {
+    pub(crate) fn set_abort_handle(&self, handle: tokio::task::AbortHandle) {
+        let mut slot = self.registry.lock();
+        if let Some(op) = slot.as_mut().filter(|op| op.id == self.id) {
+            op.abort_handle = Some(handle);
+        }
+    }
+
+    /// A detached supervisor must not clear a later task's registration.
+    pub(crate) fn clear_abort_handle(&self, task_id: tokio::task::Id) {
+        let mut slot = self.registry.lock();
+        if let Some(op) = slot.as_mut().filter(|op| op.id == self.id) {
+            if op
+                .abort_handle
+                .as_ref()
+                .is_some_and(|handle| handle.id() == task_id)
+            {
+                op.abort_handle = None;
+            }
+        }
+    }
+}
+
+impl Drop for PublicationHold {
+    fn drop(&mut self) {
+        let mut slot = self.registry.lock();
+        if let Some(op) = slot.as_mut().filter(|op| op.id == self.id) {
+            op.publication_holds -= 1;
+            if op.publication_holds == 0 && op.guard_dropped {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// RAII guard owning a registered active operation.
@@ -39,11 +80,35 @@ struct ActiveOperation {
 pub struct OperationGuard {
     registry: Arc<OperationRegistry>,
     id: u64,
-    cancel_rx: watch::Receiver<bool>,
-    soft_stop_rx: watch::Receiver<bool>,
+    stop: StopToken,
 }
 
 impl OperationGuard {
+    /// Retain registration through task recovery, even if the caller exits.
+    pub(crate) fn retain_supervision(&self) -> Option<PublicationHold> {
+        self.retain_publication(&self.registry)
+    }
+
+    // The scenario publication hookup follows the session-level binding.
+    #[allow(dead_code)]
+    pub(crate) fn retain_publication(
+        &self,
+        registry: &Arc<OperationRegistry>,
+    ) -> Option<PublicationHold> {
+        if !Arc::ptr_eq(&self.registry, registry) {
+            return None;
+        }
+        let mut slot = registry.lock();
+        let op = slot
+            .as_mut()
+            .filter(|op| op.id == self.id && !op.guard_dropped)?;
+        op.publication_holds += 1;
+        Some(PublicationHold {
+            registry: registry.clone(),
+            id: self.id,
+        })
+    }
+
     pub(crate) fn belongs_to(&self, registry: &Arc<OperationRegistry>) -> bool {
         Arc::ptr_eq(&self.registry, registry) && registry.current_id() == Some(self.id)
     }
@@ -63,18 +128,14 @@ impl OperationGuard {
         format!("op-{}", self.id)
     }
 
-    /// Returns a receiver that observes this operation's cancellation signal.
-    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
-        self.cancel_rx.clone()
+    /// Reads the full stop state at scheduling boundaries.
+    pub fn stop_token(&self) -> StopToken {
+        self.stop.clone()
     }
 
-    /// Returns a receiver that observes this operation's soft-stop signal.
-    ///
-    /// A batch supervisor checks it between members: the current member finishes
-    /// its bounded turn, compiler verification, and Git commit, and only then
-    /// does the queue stop before launching the next one.
-    pub fn soft_stop_receiver(&self) -> watch::Receiver<bool> {
-        self.soft_stop_rx.clone()
+    /// Observes only Hard on the same operation channel.
+    pub fn hard_cancellation(&self) -> HardCancellation {
+        self.stop.hard_cancellation()
     }
 
     /// Reserves release for the guard held by the interactive supervisor through
@@ -119,11 +180,16 @@ impl Drop for OperationGuard {
     fn drop(&mut self) {
         let released = {
             let mut slot = self.registry.lock();
-            if slot.as_ref().map(|op| op.id) == Some(self.id) {
-                *slot = None;
-                true
-            } else {
-                false
+            match slot.as_mut().filter(|op| op.id == self.id) {
+                Some(op) if op.publication_holds == 0 => {
+                    *slot = None;
+                    true
+                }
+                Some(op) => {
+                    op.guard_dropped = true;
+                    false
+                }
+                None => false,
             }
         };
         if released {
@@ -148,21 +214,21 @@ impl OperationRegistry {
             return Err(OperationInProgress);
         }
         let id = next_operation_id();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
+        let token = stop.token();
         *slot = Some(ActiveOperation {
             id,
-            cancel_tx,
-            soft_stop_tx,
+            stop,
             abort_handle: None,
             release_by_supervisor: false,
+            publication_holds: 0,
+            guard_dropped: false,
         });
         tracing::info!(operation_slot_id = id, "Registered active operation slot");
         Ok(OperationGuard {
             registry: Arc::clone(self),
             id,
-            cancel_rx,
-            soft_stop_rx,
+            stop: token,
         })
     }
 
@@ -173,18 +239,19 @@ impl OperationRegistry {
     pub(crate) fn hard_cancel(&self) -> Option<u64> {
         let slot = self.lock();
         let op = slot.as_ref()?;
-        if !op.cancel_tx.send_replace(true) {
+        if !op.stop.token().hard_cancellation().is_cancelled() {
             tracing::info!(
                 operation_slot_id = op.id,
                 "Delivered hard-cancel signal to active operation"
             );
         }
+        op.stop.request_hard();
         Some(op.id)
     }
 
     pub(crate) fn soft_stop(&self) {
         if let Some(op) = self.lock().as_ref() {
-            let _ = op.soft_stop_tx.send(true);
+            op.stop.request_soft();
             tracing::info!(
                 operation_slot_id = op.id,
                 "Requested soft stop of active operation"
@@ -208,11 +275,72 @@ impl OperationRegistry {
         let mut slot = self.lock();
         if !slot
             .as_ref()
-            .is_some_and(|op| op.id == id && !op.release_by_supervisor)
+            .is_some_and(|op| op.id == id && !op.release_by_supervisor && op.publication_holds == 0)
         {
             return false;
         }
         *slot = None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn hard_view_observes_prior_cancellation() {
+        let registry = Arc::new(OperationRegistry::default());
+        let guard = registry.begin().unwrap();
+        assert_eq!(registry.hard_cancel(), Some(guard.id()));
+
+        let cancellation = guard.hard_cancellation();
+        assert!(cancellation.is_cancelled());
+        timeout(Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn soft_stop_does_not_cancel_hard_view() {
+        let registry = Arc::new(OperationRegistry::default());
+        let guard = registry.begin().unwrap();
+        registry.soft_stop();
+
+        let cancellation = guard.hard_cancellation();
+        assert!(!cancellation.is_cancelled());
+        assert!(timeout(Duration::from_millis(20), cancellation.cancelled())
+            .await
+            .is_err());
+
+        assert_eq!(registry.hard_cancel(), Some(guard.id()));
+        timeout(Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_supervision_clears_only_its_task_and_holds_registration() {
+        let registry = Arc::new(OperationRegistry::default());
+        let guard = registry.begin().unwrap();
+        let id = guard.id();
+        let hold = guard.retain_supervision().unwrap();
+        let first = tokio::spawn(std::future::pending::<()>());
+        let second = tokio::spawn(std::future::pending::<()>());
+        hold.set_abort_handle(first.abort_handle());
+        guard.set_abort_handle(second.abort_handle());
+        hold.clear_abort_handle(first.id());
+        assert!(registry.abort(id));
+        assert!(second.await.unwrap_err().is_cancelled());
+        assert!(!first.is_finished());
+        first.abort();
+        let _ = first.await;
+        drop(guard);
+        assert_eq!(registry.current_id(), Some(id));
+        assert!(registry.begin().is_err());
+        drop(hold);
+        assert_eq!(registry.current_id(), None);
     }
 }

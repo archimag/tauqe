@@ -2,7 +2,10 @@ mod groups;
 mod items;
 mod post_analysis;
 
-pub use groups::GroupCompletion;
+pub use groups::{
+    GroupCompletion, GroupHorizonReplacementError, GroupStepStatusError, InitialGroupHorizon,
+    InitialGroupHorizonError,
+};
 pub use items::ReviewDecisionOutcome;
 pub use post_analysis::FindingAssignment;
 
@@ -13,8 +16,32 @@ use std::path::{Path, PathBuf};
 use crate::review::ReviewSession;
 use std::sync::{Mutex, MutexGuard};
 use tauqe_tools::atomic_write::write_atomic;
+use tauqe_tools::atomic_write::{BatchError, SiblingBatch};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewBatchCommitError {
+    #[error("review storage changed since preparation: {0}")]
+    Conflict(PathBuf),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Storage(#[from] anyhow::Error),
+    #[error(transparent)]
+    Batch(#[from] BatchError),
+}
 
 pub struct ReviewStorage;
+
+/// The resolved review document and its original bytes, prepared without writes.
+#[derive(Debug)]
+pub struct PreparedReviewDecisions {
+    pub path: PathBuf,
+    pub original: Vec<u8>,
+    pub session: ReviewSession,
+    pub active_before: Option<Vec<u8>>,
+}
 
 /// Process-global lock serializing review storage mutations.
 ///

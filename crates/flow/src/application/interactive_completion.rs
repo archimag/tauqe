@@ -1,6 +1,14 @@
 //! Project completed interactive turns and persist their terminal response.
 
-use crate::api::{Application, ContextClearScope, HistoryError, OperationGuard};
+#[cfg(test)]
+use crate::api::OperationGuard;
+use crate::api::{Application, HistoryError};
+#[cfg(test)]
+use crate::application::context::{ContextError, ContextSession};
+use crate::application::history::HistorySession;
+#[cfg(test)]
+use crate::application::infrastructure::execution::ExecutionSession;
+use crate::application::interactive_history::{CompleteTurn, InterruptTurn};
 
 use tauqe_core::edits::EditOutcome;
 use tauqe_core::history::HistoryFileChange;
@@ -53,12 +61,98 @@ impl InteractiveTurnCompletion {
 
 impl Application {
     /// Record the response independently of publishing the settled edit.
+    #[cfg(test)]
     pub(crate) async fn persist_interactive_completion(
         &self,
         operation: &OperationGuard,
         completion: &InteractiveTurnCompletion,
     ) -> Result<(), HistoryError> {
-        if !self.owns_operation(operation) {
+        self.history_session()
+            .persist_interactive_completion(&self.execution_session(), operation, completion)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clean_up_interactive_edit(&self) {
+        clean_up_interactive_edit(self.context_session())
+            .await
+            .unwrap();
+    }
+}
+
+impl HistorySession {
+    pub(crate) async fn complete_open_turn(
+        &self,
+        turn_id: u64,
+        mut input: CompleteTurn,
+    ) -> Result<(), HistoryError> {
+        // Only the final accepted round can be moved without reordering the dialogue.
+        if input.source.is_some() {
+            input.response.clear();
+        }
+        let moved = input.source.and_then(|source| {
+            input
+                .rounds
+                .last()
+                .filter(|round| source.identifies(round))
+                .cloned()
+        });
+        if let Some(round) = &moved {
+            input.rounds.pop();
+            input.response.clone_from(&round.message);
+        }
+        self.write_open_rounds(turn_id, input.rounds.clone())
+            .await?;
+        let edit = input.edit.as_ref().map(|edit| (edit, REPL_EDIT_SUMMARY));
+        if let Err(error) = self.record_interactive_response(input.response, edit).await {
+            let mut diagnostic = format!("Could not record the final response: {error}");
+            if let Some(round) = moved {
+                input.rounds.push(round);
+                if let Err(restore) = self.write_open_rounds(turn_id, input.rounds).await {
+                    diagnostic.push_str(&format!(
+                        "\n\nCould not retain the final accepted round: {restore}"
+                    ));
+                }
+            }
+            return Err(HistoryError::Storage(diagnostic));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn interrupt_open_turn(
+        &self,
+        turn_id: u64,
+        input: InterruptTurn,
+    ) -> Result<(), HistoryError> {
+        let edit = input.confirmed_edit.as_ref();
+        let confirmed = edit.is_some_and(|edit| edit.applied) || input.confirmed_documents;
+        if input.cancelled && input.rounds.is_empty() && !confirmed && input.diagnostic.is_empty() {
+            return self.rollback_turn(turn_id, input.reason).await;
+        }
+        self.write_open_rounds(turn_id, input.rounds).await?;
+        self.record_interactive_response(input.reason, edit.map(|edit| (edit, REPL_EDIT_SUMMARY)))
+            .await
+    }
+
+    async fn write_open_rounds(
+        &self,
+        turn_id: u64,
+        rounds: Vec<tauqe_core::history::TurnRoundRecord>,
+    ) -> Result<(), HistoryError> {
+        if rounds.is_empty() {
+            return Ok(());
+        }
+        self.set_turn_rounds(turn_id, rounds).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_interactive_completion(
+        &self,
+        execution: &ExecutionSession,
+        operation: &OperationGuard,
+        completion: &InteractiveTurnCompletion,
+    ) -> Result<(), HistoryError> {
+        if !execution.owns(operation) {
             return Err(HistoryError::OperationNotOwned);
         }
         let edit = match &completion.result {
@@ -89,15 +183,16 @@ impl Application {
             ),
             _ => (None, None, Vec::new()),
         };
-        self.record_history_response(message, commit, summary, files)
-            .await
+        self.record_response(message, commit, summary, files).await
     }
+}
 
-    /// An applied edit invalidates transient context even if history is unavailable.
-    pub(crate) async fn clean_up_interactive_edit(&self) {
-        let _ = self.clear_context(ContextClearScope::Transient).await;
-        self.reset_session_uuid().await;
-    }
+/// An applied edit invalidates transient context even if history is unavailable.
+#[cfg(test)]
+pub(crate) async fn clean_up_interactive_edit(
+    context: &ContextSession,
+) -> Result<(), ContextError> {
+    context.finish_applied_edit().await.map(|_| ())
 }
 
 #[cfg(test)]

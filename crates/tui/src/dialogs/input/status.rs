@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tauqe_tui::projection::*;
 
-use tauqe_protocol::methods;
+use tauqe_protocol::{methods, ReviewUpdateGroupStepParams};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::AppState;
@@ -24,6 +24,48 @@ pub(crate) async fn apply_status_dialog(
     };
 
     match dialog.target {
+        crate::app::StatusDialogTarget::ReviewPlanStep {
+            review_id,
+            group_id,
+            step_id,
+            current_status,
+            ..
+        } => {
+            let Some(new_status) = PLAN_STATUS_ORDER.get(chosen_idx).copied() else {
+                return Ok(());
+            };
+            if new_status == current_status {
+                return Ok(());
+            }
+            if st.model.is_busy()
+                || st.review.running
+                || st.review.analyzing
+                || st.plans_view.refining
+            {
+                st.notify_warning(crate::i18n::active_t("notify.model_busy"));
+                return Ok(());
+            }
+            // Only the saved session event updates the view; no optimistic
+            // mutation or rollback accompanies this request.
+            let payload = serde_json::to_value(ReviewUpdateGroupStepParams {
+                review_id,
+                group_id,
+                step_id,
+                status: new_status,
+            })?;
+            drop(st);
+            if let Err(error) =
+                crate::rpc::send_request(server_writer, methods::REVIEW_UPDATE_GROUP_STEP, payload)
+                    .await
+            {
+                let mut st = state.lock().await;
+                st.notify_error(crate::i18n::active_t("notify.command_error").replacen(
+                    "{}",
+                    &error.to_string(),
+                    1,
+                ));
+            }
+        }
         crate::app::StatusDialogTarget::PlanItem {
             plan_id,
             item_id,

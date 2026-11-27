@@ -1,10 +1,11 @@
 use super::{LlmRequest, ModelUsageInfo, ProviderResult};
 use crate::models::ProviderKind;
+use crate::stop::HardCancellation;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::retry::JSON_TRUNCATION_MARKER;
 #[cfg(test)]
@@ -18,6 +19,33 @@ use self::types::{
     StreamingChunk,
 };
 use super::sse::{find_sse_event_boundary, MAX_SSE_EVENT_BYTES};
+
+/// Provider-facing projection shared with pre-dispatch input admission.
+pub(crate) fn input_projection(
+    request: &LlmRequest<'_>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let uses_json_schema = matches!(
+        request.response_format,
+        Some(ResponseFormat::JsonSchema { .. })
+    );
+    serde_json::to_value(ChatCompletionRequest {
+        model: request.model.to_string(),
+        messages: request.messages.clone(),
+        stream: true,
+        session_id: request.session_id.map(str::to_string),
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        reasoning: Some(ReasoningOption {
+            enabled: true,
+            effort: request.reasoning_effort,
+        }),
+        provider: uses_json_schema.then_some(ProviderPreferences {
+            require_parameters: true,
+        }),
+        response_format: request.response_format.clone(),
+    })
+}
 
 #[cfg(test)]
 pub(crate) mod catalog;
@@ -153,8 +181,21 @@ impl OpenRouterProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> Result<()> {
+        macro_rules! send_event {
+            ($event:expr) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _ = tx.try_send(StreamEvent::Cancelled);
+                        return Ok(());
+                    }
+                    _ = tx.closed() => return Ok(()),
+                    _ = tx.send($event) => {}
+                }
+            };
+        }
         let LlmRequest {
             model,
             messages,
@@ -174,8 +215,8 @@ impl OpenRouterProvider {
         );
         headers.insert("X-Title", HeaderValue::from_static("Tauqe"));
 
-        if *cancel_rx.borrow() {
-            let _ = tx.send(StreamEvent::Cancelled).await;
+        if cancel.is_cancelled() {
+            let _ = tx.try_send(StreamEvent::Cancelled);
             return Ok(());
         }
 
@@ -220,21 +261,8 @@ impl OpenRouterProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = tokio::select! {
-            // The `wait_for` future yields a `watch::Ref` guard, which is not
-            // `Send`. Scope it inside an async block that drops the guard
-            // before the branch body awaits, so the whole turn future stays
-            // `Send`.
-            //
-            // A dropped cancellation sender surfaces as `Err`: no signal can
-            // ever arrive again, so the branch parks instead of firing and
-            // the request proceeds without a cancellation branch, applying
-            // the same closure policy as `retry::wait_with_countdown`.
-            _ = async {
-                if cancel_rx.wait_for(|cancelled| *cancelled).await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                let _ = tx.send(StreamEvent::Cancelled).await;
+            _ = cancel.cancelled() => {
+                let _ = tx.try_send(StreamEvent::Cancelled);
                 return Ok(());
             }
             res = self
@@ -257,7 +285,15 @@ impl OpenRouterProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let err_text = response.text().await.unwrap_or_default();
+            let err_text = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = tx.try_send(StreamEvent::Cancelled);
+                    return Ok(());
+                }
+                _ = tx.closed() => return Ok(()),
+                text = response.text() => text.unwrap_or_default(),
+            };
             tracing::error!(
                 status_code = status.as_u16(),
                 response = %truncate_response_body(&err_text),
@@ -272,31 +308,16 @@ impl OpenRouterProvider {
         let mut got_done_marker = false;
         let mut generation_id: Option<String> = None;
         let mut latest_usage: Option<ModelUsageInfo> = None;
-        // Set once the cancellation sender is dropped: no further signal
-        // can ever arrive, so the cancellation branch is disabled for the
-        // rest of the stream instead of re-polling a future that stays
-        // permanently ready. This mirrors the closure policy of
-        // `retry::wait_with_countdown`.
-        let mut cancel_closed = false;
-
+        let mut published_usage: Option<ModelUsageInfo> = None;
         while !finished {
             if tx.is_closed() {
                 return Ok(());
             }
             tokio::select! {
-                changed = cancel_rx.changed(), if !cancel_closed => {
-                    match changed {
-                        Ok(()) => {
-                            if *cancel_rx.borrow() {
-                                let _ = tx.send(StreamEvent::Cancelled).await;
-                                return Ok(());
-                            }
-                        }
-                        // The cancellation sender is gone, so the branch is
-                        // disabled instead of spinning on a permanently ready
-                        // future.
-                        Err(_) => cancel_closed = true,
-                    }
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = tx.try_send(StreamEvent::Cancelled);
+                    return Ok(());
                 }
                 chunk_res = byte_stream.next() => {
                     match chunk_res {
@@ -313,7 +334,7 @@ impl OpenRouterProvider {
                                     limit_bytes = MAX_SSE_EVENT_BYTES,
                                     "openrouter sse buffer cap exceeded"
                                 );
-                                let _ = tx.send(StreamEvent::Error(msg.clone())).await;
+                                send_event!(StreamEvent::Error(msg.clone()));
                                 bail!("{}", msg);
                             }
 
@@ -361,7 +382,7 @@ impl OpenRouterProvider {
 
                                             if let Some(err) = chunk.error {
                                                 tracing::error!(error = %err.message, "openrouter stream error");
-                                                let _ = tx.send(StreamEvent::Error(err.message.clone())).await;
+                                                send_event!(StreamEvent::Error(err.message.clone()));
                                                 bail!("OpenRouter streaming error: {}", err.message);
                                             }
 
@@ -386,7 +407,10 @@ impl OpenRouterProvider {
                                                 let usage_info =
                                                     merge_usage(latest_usage.clone(), incoming);
                                                 latest_usage = Some(usage_info.clone());
-                                                let _ = tx.send(StreamEvent::Usage(usage_info)).await;
+                                                if let Some(delta) = usage_delta(published_usage.as_ref(), &usage_info) {
+                                                    published_usage = Some(usage_info);
+                                                    send_event!(StreamEvent::Usage(delta));
+                                                }
                                             } else if chunk.cost.is_some() || chunk.total_cost.is_some() {
                                                 let incoming = ModelUsageInfo {
                                                     cost: chunk.cost.or(chunk.total_cost),
@@ -395,13 +419,16 @@ impl OpenRouterProvider {
                                                 let usage_info =
                                                     merge_usage(latest_usage.clone(), incoming);
                                                 latest_usage = Some(usage_info.clone());
-                                                let _ = tx.send(StreamEvent::Usage(usage_info)).await;
+                                                if let Some(delta) = usage_delta(published_usage.as_ref(), &usage_info) {
+                                                    published_usage = Some(usage_info);
+                                                    send_event!(StreamEvent::Usage(delta));
+                                                }
                                             }
 
                                             for choice in chunk.choices {
                                                 if let Some(err) = choice.error {
                                                     tracing::error!(error = %err.message, "openrouter stream choice error");
-                                                    let _ = tx.send(StreamEvent::Error(err.message.clone())).await;
+                                                    send_event!(StreamEvent::Error(err.message.clone()));
                                                     bail!("OpenRouter streaming choice error: {}", err.message);
                                                 }
                                                 if choice.finish_reason.as_deref() == Some("error") {
@@ -410,9 +437,7 @@ impl OpenRouterProvider {
                                                         "openrouter generation error"
                                                     );
                                                     let msg = "Generation ended with finish_reason: error".to_string();
-                                                    let _ = tx
-                                                        .send(StreamEvent::Error(msg.clone()))
-                                                        .await;
+                                                    send_event!(StreamEvent::Error(msg.clone()));
                                                     bail!("OpenRouter error: {}", msg);
                                                 }
                                                 if choice.finish_reason.as_deref() == Some("length")
@@ -426,21 +451,19 @@ impl OpenRouterProvider {
                                                         "OpenRouter structured JSON response {}",
                                                         JSON_TRUNCATION_MARKER
                                                     );
-                                                    let _ = tx
-                                                        .send(StreamEvent::Error(msg.clone()))
-                                                        .await;
+                                                    send_event!(StreamEvent::Error(msg.clone()));
                                                     bail!("{}", msg);
                                                 }
 
                                                 if let Some(delta) = choice.delta {
                                                     if let Some(content) = delta.content {
                                                         if !content.is_empty() {
-                                                            let _ = tx.send(StreamEvent::TextDelta(content)).await;
+                                                            send_event!(StreamEvent::TextDelta(content));
                                                         }
                                                     }
                                                     if let Some(reasoning) = delta.reasoning {
                                                         if !reasoning.is_empty() {
-                                                            let _ = tx.send(StreamEvent::ReasoningDelta(reasoning)).await;
+                                                            send_event!(StreamEvent::ReasoningDelta(reasoning));
                                                         }
                                                     }
                                                 }
@@ -452,7 +475,7 @@ impl OpenRouterProvider {
                         }
                         Some(Err(err)) => {
                             tracing::warn!(error = %err, "openrouter stream read error");
-                            let _ = tx.send(StreamEvent::Error(err.to_string())).await;
+                            send_event!(StreamEvent::Error(err.to_string()));
                             bail!("OpenRouter stream read error: {}", err);
                         }
                         None => {
@@ -470,7 +493,7 @@ impl OpenRouterProvider {
         if !got_done_marker {
             tracing::warn!("openrouter stream ended prematurely without [DONE] marker");
             let msg = "OpenRouter stream ended prematurely without [DONE] marker".to_string();
-            let _ = tx.send(StreamEvent::Error(msg.clone())).await;
+            send_event!(StreamEvent::Error(msg.clone()));
             bail!("{}", msg);
         }
 
@@ -479,18 +502,14 @@ impl OpenRouterProvider {
             if needs_cost {
                 // The enrichment is best-effort, so it inherits the turn's
                 // cancellation discipline: the stats fetch races the turn
-                // cancellation signal exactly like the request path does. A
-                // dropped cancellation sender surfaces as `Err`, so the branch
-                // parks instead of firing and the fetch proceeds.
+                // cancellation signal exactly like the request path does.
                 let stats = tokio::select! {
-                    _ = async {
-                        if cancel_rx.wait_for(|cancelled| *cancelled).await.is_err() {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        let _ = tx.send(StreamEvent::Cancelled).await;
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _ = tx.try_send(StreamEvent::Cancelled);
                         return Ok(());
                     }
+                    _ = tx.closed() => return Ok(()),
                     stats = self.get_generation_stats(&gen_id) => stats,
                 };
 
@@ -513,14 +532,16 @@ impl OpenRouterProvider {
                         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                     }
                     latest_usage = Some(usage.clone());
-                    let _ = tx.send(StreamEvent::Usage(usage)).await;
+                    if let Some(delta) = usage_delta(published_usage.as_ref(), &usage) {
+                        send_event!(StreamEvent::Usage(delta));
+                    }
                 }
             }
         }
 
         log_stream_completion(model, &latest_usage);
 
-        let _ = tx.send(StreamEvent::Done).await;
+        send_event!(StreamEvent::Done);
         Ok(())
     }
 }
@@ -535,9 +556,9 @@ impl LlmProvider for OpenRouterProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult {
-        self.execute_stream(request, tx, cancel_rx)
+        self.execute_stream(request, tx, cancel)
             .await
             .map_err(super::retry::classify_transport_error)
     }
@@ -568,6 +589,42 @@ fn merge_usage(accumulated: Option<ModelUsageInfo>, incoming: ModelUsageInfo) ->
     merged
 }
 
+/// Subtracts only the usage already reported for this generation. An optional
+/// zero is reported on first observation, but not on repetition.
+fn usage_delta(
+    previous: Option<&ModelUsageInfo>,
+    current: &ModelUsageInfo,
+) -> Option<ModelUsageInfo> {
+    let old = previous.cloned().unwrap_or_default();
+    let optional_delta = |before: Option<u32>, after: Option<u32>| match (before, after) {
+        (None, Some(value)) => Some(value),
+        (Some(before), Some(after)) if after > before => Some(after - before),
+        _ => None,
+    };
+    let cost = match (old.cost, current.cost) {
+        (None, Some(value)) => Some(value),
+        (Some(before), Some(after)) if before != after => Some(after - before),
+        _ => None,
+    };
+    let delta = ModelUsageInfo {
+        prompt_tokens: current.prompt_tokens.saturating_sub(old.prompt_tokens),
+        completion_tokens: current
+            .completion_tokens
+            .saturating_sub(old.completion_tokens),
+        total_tokens: current.total_tokens.saturating_sub(old.total_tokens),
+        reasoning_tokens: optional_delta(old.reasoning_tokens, current.reasoning_tokens),
+        cached_tokens: optional_delta(old.cached_tokens, current.cached_tokens),
+        cost,
+    };
+    (delta.prompt_tokens != 0
+        || delta.completion_tokens != 0
+        || delta.total_tokens != 0
+        || delta.reasoning_tokens.is_some()
+        || delta.cached_tokens.is_some()
+        || delta.cost.is_some())
+    .then_some(delta)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -576,6 +633,20 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Keep test call sites compact while exercising the operation stop source.
+    mod watch {
+        use crate::stop::{HardCancellation, StopSource};
+
+        pub fn channel(initial: bool) -> (StopSource, HardCancellation) {
+            let source = StopSource::new();
+            if initial {
+                source.request_hard();
+            }
+            let cancel = source.token().hard_cancellation();
+            (source, cancel)
+        }
+    }
 
     #[tokio::test]
     async fn test_stream_chat_success() {
@@ -680,20 +751,25 @@ mod tests {
                 .await
         });
 
-        let mut received_usage = None;
+        let mut usage_events = Vec::new();
         while let Some(event) = rx.recv().await {
             if let StreamEvent::Usage(usage) = event {
-                received_usage = Some(usage);
+                usage_events.push(usage);
             }
         }
 
         let res = provider_task.await.expect("task join failed");
         assert!(res.is_ok());
 
-        let usage = received_usage.expect("Usage event with cost expected");
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.cost, Some(0.00045));
+        assert_eq!(usage_events.len(), 2);
+        assert_eq!(usage_events[0].prompt_tokens, 10);
+        assert_eq!(usage_events[0].completion_tokens, 5);
+        assert_eq!(usage_events[0].total_tokens, 15);
+        assert_eq!(usage_events[0].cost, None);
+        assert_eq!(usage_events[1].prompt_tokens, 0);
+        assert_eq!(usage_events[1].completion_tokens, 0);
+        assert_eq!(usage_events[1].total_tokens, 0);
+        assert_eq!(usage_events[1].cost, Some(0.00045));
     }
 
     /// A chunk that carries only a cost folds that cost into the usage the turn
@@ -747,15 +823,104 @@ mod tests {
             2,
             "the usage chunk and the cost chunk must each report usage"
         );
-        for usage in &usage_events {
-            assert_eq!(usage.prompt_tokens, 10);
-            assert_eq!(usage.completion_tokens, 5);
-            assert_eq!(usage.total_tokens, 15);
-        }
+        assert_eq!(usage_events[0].prompt_tokens, 10);
+        assert_eq!(usage_events[0].completion_tokens, 5);
+        assert_eq!(usage_events[0].total_tokens, 15);
+        assert_eq!(usage_events[1].prompt_tokens, 0);
+        assert_eq!(usage_events[1].completion_tokens, 0);
+        assert_eq!(usage_events[1].total_tokens, 0);
         assert_eq!(
             usage_events.last().and_then(|usage| usage.cost),
             Some(0.00045),
             "the cost chunk must land in the accumulated usage"
+        );
+    }
+
+    #[test]
+    fn usage_deltas_preserve_optional_zero_growth_and_signed_cost_corrections() {
+        let first = ModelUsageInfo {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: Some(0),
+            reasoning_tokens: Some(0),
+            cost: Some(0.5),
+        };
+        assert_eq!(usage_delta(None, &first), Some(first.clone()));
+        assert_eq!(usage_delta(Some(&first), &first), None);
+        let next = ModelUsageInfo {
+            prompt_tokens: 12,
+            completion_tokens: 8,
+            total_tokens: 20,
+            cached_tokens: Some(2),
+            reasoning_tokens: Some(0),
+            cost: Some(0.25),
+        };
+        assert_eq!(
+            usage_delta(Some(&first), &next),
+            Some(ModelUsageInfo {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+                cached_tokens: Some(2),
+                reasoning_tokens: None,
+                cost: Some(-0.25),
+            })
+        );
+        let absent = ModelUsageInfo::default();
+        let zero = ModelUsageInfo {
+            cached_tokens: Some(0),
+            cost: Some(0.0),
+            ..absent.clone()
+        };
+        assert_eq!(
+            usage_delta(Some(&absent), &zero).unwrap().cached_tokens,
+            Some(0)
+        );
+        assert_eq!(usage_delta(Some(&zero), &zero), None);
+    }
+
+    #[tokio::test]
+    async fn repeated_usage_and_token_growth_emit_only_new_usage() {
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":6,\"total_tokens\":18}}\n\n\
+                    data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let provider = OpenRouterProvider::new("key".into()).with_base_url(server.uri());
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        provider
+            .stream(LlmRequest::new("model", vec![]), tx, cancel_rx)
+            .await
+            .unwrap();
+        let mut reports = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Usage(usage) = event {
+                reports.push(usage);
+            }
+        }
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            (
+                reports[0].prompt_tokens,
+                reports[0].completion_tokens,
+                reports[0].total_tokens
+            ),
+            (10, 5, 15)
+        );
+        assert_eq!(
+            (
+                reports[1].prompt_tokens,
+                reports[1].completion_tokens,
+                reports[1].total_tokens
+            ),
+            (2, 1, 3)
         );
     }
 
@@ -891,7 +1056,7 @@ mod tests {
                             // provider is either inside the enrichment phase
                             // already or one step away from it.
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            let _ = cancel_tx.send(true);
+                            cancel_tx.request_hard();
                         }
                     }
                     StreamEvent::Cancelled => saw_cancelled = true,
@@ -1291,7 +1456,7 @@ mod tests {
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        cancel_tx.send(true).expect("failed to send cancel signal");
+        cancel_tx.request_hard();
 
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), provider_task)
             .await

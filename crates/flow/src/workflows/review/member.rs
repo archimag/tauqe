@@ -1,16 +1,11 @@
 //! Interpret and settle the result of one review member.
 
 use super::ReviewBatchExecutor;
+use crate::application::usage_totals::UsageReceipt;
 use crate::workflows::step::completion::{StepEditCompletion, StepEditDisposition};
 use tauqe_core::edits::VerificationVerdict;
 use tauqe_core::workflow::batch::BatchStepOutcome;
-use tauqe_core::workflow::implementation::ExecutionScope;
-
-#[derive(Debug)]
-pub(crate) struct ReviewLeafReceipt {
-    pub commit: Option<String>,
-    pub modified_paths: Vec<String>,
-}
+use tauqe_core::workflow::implementation::{ExecutionScope, StepTurnSettlement};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReviewStepStop {
@@ -35,36 +30,93 @@ pub(crate) enum ReviewSequenceStop {
 }
 
 /// Receipts survive a partial run even when it cannot publish a completed edit.
-#[derive(Debug)]
 pub(crate) struct ReviewSequenceResult {
-    pub executed_steps: Vec<ReviewLeafReceipt>,
+    pub executed_steps: Vec<StepTurnSettlement>,
     pub stop: ReviewSequenceStop,
+    pub usage: Option<UsageReceipt>,
+}
+
+/// Internal disk facts are independent of the legacy completion projection.
+pub(crate) struct ReviewSequenceFacts {
+    pub completed: bool,
+    pub applied: bool,
+    pub commit: Option<String>,
+    pub changed_files: Vec<String>,
+    pub verification: Option<VerificationVerdict>,
 }
 
 impl ReviewSequenceResult {
+    pub(crate) fn facts(&self) -> ReviewSequenceFacts {
+        let edits: Vec<_> = self
+            .executed_steps
+            .iter()
+            .filter_map(|step| step.edit.as_ref())
+            .collect();
+        let verification = if edits.is_empty() {
+            None
+        } else if edits
+            .iter()
+            .any(|edit| edit.verification == Some(VerificationVerdict::Failed))
+        {
+            Some(VerificationVerdict::Failed)
+        } else if edits
+            .iter()
+            .any(|edit| edit.verification == Some(VerificationVerdict::Cancelled))
+        {
+            Some(VerificationVerdict::Cancelled)
+        } else if edits.iter().any(|edit| edit.verification.is_none()) {
+            None
+        } else if edits
+            .iter()
+            .any(|edit| edit.verification == Some(VerificationVerdict::NotConfigured))
+        {
+            Some(VerificationVerdict::NotConfigured)
+        } else {
+            Some(VerificationVerdict::Passed)
+        };
+        ReviewSequenceFacts {
+            completed: matches!(self.stop, ReviewSequenceStop::Completed),
+            applied: edits.iter().any(|edit| edit.applied),
+            commit: self
+                .executed_steps
+                .iter()
+                .rev()
+                .find_map(|step| step.confirmed_commit().map(str::to_owned)),
+            changed_files: edits
+                .into_iter()
+                .flat_map(|edit| edit.changed_files.iter().cloned())
+                .collect(),
+            verification,
+        }
+    }
+
     pub(crate) fn edit_completion(&self) -> StepEditCompletion {
+        let facts = self.facts();
+        if facts.completed && !facts.applied {
+            tracing::debug!("review sequence completed without disk application");
+        }
         let mut completion = StepEditCompletion {
             disposition: StepEditDisposition::Completed,
-            outcome: Default::default(),
+            // Earlier leaves can remain committed when the rest of the member
+            // stops. Keep their receipts without claiming the member completed.
+            outcome: tauqe_core::edits::EditOutcome {
+                changed_files: facts.changed_files,
+                commit_hash: facts.commit,
+                verification: facts.verification,
+                ..Default::default()
+            },
         };
         match &self.stop {
             ReviewSequenceStop::Completed => {
+                // Preserve the historical wire flag even for a no-change run.
                 completion.outcome.applied = true;
-                completion.outcome.changed_files = self
-                    .executed_steps
-                    .iter()
-                    .flat_map(|step| step.modified_paths.clone())
-                    .collect();
-                completion.outcome.commit_hash = self
-                    .executed_steps
-                    .iter()
-                    .rev()
-                    .find_map(|step| step.commit.clone());
-                completion.outcome.verification = Some(VerificationVerdict::Passed);
             }
             ReviewSequenceStop::Interrupted(
-                ReviewStepStop::Blocked(_) | ReviewStepStop::Exhausted(_),
-            ) => {}
+                ReviewStepStop::Blocked(reason) | ReviewStepStop::Exhausted(reason),
+            ) => {
+                completion.disposition = StepEditDisposition::Refused;
+                completion.outcome.error = Some(reason.clone());
+            }
             ReviewSequenceStop::Interrupted(ReviewStepStop::Cancelled) => {
                 completion.disposition = StepEditDisposition::Cancelled;
             }

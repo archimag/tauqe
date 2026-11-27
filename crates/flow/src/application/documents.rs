@@ -9,8 +9,8 @@ use tauqe_core::plan::{
     find_duplicate_item_ids, storage::PlanStorage, Plan, PlanItem, PlanItemStatus, PlanSummary,
 };
 use tauqe_core::review::{
-    storage::{GroupCompletion, ReviewStorage},
-    IssueStatus, ReviewIssue, ReviewSession,
+    storage::{GroupCompletion, GroupStepStatusError, ReviewStorage},
+    IssueStatus, ReviewGroup, ReviewIssue, ReviewSession,
 };
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
@@ -20,6 +20,12 @@ pub enum DocumentError {
     InvalidPlanTree(String),
     #[error("review_id is required: review item updates are scoped to an explicit session")]
     MissingReviewId,
+    #[error("review_id, group_id and step_id must be non-empty")]
+    InvalidReviewGroupStepAddress,
+    #[error("{0}")]
+    ReviewGroupStepNotFound(String),
+    #[error("{0}")]
+    ReviewGroupStepRejected(String),
     #[error("Another operation is already running")]
     Busy,
     #[error("{0}")]
@@ -195,6 +201,23 @@ impl Application {
         self.repository_documents()
             .await
             .update_review_item(id, item, status, note, observer)
+            .await
+    }
+
+    pub async fn update_review_group_step(
+        &self,
+        review_id: &str,
+        group_id: &str,
+        step_id: &str,
+        status: PlanItemStatus,
+        observer: &dyn ApplicationObserver,
+    ) -> Result<ReviewGroup, DocumentError> {
+        let _operation = self
+            .try_begin_operation()
+            .map_err(|_| DocumentError::Busy)?;
+        self.repository_documents()
+            .await
+            .update_review_group_step(review_id, group_id, step_id, status, observer)
             .await
     }
 }
@@ -553,6 +576,45 @@ impl Documents {
             self.publish_review_snapshot(&id, observer).await;
         }
         Ok(item)
+    }
+    async fn update_review_group_step(
+        &self,
+        review_id: &str,
+        group_id: &str,
+        step_id: &str,
+        status: PlanItemStatus,
+        observer: &dyn ApplicationObserver,
+    ) -> Result<ReviewGroup, DocumentError> {
+        if [review_id, group_id, step_id]
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(DocumentError::InvalidReviewGroupStepAddress);
+        }
+        let root = self.root.clone();
+        let review = review_id.to_owned();
+        let group = group_id.to_owned();
+        let step = step_id.to_owned();
+        let saved = tokio::task::spawn_blocking(move || {
+            ReviewStorage::update_group_step_status(&root, &review, &group, &step, status)
+        })
+        .await
+        .map_err(|error| DocumentError::Storage(format!("blocking task failed: {error}")))?
+        .map_err(|error| match error {
+            GroupStepStatusError::MissingSession(_)
+            | GroupStepStatusError::MissingGroup { .. }
+            | GroupStepStatusError::MissingStep(_) => {
+                DocumentError::ReviewGroupStepNotFound(error.to_string())
+            }
+            GroupStepStatusError::NotArchitectural(_)
+            | GroupStepStatusError::InvalidTransition(_)
+            | GroupStepStatusError::InvalidTree(_) => {
+                DocumentError::ReviewGroupStepRejected(error.to_string())
+            }
+            GroupStepStatusError::Storage(_) => DocumentError::Storage(error.to_string()),
+        })?;
+        self.publish_review_snapshot(review_id, observer).await;
+        Ok(saved)
     }
     async fn effective_plan_id(&self, id: String) -> Result<String, PlanPreparationError> {
         let id = if id.trim().is_empty() {

@@ -7,8 +7,12 @@ pub use model::{ContextAccess, ContextItem, ContextLayer, ContextState};
 use std::path::{Path, PathBuf};
 use tauqe_tools::path_patterns::GlobPattern;
 
+mod manual;
+mod notifications;
 pub mod path;
 pub mod pinned;
+pub use manual::ManualContext;
+pub use notifications::ContextListener;
 
 pub use path::verify_path_within_repo;
 pub use path::verify_path_within_repo_for_write;
@@ -33,18 +37,12 @@ pub struct ContextFileContent {
 pub struct PatternAddOutcome {
     /// Files newly added to the context layer.
     pub added_items: Vec<ContextItem>,
-    /// Total estimated tokens the added files consume, the wrapper their
-    /// `<file>` elements render included.
+    /// Legacy RPC field; admission does not calculate token cost.
     pub added_tokens: u64,
-    /// Whether the file token budget dropped matched files.
-    ///
-    /// When `true`, some matching files were skipped because admitting them
-    /// would have breached the file token budget. Callers should surface this
-    /// so the omission is never silent.
+    /// Legacy RPC field; admission never truncates matches.
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
 pub struct ContextManager {
     repo_root: PathBuf,
     revision: u64,
@@ -69,6 +67,34 @@ pub struct ContextManager {
     /// eviction order of its own: a snapshot is priced like every other file and
     /// stays resident until the transient context is released.
     outer_docs: IndexMap<String, ContextItem>,
+    listener: Option<ContextListener>,
+    mutation_depth: usize,
+}
+
+impl Clone for ContextManager {
+    fn clone(&self) -> Self {
+        Self {
+            repo_root: self.repo_root.clone(),
+            revision: self.revision,
+            insertion_counter: self.insertion_counter,
+            pinned_patterns: self.pinned_patterns.clone(),
+            pinned: self.pinned.clone(),
+            user: self.user.clone(),
+            auto: self.auto.clone(),
+            outer_docs: self.outer_docs.clone(),
+            listener: None,
+            mutation_depth: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ContextManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextManager")
+            .field("repo_root", &self.repo_root)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Stores `item` in `layer`, returning `true` only when the layer contents
@@ -80,17 +106,6 @@ fn store_item(layer: &mut IndexMap<String, ContextItem>, item: ContextItem) -> b
     }
     layer.insert(item.path.clone(), item);
     true
-}
-
-/// Promotes an existing entry to `Editable` in place. An automatic addition
-/// only ever upgrades access, so a read-only request is a no-op.
-fn upgrade_access(item: &mut ContextItem, access: ContextAccess) -> bool {
-    if access == ContextAccess::Editable && item.access != ContextAccess::Editable {
-        item.access = ContextAccess::Editable;
-        true
-    } else {
-        false
-    }
 }
 
 /// Reduces a path a caller may hold to the logical name the OuterDocs layer
@@ -143,6 +158,8 @@ impl Default for ContextManager {
             user: IndexMap::new(),
             auto: IndexMap::new(),
             outer_docs: IndexMap::new(),
+            listener: None,
+            mutation_depth: 0,
         }
     }
 }
@@ -168,6 +185,8 @@ impl ContextManager {
             user: IndexMap::new(),
             auto: IndexMap::new(),
             outer_docs: IndexMap::new(),
+            listener: None,
+            mutation_depth: 0,
         };
         cm.load_pinned(pinned_patterns);
         cm
@@ -182,8 +201,13 @@ impl ContextManager {
     }
 
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
-        self.repo_root = repo_root;
-        self.load_pinned_from_repo();
+        self.mutate(|this| {
+            if this.repo_root != repo_root {
+                this.repo_root = repo_root;
+                this.revision += 1;
+                this.load_pinned_from_repo();
+            }
+        });
     }
 
     /// Resolves access across all layers.
@@ -362,12 +386,13 @@ impl ContextManager {
     /// a no-op: the snapshot is immutable for the whole task, so no rendered
     /// byte changes and the context revision stays put.
     ///
-    /// The layer applies no budget of its own: a snapshot is priced exactly like
-    /// a repository file and admitted under the single `[context].token_budget`
-    /// ceiling by the research round that requested it. A refusal therefore
-    /// never deletes a materialized snapshot, and a later round can read it
-    /// again.
+    /// The snapshot enters context without a separate size gate. The complete
+    /// request is checked before provider I/O.
     pub fn add_outer_docs_file(&mut self, relative_path: &str) -> Result<ContextItem> {
+        self.mutate(|this| this.add_outer_docs_file_inner(relative_path))
+    }
+
+    fn add_outer_docs_file_inner(&mut self, relative_path: &str) -> Result<ContextItem> {
         crate::blocking::run_blocking(|| {
             let clean_path = self.normalize_path(document_key(relative_path))?;
             let full_path = self.outer_docs_cache_path(&clean_path);
@@ -402,6 +427,10 @@ impl ContextManager {
     /// Returns `true` only when the layer actually held documents, so callers can
     /// rotate the dialogue session exactly when the stable prompt prefix shrank.
     pub fn clear_outer_docs(&mut self) -> bool {
+        self.mutate(|this| this.clear_outer_docs_inner())
+    }
+
+    fn clear_outer_docs_inner(&mut self) -> bool {
         if self.outer_docs.is_empty() {
             return false;
         }
@@ -439,11 +468,53 @@ impl ContextManager {
         self.insertion_counter += 1;
         self.insertion_counter
     }
-    pub fn add_file(&mut self, relative_path: &str, access: ContextAccess) -> Result<ContextItem> {
+    #[cfg(test)]
+    pub(crate) fn add_file(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+    ) -> Result<ContextItem> {
         self.add_file_to_layer(relative_path, access, ContextLayer::User)
     }
 
-    pub fn add_file_to_layer(
+    /// Tests optional manual admission without treating absence as a failure.
+    #[cfg(test)]
+    pub fn add_file_if_exists(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+    ) -> Result<Option<ContextItem>> {
+        self.add_file_to_layer_if_exists(relative_path, access, ContextLayer::User)
+    }
+
+    /// Preloads an optional automatic file, preserving user-owned entries.
+    pub fn add_auto_file_if_exists(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+    ) -> Result<Option<ContextItem>> {
+        self.add_file_to_layer_if_exists(relative_path, access, ContextLayer::Auto)
+    }
+
+    /// Boundary checks precede the filesystem probe; other I/O errors and
+    /// non-file paths still fail normal admission.
+    fn add_file_to_layer_if_exists(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+        layer: ContextLayer,
+    ) -> Result<Option<ContextItem>> {
+        crate::blocking::run_blocking(|| {
+            let clean_path = self.normalize_path(relative_path)?;
+            match std::fs::metadata(self.repo_root.join(&clean_path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+                Ok(_) => self.add_file_to_layer(&clean_path, access, layer).map(Some),
+            }
+        })
+    }
+
+    fn add_file_to_layer(
         &mut self,
         relative_path: &str,
         access: ContextAccess,
@@ -453,6 +524,18 @@ impl ContextManager {
     }
 
     fn add_file_to_layer_internal(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+        layer: ContextLayer,
+        recompute: bool,
+    ) -> Result<ContextItem> {
+        self.mutate(|this| {
+            this.add_file_to_layer_unbatched(relative_path, access, layer, recompute)
+        })
+    }
+
+    fn add_file_to_layer_unbatched(
         &mut self,
         relative_path: &str,
         access: ContextAccess,
@@ -508,26 +591,18 @@ impl ContextManager {
                     store_item(&mut self.user, item.clone()) || evicted
                 }
                 ContextLayer::Auto => {
-                    if let Some(user_item) = self.user.get_mut(&clean_path) {
-                        upgrade_access(user_item, access)
-                    } else if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
-                        // A pinned entry is owned by configuration and is always
-                        // present in context, so it must never be duplicated into
-                        // the auto layer. An editable request is persisted as a
-                        // user-layer override (mirroring set_access); a read-only
-                        // request matches the pinned base access and is a no-op.
-                        if access == ContextAccess::Editable
-                            && pinned_item.access != ContextAccess::Editable
-                        {
-                            let override_item = ContextItem {
-                                access: ContextAccess::Editable,
-                                layer: ContextLayer::User,
-                                ..pinned_item
-                            };
-                            store_item(&mut self.user, override_item)
-                        } else {
+                    if let Some(existing) = self.auto.get(&clean_path) {
+                        // A read-only repeat cannot revoke a temporary edit grant.
+                        if existing.access == ContextAccess::Editable {
                             false
+                        } else {
+                            store_item(&mut self.auto, item.clone())
                         }
+                    } else if access == ContextAccess::ReadOnly
+                        && (self.user.contains_key(&clean_path)
+                            || self.pinned.contains_key(&clean_path))
+                    {
+                        false
                     } else {
                         store_item(&mut self.auto, item.clone())
                     }
@@ -569,6 +644,10 @@ impl ContextManager {
     /// the prompt shrank. A repeated clear on an already empty layer reports
     /// `false` instead of a change that did not happen.
     pub fn clear_auto(&mut self) -> bool {
+        self.mutate(|this| this.clear_auto_inner())
+    }
+
+    fn clear_auto_inner(&mut self) -> bool {
         if !self.auto.is_empty() {
             self.auto.clear();
             self.recompute_pinned();
@@ -587,6 +666,10 @@ impl ContextManager {
     /// files, so a cleanup that removed nothing is distinguishable from one
     /// that shrank the stable prefix of the prompt.
     pub fn clear_transient(&mut self) -> bool {
+        self.mutate(|this| this.clear_transient_inner())
+    }
+
+    fn clear_transient_inner(&mut self) -> bool {
         if self.auto.is_empty() && self.outer_docs.is_empty() {
             return false;
         }
@@ -598,7 +681,11 @@ impl ContextManager {
     }
     /// Drops all files strictly from the user context layer.
     /// Root pinned files are never affected; hierarchical pinned files are recomputed.
-    pub fn clear_user(&mut self) {
+    fn clear_user(&mut self) {
+        self.mutate(|this| this.clear_user_inner());
+    }
+
+    fn clear_user_inner(&mut self) {
         if !self.user.is_empty() {
             self.user.clear();
             self.recompute_pinned();
@@ -610,6 +697,21 @@ impl ContextManager {
     /// Files present in `user` or `pinned` layers are never removed and return `Ok(false)`.
     #[cfg(test)]
     fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
+        self.mutate(|this| this.remove_auto_file(relative_path))
+    }
+
+    /// Returns all paths currently tracked in the auto context layer.
+    pub fn auto_files(&self) -> Vec<String> {
+        self.auto.keys().cloned().collect()
+    }
+
+    /// Removes a deleted file only from the automatic layer. A developer's
+    /// selection survives even when the working-tree path no longer exists.
+    pub fn remove_auto_file(&mut self, relative_path: &str) -> Result<bool> {
+        self.mutate(|this| this.remove_auto_file_inner(relative_path))
+    }
+
+    fn remove_auto_file_inner(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         if self.auto.shift_remove(&clean_path).is_some() {
             self.recompute_pinned();
@@ -620,26 +722,39 @@ impl ContextManager {
         }
     }
 
-    /// Returns all paths currently tracked in the auto context layer.
-    pub fn auto_files(&self) -> Vec<String> {
-        self.auto.keys().cloned().collect()
+    /// Releases a registry snapshot without removing a repository file with
+    /// the same logical name from the developer's selection.
+    pub fn remove_outer_docs_file(&mut self, relative_path: &str) -> Result<bool> {
+        self.mutate(|this| this.remove_outer_docs_file_inner(relative_path))
+    }
+
+    fn remove_outer_docs_file_inner(&mut self, relative_path: &str) -> Result<bool> {
+        let clean_path = self.normalize_path(document_key(relative_path))?;
+        if self.outer_docs.shift_remove(&clean_path).is_none() {
+            return Ok(false);
+        }
+        self.revision += 1;
+        Ok(true)
     }
 
     /// Adds all repository files matching a glob pattern or directory prefix.
     ///
-    /// Skips files already present in the user layer. The aggregate token budget
-    /// is the only measure of how much one call may add: a candidate is priced as
-    /// its content plus the wrapper its `<file>` element renders, priced by the
-    /// same builder that renders the `<context>` block. Files are admitted in
-    /// sorted order until the budget is exhausted, and the outcome then reports
-    /// `truncated = true` so the caller can surface the omission instead of
-    /// silently dropping files.
-    pub fn add_files_by_pattern(
+    /// Skips files already present in the user layer and admits every valid
+    /// match in sorted order. Size admission belongs to the assembled request.
+    fn add_files_by_pattern(
         &mut self,
         pattern: &str,
         access: ContextAccess,
         available_files: &[String],
-        token_budget: usize,
+    ) -> Result<PatternAddOutcome> {
+        self.mutate(|this| this.add_files_by_pattern_inner(pattern, access, available_files))
+    }
+
+    fn add_files_by_pattern_inner(
+        &mut self,
+        pattern: &str,
+        access: ContextAccess,
+        available_files: &[String],
     ) -> Result<PatternAddOutcome> {
         let trimmed_pat = pattern.trim();
         if trimmed_pat.is_empty() {
@@ -661,59 +776,16 @@ impl ContextManager {
         // Sort for deterministic addition order
         matched_files.sort();
 
-        // What the loaded files already spend is measured first with the same
-        // wrapper-aware rule. A matched path is excluded here because the loop
-        // below prices it, whether it arrives fresh or is promoted out of
-        // another layer. The set keeps that exclusion linear instead of
-        // rescanning every matched path once per loaded item.
-        let mut spent_tokens: usize = {
-            let matched_paths: std::collections::HashSet<&str> =
-                matched_files.iter().map(String::as_str).collect();
-            self.get_state()
-                .items
-                .iter()
-                .filter(|item| !matched_paths.contains(item.path.as_str()))
-                .map(|item| {
-                    item.estimated_tokens as usize
-                        + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
-                })
-                .sum()
-        };
-
-        // Every candidate is priced from its own metadata before admission, so
-        // the pass touches the filesystem. It runs off the async executor
-        // thread, and the helper is reentrant: the offload each admission
-        // performs internally runs inline here instead of stacking a second
-        // hand-off.
+        // Admission touches the filesystem; keep it off the async worker.
         crate::blocking::run_blocking(|| {
             let mut added_items = Vec::new();
-            let mut total_added_tokens = 0u64;
             let mut any_changed = false;
-            let mut truncated = false;
 
             for path in matched_files {
-                // The candidate is priced from its metadata before admission,
-                // so the wrapper of its own path is charged to the budget it
-                // spends.
-                let cost = match std::fs::metadata(self.repo_root.join(&path)) {
-                    Ok(metadata) => {
-                        estimate_tokens_from_bytes(metadata.len()) as usize
-                            + crate::prompt::context_element_overhead_tokens(&path, access)
-                    }
-                    // A path that vanished between the listing and the read
-                    // adds nothing, and it is not a budget omission.
-                    Err(_) => continue,
-                };
-                if spent_tokens.saturating_add(cost) > token_budget {
-                    truncated = true;
-                    break;
-                }
                 let rev_before = self.revision;
                 if let Ok(item) =
                     self.add_file_to_layer_internal(&path, access, ContextLayer::User, false)
                 {
-                    spent_tokens += cost;
-                    total_added_tokens += cost as u64;
                     added_items.push(item);
                     if self.revision > rev_before {
                         any_changed = true;
@@ -728,12 +800,16 @@ impl ContextManager {
 
             Ok(PatternAddOutcome {
                 added_items,
-                added_tokens: total_added_tokens,
-                truncated,
+                added_tokens: 0,
+                truncated: false,
             })
         })
     }
     pub(crate) fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
+        self.mutate(|this| this.update_file_metadata_inner(relative_path))
+    }
+
+    fn update_file_metadata_inner(&mut self, relative_path: &str) -> Result<()> {
         // The metadata read is blocking filesystem work, so it runs off the
         // async executor thread.
         crate::blocking::run_blocking(|| {
@@ -764,7 +840,11 @@ impl ContextManager {
     /// files are owned by project configuration and are deliberately left in
     /// place, so removing a pinned-only path reports `Ok(false)` (no change)
     /// instead of silently succeeding.
-    pub fn remove_file(&mut self, relative_path: &str) -> Result<bool> {
+    fn remove_file(&mut self, relative_path: &str) -> Result<bool> {
+        self.mutate(|this| this.remove_file_inner(relative_path))
+    }
+
+    fn remove_file_inner(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         let removed_user = self.user.shift_remove(&clean_path).is_some();
         let removed_auto = self.auto.shift_remove(&clean_path).is_some();
@@ -784,7 +864,11 @@ impl ContextManager {
         }
     }
 
-    pub fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
+    fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
+        self.mutate(|this| this.set_access_inner(relative_path, access))
+    }
+
+    fn set_access_inner(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         // Promoting a path to Editable is a write admission: the file may be
         // written afterwards, so the escape boundary must be inspectable.
@@ -827,7 +911,11 @@ impl ContextManager {
     /// Returns `true` only when at least one layer actually held files, so a
     /// clear that removed nothing is distinguishable from a clear that shrank
     /// the prompt prefix.
-    pub fn clear(&mut self) -> bool {
+    fn clear(&mut self) -> bool {
+        self.mutate(|this| this.clear_inner())
+    }
+
+    fn clear_inner(&mut self) -> bool {
         let had_items =
             !self.user.is_empty() || !self.auto.is_empty() || !self.outer_docs.is_empty();
         if had_items {
@@ -842,8 +930,13 @@ impl ContextManager {
         }
     }
 
-    /// Prunes files from context that no longer exist on disk (e.g. after undoing AI creation).
+    /// Prunes missing automatic and derived files without discarding the user's
+    /// selection of paths that may have been deleted or moved by a turn.
     pub(crate) fn prune_missing_files(&mut self) -> Vec<String> {
+        self.mutate(|this| this.prune_missing_files_inner())
+    }
+
+    fn prune_missing_files_inner(&mut self) -> Vec<String> {
         // Existence checks against every context path are blocking filesystem
         // work, so the prune runs off the async executor thread.
         crate::blocking::run_blocking(|| {
@@ -862,7 +955,6 @@ impl ContextManager {
                 };
 
             removed.extend(prune_layer(&mut self.pinned, &self.repo_root));
-            removed.extend(prune_layer(&mut self.user, &self.repo_root));
             removed.extend(prune_layer(&mut self.auto, &self.repo_root));
             // A document is stored under its logical path while its snapshot
             // lives in the isolated cache, so the existence check reads the
@@ -890,30 +982,27 @@ impl ContextManager {
     }
 
     /// Merges updates produced by a workflow run into the current context manager.
-    /// Preserves user layer changes made concurrently. Updates the auto layer,
-    /// merges the external documentation layer symmetrically, syncs file
-    /// renames/removals, and refreshes metadata.
+    /// Preserves the user layer independently of the turn. Merges automatic
+    /// materials and external documents, then refreshes derived metadata.
     pub fn merge_turn_context(&mut self, turn_context: &ContextManager) {
+        self.mutate(|this| this.merge_turn_context_inner(turn_context));
+    }
+
+    fn merge_turn_context_inner(&mut self, turn_context: &ContextManager) {
         // The prune and the metadata refresh both touch the filesystem, so the
         // whole merge runs off the async executor thread.
         crate::blocking::run_blocking(|| {
             let mut changed = false;
 
-            // 1. Sync auto layer: replace with turn_context.auto (excluding any path
-            // already in the user layer).
+            // 1. Sync auto layer, including overrides for user-owned paths.
             let previous_auto = std::mem::take(&mut self.auto);
             for (path, item) in &turn_context.auto {
-                if !self.user.contains_key(path) {
-                    // Max-watermark rule: a path present on both sides keeps the
-                    // highest watermark it ever reached, so a file the turn
-                    // re-added holds its chronological position instead of
-                    // jumping to the tail of the timeline.
-                    let mut merged = item.clone();
-                    if let Some(previous) = previous_auto.get(path) {
-                        merged.insertion_seq = previous.insertion_seq.max(item.insertion_seq);
-                    }
-                    self.auto.insert(path.clone(), merged);
+                // Preserve the latest watermark when both sides held the path.
+                let mut merged = item.clone();
+                if let Some(previous) = previous_auto.get(path) {
+                    merged.insertion_seq = previous.insertion_seq.max(item.insertion_seq);
                 }
+                self.auto.insert(path.clone(), merged);
             }
             changed |= previous_auto != self.auto;
 
@@ -940,30 +1029,7 @@ impl ContextManager {
             // outcome is not counted again here.
             self.prune_missing_files();
 
-            // 3. Mirror any file renamed/moved into the user layer by the turn and
-            // sync access upgrades from the turn. The pinned layer is configuration
-            // owned and is never upgraded at runtime, so it needs no sync here.
-            for (path, item) in &turn_context.user {
-                if let Some(existing) = self.user.get_mut(path) {
-                    if existing.access == ContextAccess::ReadOnly
-                        && item.access == ContextAccess::Editable
-                    {
-                        existing.access = ContextAccess::Editable;
-                        changed = true;
-                    }
-                } else if self.repo_root.join(path).is_file() {
-                    // The path may have entered another layer while the turn ran,
-                    // so it keeps the higher of the two watermarks.
-                    let mut merged = item.clone();
-                    merged.insertion_seq = self
-                        .existing_insertion_seq(path)
-                        .map_or(item.insertion_seq, |seq| seq.max(item.insertion_seq));
-                    self.user.insert(path.clone(), merged);
-                    changed = true;
-                }
-            }
-
-            // Recompute hierarchical pinned files after merging user and auto layers.
+            // 3. Recompute hierarchical pinned files after merging auto.
             changed |= self.recompute_pinned();
 
             // 4. Refresh metadata for all files in context, the external
@@ -997,7 +1063,162 @@ impl ContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    fn listen(cm: &mut ContextManager) -> Arc<Mutex<Vec<ContextState>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        cm.set_listener(Some(ContextListener::new(move |state| {
+            sink.lock().unwrap().push(state);
+        })));
+        events
+    }
+
+    fn take(events: &Arc<Mutex<Vec<ContextState>>>) -> Vec<ContextState> {
+        std::mem::take(&mut *events.lock().unwrap())
+    }
+
+    #[test]
+    fn notifications_follow_completed_mutations_and_detach_on_clone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for name in ["Conventions.md", "src/a.rs", "src/b.rs"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "one").unwrap();
+        }
+        let mut cm = ContextManager::new(root.to_path_buf());
+        let events = listen(&mut cm);
+        assert!(take(&events).is_empty());
+        cm.load_pinned(&["Conventions.md".into()]);
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.load_pinned(&["Conventions.md".into()]);
+        assert!(take(&events).is_empty());
+
+        cm.add_auto_file("src/a.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.add_auto_file("src/a.rs", ContextAccess::Editable)
+            .unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.add_auto_file("src/a.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(take(&events).is_empty());
+
+        cm.add_files_by_pattern(
+            "src/*.rs",
+            ContextAccess::ReadOnly,
+            &["src/a.rs".into(), "src/b.rs".into()],
+        )
+        .unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        let mut detached = cm.clone();
+        detached.clear_auto();
+        assert!(take(&events).is_empty());
+        cm.add_auto_file("src/b.rs", ContextAccess::Editable)
+            .unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.remove_auto_file("src/b.rs").unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.remove_auto_file("src/b.rs").unwrap();
+        assert!(take(&events).is_empty());
+
+        std::fs::write(root.join("src/b.rs"), "longer bytes").unwrap();
+        cm.update_file_metadata("src/b.rs").unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.update_file_metadata("src/b.rs").unwrap();
+        assert!(take(&events).is_empty());
+        cm.clear();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.clear();
+        assert!(take(&events).is_empty());
+    }
+
+    #[test]
+    fn notifications_coalesce_merge_clear_and_outer_docs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("auto.rs"), "one").unwrap();
+        std::fs::write(root.join("other.rs"), "two").unwrap();
+        cache_document(root, "doc.md", "document");
+        let mut cm = ContextManager::new(root.to_path_buf());
+        let events = listen(&mut cm);
+        cm.add_outer_docs_file("doc.md").unwrap();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.add_outer_docs_file("doc.md").unwrap();
+        assert!(take(&events).is_empty());
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        take(&events);
+        let mut turn = cm.clone();
+        turn.remove_auto_file("auto.rs").unwrap();
+        turn.add_auto_file("other.rs", ContextAccess::Editable)
+            .unwrap();
+        cm.merge_turn_context(&turn);
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.merge_turn_context(&turn);
+        assert!(take(&events).is_empty());
+        cm.clear_transient();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.clear_transient();
+        assert!(take(&events).is_empty());
+        cm.add_outer_docs_file("doc.md").unwrap();
+        take(&events);
+        cm.clear_outer_docs();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.clear_outer_docs();
+        assert!(take(&events).is_empty());
+        cm.add_auto_file("auto.rs", ContextAccess::Editable)
+            .unwrap();
+        take(&events);
+        cm.clear_auto();
+        assert_eq!(take(&events), vec![cm.get_state()]);
+        cm.clear_auto();
+        assert!(take(&events).is_empty());
+    }
+
+    #[test]
+    fn optional_file_admission_skips_absence_but_preserves_validation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("reference.rs"), "source").unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        let mut context = ContextManager::new(root.to_path_buf());
+        let revision = context.get_state().revision;
+        for access in [ContextAccess::ReadOnly, ContextAccess::Editable] {
+            assert!(context
+                .add_file_if_exists("missing/child.rs", access)
+                .unwrap()
+                .is_none());
+            assert!(context.add_file_if_exists("directory", access).is_err());
+            assert!(context.add_file_if_exists("../missing.rs", access).is_err());
+            assert!(context
+                .add_file_if_exists(root.join("missing.rs").to_str().unwrap(), access)
+                .is_err());
+        }
+        assert_eq!(context.get_state().revision, revision);
+        let item = context
+            .add_file_if_exists("./absent/../reference.rs", ContextAccess::ReadOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.path, "reference.rs");
+        assert_eq!(item.access, ContextAccess::ReadOnly);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_file_admission_rejects_a_dangling_external_symlink() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("missing"), dir.path().join("link"))
+            .unwrap();
+        let mut context = ContextManager::new(dir.path().to_path_buf());
+        assert!(context
+            .add_file_if_exists("link/child.rs", ContextAccess::ReadOnly)
+            .is_err());
+        assert!(context.get_state().items.is_empty());
+    }
 
     /// Writes one external document into the isolated cache a declaration
     /// materializes into.
@@ -1033,11 +1254,11 @@ mod tests {
 
         let mut cm = ContextManager::new(root);
         let outcome = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 300_000)
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files)
             .unwrap();
 
         assert_eq!(outcome.added_items.len(), 2);
-        assert!(outcome.added_tokens > 0);
+        assert_eq!(outcome.added_tokens, 0);
         assert!(!outcome.truncated);
         assert!(cm.contains("src/lib.rs").unwrap());
         assert!(cm.contains("src/main.rs").unwrap());
@@ -1045,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_files_by_pattern_reports_a_budget_truncation() {
+    fn test_add_files_by_pattern_admits_every_match() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
@@ -1055,20 +1276,13 @@ mod tests {
 
         let repo_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
 
-        // The file token budget is the only measure: it pays for one file's
-        // content together with the wrapper its `<file>` element renders, so
-        // exactly one of the two matches is admitted.
-        let budget = crate::prompt::estimate_tokens_from_bytes("pub fn a() {}".len() as u64)
-            as usize
-            + crate::prompt::context_element_overhead_tokens("src/a.rs", ContextAccess::ReadOnly);
-
         let mut cm = ContextManager::new(root);
         let outcome = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, budget)
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files)
             .unwrap();
 
-        assert_eq!(outcome.added_items.len(), 1);
-        assert!(outcome.truncated);
+        assert_eq!(outcome.added_items.len(), 2);
+        assert!(!outcome.truncated);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1083,16 +1297,16 @@ mod tests {
         let repo_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
         let mut cm = ContextManager::new(root);
 
-        // The pricing walk reads metadata for every candidate, so the whole
+        // The admission walk reads metadata for every candidate, so the whole
         // pass is offloaded: it must complete from a multi-threaded executor
         // exactly as it does from synchronous code.
         let outcome = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::Editable, &repo_files, 300_000)
+            .add_files_by_pattern("src/*.rs", ContextAccess::Editable, &repo_files)
             .unwrap();
 
         assert_eq!(outcome.added_items.len(), 2);
         assert!(!outcome.truncated);
-        assert!(outcome.added_tokens > 0);
+        assert_eq!(outcome.added_tokens, 0);
         assert!(cm.is_editable("src/a.rs").unwrap());
         assert!(cm.is_editable("src/b.rs").unwrap());
     }
@@ -1178,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_missing_files() {
+    fn test_prune_missing_files_preserves_user_selection() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
@@ -1193,8 +1407,9 @@ mod tests {
         std::fs::remove_file(&file_path).unwrap();
 
         let pruned = cm.prune_missing_files();
-        assert_eq!(pruned, vec!["test.rs".to_string()]);
-        assert!(!cm.contains("test.rs").unwrap());
+        assert!(pruned.is_empty());
+        assert!(cm.contains("test.rs").unwrap());
+        assert!(cm.read_context_files().is_empty());
     }
 
     #[test]
@@ -1210,10 +1425,23 @@ mod tests {
         cm.add_auto_file("file.rs", ContextAccess::Editable)
             .unwrap();
         assert!(cm.is_editable("file.rs").unwrap());
+        assert_eq!(cm.auto_files(), ["file.rs"]);
+        let state = cm.get_state();
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].layer, ContextLayer::User);
+        let revision = state.revision;
+        let watermark = state.items[0].insertion_seq;
+        cm.add_auto_file("file.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(cm.get_state().revision, revision);
+        assert_eq!(watermark_of(&cm, "file.rs"), watermark);
+        cm.clear_auto();
+        assert!(!cm.is_editable("file.rs").unwrap());
+        assert_eq!(cm.get_state().items[0].layer, ContextLayer::User);
     }
 
     #[test]
-    fn test_merge_turn_context_syncs_upgraded_user_access() {
+    fn test_merge_turn_context_keeps_user_access_and_temporary_override_separate() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("file.rs"), "fn test() {}").unwrap();
@@ -1231,6 +1459,28 @@ mod tests {
 
         primary.merge_turn_context(&turn_snapshot);
         assert!(primary.is_editable("file.rs").unwrap());
+        assert_eq!(primary.auto_files(), ["file.rs"]);
+        primary.clear_auto();
+        assert!(!primary.is_editable("file.rs").unwrap());
+        assert_eq!(primary.get_state().items[0].layer, ContextLayer::User);
+    }
+
+    #[test]
+    fn merge_does_not_import_turn_user_paths_or_replace_moved_user_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("old.rs"), "old").unwrap();
+        std::fs::write(root.join("new.rs"), "new").unwrap();
+        let mut primary = ContextManager::new(root.to_path_buf());
+        primary.add_file("old.rs", ContextAccess::ReadOnly).unwrap();
+        let mut turn = primary.clone();
+        turn.add_file("new.rs", ContextAccess::Editable).unwrap();
+        std::fs::remove_file(root.join("old.rs")).unwrap();
+        primary.merge_turn_context(&turn);
+        assert!(primary.contains("old.rs").unwrap());
+        assert!(!primary.contains("new.rs").unwrap());
+        assert!(primary.read_context_files().is_empty());
+        assert_eq!(primary.get_state().items[0].access, ContextAccess::ReadOnly);
     }
 
     #[test]
@@ -1723,9 +1973,7 @@ mod tests {
         );
     }
 
-    /// The layer itself applies no budget: a snapshot is priced by the research
-    /// round that requested it, so a document the aggregate ceiling refuses is
-    /// still admitted here and a later round can read it again.
+    /// The document layer admits snapshots independently of request size.
     #[test]
     fn test_the_outer_docs_layer_applies_no_budget_of_its_own() {
         let dir = tempdir().unwrap();
@@ -1735,7 +1983,7 @@ mod tests {
         let mut cm = ContextManager::new(root);
         let document = cm
             .add_outer_docs_file("huge.md")
-            .expect("the layer prices the document but never refuses it");
+            .expect("the layer admits the document");
 
         assert_eq!(document.layer, ContextLayer::OuterDocs);
         assert!(document.estimated_tokens > 0);

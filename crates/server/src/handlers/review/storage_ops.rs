@@ -7,8 +7,56 @@ use std::sync::Arc;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
     errors, Request, Response, ReviewDeleteParams, ReviewDeleteResult, ReviewGetParams,
-    ReviewGetResult, ReviewListResult, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewGetResult, ReviewListResult, ReviewUpdateGroupStepParams, ReviewUpdateGroupStepResult,
+    ReviewUpdateItemParams, ReviewUpdateItemResult,
 };
+pub async fn handle_review_update_group_step(req: Request, state: &Arc<AppState>) -> Response {
+    let params: ReviewUpdateGroupStepParams = match req
+        .params
+        .and_then(|payload| serde_json::from_value(payload).ok())
+    {
+        Some(params) => params,
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid group step update",
+            )
+        }
+    };
+    let observer = Publisher {
+        out: state.out.clone(),
+    };
+    match state
+        .application
+        .update_review_group_step(
+            &params.review_id,
+            &params.group_id,
+            &params.step_id,
+            params.status.project(),
+            &observer,
+        )
+        .await
+    {
+        Ok(group) => Response::ok_typed(
+            req.id,
+            &ReviewUpdateGroupStepResult {
+                group: group.project(),
+            },
+        ),
+        Err(error) => {
+            let code = match &error {
+                tauqe_flow::api::DocumentError::InvalidReviewGroupStepAddress => {
+                    errors::INVALID_PARAMS
+                }
+                tauqe_flow::api::DocumentError::ReviewGroupStepNotFound(_) => errors::NOT_FOUND,
+                tauqe_flow::api::DocumentError::Busy => errors::OPERATION_IN_PROGRESS,
+                _ => errors::REVIEW_UPDATE_FAILED,
+            };
+            Response::err(req.id, code, error.to_string())
+        }
+    }
+}
 pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response {
     match state.application.list_reviews().await {
         Ok((reviews, active_id)) => Response::ok_typed(

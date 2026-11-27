@@ -2,6 +2,14 @@
 
 The method names are constants from `tauqe_protocol::methods`. An immediate response projects state or acknowledges a signal. Synchronous requests wait for the command to settle. Launch requests acknowledge registered work that continues in flow.
 
+Plan create, refine and replan share the synthesis entry but keep distinct
+draft/critique and directed-replanning policies. Plain and preset review launch
+share window expansion; grouped audits keep per-group outcomes, and automatic
+post-analysis runs only after a successful group batch. Review execution of a
+single finding and a group shares the isolated step machinery without treating
+one member's failure as success. REPL discussion retains its authorized plan or
+review focus and uses the same admitted technical turn as a plain prompt.
+
 Exclusive scenarios claim the operation slot. Observe samples the slot for a bounded update. Open routes remain available during an operation. The server decodes parameters before entering the scenario.
 
 | RPC method | Application scenario | Response | Admission |
@@ -39,9 +47,11 @@ Exclusive scenarios claim the operation slot. Observe samples the slot for a bou
 | `REVIEW_LIST` | `list_reviews` | Synchronous | Open |
 | `REVIEW_GET` | `get_review` | Synchronous | Open |
 | `REVIEW_UPDATE_ITEM` | `update_review_item` | Synchronous | Exclusive |
+| `REVIEW_UPDATE_GROUP_STEP` | `update_review_group_step` | Synchronous | Exclusive |
 | `REVIEW_DELETE` | `delete_review` | Synchronous | Exclusive |
 | `REVIEW_EXECUTE` | `execute_review` | Launch | Exclusive |
 | `REVIEW_ANALYZE` | `analyze_review` | Synchronous | Exclusive |
+| `REVIEW_REFINE_GROUP` | `refine_review_group` | Synchronous | Exclusive |
 | `PLAN_LIST` | `list_plans` | Synchronous | Open |
 | `PLAN_GET` | `get_plan` | Synchronous | Open |
 | `PLAN_SAVE` | `save_plan` | Synchronous | Exclusive |

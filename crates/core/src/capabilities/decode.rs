@@ -6,11 +6,12 @@
 //! composed schema declared.
 
 use crate::config::project::ProjectConfig;
-use crate::context::ContextAccess;
+use crate::edits::normalize_repo_path;
 use crate::edits::EditFileOp;
 use crate::edits::StructuredChangeProposal;
 use crate::llm::discussion::normalize_repo_map_path;
 use crate::llm::discussion::DirListRequest;
+use crate::llm::discussion::DiscussionContextRequest;
 use crate::llm::discussion::RepoSearchRequest;
 use crate::llm::discussion::ReviewUpdateProposal;
 use crate::llm::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
@@ -159,13 +160,11 @@ fn decode_leaf(cap: LlmCapability, node: &Value, ctx: &PromptRenderContext<'_>) 
         LlmCapability::EditOverwrite => decode_changes_for_op(node, &[EditFileOp::Overwrite]),
         LlmCapability::ContextRequest => decode_context_requests(node),
         LlmCapability::RepoSearch => decode_repo_searches(node),
-        LlmCapability::RepoDirs => {
-            if node.get("repo_dirs").and_then(Value::as_bool) == Some(true) {
-                vec![LlmCommand::RepoDirs(RepoDirsCommand {})]
-            } else {
-                Vec::new()
-            }
-        }
+        LlmCapability::RepoDirs => match node.get("repo_dirs") {
+            Some(Value::Bool(true)) => vec![LlmCommand::RepoDirs(RepoDirsCommand {})],
+            Some(Value::Bool(false)) | None => Vec::new(),
+            _ => vec![research_error("repo_dirs", "expected a boolean")],
+        },
         LlmCapability::RepoMap => decode_repo_maps(node),
         LlmCapability::DirList => decode_dir_lists(node),
         LlmCapability::DocRequest => decode_doc_requests(node),
@@ -282,80 +281,131 @@ fn decode_changes_for_op(node: &Value, allowed_ops: &[EditFileOp]) -> Vec<LlmCom
 
 fn decode_context_requests(node: &Value) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(reqs) = node.get("context_requests").and_then(Value::as_array) {
-        for item in reqs {
-            if let Some(spec) = item.as_str() {
-                let access = if spec.starts_with("editable:") {
-                    ContextAccess::Editable
-                } else {
-                    ContextAccess::ReadOnly
-                };
-                let path = spec.strip_prefix("editable:").unwrap_or(spec).trim();
-                if !path.is_empty() {
-                    commands.push(LlmCommand::ContextRequest(ContextRequestCommand {
-                        path: path.to_string(),
-                        access,
-                    }));
+    let Some(reqs) = research_array(node, "context_requests") else {
+        return commands;
+    };
+    let reqs = match reqs {
+        Ok(reqs) => reqs,
+        Err(error) => return vec![research_error("context_requests", error)],
+    };
+    for (index, item) in reqs.iter().enumerate() {
+        let parsed = if let Some(spec) = item.as_str() {
+            if spec.trim().is_empty() {
+                continue;
+            }
+            DiscussionContextRequest::parse_spec(spec)
+                .map(|request| (request.path, request.access))
+                .ok_or_else(|| "invalid repository file path".to_string())
+        } else {
+            match serde_json::from_value::<ContextRequest>(item.clone()) {
+                Ok(request) => {
+                    normalize_repo_path(&request.path).map(|path| (path, request.access))
                 }
-            } else if let Ok(parsed) = serde_json::from_value::<ContextRequest>(item.clone()) {
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        match parsed {
+            Ok((path, access)) => {
                 commands.push(LlmCommand::ContextRequest(ContextRequestCommand {
-                    path: parsed.path,
-                    access: parsed.access,
-                }));
+                    path,
+                    access,
+                }))
+            }
+            Err(error) => {
+                return vec![research_error(&format!("context_requests[{index}]"), error)]
             }
         }
     }
     commands
 }
 
+fn research_error(field: &str, error: impl std::fmt::Display) -> LlmCommand {
+    LlmCommand::ProtocolError {
+        message: format!("invalid {field}: {error}"),
+    }
+}
+
+fn research_array<'a>(node: &'a Value, field: &str) -> Option<Result<&'a Vec<Value>, String>> {
+    node.get(field).map(|value| {
+        value
+            .as_array()
+            .ok_or_else(|| format!("{field} must be an array"))
+    })
+}
+
 fn decode_repo_searches(node: &Value) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(s_val) = node.get("repo_searches").and_then(Value::as_array) {
-        if let Ok(parsed) =
-            serde_json::from_value::<Vec<RepoSearchRequest>>(Value::Array(s_val.clone()))
-        {
-            for request in parsed {
-                commands.push(LlmCommand::RepoSearch(RepoSearchCommand {
-                    path: request.path,
-                    regex: request.regex,
-                }));
-            }
-        }
+    let Some(requests) = research_array(node, "repo_searches") else {
+        return commands;
+    };
+    let requests = match requests {
+        Ok(requests) => requests,
+        Err(error) => return vec![research_error("repo_searches", error)],
+    };
+    for (index, item) in requests.iter().enumerate() {
+        let request = match serde_json::from_value::<RepoSearchRequest>(item.clone()) {
+            Ok(request) => request,
+            Err(error) => return vec![research_error(&format!("repo_searches[{index}]"), error)],
+        };
+        let Some(path) = normalize_repo_map_path(&request.path) else {
+            return vec![research_error(
+                &format!("repo_searches[{index}].path"),
+                "invalid repository path",
+            )];
+        };
+        commands.push(LlmCommand::RepoSearch(RepoSearchCommand {
+            path,
+            regex: request.regex,
+        }));
     }
     commands
 }
 
 fn decode_repo_maps(node: &Value) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(m_val) = node.get("repo_maps").and_then(Value::as_array) {
-        for item in m_val {
-            if let Some(p) = item.as_str() {
-                if !p.contains("..") {
-                    if let Some(normalized) = normalize_repo_map_path(p) {
-                        commands.push(LlmCommand::RepoMap(RepoMapCommand { path: normalized }));
-                    }
-                }
-            }
-        }
+    let Some(paths) = research_array(node, "repo_maps") else {
+        return commands;
+    };
+    let paths = match paths {
+        Ok(paths) => paths,
+        Err(error) => return vec![research_error("repo_maps", error)],
+    };
+    for (index, item) in paths.iter().enumerate() {
+        let Some(path) = item.as_str().and_then(normalize_repo_map_path) else {
+            return vec![research_error(
+                &format!("repo_maps[{index}]"),
+                "expected a repository-relative path",
+            )];
+        };
+        commands.push(LlmCommand::RepoMap(RepoMapCommand { path }));
     }
     commands
 }
 
 fn decode_dir_lists(node: &Value) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(d_val) = node.get("dir_lists").and_then(Value::as_array) {
-        for item in d_val {
-            if let Ok(req) = serde_json::from_value::<DirListRequest>(item.clone()) {
-                if !req.path.contains("..") {
-                    if let Some(normalized) = req.normalized() {
-                        commands.push(LlmCommand::DirList(DirListCommand {
-                            path: normalized.path,
-                            recursive: normalized.recursive,
-                        }));
-                    }
-                }
-            }
-        }
+    let Some(requests) = research_array(node, "dir_lists") else {
+        return commands;
+    };
+    let requests = match requests {
+        Ok(requests) => requests,
+        Err(error) => return vec![research_error("dir_lists", error)],
+    };
+    for (index, item) in requests.iter().enumerate() {
+        let request = match serde_json::from_value::<DirListRequest>(item.clone()) {
+            Ok(request) => request,
+            Err(error) => return vec![research_error(&format!("dir_lists[{index}]"), error)],
+        };
+        let Some(request) = request.normalized() else {
+            return vec![research_error(
+                &format!("dir_lists[{index}].path"),
+                "invalid repository path",
+            )];
+        };
+        commands.push(LlmCommand::DirList(DirListCommand {
+            path: request.path,
+            recursive: request.recursive,
+        }));
     }
     commands
 }
@@ -365,16 +415,24 @@ fn decode_doc_requests(node: &Value) -> Vec<LlmCommand> {
     let val = node
         .get("tauqe_doc_requests")
         .or_else(|| node.get("doc_requests"));
-    if let Some(d_val) = val.and_then(Value::as_array) {
-        for item in d_val {
+    if let Some(val) = val {
+        let Some(d_val) = val.as_array() else {
+            return vec![research_error("tauqe_doc_requests", "expected an array")];
+        };
+        for (index, item) in d_val.iter().enumerate() {
             if item.is_null() {
                 commands.push(LlmCommand::DocRequest(DocRequestCommand {
                     topic: DocTopic::All,
                 }));
             } else if let Some(s) = item.as_str() {
-                if let Ok(topic) = s.parse::<DocTopic>() {
-                    commands.push(LlmCommand::DocRequest(DocRequestCommand { topic }));
-                }
+                commands.push(LlmCommand::DocRequest(DocRequestCommand {
+                    topic: DocTopic::from(s),
+                }));
+            } else {
+                return vec![research_error(
+                    &format!("tauqe_doc_requests[{index}]"),
+                    "expected a topic string or null",
+                )];
             }
         }
     }
@@ -383,16 +441,24 @@ fn decode_doc_requests(node: &Value) -> Vec<LlmCommand> {
 
 fn decode_outer_doc_requests(node: &Value) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(o_val) = node.get("outer_doc_requests").and_then(Value::as_array) {
-        for item in o_val {
-            if let Some(id) = item.as_str() {
-                let trimmed = id.trim();
-                if !trimmed.is_empty() {
-                    commands.push(LlmCommand::OuterDocRequest(OuterDocRequestCommand {
-                        id: trimmed.to_string(),
-                    }));
-                }
-            }
+    let Some(ids) = research_array(node, "outer_doc_requests") else {
+        return commands;
+    };
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(error) => return vec![research_error("outer_doc_requests", error)],
+    };
+    for (index, item) in ids.iter().enumerate() {
+        let Some(id) = item.as_str() else {
+            return vec![research_error(
+                &format!("outer_doc_requests[{index}]"),
+                "expected an identifier string",
+            )];
+        };
+        if !id.trim().is_empty() {
+            commands.push(LlmCommand::OuterDocRequest(OuterDocRequestCommand {
+                id: id.trim().to_string(),
+            }));
         }
     }
     commands
@@ -488,32 +554,55 @@ fn decode_abort(node: &Value) -> Vec<LlmCommand> {
 
 fn decode_custom_tools(node: &Value, project: Option<&ProjectConfig>) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
-    if let Some(t_val) = node.get("custom_tools").and_then(Value::as_array) {
-        for item in t_val {
-            if let (Some(name), Some(args)) =
-                (item.get("name").and_then(Value::as_str), item.get("args"))
-            {
-                let mut args = args.clone();
-                if let Some(resolved) = project.and_then(|project| {
-                    let spec = project.commands.get(name)?;
-                    project.resolve(&format!("commands.{name}"), spec).ok()
-                }) {
-                    if let Some(object) = args.as_object_mut() {
-                        for parameter in resolved.parameters {
-                            if parameter.default.is_some()
-                                && object.get(&parameter.name).is_some_and(Value::is_null)
-                            {
-                                object.remove(&parameter.name);
-                            }
-                        }
+    let Some(tools) = research_array(node, "custom_tools") else {
+        return commands;
+    };
+    let tools = match tools {
+        Ok(tools) => tools,
+        Err(error) => return vec![research_error("custom_tools", error)],
+    };
+    for (index, item) in tools.iter().enumerate() {
+        let Some(name) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return vec![research_error(
+                &format!("custom_tools[{index}].name"),
+                "expected a command name",
+            )];
+        };
+        let Some(args) = item.get("args").filter(|args| args.is_object()) else {
+            return vec![research_error(
+                &format!("custom_tools[{index}].args"),
+                "expected an object",
+            )];
+        };
+        if !item.as_object().is_some_and(|object| object.len() == 2) {
+            return vec![research_error(
+                &format!("custom_tools[{index}]"),
+                "unexpected fields",
+            )];
+        }
+        let mut args = args.clone();
+        if let Some(resolved) = project.and_then(|project| {
+            let spec = project.commands.get(name)?;
+            project.resolve(&format!("commands.{name}"), spec).ok()
+        }) {
+            if let Some(object) = args.as_object_mut() {
+                for parameter in resolved.parameters {
+                    if parameter.default.is_some()
+                        && object.get(&parameter.name).is_some_and(Value::is_null)
+                    {
+                        object.remove(&parameter.name);
                     }
                 }
-                commands.push(LlmCommand::CustomTool(CustomToolCommand {
-                    name: name.to_string(),
-                    args,
-                }));
             }
         }
+        commands.push(LlmCommand::CustomTool(CustomToolCommand {
+            name: name.to_string(),
+            args,
+        }));
     }
     commands
 }
@@ -522,6 +611,7 @@ fn decode_custom_tools(node: &Value, project: Option<&ProjectConfig>) -> Vec<Llm
 mod tests {
     use super::*;
     use crate::capabilities::capability_expr_schema;
+    use crate::context::ContextAccess;
     use crate::edits::EditCreate;
     use crate::edits::EditDelete;
     use crate::edits::EditLineAnchor;

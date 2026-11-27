@@ -21,7 +21,7 @@ use crate::toolchain::config::{ProjectCommandSpec, TaskRunnerKind};
 use std::fmt;
 use std::path::Path;
 
-use tokio::sync::watch;
+use crate::stop::HardCancellation;
 
 mod just;
 
@@ -177,7 +177,7 @@ pub async fn load_manifest(
     runner: &dyn TaskRunner,
     repo_root: &Path,
     timeout_secs: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> Result<RunnerManifest, RunnerManifestError> {
     let command = super::exec::CommandLine::new(runner.program(), runner.dump_args());
     // The change-set contract belongs to the verification lifecycle alone, so
@@ -200,9 +200,9 @@ pub async fn load_manifest(
 
 #[cfg(test)]
 mod tests {
+    use crate::stop::StopSource;
     use crate::toolchain::config::TaskRunnerKind;
     use crate::toolchain::config::{ProjectCommandSpec, ProjectConfig, ProjectParameterSpec};
-    use tokio::sync::watch;
 
     use super::{
         load_manifest, merge_manifest, task_runner, RunnerCommand, RunnerManifest,
@@ -438,8 +438,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_cancelled_dump_is_not_a_failure_report() {
         let dir = repo();
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
-        let error = load_manifest(&PrintfRunner, dir.path(), 10, Some(&cancel_rx))
+        let source = StopSource::new();
+        source.request_hard();
+        let cancel = source.token().hard_cancellation();
+        let error = load_manifest(&PrintfRunner, dir.path(), 10, Some(&cancel))
             .await
             .expect_err("a cancelled dump yields no manifest");
 

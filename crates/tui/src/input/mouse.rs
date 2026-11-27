@@ -536,13 +536,8 @@ mod tests {
         ));
 
         let term = st.last_frame_area;
-        let entry_count = st
-            .modals
-            .confirm_execute_review
-            .as_ref()
-            .map(|target| target.selector.len())
-            .unwrap_or(0);
-        let geom = crate::dialogs::render::execute_review_dialog_geometry(term, entry_count);
+        let target = st.modals.confirm_execute_review.as_ref().unwrap();
+        let geom = crate::dialogs::render::execute_review_dialog_geometry(term, target);
 
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),

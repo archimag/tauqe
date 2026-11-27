@@ -41,9 +41,11 @@ pub const REVIEW_CANCEL: &str = "review/cancel";
 pub const REVIEW_LIST: &str = "review/list";
 pub const REVIEW_GET: &str = "review/get";
 pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
+pub const REVIEW_UPDATE_GROUP_STEP: &str = "review/updateGroupStep";
 pub const REVIEW_DELETE: &str = "review/delete";
 pub const REVIEW_EXECUTE: &str = "review/execute";
 pub const REVIEW_ANALYZE: &str = "review/analyze";
+pub const REVIEW_REFINE_GROUP: &str = "review/refineGroup";
 
 pub const PLAN_LIST: &str = "plan/list";
 pub const PLAN_GET: &str = "plan/get";

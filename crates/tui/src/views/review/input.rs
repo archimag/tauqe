@@ -32,6 +32,7 @@ pub enum ReviewAction {
     RunReview,
     Discuss,
     Analyze,
+    RefineGroup,
     ChangeStatus,
     SetFocus,
     ToggleHideClosed,
@@ -77,6 +78,12 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         ReviewAction::Execute,
         Essential,
         "cmd.review.execute",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
+        ReviewAction::RefineGroup,
+        Essential,
+        "cmd.review.refine_group",
     ),
     // Starting a new review session is a creation verb, so it takes `N` and
     // refresh keeps the canonical `g` (Conventions §4.5, §4.6).
@@ -452,25 +459,91 @@ fn find_session(state: &AppState, session_id: &str) -> Option<ReviewSession> {
         })
 }
 
-/// Number of architectural root-cause plans an actionable queue carries.
-///
-/// Every architectural group owning at least one actionable finding
-/// contributes exactly one coherent plan to the queue the server executes —
-/// stored already or projected just-in-time — so the confirmation states how
-/// many root causes the run resolves through its groups (c-2, c-4).
-fn architectural_plan_count(session: &ReviewSession, items: &[ReviewIssue]) -> usize {
-    let groups = session.effective_groups();
-    let mut counted: Vec<&str> = Vec::new();
-    for item in items {
-        let group_id = item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID);
-        let architectural = groups
-            .iter()
-            .any(|group| group.id == group_id && group.kind == ReviewGroupKind::Architectural);
-        if architectural && !counted.contains(&group_id) {
-            counted.push(group_id);
+/// Finds a stored step, including a leaf nested under a container.
+fn find_group_step<'a>(steps: &'a [PlanItem], id: &str) -> Option<&'a PlanItem> {
+    for step in steps {
+        if step.id == id {
+            return Some(step);
+        }
+        if let Some(found) = find_group_step(&step.children, id) {
+            return Some(found);
         }
     }
-    counted.len()
+    None
+}
+
+/// Preview every architectural group with open questions or remaining horizon
+/// work. Flow, not this client-side count, decides which groups can execute.
+fn pending_architectural_groups(session: &ReviewSession) -> usize {
+    session
+        .groups
+        .iter()
+        .filter(|group| group.kind == ReviewGroupKind::Architectural)
+        .filter(|group| {
+            session.items.iter().any(|item| {
+                item.group.as_deref() == Some(group.id.as_str())
+                    && matches!(
+                        item.status,
+                        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Discussion
+                    )
+            }) || (!group.implementation.items.is_empty()
+                && !matches!(
+                    group.implementation.evaluate_scope(None),
+                    tauqe_tui::projection::PlanScopeEvaluation::AllCompleted
+                ))
+        })
+        .count()
+}
+
+/// Only an explicitly stored architectural group can open the refinement form.
+fn refine_review_group_action(st: &mut AppState, row: VisibleReviewRow) {
+    if st.model.is_busy() || st.review.running || st.review.analyzing || st.plans_view.refining {
+        st.notify_warning(active_t("notify.model_busy"));
+        return;
+    }
+    let (session_id, group_id) = match &row {
+        VisibleReviewRow::GroupHeader {
+            session_id,
+            group_id,
+            ..
+        }
+        | VisibleReviewRow::GroupPlanHeader {
+            session_id,
+            group_id,
+            ..
+        }
+        | VisibleReviewRow::SubplanItem {
+            session_id,
+            group_id,
+            ..
+        } => (session_id, group_id),
+        _ => {
+            st.notify_info(active_t("notify.review_refine_group_only"));
+            return;
+        }
+    };
+    let group = find_session(st, session_id).and_then(|session| {
+        session
+            .groups
+            .into_iter()
+            .find(|group| group.id == *group_id)
+    });
+    let Some(group) = group.filter(|group| group.kind == ReviewGroupKind::Architectural) else {
+        st.notify_info(active_t("notify.review_refine_group_only"));
+        return;
+    };
+    let entries = crate::views::plans::architect_entries(st);
+    let mut dialog = crate::views::plans::PlanRefineDialogState::for_review_group(
+        session_id.clone(),
+        group_id.clone(),
+        group_display_title(&group),
+        entries,
+    );
+    if dialog.planner.len() > 1 {
+        dialog.focus = crate::views::plans::PlanFormFocus::PlannerList;
+    }
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.refine_dialog = Some(dialog);
 }
 
 /// Localized description of a mixed review queue.
@@ -609,7 +682,7 @@ fn execute_review_session_action(st: &mut AppState, session_id: &str) {
         .map(ReviewIssue::from)
         .collect();
 
-    if todo_items.is_empty() {
+    if todo_items.is_empty() && pending_architectural_groups(&session) == 0 {
         let (total, fixed) = session.stats();
         if fixed == total && total > 0 {
             st.notify_info(active_t("notify.review_all_fixed_session"));
@@ -619,7 +692,7 @@ fn execute_review_session_action(st: &mut AppState, session_id: &str) {
         return;
     }
 
-    let scope_title = queue_scope_title(architectural_plan_count(&session, &todo_items));
+    let scope_title = queue_scope_title(pending_architectural_groups(&session));
     let session_title = if session.title.trim().is_empty() {
         session.id.clone()
     } else {
@@ -677,11 +750,15 @@ fn execute_review_group_action(
         .review
         .group_findings(&session, group_id)
         .into_iter()
-        .filter(|item| is_actionable(item.status))
+        .filter(|item| {
+            is_actionable(item.status)
+                || (kind == ReviewGroupKind::Architectural
+                    && item.status == IssueStatus::Discussion)
+        })
         .map(ReviewIssue::from)
         .collect();
 
-    if items.is_empty() {
+    if items.is_empty() && (kind != ReviewGroupKind::Architectural || subplan.is_empty()) {
         st.notify_info(active_t("notify.review_no_todo_section"));
         return;
     }
@@ -767,11 +844,11 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
                 _ => {}
             }
         }
-        group_plans += architectural_plan_count(session.as_ref(), &session_items);
+        group_plans += pending_architectural_groups(session.as_ref());
         todo_items.extend(session_items);
     }
 
-    if todo_items.is_empty() {
+    if todo_items.is_empty() && group_plans == 0 {
         if total_items == 0 {
             st.notify_info(active_t("notify.review_no_findings"));
         } else if discussion_count > 0 {
@@ -1063,6 +1140,11 @@ pub async fn handle_review_key(
         ReviewAction::ExecuteAll => {
             execute_all_reviews_action(&mut st);
         }
+        ReviewAction::RefineGroup => {
+            if let Some(row) = st.review.selected_row() {
+                refine_review_group_action(&mut st, row);
+            }
+        }
         ReviewAction::Execute => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
@@ -1155,10 +1237,39 @@ pub async fn handle_review_key(
                         session_id: session_id.clone(),
                         group_id: group_id.clone(),
                         group_title: title.clone(),
+                        focused_steps: Vec::new(),
                         blocked_reason: blocked_reason.clone(),
                         purpose: GroupDialoguePurpose::Discuss,
                     };
                     st.modals.prompt_modal = Some(PromptModalState::new(prompt_target));
+                    return Ok(InputResult::Continue);
+                }
+
+                if let VisibleReviewRow::GroupPlanHeader {
+                    session_id,
+                    group_id,
+                    ..
+                }
+                | VisibleReviewRow::SubplanItem {
+                    session_id,
+                    group_id,
+                    ..
+                } = &row
+                {
+                    let (_, title, _) = resolve_group_target(&st, session_id, group_id);
+                    let focused_steps = match &row {
+                        VisibleReviewRow::SubplanItem { step_id, .. } => vec![step_id.clone()],
+                        _ => Vec::new(),
+                    };
+                    st.modals.prompt_modal =
+                        Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
+                            session_id: session_id.clone(),
+                            group_id: group_id.clone(),
+                            group_title: title,
+                            focused_steps,
+                            blocked_reason: None,
+                            purpose: GroupDialoguePurpose::Discuss,
+                        }));
                     return Ok(InputResult::Continue);
                 }
 
@@ -1220,13 +1331,22 @@ pub async fn handle_review_key(
                     VisibleReviewRow::ReviewItem { item_id, .. } => {
                         DiscussionFocus::review(session_id.clone(), vec![item_id.to_string()])
                     }
-                    VisibleReviewRow::GroupHeader { group_id, .. } => DiscussionFocus::from_target(
-                        DiscussionTarget::ReviewGroup {
-                            session_id: session_id.clone(),
-                            group_id: group_id.clone(),
-                        },
-                        Vec::new(),
-                    ),
+                    VisibleReviewRow::GroupHeader { group_id, .. }
+                    | VisibleReviewRow::GroupPlanHeader { group_id, .. }
+                    | VisibleReviewRow::SubplanItem { group_id, .. } => {
+                        DiscussionFocus::from_target(
+                            DiscussionTarget::ReviewGroup {
+                                session_id: session_id.clone(),
+                                group_id: group_id.clone(),
+                            },
+                            match &row {
+                                VisibleReviewRow::SubplanItem { step_id, .. } => {
+                                    vec![format!("step:{step_id}")]
+                                }
+                                _ => Vec::new(),
+                            },
+                        )
+                    }
                     _ => DiscussionFocus::review(session_id.clone(), Vec::new()),
                 };
                 let message = match &row {
@@ -1242,6 +1362,13 @@ pub async fn handle_review_key(
                     VisibleReviewRow::GroupHeader { title, .. } => {
                         active_t("notify.review_focus_group_set")
                             .replacen("{}", title.as_str(), 1)
+                            .replacen("{}", review_title.as_str(), 1)
+                    }
+                    VisibleReviewRow::GroupPlanHeader { group_id, .. }
+                    | VisibleReviewRow::SubplanItem { group_id, .. } => {
+                        let (_, title, _) = resolve_group_target(&st, &session_id, group_id);
+                        active_t("notify.review_focus_group_set")
+                            .replacen("{}", &title, 1)
                             .replacen("{}", review_title.as_str(), 1)
                     }
                     _ => {
@@ -1263,6 +1390,55 @@ pub async fn handle_review_key(
         }
         ReviewAction::ChangeStatus => {
             let sel_row = st.review.selected_row();
+            if let Some(VisibleReviewRow::SubplanItem {
+                session_id,
+                group_id,
+                step_id,
+                ..
+            }) = sel_row.as_ref()
+            {
+                if st.model.is_busy()
+                    || st.review.running
+                    || st.review.analyzing
+                    || st.plans_view.refining
+                {
+                    st.notify_warning(active_t("notify.model_busy"));
+                    return Ok(InputResult::Continue);
+                }
+                let step = find_session(&st, session_id)
+                    .and_then(|session| {
+                        session
+                            .groups
+                            .into_iter()
+                            .find(|group| group.id == *group_id)
+                    })
+                    .and_then(|group| {
+                        find_group_step(&group.implementation.items, step_id).cloned()
+                    });
+                if let Some(step) = step {
+                    if !step.is_leaf() {
+                        st.notify_info(active_t("notify.review_plan_step_container"));
+                    } else if step.status == PlanItemStatus::Done {
+                        st.notify_info(active_t("notify.review_plan_step_done"));
+                    } else {
+                        let selected = crate::dialogs::render::status::PLAN_STATUS_ORDER
+                            .iter()
+                            .position(|status| *status == step.status)
+                            .unwrap_or(0);
+                        st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
+                            crate::app::StatusDialogTarget::ReviewPlanStep {
+                                review_id: session_id.clone(),
+                                group_id: group_id.clone(),
+                                step_id: step_id.clone(),
+                                item_title: step.title,
+                                current_status: step.status,
+                            },
+                            selected,
+                        ));
+                    }
+                }
+                return Ok(InputResult::Continue);
+            }
             // A group has no status of its own to cycle: its resolution is an
             // architectural decision, so `t` opens the dialogue that records it
             // and the harness applies the decision atomically (c-3, c-4).
@@ -1279,6 +1455,7 @@ pub async fn handle_review_key(
                         session_id: session_id.clone(),
                         group_id: group_id.clone(),
                         group_title: title.clone(),
+                        focused_steps: Vec::new(),
                         blocked_reason: blocked_reason.clone(),
                         purpose: GroupDialoguePurpose::Resolve,
                     }));
@@ -2291,6 +2468,253 @@ mod tests {
         .unwrap();
     }
 
+    /// Exercises the real row command, model-list selection and confirmation,
+    /// rather than constructing a confirmation state directly.
+    #[tokio::test]
+    async fn review_execution_routes_preserve_target_and_selected_coder() {
+        use crossterm::event::KeyModifiers;
+        use tauqe_protocol::{
+            ModelEntry, ModelRef, ModelRolesEntries, ModelRolesSummary, ReasoningEffort,
+            ReviewExecuteParams, ReviewExecuteTarget,
+        };
+
+        for (row_kind, key, missing_plan) in [
+            ("finding", KeyCode::Char('x'), false),
+            ("simple", KeyCode::Char('x'), false),
+            ("arch", KeyCode::Char('x'), false),
+            ("arch", KeyCode::Enter, true),
+            ("branch", KeyCode::Char('x'), false),
+            ("branch", KeyCode::Enter, false),
+            ("step", KeyCode::Char('x'), false),
+            ("step", KeyCode::Enter, false),
+            ("session", KeyCode::Char('x'), false),
+            ("summary", KeyCode::Char('x'), false),
+            ("all", KeyCode::Char('X'), false),
+        ] {
+            let mut session = architectural_session(
+                "rev-arch",
+                if missing_plan {
+                    Vec::new()
+                } else {
+                    root_cause_plan()
+                },
+            );
+            session.description = Some("Summary".into());
+            session.groups.push(tauqe_protocol::ReviewGroup {
+                id: "simple".into(),
+                title: "Independent".into(),
+                kind: ReviewGroupKind::Simple,
+                ..Default::default()
+            });
+            let mut independent = todo_session("other", 2).items.remove(0);
+            independent.group = Some("simple".into());
+            session.items.push(independent);
+            let mut st = crate::app::test_state();
+            st.view_mode = ViewMode::Review;
+            let coder = ModelRef::openrouter("coder/same");
+            let entries = vec![
+                ModelEntry::new(coder.clone(), Some(ReasoningEffort::Low)),
+                ModelEntry::new(coder.clone(), Some(ReasoningEffort::High)),
+            ];
+            st.model_choice.roles = Some(ModelRolesSummary {
+                coder: coder.clone(),
+                repl: ModelRef::openrouter("repl/different"),
+                architect: ModelRef::openrouter("architect/different"),
+                reviewer: ModelRef::openrouter("reviewer/different"),
+                scribe: ModelRef::openrouter("scribe/different"),
+                efforts: None,
+                entries: Some(ModelRolesEntries {
+                    coder: entries.clone(),
+                    ..Default::default()
+                }),
+            });
+            st.review.sessions = vec![session];
+            if row_kind == "finding" {
+                // The point target must be independent; an architectural symptom
+                // is refused before the form is opened.
+                st.review.sessions[0].items[1].status = IssueStatus::Todo;
+            }
+            st.review.selected_index = st
+                .review
+                .flatten_rows()
+                .iter()
+                .position(|row| match (row_kind, row) {
+                    ("finding", VisibleReviewRow::ReviewItem { item_id: 2, .. }) => true,
+                    ("simple", VisibleReviewRow::GroupHeader { group_id, .. }) => {
+                        group_id == "simple"
+                    }
+                    ("arch", VisibleReviewRow::GroupHeader { group_id, .. }) => group_id == "arch",
+                    ("branch", VisibleReviewRow::GroupPlanHeader { .. }) => true,
+                    ("step", VisibleReviewRow::SubplanItem { .. }) => true,
+                    ("session" | "all", VisibleReviewRow::SessionHeader { .. }) => true,
+                    ("summary", VisibleReviewRow::SessionSummary { .. }) => true,
+                    _ => false,
+                })
+                .expect("route row");
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+            press_review_key(&state, &mut conn, key).await;
+            {
+                let guard = state.lock().await;
+                let dialog = guard
+                    .modals
+                    .confirm_execute_review
+                    .as_ref()
+                    .expect("execution form");
+                assert_eq!(dialog.selector.len(), 2, "{row_kind}");
+                assert_eq!(
+                    dialog.focus,
+                    crate::views::plans::RefineDialogFocus::ModelList
+                );
+                assert_eq!(
+                    dialog.confirm_button,
+                    crate::app::ConfirmDialogButton::Cancel
+                );
+                assert!(conn.written().is_empty());
+            }
+            crate::dialogs::input::handle_dialog_event(
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state
+                    .lock()
+                    .await
+                    .modals
+                    .confirm_execute_review
+                    .as_ref()
+                    .unwrap()
+                    .selected_entry(),
+                entries.get(1)
+            );
+            crate::dialogs::input::handle_dialog_event(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                &state,
+                &mut conn,
+            )
+            .await
+            .unwrap();
+            let request: tauqe_protocol::Request = serde_json::from_slice(conn.written()).unwrap();
+            assert_eq!(request.method, methods::REVIEW_EXECUTE);
+            let json = request.params.unwrap();
+            assert!(json.get("step_id").is_none(), "{row_kind}: {json}");
+            let params: ReviewExecuteParams = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(
+                params.model,
+                Some(ModelSelection::Tier {
+                    model: coder,
+                    effort: Some(ReasoningEffort::High)
+                }),
+                "{row_kind}"
+            );
+            match row_kind {
+                "finding" => assert!(
+                    matches!(params.target, ReviewExecuteTarget::Finding(ref target) if target.review_id == "rev-arch" && target.item_id == 2)
+                ),
+                "simple" => assert!(
+                    matches!(params.target, ReviewExecuteTarget::Findings(ref target) if target.review_id == "rev-arch" && target.item_ids == [2])
+                ),
+                "arch" | "branch" | "step" => {
+                    assert!(
+                        matches!(params.target, ReviewExecuteTarget::Group(ref target) if target.review_id == "rev-arch" && target.group_id == "arch")
+                    );
+                    assert!(json.get("item_ids").is_none());
+                }
+                "session" | "summary" => {
+                    assert!(
+                        matches!(params.target, ReviewExecuteTarget::Session(ref target) if target.review_id == "rev-arch")
+                    );
+                    assert!(json.get("item_ids").is_none());
+                }
+                "all" => {
+                    assert_eq!(params.target, ReviewExecuteTarget::AllSessions);
+                    assert!(json.get("item_ids").is_none());
+                }
+                other => panic!("unexpected review execution route: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_on_session_header_still_folds_without_launching() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Enter).await;
+        let guard = state.lock().await;
+        assert!(!guard.review.is_session_expanded("rev-1"));
+        assert!(guard.modals.confirm_execute_review.is_none());
+        assert!(conn.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refine_group_routes_only_declared_architectural_rows() {
+        use crate::views::plans::PlanRefineTarget;
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        let mut session = architectural_session("rev-arch", root_cause_plan());
+        session.groups[0].blocked_reason = Some("Saved blocker".into());
+        session.items[0].status = IssueStatus::Discussion;
+        st.review.sessions = vec![session];
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for index in [1, 2, 3] {
+            state.lock().await.review.selected_index = index;
+            press_review_key(&state, &mut conn, KeyCode::Char('r')).await;
+            let guard = state.lock().await;
+            let dialog = guard.modals.refine_dialog.as_ref().expect("group form");
+            assert!(
+                matches!(&dialog.target, PlanRefineTarget::ReviewGroup { review_id, group_id, .. }
+                if review_id == "rev-arch" && group_id == "arch")
+            );
+            assert!(dialog.skip_critique);
+            assert_eq!(
+                dialog.confirm_button,
+                crate::app::ConfirmDialogButton::Cancel
+            );
+            assert!(conn.written().is_empty());
+            drop(guard);
+            state.lock().await.modals.refine_dialog = None;
+        }
+
+        for index in [0, 5] {
+            state.lock().await.review.selected_index = index;
+            press_review_key(&state, &mut conn, KeyCode::Char('r')).await;
+            assert!(state.lock().await.modals.refine_dialog.is_none());
+            assert!(conn.written().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn discussion_only_architectural_group_reaches_execution_confirmation() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        let mut session = architectural_session("rev-arch", Vec::new());
+        session.items[0].status = IssueStatus::Discussion;
+        st.review.sessions = vec![session];
+        st.review.selected_index = 1;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+        let guard = state.lock().await;
+        assert_eq!(
+            guard
+                .modals
+                .confirm_execute_review
+                .as_ref()
+                .and_then(|target| target.group_id.as_deref()),
+            Some("arch")
+        );
+        assert!(conn.written().is_empty());
+    }
+
     /// `x` on the header of an architectural group arms the binary confirmation
     /// of its root-cause plan: one root cause is fixed by one coherent change
     /// set, so the developer never executes its findings one by one (c-1, c-4,
@@ -2659,7 +3083,13 @@ mod tests {
 
         {
             let mut guard = state.lock().await;
-            guard.modals.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+            let target = guard
+                .modals
+                .confirm_execute_review
+                .as_mut()
+                .expect("review form");
+            target.focus = crate::views::plans::RefineDialogFocus::Actions;
+            target.confirm_button = crate::app::ConfirmDialogButton::Confirm;
         }
         crate::dialogs::input::handle_dialog_event(
             KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),

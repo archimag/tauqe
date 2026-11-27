@@ -3,6 +3,24 @@ use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
 const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
 
+/// Lifecycle provenance belongs only to a currently blocked executable leaf.
+fn render_blocked_reason(out: &mut String, item: &PlanItem, indent: &str) {
+    if !item.is_leaf() || item.status != PlanItemStatus::Blocked {
+        return;
+    }
+    if let Some(reason) = item
+        .blocked_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        out.push_str(&format!(
+            "{indent}  <blocked_reason>{}</blocked_reason>\n",
+            escape_xml_text(reason)
+        ));
+    }
+}
+
 /// Joins identifiers or paths into a single escaped, comma-separated line.
 fn join_escaped(items: &[String]) -> String {
     items
@@ -119,6 +137,7 @@ pub fn format_plan_discussion_prompt(
                 }
             }
             out.push('\n');
+            render_blocked_reason(out, item, &indent);
             if !item.children.is_empty() {
                 render_discussion_items(out, &item.children, depth + 1, focused_item_ids);
             }
@@ -143,6 +162,7 @@ pub fn format_plan_discussion_prompt(
                         out.push_str(&format!("  {}\n", escape_xml_text(trimmed)));
                     }
                 }
+                render_blocked_reason(&mut out, item, "");
             } else if let Some(concept) = plan.find_concept_item(id) {
                 out.push_str(&format!(
                     "- **[CONCEPT] #{} {}**\n",
@@ -275,6 +295,7 @@ pub(crate) fn format_active_plan_context(plan: &Plan) -> Option<String> {
                 }
                 out.push('\n');
 
+                render_blocked_reason(out, item, &indent);
                 if !item.children.is_empty() {
                     render_items(out, &item.children, depth + 1);
                 }
@@ -320,6 +341,78 @@ mod tests {
         assert!(prompt.contains("Automated Verification Invariant"));
         assert!(prompt.contains("without changing code"));
         assert!(prompt.contains("no shell"));
+    }
+
+    #[test]
+    fn plan_contexts_include_nested_blockers_without_chat_history() {
+        let mut plan = sample_plan();
+        plan.implementation.items = vec![PlanItem {
+            id: "1".into(),
+            title: "Container".into(),
+            status: PlanItemStatus::Blocked,
+            children: vec![PlanItem {
+                id: "1.1".into(),
+                title: "Blocked leaf".into(),
+                status: PlanItemStatus::Blocked,
+                blocked_reason: Some("  Missing <contract> & dependency\nSecond line  ".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let expected = "<blocked_reason>Missing &lt;contract&gt; &amp; dependency\nSecond line</blocked_reason>";
+        let discussion = format_plan_discussion_prompt(&plan, &[], "Explain the blocker");
+        assert_eq!(discussion.matches(expected).count(), 1);
+        let active = format_active_plan_context(&plan).unwrap();
+        assert_eq!(active.matches(expected).count(), 1);
+        let focused = format_plan_discussion_prompt(&plan, &["1.1".into()], "Explain");
+        let selection = focused
+            .split("### Items Focused by User for Discussion:")
+            .nth(1)
+            .unwrap();
+        assert!(selection.contains(expected));
+        assert!(!focused.contains("Missing <contract>"));
+    }
+
+    #[test]
+    fn plan_contexts_omit_empty_and_inapplicable_blocker_reports() {
+        let mut plan = sample_plan();
+        plan.implementation.items = vec![
+            PlanItem {
+                id: "1".into(),
+                status: PlanItemStatus::Todo,
+                blocked_reason: Some("stale leaf report".into()),
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2".into(),
+                status: PlanItemStatus::Blocked,
+                blocked_reason: Some("container report".into()),
+                children: vec![PlanItem {
+                    id: "2.1".into(),
+                    status: PlanItemStatus::Blocked,
+                    blocked_reason: Some(" \n ".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "3".into(),
+                status: PlanItemStatus::Blocked,
+                ..Default::default()
+            },
+        ];
+        for prompt in [
+            format_plan_discussion_prompt(
+                &plan,
+                &["1".into(), "2".into(), "2.1".into(), "3".into()],
+                "Explain",
+            ),
+            format_active_plan_context(&plan).unwrap(),
+        ] {
+            assert!(!prompt.contains("<blocked_reason>"));
+            assert!(!prompt.contains("stale leaf report"));
+            assert!(!prompt.contains("container report"));
+        }
     }
 
     #[test]

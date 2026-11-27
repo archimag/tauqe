@@ -16,7 +16,7 @@ use tauqe_core::plan::PlanItemStatus;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::review::{IssueStatus, ReviewItem, ReviewSession};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 mod batch;
 mod batch_failures;
@@ -27,13 +27,13 @@ mod start;
 mod storage_ops;
 
 /// Repository scratch directory owned by a test and removed on drop.
-struct TestDir(std::path::PathBuf);
+pub(super) struct TestDir(std::path::PathBuf);
 
 impl TestDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(scratch_root("test-review"))
     }
-    fn path(&self) -> &std::path::Path {
+    pub(super) fn path(&self) -> &std::path::Path {
         &self.0
     }
 }
@@ -105,7 +105,7 @@ pub(crate) async fn await_published(sink: &RecordingSink, needle: &str) -> Strin
     published
 }
 
-fn test_state(dir: &TestDir) -> Arc<AppState> {
+pub(super) fn test_state(dir: &TestDir) -> Arc<AppState> {
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
     AppState::new(
@@ -116,7 +116,11 @@ fn test_state(dir: &TestDir) -> Arc<AppState> {
     )
 }
 
-fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_core::review::ReviewIssue {
+pub(super) fn test_item(
+    id: u32,
+    status: IssueStatus,
+    file: &str,
+) -> tauqe_core::review::ReviewIssue {
     tauqe_core::review::ReviewIssue {
         id,
         title: format!("Finding {}", id),
@@ -161,6 +165,39 @@ fn test_config() -> tauqe_core::config::AppConfig {
     config.models.auto_level_up = false;
     config
 }
+
+/// Distinct roles expose an accidental dispatch to the wrong model.
+pub(super) fn horizon_config() -> tauqe_core::config::AppConfig {
+    let mut config = test_config();
+    config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("review/coder").into()];
+    config.models.architect = Some(vec![tauqe_core::models::ModelRef::openrouter(
+        "review/architect",
+    )
+    .into()]);
+    config.models.coder = Some(vec![tauqe_core::models::ModelRef::openrouter(
+        "review/coder",
+    )
+    .into()]);
+    config
+}
+
+pub(super) fn horizon_response(items: serde_json::Value) -> String {
+    serde_json::json!({
+        "status": "success", "explanation": "Resolve the shared cause",
+        "reason": null, "abort": null, "context_requests": [],
+        "repo_searches": [], "repo_maps": [], "items": items
+    })
+    .to_string()
+}
+
+pub(super) fn horizon_leaf(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "title": "Repair the shared cause", "details": null,
+        "status": "todo", "commit": null, "files": ["src/target.rs"],
+        "readonly_files": [], "outer_docs": [], "concept_refs": [],
+        "depends_on": [], "children": []
+    })
+}
 /// Creates a scratch repository holding the given files, committed once so the
 /// repository listing an audit window reads reports every one of them as
 /// tracked.
@@ -180,7 +217,7 @@ fn init_repo_with_files(dir: &TestDir, files: &[(&str, &str)]) {
 }
 
 /// Creates a scratch repository holding one committed target file.
-fn init_repo_with_file(dir: &TestDir, path: &str) {
+pub(super) fn init_repo_with_file(dir: &TestDir, path: &str) {
     init_repo_with_files(dir, &[(path, "pub fn target() {}\n")]);
 }
 
@@ -211,7 +248,7 @@ async fn test_state_with_provider(
     state
 }
 
-fn subplan_item(
+pub(super) fn subplan_item(
     id: &str,
     title: &str,
     status: PlanItemStatus,
@@ -251,7 +288,7 @@ fn save_grouped_session(
 }
 
 /// A session collecting one finding under an architectural group.
-fn architectural_session(review_id: &str, group_id: &str) -> ReviewSession {
+pub(super) fn architectural_session(review_id: &str, group_id: &str) -> ReviewSession {
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.group = Some(group_id.to_string());
     let mut session = test_session(review_id, vec![item]);
@@ -311,7 +348,7 @@ impl LlmProvider for InterruptedAttemptProvider {
         &self,
         _request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
+        _cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         let attempt = self
             .attempts

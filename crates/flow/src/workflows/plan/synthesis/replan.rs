@@ -1,19 +1,15 @@
 //! Directed replanning around an addressed leaf.
 use super::{
     cleanup_transient_context, preload_readonly_files, publish_plan, record_synthesis_history,
-    Runtime, BUDGET_HINT,
+    Runtime,
 };
 use crate::api::{ApplicationEvent, OperationGuard};
 use crate::application::PlanExecutionEnvironment;
 use crate::workflows::architect::{
-    self, publish_architect_started, ArchitectScope, PlanHorizonContour,
+    self, publish_architect_started, ArchitectScope, HorizonVerdict, PlanHorizonContour,
 };
 use tauqe_core::models::{ModelRole, ModelSelection};
-use tauqe_core::plan::find_duplicate_item_ids;
-use tauqe_core::plan::prompt::{
-    format_architect_escalation_note, PlanHorizonDiagnostics, StructuredRefineOutcome,
-    StructuredRefineStatus,
-};
+use tauqe_core::plan::prompt::{format_architect_escalation_note, PlanHorizonDiagnostics};
 use tauqe_core::plan::{Plan, PlanSynthesisResult};
 
 use std::collections::HashSet;
@@ -223,10 +219,9 @@ impl Runtime<'_> {
             instructions.as_deref(),
         ));
 
-        let (contour_result, summary) = architect::run_contour(
+        let (verdict, summary) = architect::run_horizon_wave(
             &step.execution,
             &step.context,
-            &step.usage,
             operation,
             environment,
             PlanHorizonContour {
@@ -236,56 +231,56 @@ impl Runtime<'_> {
                 scope: ArchitectScope::Plan(plan.id.clone()),
                 tier: architect_tier,
                 intro_header,
-                budget_hint: BUDGET_HINT.to_string(),
             },
             observer.clone(),
         )
         .await;
 
-        let StructuredRefineOutcome {
-            output,
-            tier,
-            status,
-        } = match contour_result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                // The contour owns the transient layers it widened and the launch
-                // skeleton merged everything else back, so the transient context is
-                // released before the turn reports its failure.
-                cleanup_transient_context(self).await;
-                // A cancellation observed while the contour settled still ends the
-                // turn as a cancellation instead of a provider failure.
-                if summary.cancelled {
-                    return Err(PlanHorizonError {
-                        kind: PlanHorizonFailure::Cancelled,
-                        message: format!("{} was cancelled", operation_title),
-                    });
-                }
-                let message = summary.error.unwrap_or_else(|| err.to_string());
-                return Err(PlanHorizonError {
-                    kind: PlanHorizonFailure::Model,
-                    message,
-                });
-            }
-        };
+        if !step
+            .context
+            .activate_manual_publication(operation, observer.clone())
+        {
+            return Err(PlanHorizonError {
+                kind: PlanHorizonFailure::Model,
+                message: "Could not restore plan replanning context publication".into(),
+            });
+        }
 
-        if !matches!(status, StructuredRefineStatus::Cancelled) {
+        if !matches!(
+            verdict,
+            HorizonVerdict::Cancelled | HorizonVerdict::Failed(_)
+        ) {
             // The answer the turn relay accumulated is the single source of the
             // finished text, exactly as the retired manual loop published it.
             observer.publish(&op_id, ApplicationEvent::Finished(summary.assistant_text));
         }
 
-        match status {
-            StructuredRefineStatus::Cancelled => {
-                // A cancelled synthesis leaves the transient context behind, so it
-                // is released exactly as an ended step does.
-                cleanup_transient_context(self).await;
+        let (output, tier) = match verdict {
+            HorizonVerdict::Cancelled => {
                 return Err(PlanHorizonError {
                     kind: PlanHorizonFailure::Cancelled,
                     message: format!("{} was cancelled", operation_title),
                 });
             }
-            StructuredRefineStatus::Blocked { reason } => {
+            HorizonVerdict::Failed(message) => {
+                return Err(PlanHorizonError {
+                    kind: PlanHorizonFailure::Model,
+                    message,
+                });
+            }
+            HorizonVerdict::EmptyHorizon { .. } => {
+                return Err(PlanHorizonError {
+                    kind: PlanHorizonFailure::EmptyItems,
+                    message: "The Architect reported a synthesized horizon without any step".into(),
+                });
+            }
+            HorizonVerdict::InvalidTree { duplicate, .. } => {
+                return Err(PlanHorizonError {
+                    kind: PlanHorizonFailure::InvalidTree,
+                    message: format!("Architect returned a plan with a duplicate or empty step ID: '{duplicate}'"),
+                });
+            }
+            HorizonVerdict::Blocked { reason, .. } => {
                 tracing::warn!(
                     plan_id = %plan.id,
                     reason = %reason,
@@ -305,7 +300,7 @@ impl Runtime<'_> {
                 .await;
                 return Ok(PlanSynthesisResult::Blocked { reason });
             }
-            StructuredRefineStatus::Aborted(report) => {
+            HorizonVerdict::Aborted { report, .. } => {
                 // An abort states that the work cannot be completed in the current
                 // environment, so the developer receives the exact host action
                 // beside the recorded verdict instead of a contradiction the
@@ -326,57 +321,18 @@ impl Runtime<'_> {
                 .await;
                 return Ok(PlanSynthesisResult::Blocked { reason: message });
             }
-            StructuredRefineStatus::BudgetExceeded { diagnostic } => {
-                record_synthesis_history(
-                    self,
-                    history_turn_prompt,
-                    history_context_paths,
-                    diagnostic.clone(),
-                    Some(format!(
-                        "{}: Token Budget Exceeded ({})",
-                        operation_title, plan.title
-                    )),
-                )
-                .await;
-                return Ok(PlanSynthesisResult::Blocked { reason: diagnostic });
-            }
-            StructuredRefineStatus::Synthesized => {}
-        }
-
-        let Some(output) = output else {
-            return Err(PlanHorizonError {
-                kind: PlanHorizonFailure::EmptyItems,
-                message: ("Model returned success status but no horizon payload").into(),
-            });
+            HorizonVerdict::Synthesized { output, tier } => (output, tier),
         };
-
-        if output.items.is_empty() {
-            return Err(PlanHorizonError {
-                kind: PlanHorizonFailure::EmptyItems,
-                message: ("Model returned success status but an empty items array").into(),
-            });
-        }
-
-        if let Some(duplicate) = find_duplicate_item_ids(&output.items) {
-            return Err(PlanHorizonError {
-                kind: PlanHorizonFailure::InvalidTree,
-                message: format!(
-                    "Architect returned a plan with a duplicate or empty step ID: '{}'",
-                    duplicate
-                ),
-            });
-        }
 
         // The operation slot is held for the whole synthesis, so a hard cancel may
         // land after the contour's final provider round resolved and before this
         // write. The horizon below destructively replaces the plan's uncompleted
         // steps, so the authoritative signal is re-checked here, at the same seam
         // the review subsystem guards before it touches its session on disk. A
-        // raised signal releases the transient context, answers a cancellation, and
+        // raised signal answers a cancellation, and
         // leaves the stored plan untouched instead of persisting a horizon for an
         // operation the developer already aborted.
-        if *operation.cancel_receiver().borrow() {
-            cleanup_transient_context(self).await;
+        if operation.hard_cancellation().is_cancelled() {
             tracing::warn!(
                 plan_id = %plan.id,
                 operation = operation_title,

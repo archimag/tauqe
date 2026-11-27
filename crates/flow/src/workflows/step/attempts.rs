@@ -1,31 +1,29 @@
 //! Resolve an addressed leaf and drive its bounded coder attempts.
 
+use super::completion::CoderAttempt;
 use async_trait::async_trait;
 use tauqe_core::config::ModelsConfig;
 use tauqe_core::models::{ModelEntry, ModelRole, ModelSelection, ReasoningEffort};
-use tauqe_core::plan::prompt::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus, PlanScopeEvaluation};
 use tauqe_core::providers::StreamEvent;
+use tauqe_core::stop::HardCancellation;
 use tauqe_core::workflow::implementation::{
     classify_scope_stall, ImplementationFrame, StepFailure, StepTurnRequest, StepTurnResult,
     StepTurnSettlement,
 };
 use tauqe_core::workflow::turn::{TurnWorkItem, TurnWorkQueue};
-use tauqe_core::workflow::EditProtocolKind;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 /// Configuration of one implementation run.
 ///
 /// The executor stays independent of where the configuration came from: the
-/// coder ladder, the protocol vocabulary, and the scheduled queue arrive here,
+/// coder ladder and the scheduled queue arrive here,
 /// so one executor serves a plan batch, a review group run, and a degenerate
 /// single-finding run alike.
 #[derive(Debug, Clone)]
 pub(crate) struct ImplementationRunConfig {
     /// Coder ladder and the automatic escalation policy of the run.
     pub models: ModelsConfig,
-    /// Protocol that shapes the step prompts and their control tags.
-    pub protocol: EditProtocolKind,
     /// Turn marker bound to the tagged control channel.
     pub marker: Option<String>,
     /// Coder selection the run starts from.
@@ -44,12 +42,18 @@ pub(crate) struct ImplementationRunConfig {
 #[async_trait]
 pub(crate) trait LeafOperations: Send + Sync {
     async fn read(&self) -> Result<ImplementationFrame, StepFailure>;
+    async fn task(
+        &self,
+        frame: &ImplementationFrame,
+        leaf: &PlanItem,
+    ) -> Result<String, StepFailure>;
+    fn retry_task(&self, task: &str, answer: &str, error: &str) -> String;
     fn session_id(&self) -> String;
     async fn begin(&self, step_id: &str) -> Result<Option<PlanImplementation>, StepFailure>;
     /// Settle an admitted leaf before the queue observes its verdict.
     async fn finish(&self, step_id: &str, outcome: &LeafOutcome) -> Result<(), StepFailure>;
     /// Runs a turn and returns any previous-answer text needed for a retry.
-    async fn attempt(&self, request: StepTurnRequest) -> (StepTurnSettlement, String);
+    async fn attempt(&self, request: StepTurnRequest) -> CoderAttempt;
 }
 
 /// A leaf verdict is independent of both the batch policy and the disk receipt.
@@ -70,6 +74,18 @@ pub(crate) enum LeafOutcome {
     },
 }
 
+/// Work admitted for one coder, with no document graph in the retry loop.
+struct CoderTask {
+    scope: tauqe_core::workflow::implementation::ExecutionScope,
+    title: String,
+    queue: TurnWorkQueue,
+    step_id: String,
+    step_title: String,
+    prompt: String,
+    files: Vec<String>,
+    readonly_files: Vec<String>,
+}
+
 pub(crate) struct LeafExecutor<'a> {
     pub operations: &'a dyn LeafOperations,
     pub config: &'a ImplementationRunConfig,
@@ -81,7 +97,7 @@ impl LeafExecutor<'_> {
         &self,
         step_id: &str,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> LeafOutcome {
         // The horizon is re-resolved from the storage that owns it, so the
         // executor never decides a lifecycle transition from a stale copy of
@@ -145,7 +161,7 @@ impl LeafExecutor<'_> {
 
         // Phase boundary: a cancel observed before the step is launched ends the
         // step before any model turn is requested.
-        if *cancel_rx.borrow() {
+        if cancel_rx.is_cancelled() {
             return LeafOutcome::Cancelled(None);
         }
 
@@ -166,7 +182,26 @@ impl LeafExecutor<'_> {
             "implementation step started"
         );
 
-        let outcome = self.run_attempts(&frame, &leaf, stream_tx, cancel_rx).await;
+        let outcome = match self.operations.task(&frame, &leaf).await {
+            Ok(task) => {
+                self.run_attempts(
+                    CoderTask {
+                        scope: frame.scope.clone(),
+                        title: frame.plan.title.clone(),
+                        queue: self.work_queue(&frame, &leaf.id),
+                        step_id: leaf.id.clone(),
+                        step_title: leaf.title.clone(),
+                        prompt: task,
+                        files: leaf.files.clone(),
+                        readonly_files: leaf.readonly_files.clone(),
+                    },
+                    stream_tx,
+                    cancel_rx,
+                )
+                .await
+            }
+            Err(failure) => LeafOutcome::Infrastructure(failure),
+        };
         if let Err(failure) = self.operations.finish(&leaf.id, &outcome).await {
             return LeafOutcome::TransitionFailed {
                 failure,
@@ -203,15 +238,12 @@ impl LeafExecutor<'_> {
 
     async fn run_attempts(
         &self,
-        frame: &ImplementationFrame,
-        leaf: &PlanItem,
+        task: CoderTask,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> LeafOutcome {
-        let queue = self.work_queue(frame, &leaf.id);
         let session_id = self.operations.session_id();
         let models = &self.config.models;
-        let marker = self.config.marker.as_deref();
 
         // The selected coder is the starting rung of the step: an explicit
         // selection runs at its own reasoning depth, and a later escalation
@@ -234,31 +266,22 @@ impl LeafExecutor<'_> {
         let mut tier_attempts = 0u32;
         let mut max_tier_attempts = models.resolve_selection_attempts(ModelRole::Coder, &selection);
 
-        let base_prompt = match format_plan_step_execution_prompt(
-            &frame.plan,
-            &leaf.id,
-            self.config.protocol,
-            marker,
-        ) {
-            Ok(prompt) => prompt,
-            Err(err) => return LeafOutcome::Refused(err),
-        };
-        let mut prompt = base_prompt.clone();
+        let mut prompt = task.prompt.clone();
 
         loop {
             // Phase boundary: every attempt is a whole bounded turn, so a
             // cancel observed here ends the step before another turn is requested.
-            if *cancel_rx.borrow() {
+            if cancel_rx.is_cancelled() {
                 return LeafOutcome::Cancelled(None);
             }
 
             let request = StepTurnRequest {
-                scope: frame.scope.clone(),
-                title: frame.plan.title.clone(),
-                queue: queue.clone(),
+                scope: task.scope.clone(),
+                title: task.title.clone(),
+                queue: task.queue.clone(),
                 prompt: prompt.clone(),
-                files: leaf.files.clone(),
-                readonly_files: leaf.readonly_files.clone(),
+                files: task.files.clone(),
+                readonly_files: task.readonly_files.clone(),
                 selection: selection.clone(),
                 reasoning_effort,
                 instructions: self.config.instructions.clone(),
@@ -267,7 +290,7 @@ impl LeafExecutor<'_> {
                 cancel_rx: cancel_rx.clone(),
             };
 
-            let (settlement, answer) = self.operations.attempt(request).await;
+            let CoderAttempt { settlement, answer } = self.operations.attempt(request).await;
             match &settlement.result {
                 StepTurnResult::Success { .. } => return LeafOutcome::Completed(settlement),
                 StepTurnResult::Blocked(reason) => {
@@ -275,7 +298,7 @@ impl LeafExecutor<'_> {
                 }
                 StepTurnResult::Abort(message) => {
                     tracing::warn!(
-                        step_id = leaf.id.as_str(),
+                        step_id = task.step_id.as_str(),
                         message = message.as_str(),
                         "implementation step aborted; developer action in the host environment is required"
                     );
@@ -285,7 +308,7 @@ impl LeafExecutor<'_> {
                     return LeafOutcome::Cancelled(Some(settlement));
                 }
                 StepTurnResult::Failed(failure) => {
-                    if *cancel_rx.borrow() {
+                    if cancel_rx.is_cancelled() {
                         return LeafOutcome::Cancelled(Some(settlement));
                     }
                     // A failed change set the host could not roll back leaves
@@ -294,7 +317,7 @@ impl LeafExecutor<'_> {
                     // nobody verified, so the failure ends the step here.
                     if failure.is_unreverted() {
                         tracing::warn!(
-                            step_id = leaf.id.as_str(),
+                            step_id = task.step_id.as_str(),
                             reason = failure.reason(),
                             "implementation step left unreverted changes; the step ends without a retry"
                         );
@@ -305,7 +328,7 @@ impl LeafExecutor<'_> {
                     // transport, a missing credential, or the same cancellation.
                     if !failure.is_domain() {
                         tracing::warn!(
-                            step_id = leaf.id.as_str(),
+                            step_id = task.step_id.as_str(),
                             reason = failure.reason(),
                             "implementation step ended on an infrastructure failure; no coder tier was spent"
                         );
@@ -326,12 +349,18 @@ impl LeafExecutor<'_> {
                         match next_rung {
                             None => {
                                 let message = if models.auto_level_up {
-                                    saturation_message(models, &selection, leaf, failure.reason())
+                                    saturation_message(
+                                        models,
+                                        &selection,
+                                        &task.step_id,
+                                        &task.step_title,
+                                        failure.reason(),
+                                    )
                                 } else {
                                     failure.reason().to_string()
                                 };
                                 tracing::warn!(
-                                    step_id = leaf.id.as_str(),
+                                    step_id = task.step_id.as_str(),
                                     tier = ladder_idx,
                                     reason = failure.reason(),
                                     "implementation step escalation is exhausted"
@@ -340,7 +369,7 @@ impl LeafExecutor<'_> {
                             }
                             Some((next_idx, tier)) => {
                                 tracing::warn!(
-                                    step_id = leaf.id.as_str(),
+                                    step_id = task.step_id.as_str(),
                                     from_tier = ladder_idx,
                                     to_tier = next_idx,
                                     to_model = %tier.model,
@@ -367,19 +396,21 @@ impl LeafExecutor<'_> {
                                 // channel instead of staying a log line. A
                                 // channel nobody holds any more is not a
                                 // failure of the step.
-                                let _ = stream_tx
-                                    .send(StreamEvent::TierEscalated {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_rx.cancelled() => return LeafOutcome::Cancelled(Some(settlement)),
+                                    _ = stream_tx.send(StreamEvent::TierEscalated {
                                         tier: next_idx,
                                         model: tier.model,
                                         role: ModelRole::Coder,
                                         effort: tier.effort,
-                                    })
-                                    .await;
+                                    }) => {}
+                                }
                             }
                         }
                     } else {
                         tracing::warn!(
-                            step_id = leaf.id.as_str(),
+                            step_id = task.step_id.as_str(),
                             tier = ladder_idx,
                             tier_attempt = tier_attempts,
                             max_tier_attempts = max_tier_attempts,
@@ -388,13 +419,9 @@ impl LeafExecutor<'_> {
                         );
                     }
 
-                    prompt = format_plan_step_retry_prompt(
-                        &base_prompt,
-                        &answer,
-                        Some(failure.reason()),
-                        self.config.protocol,
-                        marker,
-                    );
+                    prompt = self
+                        .operations
+                        .retry_task(&task.prompt, &answer, failure.reason());
                 }
             }
         }
@@ -444,7 +471,8 @@ impl LeafExecutor<'_> {
 fn saturation_message(
     models: &ModelsConfig,
     selection: &ModelSelection,
-    leaf: &PlanItem,
+    step_id: &str,
+    step_title: &str,
     reason: &str,
 ) -> String {
     let model = models.resolve_model(selection);
@@ -467,7 +495,7 @@ fn saturation_message(
     };
     format!(
         "Coder escalation is exhausted for step '{}' ({}): {}. The failure is terminal, so no stronger coder tier is attempted and the step is not retried.\n\nCause: {}",
-        leaf.id, leaf.title, saturation, reason
+        step_id, step_title, saturation, reason
     )
 }
 
@@ -481,6 +509,7 @@ mod tests {
     use crate::api::Application;
     use crate::workflows::plan::PlanLeaf;
     use crate::workflows::review::sequence::{ReviewLeafAddress, ReviewLeafTarget};
+    use crate::workflows::step::completion::CoderAttempt;
     use crate::workflows::step::queue::{run_queue, QueueStop};
     use async_trait::async_trait;
     use tauqe_core::config::ModelsConfig;
@@ -491,13 +520,14 @@ mod tests {
     use tauqe_core::review::storage::ReviewStorage;
     use tauqe_core::review::{IssueStatus, IssueType, ReviewIssue};
     use tauqe_core::review::{ReviewGroup, ReviewItem, ReviewSession};
+    use tauqe_core::stop::{HardCancellation, StopSource};
     use tauqe_core::workflow::implementation::{
         ExecutionScope, ImplementationFrame, StepFailure, StepTurnRequest, StepTurnResult,
         StepTurnSettlement,
     };
     use tauqe_core::workflow::EditProtocolKind;
     use tempfile::tempdir;
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::mpsc;
 
     enum FixtureOperations<'a> {
         Plan(PlanLeaf, &'a ScriptedHost),
@@ -515,6 +545,72 @@ mod tests {
             match self {
                 Self::Plan(plan, _) => plan.read().await,
                 Self::Review(target, _) => target.read().await,
+            }
+        }
+
+        async fn task(
+            &self,
+            frame: &ImplementationFrame,
+            leaf: &PlanItem,
+        ) -> Result<String, StepFailure> {
+            match self {
+                Self::Review(
+                    ReviewLeafTarget {
+                        documents,
+                        review_id,
+                        address: ReviewLeafAddress::Finding(id),
+                    },
+                    _,
+                ) => {
+                    let session = documents
+                        .review(review_id)
+                        .await
+                        .map_err(StepFailure::infrastructure)?
+                        .ok_or_else(|| StepFailure::infrastructure("Review session not found"))?;
+                    tauqe_core::review::prompt::format_review_step_execution_prompt(
+                        &session,
+                        *id,
+                        EditProtocolKind::Structured,
+                        None,
+                    )
+                    .map_err(StepFailure::infrastructure)
+                }
+                _ => tauqe_core::plan::prompt::format_plan_step_execution_prompt(
+                    &frame.plan,
+                    &leaf.id,
+                    EditProtocolKind::Structured,
+                    None,
+                )
+                .map_err(StepFailure::infrastructure),
+            }
+        }
+
+        fn retry_task(&self, task: &str, answer: &str, error: &str) -> String {
+            match self {
+                Self::Review(
+                    ReviewLeafTarget {
+                        address: ReviewLeafAddress::Finding(_),
+                        ..
+                    },
+                    _,
+                ) => {
+                    let mut prompt = tauqe_core::review::prompt::format_review_step_retry_prompt(
+                        answer,
+                        Some(error),
+                        EditProtocolKind::Structured,
+                        None,
+                    );
+                    prompt.push_str("\n---\n\n");
+                    prompt.push_str(task);
+                    prompt
+                }
+                _ => tauqe_core::plan::prompt::format_plan_step_retry_prompt(
+                    task,
+                    answer,
+                    Some(error),
+                    EditProtocolKind::Structured,
+                    None,
+                ),
             }
         }
 
@@ -539,11 +635,12 @@ mod tests {
             }
         }
 
-        async fn attempt(&self, request: StepTurnRequest) -> (StepTurnSettlement, String) {
+        async fn attempt(&self, request: StepTurnRequest) -> CoderAttempt {
             match self {
-                Self::Plan(_, host) | Self::Review(_, host) => {
-                    (host.run_step(request), String::new())
-                }
+                Self::Plan(_, host) | Self::Review(_, host) => CoderAttempt {
+                    settlement: host.run_step(request),
+                    answer: String::new(),
+                },
             }
         }
     }
@@ -560,7 +657,7 @@ mod tests {
             &self,
             step_id: &str,
             stream_tx: mpsc::Sender<StreamEvent>,
-            cancel_rx: watch::Receiver<bool>,
+            cancel_rx: HardCancellation,
         ) -> LeafOutcome {
             self.leaf_executor()
                 .run(step_id, stream_tx, cancel_rx)
@@ -571,12 +668,17 @@ mod tests {
     async fn execute_queue(
         executor: &FixtureExecutor<'_>,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        _cancel_rx: HardCancellation,
     ) -> QueueStop {
-        let (_stop_tx, stop_rx) = watch::channel(false);
-        run_queue(executor.leaf_executor(), &stream_tx, &cancel_rx, &stop_rx)
-            .await
-            .stop
+        let stop = StopSource::new();
+        run_queue(
+            executor.leaf_executor(),
+            &stream_tx,
+            &stop.token(),
+            tauqe_core::workflow::batch::SoftStopPolicy::Observe,
+        )
+        .await
+        .stop
     }
 
     /// Host that replays a scripted sequence of step results and records every
@@ -718,7 +820,6 @@ mod tests {
                 auto_level_up: true,
                 ..ModelsConfig::default()
             },
-            protocol: EditProtocolKind::Structured,
             marker: None,
             selection: None,
             instructions: None,
@@ -801,18 +902,18 @@ mod tests {
     fn channels_with_events() -> (
         mpsc::Sender<StreamEvent>,
         mpsc::Receiver<StreamEvent>,
-        watch::Receiver<bool>,
+        HardCancellation,
     ) {
         let (stream_tx, stream_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        (stream_tx, stream_rx, cancel_rx)
+        let stop = StopSource::new();
+        (stream_tx, stream_rx, stop.token().hard_cancellation())
     }
 
     /// Channels of a run whose streamed telemetry no test observes.
     ///
     /// The receiver is dropped, so a promotion the step publishes reaches a
     /// closed channel and stays a no-op instead of parking the run.
-    fn channels() -> (mpsc::Sender<StreamEvent>, watch::Receiver<bool>) {
+    fn channels() -> (mpsc::Sender<StreamEvent>, HardCancellation) {
         let (stream_tx, stream_rx, cancel_rx) = channels_with_events();
         drop(stream_rx);
         (stream_tx, cancel_rx)
@@ -1231,7 +1332,8 @@ mod tests {
         assert_eq!(stored.items[0].status, IssueStatus::InProgress);
         let requests = host.requests();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].prompt.contains("Target Plan Step Execution"));
+        assert!(requests[0].prompt.contains("Target Review Step Execution"));
+        assert!(!requests[0].prompt.contains("Target Plan Step Execution"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1399,7 +1501,7 @@ mod tests {
             model: shared.clone(),
             effort: Some(ReasoningEffort::Max),
         };
-        let message = super::saturation_message(&models, &selection, leaf, reason);
+        let message = super::saturation_message(&models, &selection, &leaf.id, &leaf.title, reason);
         assert!(
             message.contains("excluded from the automatic ladder"),
             "got: {message}"
@@ -1412,7 +1514,7 @@ mod tests {
             model: shared,
             effort: Some(ReasoningEffort::Low),
         };
-        let message = super::saturation_message(&models, &selection, leaf, reason);
+        let message = super::saturation_message(&models, &selection, &leaf.id, &leaf.title, reason);
         assert!(
             message.contains("strongest rung of the automatic ladder"),
             "got: {message}"

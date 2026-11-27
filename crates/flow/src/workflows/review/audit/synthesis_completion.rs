@@ -34,7 +34,7 @@ impl AuditResources {
         if !self.execution.owns(operation) {
             return Err(ReviewSynthesisPersistenceError::OperationNotOwned);
         }
-        if *operation.cancel_receiver().borrow() {
+        if operation.hard_cancellation().is_cancelled() {
             return Err(ReviewSynthesisPersistenceError::Cancelled);
         }
         Documents::new(root)
@@ -153,6 +153,28 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!root.path().join(".tauqe/history.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn soft_stop_does_not_prevent_saving_or_publishing_review() {
+        let root = tempfile::tempdir().unwrap();
+        let app = application(root.path());
+        let operation = app.try_begin_operation().unwrap();
+        app.soft_stop_active_operation();
+        let session = session();
+        let published = AtomicBool::new(false);
+        app.audit_resources()
+            .persist_review_synthesis(&operation, root.path(), &session, || async {
+                published.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert!(published.load(Ordering::SeqCst));
+        assert_eq!(
+            ReviewStorage::load_review(root.path(), &session.id).unwrap(),
+            Some(session)
+        );
+        assert_eq!(app.history_page(None, None).await.unwrap().total_count, 1);
     }
 
     #[tokio::test]

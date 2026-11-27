@@ -55,7 +55,7 @@ fn stored_statuses(dir: &TestDir, review_id: &str) -> Vec<IssueStatus> {
         .collect()
 }
 
-fn json_edit_response(content: &str) -> String {
+pub(super) fn json_edit_response(content: &str) -> String {
     serde_json::json!({
         "message": "Applied architecture fix",
         "action": {
@@ -69,6 +69,73 @@ fn json_edit_response(content: &str) -> String {
     })
     .to_string()
 }
+/// A stored horizon is authoritative even if its first leaf already has a receipt.
+#[tokio::test]
+async fn batch_resumes_a_partial_group_without_replanning_its_done_foundation() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+    let mut done = subplan_item(
+        "s-1",
+        "Already done",
+        PlanItemStatus::Done,
+        vec!["src/target.rs"],
+    );
+    done.commit = Some("existing-receipt".into());
+    save_grouped_session(
+        &dir,
+        "rev-resume",
+        "arch-1",
+        vec![
+            done,
+            subplan_item(
+                "s-2",
+                "Remaining",
+                PlanItemStatus::Todo,
+                vec!["src/target.rs"],
+            ),
+        ],
+    );
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        json_edit_response("pub fn target() { let value = 9; }"),
+    )]));
+    let state = test_state_with_provider(&dir, super::horizon_config(), provider.clone()).await;
+    let operation = Arc::new(state.try_begin_operation().unwrap());
+    let outcome = run_review_batch_with_options(
+        &state,
+        "rev-resume",
+        vec![group_member_id("rev-resume", "arch-1")],
+        None,
+        0,
+        None,
+        None,
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        provider
+            .requests()
+            .iter()
+            .map(|r| r.model.as_str())
+            .collect::<Vec<_>>(),
+        ["review/coder"]
+    );
+    let stored = ReviewStorage::load_review(dir.path(), "rev-resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.groups[0].implementation.items[0].commit.as_deref(),
+        Some("existing-receipt")
+    );
+    assert_eq!(
+        stored.groups[0].implementation.items[1].status,
+        PlanItemStatus::Done
+    );
+}
+
 /// A member the queue cannot run stops it: without credentials the first turn
 /// never starts, so the second member is never scheduled.
 #[tokio::test]
@@ -246,6 +313,7 @@ async fn batch_dispatches_a_group_member_through_the_implementation_pipeline() {
         .find(|group| group.id == "arch-1")
         .expect("the group is stored");
     assert_eq!(group.implementation.items[0].status, PlanItemStatus::Done);
+    assert!(group.implementation.items[0].commit.is_none());
 }
 
 /// The supervisor publishes a single typed completion event for the whole batch.

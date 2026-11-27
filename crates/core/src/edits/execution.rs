@@ -5,21 +5,19 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::staging::StagingState;
-use super::transaction::{ArtifactBaseline, DiskBackup, TurnTransaction};
 use crate::context::ContextManager;
 use crate::edits::EditFileOp;
 use crate::edits::EditOperation;
 use crate::edits::StagedEditsState;
 use crate::edits::VerificationVerdict;
 use crate::execution::{CancellationToken, EventSink, ExecutionError, ResponseEnvelope};
-use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnapshot};
 use crate::llm::LlmCapability;
 use crate::llm::LlmCommand;
 use crate::providers::StreamEvent;
 use crate::toolchain::{
-    run_post_hooks_with_config, run_verification_pipeline_with_config, VerificationStatus,
+    run_post_hooks_with_operations, run_verification_pipeline_with_operations, VerificationStatus,
 };
-use crate::workflow::policy::ApplyPolicy;
+use crate::workflow::policy::owned::OwnedApplyPolicy;
 use crate::workflow::verification::extract_error_paths;
 use similar::{ChangeTag, TextDiff};
 
@@ -36,7 +34,7 @@ pub const EDIT_CAPABILITIES: &[LlmCapability] = &[
 pub struct EditEnvironment<'a> {
     pub repo_root: &'a Path,
     pub context_manager: &'a mut ContextManager,
-    pub policy: &'a mut dyn ApplyPolicy,
+    pub policy: &'a OwnedApplyPolicy,
     pub cancel: &'a CancellationToken,
     pub events: &'a EventSink,
 }
@@ -45,11 +43,9 @@ pub struct EditEnvironment<'a> {
 ///
 /// A turn applies and verifies its change set as many times as it spends healing
 /// rounds, so the material those passes share belongs to the turn rather than to
-/// one pass. The loop that drives the turn owns the value and hands every pass a
-/// mutable reference to it: the virtual change set it converged on, the
-/// operations that produced it, the paths the change set touched, and the
-/// working-copy status the turn opened with, which is the baseline every
-/// generated artifact is measured against.
+/// one pass. The loop that drives the turn owns the virtual change set and
+/// its operations; the policy owns original bytes, changed paths and command
+/// artifacts across those passes.
 #[derive(Debug)]
 pub struct EditState {
     /// Project configuration the turn froze for its own execution.
@@ -58,45 +54,35 @@ pub struct EditState {
     staged: StagedEditsState,
     /// Operations that converged, in change-set order.
     edit_batches: Vec<Vec<EditOperation>>,
-    /// Paths the change set touched so far, in first-touch order.
-    modified_paths: Vec<String>,
-    /// Working-copy status used to detect external-command artifacts, refreshed
-    /// after policy application so checkpoint commits are not counted as drift.
-    initial_worktree: WorktreeSnapshot,
     /// Number of application and verification passes the turn spent.
     attempts: usize,
+    last_verdict: Option<EditStepVerdict>,
 }
 
 impl EditState {
     /// Creates the state the application passes of one turn share.
-    pub fn new(project: ProjectConfig, initial_worktree: WorktreeSnapshot) -> Self {
+    pub fn new(project: ProjectConfig) -> Self {
         Self {
             project,
             staged: StagedEditsState::default(),
             edit_batches: Vec::new(),
-            modified_paths: Vec::new(),
-            initial_worktree,
             attempts: 0,
+            last_verdict: None,
         }
+    }
+
+    pub fn reset_verdict(&mut self) {
+        self.last_verdict = None;
+    }
+
+    pub fn last_verdict(&self) -> Option<&EditStepVerdict> {
+        self.last_verdict.as_ref()
     }
 
     /// Adopts the virtual change set the staging attempts of the turn converged on.
     pub fn adopt_staging(&mut self, staging: &StagingState) {
         self.staged = staging.staged_state().cloned().unwrap_or_default();
         self.edit_batches = staging.edit_batches().to_vec();
-    }
-
-    pub fn modified_paths(&self) -> &[String] {
-        &self.modified_paths
-    }
-
-    /// Records the paths the change set touched, keeping the first-touch order.
-    fn record_modified(&mut self, paths: impl IntoIterator<Item = String>) {
-        for path in paths {
-            if !self.modified_paths.contains(&path) {
-                self.modified_paths.push(path);
-            }
-        }
     }
 }
 
@@ -124,51 +110,45 @@ pub enum EditStepVerdict {
 pub async fn execute_edit_step(
     ctx: &mut EditEnvironment<'_>,
     state: &mut EditState,
-    transaction: &mut TurnTransaction,
-) -> Result<EditStepVerdict, ExecutionError> {
+) -> Result<(), ExecutionError> {
+    ensure_active(ctx.cancel)?;
     state.attempts += 1;
 
     let touched_paths = collect_staged_paths(&state.staged);
-    if let Err(error) =
-        crate::blocking::run_blocking(|| transaction.backup.record_paths(&touched_paths))
-    {
-        return Ok(EditStepVerdict::ApplyFailed {
-            message: format!("{error:#}"),
-        });
-    }
-
     let batches: Vec<_> = state.edit_batches.iter().map(Vec::as_slice).collect();
     if let Err(err) = ctx
         .policy
-        .apply_temporary_batches(ctx.repo_root, &state.project, ctx.context_manager, &batches)
+        .apply(
+            &state.project,
+            ctx.context_manager,
+            &touched_paths,
+            &batches,
+        )
         .await
     {
-        return Ok(EditStepVerdict::ApplyFailed {
+        ensure_active(ctx.cancel)?;
+        state.last_verdict = Some(EditStepVerdict::ApplyFailed {
             message: err.to_string(),
         });
+        return Err(ExecutionError::Other(format!(
+            "Failed to commit staged edits to disk: {err}"
+        )));
     }
 
-    // Git application can capture pre-existing dirty files in a checkpoint.
-    // Their disappearance from status is not a hook or verification artifact.
-    // Compare external commands against the post-application status, while
-    // keeping touched paths and transaction backups cumulative across healing.
-    state.initial_worktree = crate::blocking::run_blocking(|| snapshot_worktree(ctx.repo_root));
-
-    ctx.events
-        .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
-    state.record_modified(touched_paths);
-
+    ensure_active(ctx.cancel)?;
     // Emit live cumulative diff against pre-turn baseline for all touched files
-    emit_cumulative_diff(ctx, &transaction.backup);
+    emit_cumulative_diff(ctx).await;
 
     // 3. Run the declared post-hook and fold the artifacts it generated into the
     // change set, so verification and the final commit observe them.
-    if let Some(verdict) = run_post_hook_pass(ctx, state, transaction).await {
-        return Ok(verdict);
+    if let Some(verdict) = run_post_hook_pass(ctx, state).await? {
+        state.last_verdict = Some(verdict);
+        return Ok(());
     }
 
     // 4. Run the deterministic toolchain verification.
-    run_verification_pass(ctx, state, transaction).await
+    state.last_verdict = Some(run_verification_pass(ctx, state).await?);
+    Ok(())
 }
 
 /// Runs the declared post-hook, reporting a typed verdict when it failed.
@@ -176,21 +156,24 @@ pub async fn execute_edit_step(
 async fn run_post_hook_pass(
     ctx: &mut EditEnvironment<'_>,
     state: &mut EditState,
-    transaction: &mut TurnTransaction,
-) -> Option<EditStepVerdict> {
-    state.project.post_hook.as_ref()?;
-    let baseline = crate::blocking::run_blocking(|| ArtifactBaseline::capture(ctx.repo_root));
-
-    let hook_res = run_post_hooks_with_config(
+) -> Result<Option<EditStepVerdict>, ExecutionError> {
+    if state.project.post_hook.is_none() {
+        return Ok(None);
+    }
+    ensure_active(ctx.cancel)?;
+    let operations = ctx.policy.begin_command().await.map_err(command_error)?;
+    let hard = ctx.cancel.clone();
+    let hook_res = run_post_hooks_with_operations(
         ctx.repo_root,
         &state.project,
-        &state.modified_paths,
-        Some(&ctx.cancel.receiver()),
+        &ctx.policy.changed_files().await,
+        Some(&hard),
+        &operations,
     )
     .await;
-
-    record_command_artifacts(ctx, state, transaction, &baseline);
-    match hook_res {
+    record_command_artifacts(ctx).await?;
+    ensure_active(ctx.cancel)?;
+    Ok(match hook_res {
         Ok(resp) if !resp.success => {
             let hook_error = resp.message.unwrap_or_else(|| "Post-hook failed".into());
             Some(EditStepVerdict::HookFailed {
@@ -201,7 +184,7 @@ async fn run_post_hook_pass(
         Err(err) => Some(EditStepVerdict::HookFailed {
             report: format!("Project post-hook execution error:\n```\n{}\n```\n", err),
         }),
-    }
+    })
 }
 
 /// Runs the declared toolchain verification and reports its typed verdict.
@@ -209,22 +192,23 @@ async fn run_post_hook_pass(
 async fn run_verification_pass(
     ctx: &mut EditEnvironment<'_>,
     state: &mut EditState,
-    transaction: &mut TurnTransaction,
 ) -> Result<EditStepVerdict, ExecutionError> {
-    let baseline = crate::blocking::run_blocking(|| ArtifactBaseline::capture(ctx.repo_root));
+    ensure_active(ctx.cancel)?;
+    let operations = ctx.policy.begin_command().await.map_err(command_error)?;
+    let hard = ctx.cancel.clone();
     ctx.events.emit(StreamEvent::ToolchainStarted {
         command: "verify".into(),
     });
 
-    let (status, results) = run_verification_pipeline_with_config(
+    let (status, results) = run_verification_pipeline_with_operations(
         ctx.repo_root,
         &state.project,
-        &state.modified_paths,
-        Some(&ctx.cancel.receiver()),
+        &ctx.policy.changed_files().await,
+        Some(&hard),
+        Some(&operations),
     )
     .await;
-
-    record_command_artifacts(ctx, state, transaction, &baseline);
+    record_command_artifacts(ctx).await?;
     if status == VerificationStatus::Cancelled || ctx.cancel.is_cancelled() {
         ctx.events.emit(StreamEvent::ToolchainFinished {
             command: "verify".into(),
@@ -240,10 +224,11 @@ async fn run_verification_pass(
             success: true,
             message: Some("Verification passed".into()),
         });
+        let files = ctx.policy.changed_files().await.len();
         tracing::info!(
             repo_root = %ctx.repo_root.display(),
             attempt = state.attempts,
-            files = state.modified_paths.len(),
+            files,
             "project verification passed"
         );
         return Ok(EditStepVerdict::Passed(status.into()));
@@ -254,10 +239,11 @@ async fn run_verification_pass(
         success: false,
         message: Some("Verification failed".into()),
     });
+    let files = ctx.policy.changed_files().await.len();
     tracing::warn!(
         repo_root = %ctx.repo_root.display(),
         attempt = state.attempts,
-        files = state.modified_paths.len(),
+        files,
         "project verification failed"
     );
 
@@ -266,22 +252,23 @@ async fn run_verification_pass(
     })
 }
 
-fn record_command_artifacts(
-    ctx: &EditEnvironment<'_>,
-    state: &mut EditState,
-    transaction: &mut TurnTransaction,
-    baseline: &ArtifactBaseline,
-) {
-    let (current, paths) = crate::blocking::run_blocking(|| {
-        let current = snapshot_worktree(ctx.repo_root);
-        let paths = changed_worktree_paths(&state.initial_worktree, &current);
-        transaction.backup.record_artifacts(baseline, &paths);
-        (current, paths)
-    });
-    state.initial_worktree = current;
+async fn record_command_artifacts(ctx: &EditEnvironment<'_>) -> Result<(), ExecutionError> {
+    let paths = ctx.policy.complete_command().await.map_err(command_error)?;
     if !paths.is_empty() {
-        state.record_modified(paths);
-        emit_cumulative_diff(ctx, &transaction.backup);
+        emit_cumulative_diff(ctx).await;
+    }
+    Ok(())
+}
+
+fn command_error(error: anyhow::Error) -> ExecutionError {
+    ExecutionError::Other(format!("Cannot account for project command: {error:#}"))
+}
+
+fn ensure_active(cancel: &CancellationToken) -> Result<(), ExecutionError> {
+    if cancel.is_cancelled() {
+        Err(ExecutionError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -316,9 +303,9 @@ fn collect_staged_paths(staged: &StagedEditsState) -> Vec<String> {
     paths
 }
 
-fn emit_cumulative_diff(ctx: &EditEnvironment<'_>, backup: &DiskBackup) {
+async fn emit_cumulative_diff(ctx: &EditEnvironment<'_>) {
     let root = ctx.repo_root.to_path_buf();
-    let files = backup.known_files();
+    let files = ctx.policy.original_bytes().await;
     let events =
         crate::blocking::run_blocking(move || compute_cumulative_diff_events(&root, &files));
     for ev in events {
@@ -685,7 +672,7 @@ mod tests {
         context: ContextManager,
         cancel: CancellationToken,
         events: EventSink,
-        policy: crate::workflow::policy::DirectApplyPolicy,
+        policy: OwnedApplyPolicy,
     }
 
     impl Fixture {
@@ -706,12 +693,14 @@ mod tests {
                     .add_file(path, ContextAccess::Editable)
                     .expect("context file");
             }
+            let cancel = CancellationToken::never();
+            let policy = OwnedApplyPolicy::direct(dir.path(), cancel.clone());
             Self {
                 dir,
                 context,
-                cancel: CancellationToken::new(),
+                cancel,
                 events: EventSink::noop(),
-                policy: crate::workflow::policy::DirectApplyPolicy::new(),
+                policy,
             }
         }
 
@@ -719,7 +708,7 @@ mod tests {
             EditEnvironment {
                 repo_root: self.dir.path(),
                 context_manager: &mut self.context,
-                policy: &mut self.policy,
+                policy: &self.policy,
                 cancel: &self.cancel,
                 events: &self.events,
             }
@@ -757,20 +746,17 @@ mod tests {
     #[tokio::test]
     async fn an_empty_change_set_passes_a_project_without_verification() {
         let mut fixture = Fixture::new(&[("a.rs", "fn a() {}\n")]);
-        let root = fixture.dir.path().to_path_buf();
-        let initial_worktree = crate::blocking::run_blocking(|| snapshot_worktree(&root));
-        let mut state = EditState::new(ProjectConfig::default(), initial_worktree);
-        let mut transaction = TurnTransaction::new(&root);
+        let mut state = EditState::new(ProjectConfig::default());
         let mut ctx = fixture.context();
 
-        let verdict = execute_edit_step(&mut ctx, &mut state, &mut transaction)
+        execute_edit_step(&mut ctx, &mut state)
             .await
             .expect("the pass runs");
         assert_eq!(
-            verdict,
-            EditStepVerdict::Passed(VerificationVerdict::NotConfigured)
+            state.last_verdict(),
+            Some(&EditStepVerdict::Passed(VerificationVerdict::NotConfigured))
         );
-        assert!(state.modified_paths.is_empty());
+        assert!(ctx.policy.changed_files().await.is_empty());
     }
 
     /// A staged replacement reaches the working tree in one pass.
@@ -778,8 +764,7 @@ mod tests {
     async fn a_staged_replacement_reaches_the_working_tree() {
         let mut fixture = Fixture::new(&[("a.rs", "fn a() {}\n")]);
         let root = fixture.dir.path().to_path_buf();
-        let initial_worktree = crate::blocking::run_blocking(|| snapshot_worktree(&root));
-        let mut state = EditState::new(ProjectConfig::default(), initial_worktree);
+        let mut state = EditState::new(ProjectConfig::default());
         state
             .staged
             .staged_files
@@ -791,14 +776,16 @@ mod tests {
                 old_text: "fn a() {}\n".to_string(),
                 new_text: "fn a() -> i32 { 1 }\n".to_string(),
             })]);
-        let mut transaction = TurnTransaction::new(&root);
         let mut ctx = fixture.context();
 
-        let verdict = execute_edit_step(&mut ctx, &mut state, &mut transaction)
+        execute_edit_step(&mut ctx, &mut state)
             .await
             .expect("the pass runs");
-        assert!(matches!(verdict, EditStepVerdict::Passed(_)));
-        assert_eq!(state.modified_paths, vec!["a.rs".to_string()]);
+        assert!(matches!(
+            state.last_verdict(),
+            Some(EditStepVerdict::Passed(_))
+        ));
+        assert_eq!(ctx.policy.changed_files().await, vec!["a.rs".to_string()]);
         assert_eq!(
             std::fs::read_to_string(root.join("a.rs")).expect("read the target"),
             "fn a() -> i32 { 1 }\n"
@@ -810,7 +797,7 @@ mod tests {
         let mut fixture = Fixture::new(&[("a.rs", "before\n")]);
         let root = fixture.dir.path().to_path_buf();
         std::fs::create_dir(root.join("conflict")).unwrap();
-        let mut state = EditState::new(ProjectConfig::default(), snapshot_worktree(&root));
+        let mut state = EditState::new(ProjectConfig::default());
         state
             .staged
             .staged_files
@@ -826,12 +813,12 @@ mod tests {
                 old_text: "before\n".into(),
                 new_text: "after\n".into(),
             })]);
-        let mut transaction = TurnTransaction::new(&root);
-        let verdict = execute_edit_step(&mut fixture.context(), &mut state, &mut transaction)
+        let error = execute_edit_step(&mut fixture.context(), &mut state)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, ExecutionError::Other(_)));
         assert!(
-            matches!(verdict, EditStepVerdict::ApplyFailed { message } if message.contains("`conflict`"))
+            matches!(state.last_verdict(), Some(EditStepVerdict::ApplyFailed { message }) if message.contains("`conflict`"))
         );
         assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), b"before\n");
         assert!(root.join("conflict").is_dir());

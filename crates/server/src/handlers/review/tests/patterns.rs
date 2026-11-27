@@ -151,8 +151,8 @@ async fn drain_until(
 }
 
 /// The projection is a pre-computation of the launch, not a parallel copy of
-/// it: the window it reports is exactly the window `review/start` reads, down
-/// to the omitted files and the token estimate (#c-1, #c-4).
+/// it: the window it reports is exactly the material set `review/start` reads,
+/// independent of admission of the full model request (#c-1, #c-4).
 #[tokio::test]
 async fn preview_window_matches_the_window_the_launch_reads() {
     let dir = TestDir::new();
@@ -165,16 +165,9 @@ async fn preview_window_matches_the_window_the_launch_reads() {
         ],
     );
     let mut config = test_config();
-    // The file token budget is the only knife: it pays for two of the three
-    // matched files, so the projection and the launch must drop exactly one.
-    let content_tokens =
-        tauqe_core::prompt::estimate_tokens_from_bytes("pub fn target() {}\n".len() as u64)
-            as usize;
-    let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
-        "src/a.rs",
-        tauqe_core::context::ContextAccess::ReadOnly,
-    );
-    config.context.token_budget = content_tokens.saturating_add(wrapper).saturating_mul(2);
+    // The former file allowance would pay for only two matches; preview and
+    // launch must still agree on the full three-file material set.
+    config.request.max_input_tokens = 1_000_000;
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
         r#"{"summary":"The audited slice is sound.","findings":[]}"#,
     )]));
@@ -188,8 +181,8 @@ async fn preview_window_matches_the_window_the_launch_reads() {
         "a read RPC claims no operation slot"
     );
     assert_eq!(window.matched_files, 3);
-    assert_eq!(window.selected_files, 2);
-    assert_eq!(window.omitted_by_budget, 1);
+    assert_eq!(window.selected_files, 3);
+    assert_eq!(window.omitted_by_budget, 0);
 
     let res = handle_review_start(start_request(params), &state).await;
     assert!(
@@ -218,28 +211,17 @@ async fn preview_window_matches_the_window_the_launch_reads() {
     );
 }
 
-/// The number of matched files is never a limit: a launch audits every file the
-/// token budget pays for, even beyond the retired 150-file batch cap (#c-1).
+/// The number of matched files is never a limit: a launch audits every readable
+/// file, even beyond the retired 150-file batch cap (#c-1).
 #[tokio::test]
 async fn a_launch_audits_every_paid_file_beyond_the_retired_batch_cap() {
     // The retired cap admitted at most 150 files per expansion, so a wider
     // selection proves that only the token budget decides the window.
     const MATCHED: usize = 151;
     let dir = TestDir::new();
-    let paths = init_repo_with_uniform_files(&dir, MATCHED);
-    let sample = paths.first().expect("the fixture creates the files");
-    // Every fixture path has the same length, so one price describes them all.
-    let content_tokens =
-        tauqe_core::prompt::estimate_tokens_from_bytes("pub fn target() {}\n".len() as u64)
-            as usize;
-    let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
-        sample,
-        tauqe_core::context::ContextAccess::ReadOnly,
-    );
+    init_repo_with_uniform_files(&dir, MATCHED);
     let mut config = test_config();
-    config.context.token_budget = content_tokens
-        .saturating_add(wrapper)
-        .saturating_mul(MATCHED);
+    config.request.max_input_tokens = 1_000_000;
 
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
         r#"{"summary":"The audited slice is sound.","findings":[]}"#,
@@ -323,6 +305,38 @@ async fn preview_reports_unreadable_matches_the_launch_never_omits() {
     assert_eq!(
         started["omitted_files"].as_u64(),
         Some(0),
-        "a file nobody could read is never charged to the token budget"
+        "a file nobody could read is not a budget omission"
+    );
+}
+
+/// Preview describes files, not admission of the complete request. The shared
+/// limit rejects an oversized audit before any provider call.
+#[tokio::test]
+async fn preview_does_not_admit_an_oversized_launch() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+    let mut config = test_config();
+    config.request.max_input_tokens = 1;
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        r#"{"summary":"unexpected","findings":[]}"#,
+    )]));
+    let (state, mut events) = state_with_events(&dir, config, provider.clone()).await;
+    let params = serde_json::json!({ "path_patterns": ["src/"] });
+    let window =
+        projected_window(handle_review_preview(preview_request(params.clone()), &state).await);
+    assert_eq!(window.selected_files, 1);
+    assert_eq!(window.omitted_files, 0);
+    assert_eq!(window.omitted_by_budget, 0);
+    assert_eq!(window.files_token_budget, 0);
+
+    let response = handle_review_start(start_request(params), &state).await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let error = drain_until(&mut events, events::REVIEW_ERROR)
+        .await
+        .expect("oversized complete input is refused");
+    assert!(error.to_string().contains("exceeds limit"), "{error}");
+    assert!(
+        provider.requests().is_empty(),
+        "provider must not be called"
     );
 }

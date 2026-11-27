@@ -269,7 +269,7 @@ repl = ["openrouter:~google/gemini-flash-latest"]
 # the turn keeps its density without an unbounded window.
 
 # [history]
-# budget_tokens = 20000          # compaction threshold of the session history
+# budget_tokens = 20000          # maximum history size in tokens (default: 20000)
 # tail_turns = 10                # recent turns kept verbatim after compaction
 
 

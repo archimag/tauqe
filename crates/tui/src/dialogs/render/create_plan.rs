@@ -132,6 +132,7 @@ pub(crate) fn render_plan_create_dialog(
             critic_title: critic_title(dialog),
             critic: &dialog.critic,
             critic_focused: dialog.focus.is_critic_list(),
+            critic_enabled: !dialog.skip_critique,
             editor_title: active_t("dialog.create_plan.editor_title"),
             editor_placeholder: active_t("dialog.create_plan.editor_placeholder"),
             editor: &dialog.directives_editor,

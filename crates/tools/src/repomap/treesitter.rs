@@ -998,7 +998,7 @@ function build_service(int $retries): Service
 
         // The public map-generation path resolves through the process-wide
         // extractor, so its parse lands in the shared cache.
-        let first = crate::repomap::generate_repo_map(&root, &files, &[], 1000).unwrap();
+        let first = crate::repomap::generate_repo_map(&root, &files).unwrap();
         assert!(first.contains("pub fn shared_map_fn"));
         let entry_before = {
             let state = shared_extractor().state.lock().unwrap();
@@ -1011,7 +1011,7 @@ function build_service(int $retries): Service
 
         // The second generation over the unchanged repository reuses the cached
         // parse instead of re-running the Tree-sitter pass.
-        let second = crate::repomap::generate_repo_map(&root, &files, &[], 1000).unwrap();
+        let second = crate::repomap::generate_repo_map(&root, &files).unwrap();
         assert_eq!(second, first);
         let entry_after = {
             let state = shared_extractor().state.lock().unwrap();

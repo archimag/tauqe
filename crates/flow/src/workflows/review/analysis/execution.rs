@@ -6,7 +6,9 @@ use super::{
 };
 use crate::api::OperationGuard;
 use crate::application::review_observer::ReviewObserver;
-use crate::application::{structured_task, StructuredExecution};
+use crate::application::usage_totals::UsageReceipt;
+use crate::application::StructuredExecution;
+use crate::workflows::structured::{self, StructuredFailure};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,35 +37,30 @@ impl AnalysisResources<'_> {
         execution: &StructuredExecution,
         observer: Arc<dyn ReviewObserver>,
         exit_deadline: Duration,
-    ) -> Result<ReviewSession, ReviewAnalysisExecutionError> {
+    ) -> Result<(ReviewSession, UsageReceipt), ReviewAnalysisExecutionError> {
         if !self.execution.owns(operation) {
             return Err(ReviewAnalysisPreparationError::OperationNotOwned.into());
         }
         let operation_id = operation.publication_id();
         let publisher = Arc::clone(&observer);
-        let usage = self
-            .usage
-            .begin(self.context, &operation_id, move |id, snapshot| {
-                publisher.publish_usage_totals(id, snapshot);
-            })
-            .await;
-        let cancel = operation.cancel_receiver();
-        let result = structured_task::run_with_session(
+        let cancel = operation.hard_cancellation();
+        let pacing_cancel = operation.hard_cancellation();
+        let completed = structured::run_bound(
             self.execution,
+            self.context,
             operation,
             execution,
             post_analysis_contract(),
             prepared.messages(),
             &operation_id,
             exit_deadline,
+            move |id, snapshot| publisher.publish_usage_totals(id, snapshot),
             |event| {
-                let usage = &usage;
                 let observer = &observer;
-                let mut pacing_cancel = cancel.clone();
+                let pacing_cancel = pacing_cancel.clone();
                 async move {
-                    observer.pace(&event, &mut pacing_cancel).await;
+                    observer.pace(&event, &pacing_cancel).await;
                     match event {
-                        StreamEvent::Usage(report) => usage.observe(&report).await,
                         StreamEvent::TextDelta(delta) => {
                             observer.publish(ReviewStreamUpdate::Content(delta))
                         }
@@ -77,13 +74,34 @@ impl AnalysisResources<'_> {
             },
         )
         .await;
-        usage.flush().await;
-        observer.publish_usage(&self.usage.snapshot().await);
-        let cancelled = *cancel.borrow();
+        let (result, receipt) = completed.map_err(|error| {
+            let failure = if cancel.is_cancelled() {
+                StructuredFailure::Cancelled
+            } else {
+                error.classify("review post-analysis")
+            };
+            ReviewAnalysisExecutionError::Completion(match failure {
+                StructuredFailure::Cancelled => {
+                    ReviewAnalysisCompletionError::Cancelled(prepared.session.id.clone())
+                }
+                StructuredFailure::Empty => {
+                    ReviewAnalysisCompletionError::EmptyResponse(prepared.session.id.clone())
+                }
+                StructuredFailure::Decode(message) => ReviewAnalysisCompletionError::Parse(message),
+                StructuredFailure::InputLimit(error) => error.into(),
+                StructuredFailure::Failed(message) => {
+                    ReviewAnalysisCompletionError::Provider(message)
+                }
+            })
+        })?;
+        observer.publish_usage(&receipt.snapshot);
+        let cancelled = cancel.is_cancelled();
         let regrouping = ReviewAnalysisResponse::finish(result, &prepared.session, cancelled)?;
-        self.persist_review_post_analysis(operation, root, prepared, regrouping)
+        let stored = self
+            .persist_review_post_analysis(operation, root, prepared, regrouping)
             .await
-            .map_err(Into::into)
+            .map_err(ReviewAnalysisExecutionError::from)?;
+        Ok((stored, receipt))
     }
 }
 
@@ -98,7 +116,6 @@ mod tests {
     use tauqe_core::models::{ModelEntry, ModelRef, ProviderKind};
     use tauqe_core::providers::{mock::MockResponse, MockLlmProvider, ModelUsageInfo, StreamEvent};
     use tauqe_core::review::ReviewStorage;
-    use tokio::sync::watch;
 
     #[derive(Default)]
     struct Observer {
@@ -110,7 +127,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ReviewObserver for Observer {
-        async fn pace(&self, event: &StreamEvent, _: &mut watch::Receiver<bool>) {
+        async fn pace(&self, event: &StreamEvent, _: &tauqe_core::stop::HardCancellation) {
             if matches!(event, StreamEvent::Usage(_)) {
                 self.updates.lock().unwrap().push("pace_usage");
                 if let Some(app) = &self.cancel_on_usage {
@@ -212,7 +229,7 @@ mod tests {
         app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
             .await;
         let execution = execution(&app, &operation, &prepared).await;
-        let stored = app
+        let (stored, _) = app
             .audit_resources()
             .analysis()
             .execute_review_post_analysis(
@@ -238,6 +255,8 @@ mod tests {
         assert_eq!(snapshot.prev.total_tokens, 17);
         assert_eq!(snapshot.session.cost, 0.25);
         assert!(snapshot.cur.is_none());
+        assert_eq!(app.usage_snapshot().await.session.total_tokens, 17);
+        assert_eq!(app.usage_snapshot().await.lifetime.total_tokens, 17);
         assert!(root.path().join(".tauqe/history.jsonl").is_file());
         let updates = observer.updates.lock().unwrap();
         assert!(updates.contains(&"reasoning"));
@@ -293,6 +312,7 @@ mod tests {
             17
         );
         assert_eq!(app.usage_snapshot().await.operations, 1);
+        assert_eq!(app.usage_snapshot().await.session.total_tokens, 17);
         assert_eq!(
             ReviewStorage::load_review(root.path(), &prepared.session.id)
                 .unwrap()
@@ -366,5 +386,7 @@ mod tests {
             1
         );
         assert!(!root.path().join(".tauqe/history.jsonl").exists());
+        assert_eq!(app.usage_snapshot().await.operations, 1);
+        assert!(app.usage_snapshot().await.cur.is_none());
     }
 }

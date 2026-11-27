@@ -1,8 +1,8 @@
 //! `review/preview`: the deterministic projection of the audit window.
 //!
 //! The projection is a pre-computation of what a launch reads, never a second
-//! implementation of the selection: the same order and the same limits decide
-//! the window, and the counters report separately what each limit dropped.
+//! implementation of the selection: the same order selects every readable
+//! match. The complete model input has a separate admission check at launch.
 //! Because the method is a read RPC, it must leave the context, the working
 //! tree, and the operation slot untouched.
 
@@ -51,7 +51,7 @@ fn projection(response: Response) -> ReviewPreviewResult {
         .expect("the preview projection decodes")
 }
 
-/// Token estimate of one fixture file, the unit every budget is expressed in.
+/// Token estimate of one fixture file for the window's material estimate.
 fn per_file_tokens() -> usize {
     let tokens = tauqe_core::prompt::estimate_tokens_from_bytes(TARGET_FILE.len() as u64) as usize;
     assert!(
@@ -61,7 +61,7 @@ fn per_file_tokens() -> usize {
     tokens
 }
 
-/// Price one fixture file pays against the file token budget: its content plus
+/// Price one fixture file contributes to the material estimate: content plus
 /// the wrapper its `<file>` element renders.
 fn per_file_cost() -> usize {
     per_file_tokens()
@@ -85,7 +85,7 @@ async fn preview_without_patterns_reports_the_active_context_and_omits_nothing()
     init_repo_with_files(&dir, &[("src/lib.rs", TARGET_FILE)]);
     let state = state_for(&dir, test_config());
     state
-        .mutate_context(|context| context.add_file("src/lib.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("src/lib.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -110,8 +110,8 @@ async fn preview_without_patterns_reports_the_active_context_and_omits_nothing()
     );
 }
 
-/// The number of matched files is no limit of its own: every match the file
-/// token budget pays for is selected (#c-1).
+/// The number of matched files is no limit of its own: every readable match
+/// enters the window, regardless of the old file allowance (#c-1).
 #[tokio::test]
 async fn preview_selects_every_matched_file_the_budget_pays_for() {
     let dir = TestDir::new();
@@ -124,8 +124,7 @@ async fn preview_selects_every_matched_file_the_budget_pays_for() {
         ],
     );
     let mut config = test_config();
-    config.context.token_budget = per_file_cost().saturating_mul(3);
-    let budget = config.context.token_budget;
+    config.request.max_input_tokens = 1;
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -141,14 +140,14 @@ async fn preview_selects_every_matched_file_the_budget_pays_for() {
     assert_eq!(window.selected_files, 3);
     assert_eq!(window.omitted_by_budget, 0);
     assert_eq!(window.omitted_files, 0);
-    assert_eq!(window.files_token_budget, budget);
+    assert_eq!(window.files_token_budget, 0);
     assert!(!window.is_truncated());
 }
 
-/// An exhausted file token budget is reported as the omission, so a
-/// confirmation can state how much the budget dropped (#c-1, #c-3).
+/// Preview never omits a readable match even when the old file allowance
+/// would have paid for only some of the window.
 #[tokio::test]
-async fn preview_reports_the_token_budget_omission() {
+async fn preview_reports_every_match_despite_the_old_file_allowance() {
     let dir = TestDir::new();
     init_repo_with_files(
         &dir,
@@ -160,7 +159,7 @@ async fn preview_reports_the_token_budget_omission() {
     );
     let per_file = per_file_cost();
     let mut config = test_config();
-    config.context.token_budget = per_file.saturating_mul(2);
+    config.request.max_input_tokens = 1;
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -173,12 +172,12 @@ async fn preview_reports_the_token_budget_omission() {
 
     let window = &result.window;
     assert_eq!(window.matched_files, 3);
-    assert_eq!(window.selected_files, 2);
-    assert_eq!(window.omitted_by_budget, 1);
-    assert_eq!(window.omitted_files, 1);
-    assert_eq!(window.files_token_budget, per_file.saturating_mul(2));
-    assert_eq!(window.selected_tokens, per_file.saturating_mul(2));
-    assert!(window.is_truncated());
+    assert_eq!(window.selected_files, 3);
+    assert_eq!(window.omitted_by_budget, 0);
+    assert_eq!(window.omitted_files, 0);
+    assert_eq!(window.files_token_budget, 0);
+    assert_eq!(window.selected_tokens, per_file.saturating_mul(3));
+    assert!(!window.is_truncated());
 }
 /// A matched path the window cannot read is counted on its own counter: it is
 /// never selected and never charged to the file token budget, so it cannot
@@ -200,7 +199,7 @@ async fn preview_counts_an_unreadable_match_on_its_own_counter() {
     tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add binary", false)
         .expect("the blob is committed");
     let mut config = test_config();
-    config.context.token_budget = per_file_cost().saturating_mul(3);
+    config.request.max_input_tokens = 1;
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -240,13 +239,12 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
         ],
     );
     let mut config = test_config();
-    // The audit window shares the file token budget: the file the context
-    // already holds plus one matched file fit, so exactly one further match is
-    // dropped by the budget and the number of files is never a limit.
-    config.context.token_budget = per_file_tokens().saturating_add(per_file_cost());
+    // The projection includes the context and every readable match even when
+    // the full request would not pass admission.
+    config.request.max_input_tokens = 1;
     let state = state_for(&dir, config);
     state
-        .mutate_context(|context| context.add_file("src/a.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("src/a.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -267,12 +265,12 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
 
     // A file the context already carries is found by the patterns and is not
     // read a second time, so matches are counted before the context filter and
-    // only the fresh candidates compete for the file token budget.
+    // only fresh candidates are counted as newly selected.
     assert_eq!(result.window.context_files, 1);
     assert_eq!(result.window.matched_files, 3);
-    assert_eq!(result.window.selected_files, 1);
-    assert_eq!(result.window.omitted_by_budget, 1);
-    assert_eq!(result.window.omitted_files, 1);
+    assert_eq!(result.window.selected_files, 2);
+    assert_eq!(result.window.omitted_by_budget, 0);
+    assert_eq!(result.window.omitted_files, 0);
 
     let context_after = serde_json::to_value(crate::handlers::context::context_state_dto(
         &state.context_state().await,
@@ -291,11 +289,10 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
     assert!(!state.is_operation_active());
 }
 
-/// A preset audit expands every group independently, so its projection folds
-/// the per-group windows into one aggregate while the token budget of the whole
-/// session is what each group may spend (#c-5).
+/// A preset audit expands every group independently and aggregates their full
+/// material estimates without admitting a model request (#c-5).
 #[tokio::test]
-async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() {
+async fn a_preset_preview_aggregates_complete_group_windows() {
     let dir = TestDir::new();
     init_repo_with_files(
         &dir,
@@ -305,16 +302,8 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
             ("beta/c.rs", TARGET_FILE),
         ],
     );
-    // The budget pays for one matched file per group, priced exactly as the
-    // window charges it: its content plus the wrapper its own `<file>` element
-    // renders.
-    let per_file = per_file_tokens()
-        + tauqe_core::prompt::context_element_overhead_tokens(
-            "alpha/a.rs",
-            ContextAccess::ReadOnly,
-        );
     let mut config = test_config();
-    config.context.token_budget = per_file;
+    config.request.max_input_tokens = 1;
     config.review = serde_json::from_value(serde_json::json!({
         "presets": [{
             "name": "layered",
@@ -339,8 +328,8 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
     assert_eq!(result.groups[0].title, "Alpha");
     assert_eq!(result.groups[1].title, "Beta");
     assert_eq!(result.groups[0].window.matched_files, 2);
-    assert_eq!(result.groups[0].window.selected_files, 1);
-    assert_eq!(result.groups[0].window.omitted_by_budget, 1);
+    assert_eq!(result.groups[0].window.selected_files, 2);
+    assert_eq!(result.groups[0].window.omitted_by_budget, 0);
     assert_eq!(result.groups[1].window.matched_files, 1);
     assert_eq!(result.groups[1].window.selected_files, 1);
     assert_eq!(result.groups[1].window.omitted_by_budget, 0);
@@ -348,11 +337,11 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
     let window = &result.window;
     assert_eq!(window.context_files, 0, "a preset launch reads no context");
     assert_eq!(window.matched_files, 3);
-    assert_eq!(window.selected_files, 2);
-    assert_eq!(window.omitted_by_budget, 1);
-    assert_eq!(window.omitted_files, 1);
-    assert_eq!(window.files_token_budget, per_file.saturating_mul(2));
-    assert!(window.is_truncated());
+    assert_eq!(window.selected_files, 3);
+    assert_eq!(window.omitted_by_budget, 0);
+    assert_eq!(window.omitted_files, 0);
+    assert_eq!(window.files_token_budget, 0);
+    assert!(!window.is_truncated());
     assert!(!state.is_operation_active());
 }
 
@@ -444,13 +433,28 @@ async fn preset_preview_and_launch_use_the_same_ordered_audit_windows() {
             .collect::<Vec<_>>()
     );
     assert_eq!(provider.requests().len(), 2);
+    let accounted = state.application.usage_snapshot().await;
+    assert_eq!(accounted.operations, 2, "the preset adds no parent window");
+    assert!(accounted.cur.is_none());
+
+    // A preparation refusal opens no window and cannot reuse the last receipt.
+    let refused = handle_review_start(
+        Request {
+            id: RequestId::Number(3),
+            method: methods::REVIEW_START.into(),
+            params: Some(serde_json::json!({"preset": "missing"})),
+        },
+        &state,
+    )
+    .await;
+    assert!(refused.error.is_some());
+    assert_eq!(state.application.usage_snapshot().await, accounted);
 }
 
-/// The price of a file is its content plus the wrapper its own `<file>` element
-/// renders, so identical content behind a longer path costs more and the budget
-/// measures what the audit actually reads (#c-2).
+/// The estimate includes the wrapper for each path, but a longer name never
+/// excludes an otherwise readable file from the projection (#c-2).
 #[tokio::test]
-async fn preview_prices_the_wrapper_of_each_path_into_the_budget() {
+async fn preview_prices_each_wrapper_without_truncating() {
     let long_path = "src/a_considerably_longer_module_name.rs";
     let short_cost = per_file_cost();
     let long_cost = per_file_tokens()
@@ -461,7 +465,7 @@ async fn preview_prices_the_wrapper_of_each_path_into_the_budget() {
     );
 
     let mut config = test_config();
-    config.context.token_budget = short_cost;
+    config.request.max_input_tokens = 1;
 
     let short_dir = TestDir::new();
     init_repo_with_files(&short_dir, &[("src/a.rs", TARGET_FILE)]);
@@ -493,30 +497,23 @@ async fn preview_prices_the_wrapper_of_each_path_into_the_budget() {
     )
     .window;
     assert_eq!(long_window.matched_files, 1);
-    assert_eq!(
-        long_window.selected_files, 0,
-        "the same content behind a longer path no longer fits the same budget"
-    );
-    assert_eq!(long_window.omitted_by_budget, 1);
-    assert!(long_window.is_truncated());
+    assert_eq!(long_window.selected_files, 1);
+    assert_eq!(long_window.selected_tokens, long_cost);
+    assert_eq!(long_window.omitted_by_budget, 0);
+    assert!(!long_window.is_truncated());
 }
 
 /// The number of files is never a limit: a selection wider than the retired
-/// 150-file batch cap is admitted in full while the token budget pays for it
-/// (#c-1).
+/// 150-file batch cap enters the window in full (#c-1).
 #[tokio::test]
 async fn preview_admits_more_files_than_the_retired_batch_cap() {
     // The retired cap admitted at most 150 files per expansion, so a wider
     // selection proves that only the token budget decides the window.
     const MATCHED: usize = 151;
     let dir = TestDir::new();
-    let paths = init_repo_with_uniform_files(&dir, MATCHED);
-    let sample = paths.first().expect("the fixture creates the files");
-    // Every fixture path has the same length, so one price describes them all.
-    let per_file = per_file_tokens()
-        + tauqe_core::prompt::context_element_overhead_tokens(sample, ContextAccess::ReadOnly);
+    init_repo_with_uniform_files(&dir, MATCHED);
     let mut config = test_config();
-    config.context.token_budget = per_file.saturating_mul(MATCHED);
+    config.request.max_input_tokens = 1;
     let state = state_for(&dir, config);
 
     let result = projection(

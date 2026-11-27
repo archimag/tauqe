@@ -1,6 +1,6 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
-mod openai;
+pub(crate) mod openai;
 pub use openai::login::{ChatGptSignIn, ChatGptSignInUi};
 pub mod openrouter;
 pub mod retry;
@@ -14,8 +14,9 @@ pub use retry::{RetryConfig, RetryingProvider};
 pub use types::*;
 
 use crate::models::ProviderKind;
+use crate::stop::HardCancellation;
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
 
@@ -100,7 +101,7 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult;
 }
 

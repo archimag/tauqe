@@ -561,30 +561,28 @@ a blocker. A synthesized result then reaches storage as one operation:
    after that successful persistence, so a failed attempt leaves no phantom record;
 7. the batch supervisor resumes from the first executable leaf of the new horizon.
 
-Automated recovery is bounded by `repl.max_replans`. Once consecutive waves
-exceed that budget the batch halts with the step still `Blocked` and asks for the
-developer.
+Automated recovery uses `repl.max_replans` as the repair-wave budget per Architect
+rung **without implementation progress**, not as a limit on total replans in a
+batch. With a budget of two, the Coder tries the horizon after each of two repairs
+on the current rung. Only another blocker without a newly completed leaf promotes
+the Architect. The promoted rung receives its own budget. If `models.auto_level_up`
+is disabled or no stronger eligible rung exists, the run stops with the blocker
+and an exhaustion diagnostic. A zero budget disables automated repairs; initial
+synthesis of a concept-only plan is not charged as a repair.
 
-**Lazy architect ladder escalation.** A replanning wave must not retry a
-configuration whose horizon already produced the failing step, but it also must not
-escalate on the first sign of trouble. Every horizon replacement therefore persists
-the identity of the step whose failure triggered it as `last_replanned_step` on the
-plan, and the wave compares that record with the blocked step:
+Progress means a newly completed leaf whose completion was successfully persisted,
+including an accepted no-change completion. Merely revisiting an already completed
+leaf, changing step identifiers, or replacing the horizon does not reset the budget.
+New completion resets the counter without downgrading the Architect. Independent
+blockers separated by completed work therefore do not consume a global allowance.
+The counter belongs to one execution run; the total number of replans remains
+separate telemetry. A synthesis that internally promotes during schema healing is
+charged to the actual rung that produced the persisted horizon.
 
-- **a different step, or no record at all** — this is the first replan of this
-  failure. The current architect configuration runs unchanged, so ordinary
-  replanning never consumes a rung.
-- **the same step again** — the step failed again after it was already reprojected.
-  Only then does the wave read the provenance recorded on the plan and ask the
-  `architect` ladder for the next rung, so recovery first deepens the reasoning
-  depth on the same model and only then promotes to a stronger one.
-
-The marker lives on the document rather than in the batch supervisor's memory, so a
-manual replan started from the interface or through RPC follows exactly the same
-rule as an automated wave, and a daemon restart cannot reset the position on the
-ladder. Escalation saturates on the last rung, and a recorded configuration that no
-longer exists in configuration restarts from the base rung instead of guessing a
-position.
+Manual replanning retains its separate policy: `last_replanned_step` records the
+previous blocked step, and a repeated manual replan of that step consults the
+ladder. Automatic execution does not use that identifier as evidence of progress.
+Both paths preserve Architect provenance on the stored horizon.
 
 **Coder ladder escalation** is the parallel, intra-role mechanism for execution
 failures (*Model Roles and the Coder Ladder*). With `models.auto_level_up` enabled,

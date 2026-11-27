@@ -11,8 +11,9 @@ use std::sync::Mutex;
 
 use super::{LlmRequest, ModelUsageInfo, ProviderResult};
 use crate::models::ProviderKind;
+use crate::stop::HardCancellation;
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
@@ -136,7 +137,7 @@ impl MockLlmProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: &watch::Receiver<bool>,
+        cancel: &HardCancellation,
     ) -> anyhow::Result<()> {
         self.with_state(|state| {
             state.requests.push(MockRequest {
@@ -148,7 +149,7 @@ impl MockLlmProvider {
             });
         });
 
-        let cancelled = *cancel_rx.borrow();
+        let cancelled = cancel.is_cancelled();
         if cancelled {
             let _ = tx.send(StreamEvent::Cancelled).await;
             return Ok(());
@@ -160,35 +161,45 @@ impl MockLlmProvider {
 
         if let Some(reasoning) = response.reasoning {
             if !reasoning.is_empty()
-                && tx
-                    .send(StreamEvent::ReasoningDelta(reasoning))
-                    .await
-                    .is_err()
+                && send_or_cancel(&tx, StreamEvent::ReasoningDelta(reasoning), cancel).await
             {
                 return Ok(());
             }
         }
 
         if let Some(error) = response.error {
-            let _ = tx.send(StreamEvent::Error(error)).await;
+            let _ = send_or_cancel(&tx, StreamEvent::Error(error), cancel).await;
             return Ok(());
         }
 
         if !response.content.is_empty()
-            && tx
-                .send(StreamEvent::TextDelta(response.content))
-                .await
-                .is_err()
+            && send_or_cancel(&tx, StreamEvent::TextDelta(response.content), cancel).await
         {
             return Ok(());
         }
 
         if let Some(usage) = response.usage {
+            // Once admitted, a receipt must not be dropped by a later Hard.
             let _ = tx.send(StreamEvent::Usage(usage)).await;
         }
 
-        let _ = tx.send(StreamEvent::Done).await;
+        let _ = send_or_cancel(&tx, StreamEvent::Done, cancel).await;
         Ok(())
+    }
+}
+
+async fn send_or_cancel(
+    tx: &mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+    cancel: &HardCancellation,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = tx.try_send(StreamEvent::Cancelled);
+            true
+        }
+        result = tx.send(event) => result.is_err(),
     }
 }
 
@@ -204,9 +215,9 @@ impl LlmProvider for MockLlmProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult {
-        self.replay(request, tx, &cancel_rx)
+        self.replay(request, tx, &cancel)
             .await
             .map_err(crate::providers::ProviderError::Request)
     }
@@ -215,10 +226,11 @@ impl LlmProvider for MockLlmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stop::StopSource;
 
     async fn run(provider: &MockLlmProvider, messages: Vec<ChatMessage>) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
         let collect = async {
             let mut events = Vec::new();
             while let Some(event) = rx.recv().await {
@@ -226,7 +238,11 @@ mod tests {
             }
             events
         };
-        let stream = provider.stream(LlmRequest::new("test-model", messages), tx, cancel_rx);
+        let stream = provider.stream(
+            LlmRequest::new("test-model", messages),
+            tx,
+            source.token().hard_cancellation(),
+        );
         let (result, events) = tokio::join!(stream, collect);
         result.expect("mock stream should succeed");
         events
@@ -277,10 +293,15 @@ mod tests {
     async fn cancellation_before_dispatch_reports_cancelled() {
         let provider = MockLlmProvider::scripted([MockResponse::text("ignored")]);
         let (tx, mut rx) = mpsc::channel(16);
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        let source = StopSource::new();
+        source.request_hard();
 
         let result = provider
-            .stream(LlmRequest::new("test-model", Vec::new()), tx, cancel_rx)
+            .stream(
+                LlmRequest::new("test-model", Vec::new()),
+                tx,
+                source.token().hard_cancellation(),
+            )
             .await;
         assert!(result.is_ok());
 
@@ -310,7 +331,7 @@ mod tests {
     async fn records_session_id_from_session_call() {
         let provider = MockLlmProvider::scripted([MockResponse::text("x")]);
         let (tx, mut rx) = mpsc::channel(16);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
 
         let stream = provider.stream(
             LlmRequest {
@@ -318,7 +339,7 @@ mod tests {
                 ..LlmRequest::new("test-model", Vec::new())
             },
             tx,
-            cancel_rx,
+            source.token().hard_cancellation(),
         );
         let collect = async { while rx.recv().await.is_some() {} };
         let (result, ()) = tokio::join!(stream, collect);
@@ -332,7 +353,7 @@ mod tests {
     async fn records_reasoning_effort_from_effort_call() {
         let provider = MockLlmProvider::scripted([MockResponse::text("x")]);
         let (tx, mut rx) = mpsc::channel(16);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
 
         let stream = provider.stream(
             LlmRequest {
@@ -340,7 +361,7 @@ mod tests {
                 ..LlmRequest::new("test-model", Vec::new())
             },
             tx,
-            cancel_rx,
+            source.token().hard_cancellation(),
         );
         let collect = async { while rx.recv().await.is_some() {} };
         let (result, ()) = tokio::join!(stream, collect);

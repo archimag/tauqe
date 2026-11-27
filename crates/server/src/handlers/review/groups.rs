@@ -8,7 +8,6 @@ use tauqe_core::providers::StreamEvent;
 use tauqe_core::review::{ReviewGroup, ReviewSession};
 use tauqe_core::workflow::batch::BatchReport;
 use tauqe_protocol::events;
-use tokio::sync::watch;
 
 pub(crate) async fn run_group_audits(
     state: &Arc<AppState>,
@@ -192,7 +191,7 @@ mod tests {
             &self,
             _request: tauqe_core::providers::LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
+            _cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             let call = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
             if call >= self.cancel_on_call {
@@ -393,6 +392,15 @@ mod tests {
         let published = drain_events(&mut fixture.events);
         let reasoning = events_of(&published, events::REVIEW_REASONING_DELTA);
         assert_eq!(reasoning.len(), 1, "the group forwards its reasoning");
+        let reasoning_position = published
+            .iter()
+            .position(|(method, _)| method == events::REVIEW_REASONING_DELTA)
+            .unwrap();
+        let finished_position = published
+            .iter()
+            .position(|(method, _)| method == events::REVIEW_GROUP_FINISHED)
+            .expect("the group publishes its completion");
+        assert!(reasoning_position < finished_position);
         assert_eq!(
             reasoning[0]["delta"],
             serde_json::json!("Inspecting the audited slice")

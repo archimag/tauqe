@@ -1,15 +1,14 @@
 //! Headless locale synthesis, bounded shutdown, and accounting.
-use crate::api::{Application, ApplicationEvent, ApplicationObserver, OperationGuard, UsageGuard};
+use crate::api::{Application, ApplicationEvent, ApplicationObserver, OperationGuard};
 use crate::application::infrastructure::execution::{
     PlanExecutionEnvironment, StructuredExecution,
 };
-use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
+use crate::workflows::structured::{self, StructuredFailure};
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::execution::structured::StructuredError;
 use tauqe_core::locale::{locale_translation_contract, LocaleGenerateParams, LocaleGenerateResult};
 use tauqe_core::models::{ModelRole, ModelSelection};
-use tauqe_core::providers::{ChatMessage, StreamEvent};
+use tauqe_core::providers::ChatMessage;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocaleGenerationError {
@@ -79,14 +78,10 @@ impl Application {
         let PreparedLocaleGeneration { params } = prepared;
         let op_id = format!("op-{}", crate::api::next_operation_id());
         let publisher = Arc::clone(&observer);
-        let usage_guard = self
-            .begin_usage(&op_id, move |id, snapshot| {
-                publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
-            })
-            .await;
-        let cancel_rx = operation.cancel_receiver();
-        let result = structured_task::run(
-            self,
+        let hard = operation.hard_cancellation();
+        let (result, receipt) = structured::run_bound(
+            &self.execution_session(),
+            self.context_session(),
             operation,
             execution,
             locale_translation_contract(),
@@ -95,18 +90,20 @@ impl Application {
             )],
             &op_id,
             deadline,
-            |event| {
-                let usage = &usage_guard;
-                async move {
-                    if let StreamEvent::Usage(reported) = event {
-                        usage.observe(&reported).await;
-                    }
-                }
+            move |id, snapshot| {
+                publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
             },
+            |_| async {},
         )
-        .await;
-        close_locale_usage(self, usage_guard, &op_id, &observer).await;
-        if *cancel_rx.borrow() {
+        .await
+        .map_err(|error| {
+            LocaleGenerationError::Model(match error.classify("locale generation") {
+                StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => message,
+                _ => "Locale generation was cancelled".into(),
+            })
+        })?;
+        observer.publish(&op_id, ApplicationEvent::Usage(receipt.snapshot));
+        if hard.is_cancelled() {
             return Err(LocaleGenerationError::Cancelled(
                 "Locale generation was cancelled".into(),
             ));
@@ -115,51 +112,24 @@ impl Application {
             Ok(translations) => translations,
             // Empty is reported only after a clean Done; incomplete or failed
             // requests must not silently publish an English locale.
-            Err(StructuredTaskError::Request(StructuredError::Empty)) => Default::default(),
-            Err(StructuredTaskError::Cancelled)
-            | Err(StructuredTaskError::Request(StructuredError::Cancelled)) => {
-                return Err(LocaleGenerationError::Cancelled(
-                    "Locale generation was cancelled".into(),
-                ))
-            }
-            Err(StructuredTaskError::Stream(message))
-            | Err(StructuredTaskError::Task(message))
-            | Err(StructuredTaskError::Request(StructuredError::Failed(message)))
-            | Err(StructuredTaskError::Request(StructuredError::Decode(message))) => {
-                return Err(LocaleGenerationError::Model(message))
-            }
-            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
-                return Err(LocaleGenerationError::Model(
-                    "Structured request closed without Done".into(),
-                ))
-            }
-            Err(StructuredTaskError::ForeignOperation) => {
-                return Err(LocaleGenerationError::Model(
-                    "locale generation requires an active operation for this session".into(),
-                ))
-            }
-            Err(StructuredTaskError::Orphaned) => {
-                return Err(LocaleGenerationError::Model(format!(
-                    "Locale generation stream task did not stop within the {} ms task-exit deadline",
-                    deadline.as_millis()
-                )))
-            }
+            Err(error) => match error.classify("locale generation") {
+                StructuredFailure::Empty => Default::default(),
+                StructuredFailure::InputLimit(error) => {
+                    return Err(LocaleGenerationError::Model(error.to_string()));
+                }
+                StructuredFailure::Cancelled => {
+                    return Err(LocaleGenerationError::Cancelled(
+                        "Locale generation was cancelled".into(),
+                    ));
+                }
+                StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                    return Err(LocaleGenerationError::Model(message));
+                }
+            },
         };
         Ok(tauqe_core::locale::validate_and_sanitize_locale(
             &params,
             &translations,
         ))
     }
-}
-async fn close_locale_usage(
-    application: &Application,
-    guard: UsageGuard,
-    id: &str,
-    observer: &Arc<dyn ApplicationObserver>,
-) {
-    guard.flush().await;
-    observer.publish(
-        id,
-        ApplicationEvent::Usage(application.usage_snapshot().await),
-    );
 }

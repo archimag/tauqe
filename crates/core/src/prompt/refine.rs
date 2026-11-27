@@ -30,9 +30,10 @@ use crate::context::ContextAccess;
 use std::borrow::Cow;
 
 use crate::llm::CapabilityTree;
+use crate::llm::LlmCapability;
 use crate::llm::{
-    AbortCommand, BlockedCommand, CommitMessageCommand, ContextRequestCommand, LlmCommand,
-    RepoMapCommand, RepoSearchCommand, TextCommand,
+    AbortCommand, BlockedCommand, ContextRequestCommand, LlmCommand, RepoMapCommand,
+    RepoSearchCommand, TextCommand,
 };
 use crate::workflow::EditProtocolKind;
 use crate::workflow::PatchStrategy;
@@ -40,8 +41,8 @@ use crate::workflow::PatchStrategy;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::EditStreamFilter;
 use crate::plan::prompt::{
-    architect_synthesis_capability_expr, parse_round, plan_refine_response_schema,
-    plan_refine_response_schema_definition, PlanRefinementOutput, RoundStatus,
+    architect_synthesis_capability_expr, parse_round, plan_refine_response_schema_definition,
+    plan_refine_response_schema_for, PlanRefinementOutput, RoundStatus,
 };
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -92,10 +93,7 @@ impl PlanRefinePromptProtocol {
         let strict = definition
             .get("strict")
             .and_then(serde_json::Value::as_bool);
-        let schema = definition
-            .get("schema")
-            .cloned()
-            .unwrap_or_else(plan_refine_response_schema);
+        let schema = plan_refine_response_schema_for(&self.capabilities);
         ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
                 name,
@@ -115,11 +113,47 @@ impl PlanRefinePromptProtocol {
     /// synthesis, a replanning wave, and a review decomposition without
     /// restating any of them here.
     fn instructions(&self) -> String {
-        refinement_output_contract()
+        refinement_output_contract(&self.capabilities)
     }
 
     pub fn decode_round(raw_text: &str) -> Result<PlanRefineRound, String> {
+        Self::default().decode_granted_round(raw_text)
+    }
+
+    fn decode_granted_round(&self, raw_text: &str) -> Result<PlanRefineRound, String> {
         let (output, status) = parse_round(raw_text)?;
+        if !matches!(
+            status,
+            RoundStatus::Aborted(_) | RoundStatus::PlanUpdateRefused(_)
+        ) {
+            let research = [
+                (
+                    "context_requests",
+                    LlmCapability::ContextRequest,
+                    output.context_requests.len(),
+                ),
+                (
+                    "repo_searches",
+                    LlmCapability::RepoSearch,
+                    output.repo_searches.len(),
+                ),
+                ("repo_maps", LlmCapability::RepoMap, output.repo_maps.len()),
+            ];
+            for (field, capability, count) in research {
+                if count != 0 && !self.capabilities.contains(capability) {
+                    return Err(format!(
+                        "{field} is not permitted by the request capabilities"
+                    ));
+                }
+            }
+            if matches!(status, RoundStatus::NeedsContext)
+                && !research
+                    .iter()
+                    .any(|(_, capability, _)| self.capabilities.contains(*capability))
+            {
+                return Err("needs_context is not permitted by the request capabilities".into());
+            }
+        }
         let commands = refinement_commands(&output, &status);
         Ok(PlanRefineRound {
             output,
@@ -134,8 +168,8 @@ impl PlanRefinePromptProtocol {
 /// The required field list and the accepted status values are read from the
 /// single declarative definition of the contour, so the contract and the schema
 /// name the same fields instead of drifting apart.
-fn refinement_output_contract() -> String {
-    let schema = plan_refine_response_schema();
+fn refinement_output_contract(grant: &CapabilityTree) -> String {
+    let schema = plan_refine_response_schema_for(grant);
     let fields = contract_values(&schema, "/required");
     let statuses = contract_values(&schema, "/properties/status/enum");
 
@@ -152,7 +186,20 @@ fn refinement_output_contract() -> String {
     out.push_str(&statuses.join(", "));
     out.push_str(".\n");
     out.push_str("   - `success`: `items` carries the complete new unfinished horizon, while `context_requests`, `repo_searches`, and `repo_maps` stay empty.\n");
-    out.push_str("   - `needs_context`: the contract you are about to implement is not verified yet, so `items` stays empty, `explanation` names that contract, and the evidence still missing is named by `context_requests`, `repo_searches`, or `repo_maps`.\n");
+    if statuses.iter().any(|status| status == "`needs_context`") {
+        let available: Vec<_> = [
+            ("context_requests", LlmCapability::ContextRequest),
+            ("repo_searches", LlmCapability::RepoSearch),
+            ("repo_maps", LlmCapability::RepoMap),
+        ]
+        .into_iter()
+        .filter(|(_, capability)| grant.contains(*capability))
+        .map(|(field, _)| format!("`{field}`"))
+        .collect();
+        out.push_str("   - `needs_context`: the contract you are about to implement is not verified yet, so `items` stays empty, `explanation` names that contract, and the evidence still missing is named by ");
+        out.push_str(&available.join(", "));
+        out.push_str(".\n");
+    }
     out.push_str("   - `blocked`: the horizon cannot be designed, so `reason` states the exact blocker and `items` stays empty.\n");
     out.push_str("4. `abort` reports a host-environment impossibility the harness cannot repair itself, such as a missing system utility or package, a build script awaiting approval, a stopped daemon or database, or an unauthenticated registry. Its idle form is `is_aborted: false`; an active abort (`is_aborted: true`) supersedes any declared `status`, carries the concrete missing capability in `reason` and the exact command the developer must run in `recommendation`, and is never replaced by a `blocked` answer or by an improvised surrogate step. An active abort carries no horizon: `items` stays empty.\n");
     out.push_str("5. The schema carries the authoritative description of every field and every status value, and accepts no key beyond the declared ones.\n");
@@ -191,8 +238,11 @@ impl PromptProtocol for PlanRefinePromptProtocol {
     fn with_project(&self, _project: Option<ProjectConfig>) -> Box<dyn PromptProtocol> {
         Box::new(self.clone())
     }
+    fn with_capabilities(&self, capabilities: CapabilityTree) -> Box<dyn PromptProtocol> {
+        Box::new(Self { capabilities })
+    }
     fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
-        match Self::decode_round(raw_text) {
+        match self.decode_granted_round(raw_text) {
             Ok(round) => round.commands,
             Err(error) => vec![LlmCommand::ProtocolError {
                 message: format!("Failed to decode the plan refinement payload: {error}"),
@@ -260,19 +310,17 @@ fn refinement_commands(output: &PlanRefinementOutput, status: &RoundStatus) -> V
             reason: reason.clone(),
             details: explanation,
         })),
-        RoundStatus::Success => commands.push(LlmCommand::CommitMessage(CommitMessageCommand {
-            commit_message: explanation,
-        })),
+        RoundStatus::Success => {}
         RoundStatus::Aborted(report) => commands.push(LlmCommand::Abort(AbortCommand {
             reason: report.reason.clone(),
             recommendation: report.recommendation.clone(),
         })),
-        RoundStatus::PlanUpdateRefused(message) => {
-            return vec![LlmCommand::ProtocolError {
-                message: message.clone(),
-            }];
-        }
+        RoundStatus::PlanUpdateRefused(_) => commands.clear(),
     }
+    commands.push(LlmCommand::ArchitectRound {
+        output: output.clone(),
+        status: status.clone(),
+    });
     commands
 }
 
@@ -280,7 +328,150 @@ fn refinement_commands(output: &PlanRefinementOutput, status: &RoundStatus) -> V
 mod tests {
     use super::*;
     use crate::llm::LlmCapability;
-    use crate::llm::{AbortCommand, BlockedCommand, CommitMessageCommand, TextCommand};
+    use crate::llm::{AbortCommand, BlockedCommand, TextCommand};
+    use crate::plan::prompt::{
+        architect_synthesis_terminal_capability_expr, plan_refine_response_schema,
+    };
+
+    fn granted(grant: CapabilityTree) -> Box<dyn PromptProtocol> {
+        PlanRefinePromptProtocol::default()
+            .with_capabilities(grant)
+            .with_project(None)
+    }
+
+    fn schema(protocol: &dyn PromptProtocol) -> serde_json::Value {
+        let Some(ResponseFormat::JsonSchema { json_schema }) =
+            protocol.response_format(&[], PatchStrategy::SearchReplace, None)
+        else {
+            panic!("the architect response has a JSON schema");
+        };
+        json_schema.schema.into_owned()
+    }
+
+    #[test]
+    fn terminal_grant_preserves_non_research_capabilities() {
+        let full = architect_synthesis_capability_expr();
+        let terminal = architect_synthesis_terminal_capability_expr();
+        for capability in full.leaves() {
+            assert_eq!(
+                terminal.contains(capability),
+                !crate::workflow::research::step::RESEARCH_CAPABILITIES.contains(&capability)
+            );
+        }
+        let protocol = granted(terminal.clone());
+        assert_eq!(protocol.capability_expr(), terminal);
+        let schema = schema(protocol.as_ref());
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            serde_json::json!(["success", "blocked"])
+        );
+        for field in ["context_requests", "repo_searches", "repo_maps"] {
+            assert_eq!(schema["properties"][field]["type"], "array");
+            assert_eq!(schema["properties"][field]["maxItems"], 0);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == field));
+        }
+        let instructions = protocol.system_instructions(&[], false, PatchStrategy::SearchReplace);
+        assert!(!instructions.contains("`needs_context`"));
+        assert!(!instructions.contains("evidence still missing is named by"));
+        assert!(instructions.contains("`blocked`"));
+    }
+
+    #[test]
+    fn partial_grants_restrict_each_research_field_consistently() {
+        let reply = serde_json::json!({
+            "status": "needs_context", "explanation": "Need evidence", "reason": null,
+            "context_requests": ["src/lib.rs"],
+            "repo_searches": [{"path": ".", "regex": "trait Example"}],
+            "repo_maps": ["src"], "items": []
+        });
+        for (field, capability) in [
+            ("context_requests", LlmCapability::ContextRequest),
+            ("repo_searches", LlmCapability::RepoSearch),
+            ("repo_maps", LlmCapability::RepoMap),
+        ] {
+            let grant = CapabilityTree::from_leaves(
+                architect_synthesis_capability_expr()
+                    .leaves()
+                    .into_iter()
+                    .filter(|item| *item != capability),
+            );
+            let protocol = granted(grant);
+            let projected = schema(protocol.as_ref());
+            assert_eq!(projected["properties"][field]["maxItems"], 0);
+            assert!(projected["properties"]["status"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("needs_context")));
+            let instructions =
+                protocol.system_instructions(&[], false, PatchStrategy::SearchReplace);
+            let research_line = instructions
+                .lines()
+                .find(|line| line.contains("evidence still missing is named by"))
+                .unwrap();
+            assert!(!research_line.contains(&format!("`{field}`")));
+            let mut answer = reply.clone();
+            answer[field] = serde_json::json!([]);
+            assert!(!protocol
+                .decode(&answer.to_string(), &[])
+                .iter()
+                .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
+            for status in ["needs_context", "success", "blocked"] {
+                let mut forbidden = answer.clone();
+                forbidden["status"] = serde_json::json!(status);
+                forbidden[field] = reply[field].clone();
+                let commands = protocol.decode(&forbidden.to_string(), &[]);
+                assert!(
+                    matches!(commands.as_slice(), [LlmCommand::ProtocolError { message }] if message.contains(field)),
+                    "{field} under {status}: {commands:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_decoder_rejects_research_but_accepts_outcomes_and_abort() {
+        let protocol = granted(architect_synthesis_terminal_capability_expr());
+        let mut reply = serde_json::json!({
+            "status": "needs_context", "explanation": "", "reason": null,
+            "context_requests": [], "repo_searches": [], "repo_maps": [], "items": []
+        });
+        assert!(
+            matches!(protocol.decode(&reply.to_string(), &[]).as_slice(),
+            [LlmCommand::ProtocolError { message }] if message.contains("needs_context"))
+        );
+        reply["status"] = serde_json::json!("success");
+        assert!(protocol
+            .decode(&reply.to_string(), &[])
+            .iter()
+            .any(|command| matches!(
+                command,
+                LlmCommand::ArchitectRound {
+                    status: RoundStatus::Success,
+                    ..
+                }
+            )));
+        reply["status"] = serde_json::json!("blocked");
+        reply["reason"] = serde_json::json!("Not enough evidence");
+        assert!(protocol
+            .decode(&reply.to_string(), &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Blocked(_))));
+        reply["status"] = serde_json::json!("needs_context");
+        reply["context_requests"] = serde_json::json!(["../invalid"]);
+        reply["abort"] = serde_json::json!({"is_aborted": true, "reason": "Missing tool", "recommendation": "install tool"});
+        let commands = protocol.decode(&reply.to_string(), &[]);
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Abort(_))));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            LlmCommand::ProtocolError { .. } | LlmCommand::ContextRequest(_)
+        )));
+    }
 
     /// A round that still needs evidence instead of a horizon.
     const NEEDS_CONTEXT: &str = r#"{
@@ -429,7 +620,6 @@ mod tests {
 
     #[test]
     fn test_decode_success_yields_a_terminal_outcome() {
-        let protocol = PlanRefinePromptProtocol::default();
         let success = r#"{
             "status": "success",
             "explanation": "Decomposed into three verified steps",
@@ -440,15 +630,19 @@ mod tests {
             "items": []
         }"#;
 
+        let round = PlanRefinePromptProtocol::decode_round(success).unwrap();
+        assert_eq!(round.status, RoundStatus::Success);
+        assert!(round.output.items.is_empty());
         assert_eq!(
-            protocol.decode(success, &[]),
+            round.commands,
             vec![
                 LlmCommand::Text(TextCommand {
                     content: "Decomposed into three verified steps".to_string(),
                 }),
-                LlmCommand::CommitMessage(CommitMessageCommand {
-                    commit_message: "Decomposed into three verified steps".to_string(),
-                }),
+                LlmCommand::ArchitectRound {
+                    output: round.output,
+                    status: RoundStatus::Success
+                },
             ]
         );
     }
@@ -469,7 +663,10 @@ mod tests {
         let commands = protocol.decode(mutating, &[]);
         assert_eq!(commands.len(), 1, "{commands:?}");
         match &commands[0] {
-            LlmCommand::ProtocolError { message } => {
+            LlmCommand::ArchitectRound {
+                status: RoundStatus::PlanUpdateRefused(message),
+                ..
+            } => {
                 assert!(message.contains("plan_update"), "{message}");
             }
             other => panic!("expected the refusal, got {other:?}"),
@@ -482,10 +679,13 @@ mod tests {
             r#""plan_update": null"#,
         );
         assert!(idle.contains(r#""plan_update": null"#));
-        assert!(!protocol
-            .decode(&idle, &[])
-            .iter()
-            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
+        assert!(!protocol.decode(&idle, &[]).iter().any(|command| matches!(
+            command,
+            LlmCommand::ArchitectRound {
+                status: RoundStatus::PlanUpdateRefused(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -580,6 +780,13 @@ mod tests {
             command,
             LlmCommand::ContextRequest(_) | LlmCommand::RepoSearch(_) | LlmCommand::RepoMap(_)
         )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LlmCommand::ArchitectRound {
+                status: RoundStatus::Aborted(_),
+                ..
+            }
+        )));
 
         // The explanation still reaches the developer as conversational text.
         assert!(commands.contains(&LlmCommand::Text(TextCommand {
@@ -589,7 +796,6 @@ mod tests {
 
     #[test]
     fn test_decode_an_active_abort_states_a_deterministic_payload() {
-        let protocol = PlanRefinePromptProtocol::default();
         let blank = r#"{
             "status": "success",
             "explanation": "",
@@ -600,12 +806,48 @@ mod tests {
             "repo_maps": [],
             "items": []
         }"#;
+        let round = PlanRefinePromptProtocol::decode_round(blank).unwrap();
         assert_eq!(
-            protocol.decode(blank, &[]),
-            vec![LlmCommand::Abort(AbortCommand {
-                reason: "Execution aborted".to_string(),
-                recommendation: "No recommendation was stated.".to_string(),
-            })]
+            round.commands,
+            vec![
+                LlmCommand::Abort(AbortCommand {
+                    reason: "Execution aborted".to_string(),
+                    recommendation: "No recommendation was stated.".to_string(),
+                }),
+                LlmCommand::ArchitectRound {
+                    output: round.output,
+                    status: round.status
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_result_preserves_nested_items_and_barren_research() {
+        let nested = r#"{
+            "status": "success", "explanation": "", "reason": null,
+            "items": [{"id": "1", "title": "Parent", "children": [
+                {"id": "1.1", "title": "Leaf", "files": ["src/lib.rs"]}
+            ]}]
+        }"#;
+        let round = PlanRefinePromptProtocol::decode_round(nested).unwrap();
+        assert_eq!(round.commands.len(), 1);
+        let LlmCommand::ArchitectRound { output, status } = &round.commands[0] else {
+            panic!("expected the complete architect result");
+        };
+        assert_eq!(*status, RoundStatus::Success);
+        assert_eq!(output.items[0].children[0].files, ["src/lib.rs"]);
+        assert_eq!(output, &round.output);
+
+        let barren = r#"{"status":"needs_context","explanation":"","items":[]}"#;
+        let round = PlanRefinePromptProtocol::decode_round(barren).unwrap();
+        assert_eq!(round.status, RoundStatus::NeedsContext);
+        assert_eq!(
+            round.commands,
+            vec![LlmCommand::ArchitectRound {
+                output: round.output,
+                status: RoundStatus::NeedsContext,
+            }]
         );
     }
 

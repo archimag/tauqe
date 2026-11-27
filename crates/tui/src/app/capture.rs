@@ -156,7 +156,6 @@ impl AppState {
             }
             ActiveModal::ChatGptSignIn
             | ActiveModal::ServerDisconnected
-            | ActiveModal::ReviewTruncation
             | ActiveModal::ConfirmCancel
             | ActiveModal::ConfirmQuit
             | ActiveModal::BatchCancel

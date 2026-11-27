@@ -142,7 +142,7 @@ impl AuditResources {
                 PresetReviewPreparationError::OperationNotOwned.to_string(),
             ));
         }
-        if *operation.cancel_receiver().borrow() {
+        if operation.hard_cancellation().is_cancelled() {
             return Err(Cancelled);
         }
         let documents = Documents::new(root);
@@ -152,7 +152,7 @@ impl AuditResources {
             groups = session.groups.len(),
             "preset review session persisted"
         );
-        let report = run_group_audits(
+        let (report, last_audit_receipt) = run_group_audits(
             self,
             (environment, selection),
             root,
@@ -163,7 +163,7 @@ impl AuditResources {
         )
         .await
         .map_err(Failed)?;
-        if *operation.cancel_receiver().borrow() {
+        if operation.hard_cancellation().is_cancelled() {
             return Err(Cancelled);
         }
         match &report.stop {
@@ -195,10 +195,13 @@ impl AuditResources {
             .as_ref()
             .map(|c| c.mode)
             .unwrap_or(PostAnalysisMode::None);
+        let mut session_total_cost = last_audit_receipt
+            .as_ref()
+            .map(|receipt| receipt.snapshot.session.cost);
         if mode == PostAnalysisMode::Automatic && report.is_success() {
-            stored = self
+            let (analyzed, receipt) = self
                 .analysis()
-                .run_review_analysis(
+                .run_review_analysis_with_receipt(
                     &operation,
                     environment,
                     root,
@@ -210,12 +213,14 @@ impl AuditResources {
                 )
                 .await
                 .map_err(|error| {
-                    if *operation.cancel_receiver().borrow() {
+                    if operation.hard_cancellation().is_cancelled() {
                         Cancelled
                     } else {
                         Failed(error.to_string())
                     }
                 })?;
+            stored = analyzed;
+            session_total_cost = Some(receipt.snapshot.session.cost);
         }
         if let Err(error) = self
             .history
@@ -241,7 +246,7 @@ impl AuditResources {
         Ok(PresetReviewResult {
             session: stored,
             current_cost: report.usage.cost.unwrap_or(0.0),
-            session_total_cost: self.usage.snapshot().await.session.cost,
+            session_total_cost: session_total_cost.unwrap_or(0.0),
             usage,
         })
     }

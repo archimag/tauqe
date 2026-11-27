@@ -13,6 +13,51 @@ use std::path::{Path, PathBuf};
 
 use super::{EditError, StagedEditsState};
 use tauqe_tools::atomic_write::SiblingCommit;
+use tauqe_tools::blocking::StartedOperations;
+use tauqe_tools::stop::HardCancellation;
+
+/// Publishes once, retaining the write's completion even if its await is lost.
+/// The admission check and the final cancellation check run at the write
+/// boundary, rather than only in the caller before scheduling it.
+pub(crate) async fn commit_staged_edits_with_operations(
+    repo_root: &Path,
+    staged: &StagedEditsState,
+    paths: &[String],
+    cancel_rx: Option<&HardCancellation>,
+    operations: &StartedOperations,
+) -> Result<(), EditError> {
+    let root = repo_root.to_path_buf();
+    let staged = staged.clone();
+    let paths = paths.to_vec();
+    let cancel = cancel_rx.cloned();
+    let handle = operations
+        .start(
+            move || {
+                if cancel.as_ref().is_some_and(HardCancellation::is_cancelled) {
+                    return Err(EditError::Io(
+                        String::new(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "edit publication was cancelled",
+                        ),
+                    ));
+                }
+                commit_staged_edits(&root, &staged, &paths)
+            },
+            None,
+        )
+        .map_err(|reason| EditError::Io(String::new(), std::io::Error::other(reason)))?;
+    handle
+        .take_result()
+        .await
+        .ok_or_else(|| {
+            EditError::Io(
+                String::new(),
+                std::io::Error::other("publication completion was already consumed"),
+            )
+        })?
+        .map_err(|error| EditError::Io(String::new(), std::io::Error::other(error)))?
+}
 
 /// Drops the staged content of changes that never reached their commit.
 fn discard_staged(changes: &[SiblingCommit]) {
@@ -168,6 +213,7 @@ pub(crate) fn commit_staged_edits(
 #[cfg(test)]
 mod tests {
     use super::commit_staged_edits;
+    use super::commit_staged_edits_with_operations;
     use crate::context::ContextAccess;
     use crate::context::ContextManager;
     use crate::edits::EditCreate;
@@ -179,8 +225,38 @@ mod tests {
     use crate::edits::{
         apply_edit_proposal, stage_and_validate_edits, EditError, StagedEditsState,
     };
+    use crate::stop::StopSource;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn cancelled_publication_never_updates_disk() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "original").unwrap();
+        let mut staged = StagedEditsState::default();
+        staged
+            .staged_files
+            .insert("a.rs".into(), b"changed".to_vec());
+        let stop = StopSource::new();
+        stop.request_hard();
+        let cancel = stop.token().hard_cancellation();
+        let operations = tauqe_tools::blocking::StartedOperations::default();
+        let outcome = commit_staged_edits_with_operations(
+            dir.path(),
+            &staged,
+            &["a.rs".into()],
+            Some(&cancel),
+            &operations,
+        )
+        .await;
+        assert!(outcome.is_err());
+        operations.close();
+        assert_eq!(operations.wait().await.unconfirmed, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "original"
+        );
+    }
 
     /// Names of the staging siblings currently present in `dir`.
     fn leftover_siblings(dir: &Path) -> Vec<String> {

@@ -179,14 +179,19 @@ pub(crate) async fn submit_prompt_modal(
         PromptModalTarget::ReviewGroup {
             session_id,
             group_id,
+            focused_steps,
             ..
         } => {
             let target = DiscussionTarget::ReviewGroup {
                 session_id: session_id.clone(),
                 group_id: group_id.clone(),
             };
-            let focus = DiscussionFocus::from_target(target.clone(), Vec::new());
-            (target, Vec::new(), focus)
+            let ids: Vec<String> = focused_steps
+                .iter()
+                .map(|id| format!("step:{id}"))
+                .collect();
+            let focus = DiscussionFocus::from_target(target.clone(), ids.clone());
+            (target, ids, focus)
         }
     };
 

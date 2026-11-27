@@ -2,10 +2,10 @@
 use crate::api::{Application, ApplicationObserver, DiscussionPromptError, ModelAskInput};
 use crate::application::infrastructure::execution::ExecutionFactory;
 use crate::application::turn_setup::TurnProviderError;
-use crate::workflows::repl;
+use crate::workflows::repl::lifecycle;
 use std::sync::Arc;
 use tauqe_core::models::{ModelRole, ModelSelection};
-use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REPL};
+use tauqe_core::workflow::WorkflowOptions;
 
 #[derive(Debug)]
 pub struct AskStarted {
@@ -42,27 +42,38 @@ impl Application {
             _ => ModelRole::REPL,
         };
         let model = factory.resolve_model(selection, effort_role);
-        let session = format_session_id(SESSION_PREFIX_REPL, &self.session_uuid().await);
-        let executor = factory
-            .bind_prompt(
+        let max_turn_rounds = WorkflowOptions::from_app_config(&model.config).max_turn_rounds();
+        let scope = self.execution_session().prepare_scope();
+        let binding = scope.binding();
+        let mut executor = factory
+            .bind_interactive_prompt(
                 &model.model,
                 model.effort,
-                Some(session),
+                model.role,
                 model.config.repl.patch_strategy(),
             )
             .await?;
+        executor
+            .bind_usage(binding.clone())
+            .map_err(|error| AskError::Provider(TurnProviderError::new(error.to_string())))?;
+        // Both technical bindings are frozen before scheduling the task.
         let policy = factory.apply_policy(model.config.repl.workflow);
-        let compaction = factory.compaction_environment();
-        let application = self.clone();
+        let services = lifecycle::LifecycleServices {
+            context: self.context_session().clone(),
+            interactive: self.interactive_execution().clone(),
+            execution: self.execution_session(),
+            history: self.history_session().clone(),
+        };
         tokio::spawn(async move {
-            repl::run(
-                &application,
+            lifecycle::run(
+                services,
                 operation,
                 prepared,
-                model,
+                max_turn_rounds,
+                Arc::new(model.config),
+                scope,
                 executor,
                 policy,
-                compaction,
                 observer,
             )
             .await;

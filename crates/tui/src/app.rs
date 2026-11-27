@@ -281,6 +281,13 @@ pub enum StatusDialogTarget {
         item_title: String,
         current_status: tauqe_protocol::PlanItemStatus,
     },
+    ReviewPlanStep {
+        review_id: String,
+        group_id: String,
+        step_id: String,
+        item_title: String,
+        current_status: tauqe_protocol::PlanItemStatus,
+    },
     ReviewItem {
         review_id: Option<String>,
         item_id: u32,
@@ -293,7 +300,7 @@ impl StatusDialogTarget {
     /// Number of selectable status options presented for this target.
     pub fn options_count(&self) -> usize {
         match self {
-            Self::PlanItem { .. } => 6,
+            Self::PlanItem { .. } | Self::ReviewPlanStep { .. } => 6,
             Self::ReviewItem { .. } => 6,
         }
     }
@@ -490,21 +497,6 @@ pub struct PendingReviewLaunch {
     pub params: ReviewStartParams,
 }
 
-/// Audit-window projection awaiting the developer's consent.
-///
-/// The card states the whole window the launch would audit — the context, the
-/// pattern matches, the selection, the omissions split by the limit that
-/// dropped them, and the shared token budget — because narrowing the audited
-/// set is a long autonomous operation whose consent cannot be assumed
-/// (Conventions §5.4, c-3).
-#[derive(Debug, Clone)]
-pub struct ConfirmReviewTruncationState {
-    /// Launch waiting for the decision.
-    pub pending: PendingReviewLaunch,
-    /// Projection the decision is made against.
-    pub window: tauqe_protocol::review::ReviewPreviewWindow,
-}
-
 #[derive(Debug, Clone)]
 pub struct ConfirmExecuteReviewState {
     pub review_id: Option<String>,
@@ -535,7 +527,7 @@ pub struct ConfirmExecuteReviewState {
     /// Coder-role model selector: configured entries, cyclic navigation, and the
     /// shared embedded-list rendering (concept #c-3).
     pub selector: ModelSelector,
-    /// Optional implementation directives forwarded to the Coder turn.
+    /// Implementation directives of a single finding only.
     pub instructions_editor: InputEditor,
     /// Section of the dialog that currently owns the keyboard.
     pub focus: RefineDialogFocus,
@@ -546,9 +538,8 @@ pub struct ConfirmExecuteReviewState {
 impl ConfirmExecuteReviewState {
     /// Builds a review-execution confirmation over the configured Coder entries.
     ///
-    /// One constructor serves the point-execution form: exactly one finding,
-    /// which is the shape that exposes the Coder selector and the directives
-    /// editor (concept #c-3, #c-4).
+    /// Every execution target uses this Coder selector. Only a single finding
+    /// exposes the directives editor.
     pub fn new(
         review_id: Option<String>,
         review_title: String,
@@ -557,6 +548,13 @@ impl ConfirmExecuteReviewState {
         items: Vec<tauqe_protocol::ReviewIssue>,
         coder_entries: Vec<tauqe_protocol::ModelEntry>,
     ) -> Self {
+        let focus = if coder_entries.len() > 1 {
+            RefineDialogFocus::ModelList
+        } else if item_id.is_some() && items.len() == 1 {
+            RefineDialogFocus::InstructionsEditor
+        } else {
+            RefineDialogFocus::Actions
+        };
         Self {
             review_id,
             review_title,
@@ -568,7 +566,7 @@ impl ConfirmExecuteReviewState {
             whole_session: false,
             selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
             instructions_editor: InputEditor::default(),
-            focus: RefineDialogFocus::default(),
+            focus,
             confirm_button: ConfirmDialogButton::Cancel,
         }
     }
@@ -581,6 +579,7 @@ impl ConfirmExecuteReviewState {
     /// Partial queues keep their explicit target list and never call this.
     pub fn with_whole_session(mut self) -> Self {
         self.whole_session = true;
+        self.normalize_focus();
         self
     }
     /// Targets the unified plan of one architectural group.
@@ -592,7 +591,39 @@ impl ConfirmExecuteReviewState {
     pub fn with_group(mut self, group_id: String, group_title: String) -> Self {
         self.group_id = Some(group_id);
         self.group_title = group_title;
+        self.normalize_focus();
         self
+    }
+
+    fn normalize_focus(&mut self) {
+        if !self.is_single_target() && self.focus.is_instructions_editor() {
+            self.focus = if self.selector.len() > 1 {
+                RefineDialogFocus::ModelList
+            } else {
+                RefineDialogFocus::Actions
+            };
+        }
+    }
+
+    /// Walks only the sections visible for this target.
+    pub fn cycle_focus_next(&mut self) {
+        if self.is_single_target() {
+            self.focus.cycle_next(self.selector.len());
+        } else {
+            self.focus = if self.focus.is_model_list() || self.selector.len() <= 1 {
+                RefineDialogFocus::Actions
+            } else {
+                RefineDialogFocus::ModelList
+            };
+        }
+    }
+
+    pub fn cycle_focus_prev(&mut self) {
+        if self.is_single_target() {
+            self.focus.cycle_prev(self.selector.len());
+        } else {
+            self.cycle_focus_next();
+        }
     }
 
     /// Currently selected Coder entry, if any.
@@ -602,10 +633,8 @@ impl ConfirmExecuteReviewState {
 
     /// Whether point execution targets exactly one finding.
     ///
-    /// Only this shape exposes the Coder selector and the directives editor; a
-    /// session queue, the cross-session batch, and the unified plan of an
-    /// architectural group run autonomously on the configured role defaults
-    /// (concept #c-3, #c-4, #c-5). A whole-session queue names no single unit
+    /// Only this shape exposes the directives editor. Every shape exposes the
+    /// Coder selector. A whole-session queue names no single unit
     /// of work at all, so the flag always keeps it out of the point form (c-2).
     pub fn is_single_target(&self) -> bool {
         if self.whole_session {
@@ -653,6 +682,8 @@ pub enum PromptModalTarget {
         group_id: String,
         /// Display title of the group, captured when the dialogue opens.
         group_title: String,
+        /// Selected step IDs in the group's saved horizon, not finding IDs.
+        focused_steps: Vec<String>,
         /// Reason the unified plan of the group currently cannot proceed.
         blocked_reason: Option<String>,
         /// Whether the dialogue analyses the cause or records the decision.
@@ -2314,7 +2345,6 @@ impl AppState {
             ActiveModal::ChatGptSignIn => self.modals.chatgpt.is_some(),
             ActiveModal::ServerDisconnected => self.modals.server_disconnected.is_some(),
             ActiveModal::Squash => self.modals.squash_dialog.is_some(),
-            ActiveModal::ReviewTruncation => self.modals.confirm_review_truncation.is_some(),
             ActiveModal::Review => self.modals.review_dialog.is_some(),
             ActiveModal::ConfirmCancel => self.modals.confirm_cancel,
             ActiveModal::ConfirmQuit => self.modals.confirm_quit,
@@ -3773,32 +3803,6 @@ mod tests {
         assert_eq!(dialog.path_visible_start(3), 0);
         assert_eq!(dialog.path_visible_start(0), 0);
     }
-    /// A pending consent to a truncated audit window outranks the launch dialog
-    /// it returns to and owns the keyboard until the developer answers it (c-3).
-    #[test]
-    fn test_review_truncation_confirmation_owns_the_keyboard() {
-        let mut st = test_state();
-        st.modals.review_dialog = Some(ReviewDialogState::new(0, 0, Vec::new(), Vec::new()));
-        assert_eq!(st.active_modal(), Some(ActiveModal::Review));
-
-        st.modals.confirm_review_truncation = Some(ConfirmReviewTruncationState {
-            pending: PendingReviewLaunch {
-                dialog: ReviewDialogState::new(0, 0, Vec::new(), Vec::new()),
-                params: ReviewStartParams::default(),
-            },
-            window: tauqe_protocol::review::ReviewPreviewWindow {
-                omitted_files: 3,
-                ..Default::default()
-            },
-        });
-        assert_eq!(st.active_modal(), Some(ActiveModal::ReviewTruncation));
-        assert!(st.has_active_modal());
-
-        // Answering the decision returns the keyboard to the launch dialog.
-        st.modals.confirm_review_truncation = None;
-        assert_eq!(st.active_modal(), Some(ActiveModal::Review));
-    }
-
     /// The unified plan of an architectural group always renders the binary
     /// confirmation, because the pipeline executes the whole remaining horizon
     /// of the group as one coherent change set and never dispatches a single

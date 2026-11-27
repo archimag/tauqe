@@ -65,9 +65,9 @@ completion is the whole plan. That is the entire reason the group model exists.
    when the whole plan is verified.
 6. **An independent finding is resolved in one verified bounded turn.** Marking
    `Fixed` is tied to the verified result of a turn, not to an opinion.
-7. **A remediation plan is synthesized just in time.** The harness asks the Architect
-   for the group horizon when execution starts; there is no manual decomposition
-   command and no intermediate status waiting for one.
+7. **A missing remediation plan is synthesized just in time.** A saved horizon
+   that cannot advance is not silently replanned by execution: the developer
+   explicitly refines that group's unfinished horizon with the Architect.
 8. **The audit fixes *what*; the fix owns *how*.** A resolving turn never re-audits
    the finding and never substitutes the designed structure, the interfaces the finding
    relies on, or an invariant it states.
@@ -290,9 +290,9 @@ that can follow.
   stays in `note`.
 - **REJECTED** — a false positive, an intentional trade-off, or non-actionable.
 
-There is no intermediate state between triage and execution. A finding broader than
-one turn is not parked in a "needs decomposition" limbo, because decomposition is not
-a developer ritual but a phase the harness runs when execution starts (§3.7, §3.8).
+There is no intermediate finding status between triage and execution. A group
+without a horizon is synthesized just in time; a saved, impassable horizon
+requires explicit refinement before execution (§3.7, §3.8).
 
 **Progress counting.** Session progress is `fixed / total`, where `total` counts only
 actionable findings: `SKIPPED` and `REJECTED` are terminal and are excluded from the
@@ -347,33 +347,27 @@ blank pattern narrows nothing and the launch runs unrestricted; a pattern that m
 nothing is an honest zero, and the launch is refused before a request is sent.
 
 `review/preview` projects the same window server-side: the context
-contribution, the matched files, the accepted files and their estimated
-tokens, the matches nobody could read, and the budget breakdown, per group for
-a preset launch. `ReviewPreviewWindow::is_truncated` is the single predicate a
-client branches on, so a window that drops nothing needs no consent step and a
-truncated one asks before launching.
+contribution, matched and readable files, estimated material size, and matches
+nobody could read, per group for a preset launch. It previews composition, not
+admission of the final provider request, whose instructions, response schema,
+and adapter framing are not captured by the window estimate. No
+budget-truncation consent is needed.
 
-Pattern expansion is bounded by the same budget that governs research: the
-expansion reads files in selection order and stops at the first file that would
-push the loaded window past `context.token_budget`, so a wide pattern
-never loads the whole matched tree and then discards most of it. Each file is
-priced as its content plus the wrapper its own `<file>` element renders, so the
-estimate covers what the audit actually reads. The number of matched files is
-never a limit: it is reported, not enforced, and a selection wider than any
-fixed ceiling is audited in full when the budget pays for it. Matches the
-budget cannot pay for are not inspected, and the `review/started` event reports
-how many of them were omitted, the daemon records a warning, and the interface
-raises one, so a silently narrow audit is impossible.
+Pattern expansion reads every readable tracked match without a separate file
+count or context-token allowance; duplicates already in context are not read
+twice. The final complete provider input is measured as
+`ceil(serialized_request_bytes / 4)` under `request.max_input_tokens`. This
+estimate includes instructions, context, task, response schema, and adapter
+framing and is not the provider's exact token count. Overflow refuses the
+launch before a provider call; it never silently narrows the audit window.
 
-A match the window cannot decode is never a budget omission. A binary blob, a
+A match the window cannot decode is not a budget omission. A binary blob, a
 symlink escaping the repository, and a file deleted from the working tree but
 still tracked can all match a pattern and none of them can be audited, so they
 are counted on a counter of their own. `review/preview` reports it as
 `unreadable_files`, so those matches are never charged to the token budget.
-Truncation therefore keeps exactly one cause:
-`ReviewPreviewWindow::is_truncated` is true only when the budget dropped a
-readable candidate, and `review/started` never publishes an omission count
-inflated by files nobody could read.
+No readable candidate is dropped for budget reasons. Unreadable matches
+remain a separate counter and are not mistaken for admitted files.
 
 A pattern that matches no tracked file is refused outright: launching anyway
 would audit a different file set than the one the developer believes the
@@ -698,6 +692,37 @@ confirmation of the root-cause plan the step belongs to, exactly as the group he
 does: the shared pipeline executes that plan's remaining horizon as one coherent change
 set, so a step never selects a leaf turn of its own, and no request carries a `step_id`.
 
+**Explicit refinement.** `r` on a declared architectural group header, its plan
+branch, or one of its steps opens the existing Planner / optional Critic form with
+Cancel as the safe default. Confirmation sends `review/refineGroup` addressed by
+`review_id` and `group_id`; it does not execute code, regroup findings, or create a
+standalone plan. A selected step remains an attention marker (`step:<id>`), not
+a separate execution target. A group can be refined with a blocked step, no
+saved horizon, or findings in Discussion. A model refusal, cancellation, or
+storage failure leaves the saved horizon unchanged; a successful write replaces
+only unfinished steps and publishes the updated group.
+
+**Manual step status and resumption.** The status dialog on a leaf of a saved
+architectural group changes that leaf's `PlanItemStatus` without invoking the
+Architect or executing code. After resolving an external blocker, change the
+affected leaf from `Blocked` to `Todo` to resume the existing horizon; if the
+plan itself needs changing, use `review/refineGroup` instead. A completed leaf
+and its commit remain immutable. Changing one leaf does not bypass other blocked
+or discussion steps, unresolved dependencies, or open questions on findings.
+The step's `blocked_reason` describes that leaf's obstruction and is cleared
+when the leaf leaves `Blocked`. The group's `blocked_reason` is a separate,
+preserved diagnosis: it does not prohibit execution when the saved horizon is
+ready. A decision recorded on a finding is separate again; manual step status
+does not change findings or close the group. Only the execution scenario closes
+findings after the whole horizon completes.
+
+Direct discussion and discussion through a group focus receive the same full
+saved horizon: step identities, dependencies, context declarations, commits,
+step blockers, the separate group blocker, and recorded decisions. Discussion
+of a finding retains finding-level rights while including its parent group's
+diagnostic context. Execution of an impassable saved horizon returns an
+addressed `GroupNeedsRefinement` refusal with its diagnosis and recovery action.
+
 #### Session batch
 
 `x` on a session header queues every actionable finding of the session plus one group
@@ -761,9 +786,9 @@ status of its findings follows that unit:
    record, the manual verdicts `Skipped` and `Rejected` and an earlier `Fixed` stay
    exactly as they are, and the blocker is cleared by the same write. The remediation
    therefore stays inspectable after the plan itself scrolls out of view.
-4. **When a step fails or blocks** the completed steps keep their `Done` status and
-   their verified changes, the remaining horizon is replanned by the Architect, and
-the walk continues around the failure. `repl.max_replans` bounds the waves.
+4. **When a step fails or blocks** completed steps keep their `Done` status and
+   verified changes. The saved horizon and blocker remain available for explicit
+   group refinement; execution does not automatically replan it.
 
 Planning material is exactly the set of open findings. The Architect synthesizes the
 horizon from the group description and its `Todo` findings, and a replan uses the same
@@ -1006,6 +1031,7 @@ missing icon.
 | `Enter` / `x` | execute the selected finding, group, or session |
 | `X` | execute every finding and root-cause plan across all sessions |
 | `Shift+A` | classify the selected session with the Architect post-analysis |
+| `r` | refine the selected architectural group or its plan branch/step, with confirmation |
 | `t` / `s` | open the status dialog |
 | `N` | start a new audit of the current context |
 | `d` | anchor the discussion on the selected row |

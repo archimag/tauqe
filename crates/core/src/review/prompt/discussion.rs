@@ -1,7 +1,8 @@
 use crate::context::ContextFileContent;
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
-use crate::review::{ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
+use crate::review::{ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession};
 
+use super::implementation::{render_group_implementation, render_group_implementation_with_focus};
 use super::refine::render_path_list;
 const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
@@ -95,6 +96,33 @@ pub fn format_review_discussion_prompt_items(
         out.push('\n');
     }
 
+    // Only the declared architectural parents of focused findings contribute
+    // a plan. A finding dialogue retains its finding-level permissions.
+    let mut rendered_groups = Vec::new();
+    for id in focused_item_ids {
+        let Some(group_id) = session
+            .find_item(*id)
+            .and_then(|item| item.group.as_deref())
+        else {
+            continue;
+        };
+        if rendered_groups.contains(&group_id) {
+            continue;
+        }
+        if let Some(group) = session
+            .groups
+            .iter()
+            .find(|group| group.id == group_id && group.kind == ReviewGroupKind::Architectural)
+        {
+            rendered_groups.push(group_id);
+            out.push_str(&format!(
+                "## Architectural Parent Group: `{}`\n\n",
+                escape_xml_text(&group.id)
+            ));
+            out.push_str(&render_group_implementation(group));
+        }
+    }
+
     out.push_str("## Developer Comment / Instructions:\n");
     out.push_str(user_comment.trim());
     out.push_str("\n\n");
@@ -169,6 +197,8 @@ pub fn format_review_group_discussion_prompt(
     session: &ReviewSession,
     group: &ReviewGroup,
     findings: &[ReviewItem],
+    focused_steps: &[String],
+    missing_steps: &[String],
     user_comment: &str,
 ) -> String {
     // Findings are rendered through the enriched domain view, exactly as a
@@ -218,32 +248,18 @@ pub fn format_review_group_discussion_prompt(
             escape_xml_text(root_cause)
         ));
     }
-    let blocker = group
-        .blocked_reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty());
-    match blocker {
-        Some(blocker) => out.push_str(&format!(
-            "- **Current Blocker**:\n{}\n",
-            escape_xml_text(blocker)
-        )),
-        // The dialogue states the absence explicitly, so the model never reads a
-        // missing section as a blocker it has to guess.
-        None => out.push_str("- **Current Blocker**: none recorded\n"),
-    }
-    let decision = group
-        .resolution_notes
-        .as_deref()
-        .map(str::trim)
-        .filter(|note| !note.is_empty());
-    if let Some(decision) = decision {
+    out.push('\n');
+
+    out.push_str(&render_group_implementation_with_focus(
+        group,
+        focused_steps,
+    ));
+    for id in missing_steps {
         out.push_str(&format!(
-            "- **Recorded Decision**:\n{}\n",
-            escape_xml_text(decision)
+            "Selected step #{} no longer exists in the saved group horizon. The group focus remains active.\n",
+            escape_xml_text(id)
         ));
     }
-    out.push('\n');
 
     out.push_str("## Target Review Session Context:\n");
     let (total, fixed) = session.stats();

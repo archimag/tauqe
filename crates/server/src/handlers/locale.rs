@@ -338,7 +338,7 @@ mod tests {
             &self,
             _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
-            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+            _cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             let _ = tx.send(StreamEvent::Usage(self.usage.clone())).await;
             let _ = tx.send(StreamEvent::Cancelled).await;
@@ -477,7 +477,7 @@ mod tests {
             &self,
             _request: tauqe_core::providers::LlmRequest<'_>,
             _tx: tokio::sync::mpsc::Sender<StreamEvent>,
-            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+            _cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             // The marker and the sender stay alive across the park: the future
             // only ever completes by being aborted, exactly like a provider call
@@ -560,7 +560,7 @@ mod tests {
             &self,
             _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
-            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+            _cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             // The marker and the sender stay alive across the park: the future
             // only ever completes by being aborted, exactly like a provider call
@@ -624,7 +624,7 @@ mod tests {
             &self,
             _request: tauqe_core::providers::LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
-            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+            _cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             // The payload and the channel close first, so the handler's event loop
             // ends and reaches its completed-stream await while this task is still

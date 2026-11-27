@@ -172,12 +172,7 @@ impl Application {
         let operation = self.begin_configuration_change()?;
         let repository = self.repository_state().await?;
         operation
-            .rebind_repository(
-                std::path::Path::new(&repository.root),
-                move |id, snapshot| {
-                    observer.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()));
-                },
-            )
+            .rebind_repository(std::path::Path::new(&repository.root), observer)
             .await;
         Ok(ClientInitialization {
             repository,
@@ -193,14 +188,8 @@ impl Application {
     ) -> Result<crate::api::RepositoryState, InitializationError> {
         let operation = self.begin_configuration_change()?;
         let repository = operation.initialize_repository(initial_commit).await?;
-        let publisher = observer.clone();
         operation
-            .rebind_repository(
-                std::path::Path::new(&repository.root),
-                move |id, snapshot| {
-                    publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()));
-                },
-            )
+            .rebind_repository(std::path::Path::new(&repository.root), observer.clone())
             .await;
         observer.publish("", ApplicationEvent::Repository(repository.clone()));
         Ok(repository)

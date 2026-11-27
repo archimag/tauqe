@@ -19,6 +19,7 @@ use crate::edits::EditReplace;
 use crate::llm::discussion::DiscussionPlanUpdate;
 
 use crate::llm::DocTopic;
+use crate::plan::prompt::{PlanRefinementOutput, RoundStatus};
 
 /// A request to add a file to the context at a given access level.
 ///
@@ -298,6 +299,11 @@ pub enum LlmCommand {
     /// happens to be active.
     ReviewUpdate {
         update: crate::llm::discussion::ReviewUpdateProposal,
+    },
+    /// Complete Architect synthesis result; it does not mutate a plan.
+    ArchitectRound {
+        output: PlanRefinementOutput,
+        status: RoundStatus,
     },
     /// Ephemeral working-memory notes.
     Scratchpad(ScratchpadCommand),

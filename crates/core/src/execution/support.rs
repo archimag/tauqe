@@ -1,38 +1,10 @@
 //! Cancellation, event delivery and existing read-only request contracts.
 
 use crate::providers::{ResponseFormat, StreamEvent};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
-/// Cooperative cancellation signal, independent of a workflow lifecycle.
-#[derive(Clone, Debug)]
-pub struct CancellationToken {
-    rx: watch::Receiver<bool>,
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        let (_, rx) = watch::channel(false);
-        Self { rx }
-    }
-
-    pub fn from_receiver(rx: watch::Receiver<bool>) -> Self {
-        Self { rx }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        *self.rx.borrow()
-    }
-
-    pub fn receiver(&self) -> watch::Receiver<bool> {
-        self.rx.clone()
-    }
-}
+/// Shared hard-stop view; the operation owns the stop source.
+pub use tauqe_tools::stop::HardCancellation as CancellationToken;
 
 /// Semantic event delivery without a transport or presentation dependency.
 #[derive(Clone)]

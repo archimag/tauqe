@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use tauqe_protocol::review::ReviewPreviewResult;
+use tauqe_protocol::ReviewRefineGroupResult;
 use tauqe_protocol::{
     methods, ConfigState, ContextAddPatternResult, ContextState, GitSquashGenerateMessageResult,
     GitSquashPreviewResult, HistoryGetResult, ModelCurrentResult, ModelRef, ModelRolesSummary,
@@ -19,12 +20,9 @@ use tauqe_protocol::{
 };
 use tokio::sync::Mutex;
 
-use super::events::fail_safe_reject_edits;
+use super::events::{apply_context_snapshot, fail_safe_reject_edits};
 use super::transport::{send_request, OptimisticRollback, RpcConnection};
-use crate::app::{
-    AppState, ConfirmDialogButton, ConfirmReviewTruncationState, ModelChoice, PendingReviewLaunch,
-    SquashFileItem,
-};
+use crate::app::{AppState, ConfirmDialogButton, ModelChoice, PendingReviewLaunch, SquashFileItem};
 use crate::i18n::{active_t, CustomLocale};
 use crate::views::repl::TurnStatus;
 /// A request the client dispatches once the applied response is fully handled.
@@ -185,12 +183,12 @@ fn apply_response(
         | Some(methods::CONTEXT_CLEAR)
         | Some(methods::CONTEXT_SET_ACCESS) => {
             if let Ok(context) = serde_json::from_value::<ContextState>(value) {
-                apply_context(st, context);
+                apply_context_snapshot(st, context);
             }
         }
         Some(methods::CONTEXT_ADD_PATTERN) => {
             if let Ok(added) = serde_json::from_value::<ContextAddPatternResult>(value) {
-                apply_context(st, added.state);
+                apply_context_snapshot(st, added.state);
                 let template = if added.truncated {
                     active_t("notify.context_added_truncated")
                 } else {
@@ -297,6 +295,73 @@ fn apply_response(
                 Err(_) => {}
             }
         }
+        Some(methods::REVIEW_REFINE_GROUP) => {
+            st.modals.refine_dialog = None;
+            match serde_json::from_value::<ReviewRefineGroupResult>(value) {
+                Ok(ReviewRefineGroupResult::Success {
+                    review_id,
+                    group_id,
+                    group,
+                    explanation,
+                }) => {
+                    if group.id != group_id {
+                        let message = active_t("notify.review_group_response_mismatch");
+                        settle_group_refinement_wait(st, Some(&message));
+                        st.notify_error(message);
+                        return;
+                    }
+                    // The reply carries a saved group, never a standalone Plan.
+                    // Keep the active mirror and session list aligned without resetting folds.
+                    for session in &mut st.review.sessions {
+                        if session.id == review_id {
+                            if let Some(stored) =
+                                session.groups.iter_mut().find(|g| g.id == group_id)
+                            {
+                                *stored = *group.clone();
+                            }
+                        }
+                    }
+                    if let Some(session) = st.review.session.as_mut().filter(|s| s.id == review_id)
+                    {
+                        if let Some(stored) = session.groups.iter_mut().find(|g| g.id == group_id) {
+                            *stored = *group;
+                        }
+                    }
+                    let explanation = explanation.trim();
+                    let message = if explanation.is_empty() {
+                        active_t("notify.review_group_refined_default")
+                            .replacen("{}", &group_id, 1)
+                            .replacen("{}", &review_id, 1)
+                    } else {
+                        active_t("notify.review_group_refined")
+                            .replacen("{}", &group_id, 1)
+                            .replacen("{}", &review_id, 1)
+                            .replacen("{}", explanation, 1)
+                    };
+                    settle_group_refinement_wait(st, None);
+                    st.notify_success(message);
+                }
+                Ok(ReviewRefineGroupResult::Blocked { reason }) => {
+                    settle_group_refinement_wait(st, Some(&reason));
+                    st.notify_error(reason);
+                }
+                Ok(ReviewRefineGroupResult::Aborted {
+                    reason,
+                    recommendation,
+                }) => {
+                    let message = active_t("notify.review_group_aborted")
+                        .replacen("{}", &reason, 1)
+                        .replacen("{}", &recommendation, 1);
+                    settle_group_refinement_wait(st, Some(&message));
+                    st.notify_error(message);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    settle_group_refinement_wait(st, Some(&message));
+                    st.notify_error(active_t("notify.rpc_error").replace("{}", &message));
+                }
+            }
+        }
         Some(methods::REVIEW_LIST) => {
             if let Ok(list) = serde_json::from_value::<ReviewListResult>(value) {
                 st.review.set_sessions(list.reviews, list.active_id);
@@ -309,6 +374,9 @@ fn apply_response(
                 }
             }
         }
+        // The reply acknowledges the write; review/updated and
+        // review/listChanged publish the authoritative saved session.
+        Some(methods::REVIEW_UPDATE_GROUP_STEP) => {}
         Some(methods::REVIEW_PREVIEW) => apply_review_preview(st, value, follow_ups),
         Some(methods::REVIEW_DELETE) => {
             st.notify_info(active_t("notify.review_deleted"));
@@ -340,12 +408,9 @@ fn apply_response(
 
 /// Applies the audit-window projection to the review launch that requested it.
 ///
-/// The answer is the consent gate of the launch: an untruncated window starts the
-/// audit immediately through the shared launch helper, while a truncated one
-/// opens the confirmation card with the full counters and sends nothing until
-/// the developer confirms it (c-3). A projection that cannot be read returns the
-/// launch dialog with its typed fields instead of starting an audit nobody
-/// described.
+/// A complete window starts the audit through the shared launch helper. A
+/// malformed or legacy truncated projection restores the typed launch dialog
+/// instead of starting an audit over an undisclosed subset.
 fn apply_review_preview(
     st: &mut AppState,
     value: serde_json::Value,
@@ -364,12 +429,10 @@ fn apply_review_preview(
             return;
         }
     };
-    if preview.window.is_truncated() {
-        st.modals.confirm_review_truncation = Some(ConfirmReviewTruncationState {
-            pending,
-            window: preview.window,
-        });
+    if preview.window.omitted_by_budget > 0 {
+        st.modals.review_dialog = Some(pending.dialog);
         st.modals.confirm_button = ConfirmDialogButton::Cancel;
+        st.notify_error(active_t("notify.review_preview_truncated"));
     } else {
         follow_ups.push(FollowUp::ReviewLaunch(Box::new(pending)));
     }
@@ -383,6 +446,11 @@ fn apply_review_preview(
 /// never arrive (c-3).
 fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
     match method {
+        Some(methods::REVIEW_REFINE_GROUP) => {
+            st.modals.refine_dialog = None;
+            settle_group_refinement_wait(st, Some(message));
+            st.notify_error(active_t("notify.rpc_error").replace("{}", message));
+        }
         Some(methods::REVIEW_PREVIEW) => {
             // A refused projection settles the launch it started: the dialog
             // returns with its typed fields and no operation opens (c-3).
@@ -447,6 +515,22 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
         }
         _ => st.notify_error(active_t("notify.rpc_error").replace("{}", message)),
     }
+}
+
+/// A semantic answer can arrive before model/started. Close that locally
+/// launched wait; a streamed turn is settled by its terminal event.
+fn settle_group_refinement_wait(st: &mut AppState, error: Option<&str>) {
+    if st.model.status != TurnStatus::Awaiting || st.running_model.is_some() {
+        return;
+    }
+    st.turn_started_at = None;
+    st.model.status = if error.is_some() {
+        TurnStatus::Error
+    } else {
+        TurnStatus::Done
+    };
+    st.model.error = error.map(str::to_string);
+    st.model.end_in_flight_usage();
 }
 
 /// Settles the squash dialog a request that failed left behind.
@@ -617,20 +701,6 @@ fn apply_model(
     st.set_model_choice(ModelChoice { selection, roles });
 }
 
-/// Applies the authoritative context state and keeps the cursor in range.
-fn apply_context(st: &mut AppState, context: ContextState) {
-    st.context = context;
-    let rows = st.context_view.compute_rows(&st.context.items);
-    if rows.is_empty() {
-        st.context_view.cursor_index = 0;
-    } else if st.context_view.cursor_index >= rows.len() {
-        st.context_view.cursor_index = rows.len() - 1;
-    }
-    if st.context_view.adding_file {
-        st.update_filtered_candidates();
-    }
-}
-
 /// Replaces a plan in the mirrored list or appends it when it is new.
 fn upsert_plan(st: &mut AppState, plan: tauqe_protocol::Plan) {
     match st
@@ -730,9 +800,7 @@ async fn run_follow_ups(
                 }
             }
             FollowUp::ReviewLaunch(pending) => {
-                // The audit starts through the same launch helper the consent
-                // card uses, so an untruncated projection and a confirmed
-                // truncation dispatch the identical request (c-3).
+                // Start the original parameters of the complete projection.
                 let pending = *pending;
                 let st = state.lock().await;
                 if let Err(error) =
@@ -988,6 +1056,107 @@ mod tests {
         ReviewDialogState, ViewMode,
     };
 
+    #[tokio::test]
+    async fn late_context_response_cannot_undo_newer_event_or_handshake_snapshot() {
+        let mut st = crate::app::test_state();
+        st.context.revision = 5; // Initial context/get from the handshake.
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let id = send_request(&mut conn, methods::CONTEXT_GET, serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut is_reasoning = false;
+        let newer = ContextState {
+            revision: 7,
+            items: vec![tauqe_protocol::ContextItem {
+                path: "src/user.rs".into(),
+                access: tauqe_protocol::ContextAccess::ReadOnly,
+                layer: tauqe_protocol::ContextLayer::User,
+                size_bytes: 12,
+                estimated_tokens: 3,
+                insertion_seq: 1,
+            }],
+            total_estimated_tokens: 3,
+        };
+        super::super::events::handle_event(
+            tauqe_protocol::Event {
+                method: tauqe_protocol::events::CONTEXT_CHANGED.into(),
+                params: Some(serde_json::json!({ "state": newer })),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        for revision in [4, 7, 6] {
+            handle_response(
+                Response::ok_typed(
+                    RequestId::Number(id),
+                    &ContextState {
+                        revision,
+                        items: Vec::new(),
+                        total_estimated_tokens: 0,
+                    },
+                ),
+                &state,
+                &mut conn,
+            )
+            .await;
+            // A fresh tracked request exercises the response path each time.
+            if revision != 6 {
+                let next = send_request(&mut conn, methods::CONTEXT_GET, serde_json::json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(next, id + u64::from(revision == 7) + 1);
+            }
+        }
+        assert_eq!(state.lock().await.context, newer);
+    }
+
+    #[tokio::test]
+    async fn context_mutation_responses_share_the_event_revision() {
+        let mut st = crate::app::test_state();
+        st.context.revision = 3;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let methods = [
+            methods::CONTEXT_GET,
+            methods::CONTEXT_ADD,
+            methods::CONTEXT_REMOVE,
+            methods::CONTEXT_CLEAR,
+            methods::CONTEXT_SET_ACCESS,
+            methods::CONTEXT_ADD_PATTERN,
+        ];
+        for (index, method) in methods.into_iter().enumerate() {
+            let revision = 4 + index as u64;
+            let snapshot = ContextState {
+                revision,
+                items: Vec::new(),
+                total_estimated_tokens: 0,
+            };
+            let id = send_request(&mut conn, method, serde_json::json!({}))
+                .await
+                .unwrap();
+            let value = if method == methods::CONTEXT_ADD_PATTERN {
+                serde_json::to_value(ContextAddPatternResult {
+                    added_count: 0,
+                    added_tokens: 0,
+                    truncated: false,
+                    state: snapshot,
+                })
+                .unwrap()
+            } else {
+                serde_json::to_value(snapshot).unwrap()
+            };
+            handle_response(
+                Response::ok(RequestId::Number(id), value),
+                &state,
+                &mut conn,
+            )
+            .await;
+            assert_eq!(state.lock().await.context.revision, revision, "{method}");
+        }
+    }
+
     /// Answers a pending review projection through the response handler.
     async fn deliver_preview(
         state: &Arc<Mutex<AppState>>,
@@ -1050,14 +1219,12 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(guard.modals.pending_review_launch.is_none());
-        assert!(guard.modals.confirm_review_truncation.is_none());
         assert!(guard.review.running);
     }
 
-    /// A truncated window asks for consent with the full counters and opens no
-    /// audit until the developer answers (c-3).
+    /// An obsolete server cannot launch a budget-truncated subset.
     #[tokio::test]
-    async fn a_truncated_projection_opens_the_consent_card() {
+    async fn a_truncated_projection_restores_the_launch_dialog() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.modals.pending_review_launch = Some(pending_launch("crates/"));
@@ -1082,19 +1249,21 @@ mod tests {
         )
         .await;
 
+        let payload = String::from_utf8(conn.written().to_vec()).unwrap();
+        assert!(!payload.contains("review/start"), "{payload}");
         let guard = state.lock().await;
-        let target = guard
-            .modals
-            .confirm_review_truncation
-            .as_ref()
-            .expect("the truncated window asks for consent");
-        assert_eq!(target.window.omitted_files, 5);
-        assert_eq!(target.window.omitted_by_budget, 5);
-        assert_eq!(target.window.files_token_budget, 60_000);
         assert!(guard.modals.pending_review_launch.is_none());
-        assert_eq!(guard.active_modal(), Some(ActiveModal::ReviewTruncation));
+        assert_eq!(guard.active_modal(), Some(ActiveModal::Review));
+        assert_eq!(
+            guard.modals.review_dialog.as_ref().unwrap().path_inputs[0].get_text(),
+            "crates/"
+        );
         assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
-        assert!(!guard.review.running, "a pending consent opens no audit");
+        assert!(!guard.review.running);
+        assert_eq!(
+            guard.active_notification().unwrap().text,
+            active_t("notify.review_preview_truncated")
+        );
     }
 
     /// A refused projection restores the launch dialog with its typed fields
@@ -1123,7 +1292,6 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(guard.modals.pending_review_launch.is_none());
-        assert!(guard.modals.confirm_review_truncation.is_none());
         let dialog = guard
             .modals
             .review_dialog

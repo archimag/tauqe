@@ -4,7 +4,7 @@ Research is the phase that converts "the task depends on a contract I have not
 read" into verified knowledge. It widens the working set through typed requests,
 runs each request deterministically over tracked files or over the external
 documentation the project declares, and keeps every finding available for the rest
-of the turn. It is bounded by rounds, budgets, and request caps, so exploration
+of the turn. It is bounded by rounds and resource guards, so exploration
 always terminates.
 
 ---
@@ -25,16 +25,17 @@ chapter, mount a declared external document.
 Manual context logistics is a failure mode, not a workflow. The developer states
 the task; the model asks for what it lacks; the harness decides whether the request
 names tracked material or a declared external source, whether it fits the budget,
-and whether the round cap still allows it.
+and whether the round cap still allows it. Complete-request admission, not a
+separate file allowance, determines whether the next provider call fits.
 
 ### 1.3 The invariants
 
 1. **Declared material only.** Research reads tracked files, the harness-owned
    sandboxes, and the external documents the project declares in `[[outer_docs]]`.
    An unknown path becomes explicit "not found" feedback instead of a guess.
-2. **Every round is bounded.** Each round spends one unit of the turn pool
-   (`repl.max_turn_rounds`), and searches, outines, listings, and the single
-   context token budget carry configured ceilings of their own.
+2. **Admitted rounds are bounded.** Provider calls spend the turn's
+   `repl.max_turn_rounds` pool. Searchable bytes, snapshot sizes, and process
+   time have separate resource guards, not hidden input-size quotas.
 3. **Deterministic execution.** Searches run in Rust over tracked files, outlines
    come from Tree-sitter, documentation comes from embedded chapters, and a
    declared document is materialized from its declared source exactly once.
@@ -43,7 +44,8 @@ and whether the round cap still allows it.
    follows the boundary which produced them.
 5. **The cached prefix does not move.** That feedback extends the sequence at its tail;
    it never rewrites the stable block of the system prompt.
-6. **A breach halts with a diagnostic.** No budget silently drops a requested file.
+6. **A breach is explicit.** Complete-input overflow refuses the next request
+   before the provider call without dropping requested files.
 7. **The phase is deterministic; the content is generative.** The model chooses
    what to ask for, never which stage runs next.
 8. **A refusal keeps its audience.** A trust decision of the developer's
@@ -127,20 +129,14 @@ The phase obeys these ceilings:
 | Bound | Setting or constant | Default |
 | --- | --- | --- |
 | Rounds per turn, shared with every other round of the turn | `repl.max_turn_rounds` | 16 |
-| Aggregate context tokens | `context.token_budget` | 300,000 |
-| Outline tokens | `context.repomap_token_budget` | 4,000 |
-| Searches per round | `context.max_search_requests_per_round` | 5 |
-| Matching files reported | `context.max_matched_files_per_search` | 50 |
+| Complete serialized provider input | `request.max_input_tokens` | see the shipped archetype |
 | Searchable file size | `MAX_SEARCHABLE_FILE_SIZE` | 2 MiB |
 | Searchable text per round | `MAX_SEARCHABLE_CORPUS_BYTES` | 64 MiB |
-| Targeted outlines per round | `context.max_repo_map_requests_per_round` | 3 |
-| Directory listing entries | `context.max_dir_list_entries` | 100 |
-| Project command output | `context.max_feedback_chars` | 4,000 |
-| Turn scratchpad block | `context.max_scratchpad_chars` | 4,000 |
 | One materialized snapshot | `MAX_DOCUMENT_BYTES` | 4 MiB |
 
-A project raises a ceiling in `tauqe.toml` or in a `tauqe.d` module instead of
-recompiling the engine.
+Input is estimated as `ceil(serialized provider input bytes / 4)`, including
+the response schema and adapter framing, not counted by the provider tokenizer.
+Corpus and snapshot byte guards protect host resources, not input slices.
 
 ---
 
@@ -156,8 +152,8 @@ recompiling the engine.
    with an inspection-failure feedback block.
 4. Every registered handler that owns at least one command executes in dispatch
    order and folds its findings into one outcome.
-5. A token breach stops the dispatcher immediately: later handlers are not run
-   against a context that was never widened.
+5. Findings are retained without a separate context-token gate; admission
+   measures the complete next request before provider execution.
 6. The outcome reports whether the round made progress, and the turn either asks
    again or proceeds to proposal while the round budget lasts.
 
@@ -169,10 +165,8 @@ that fails becomes a missing-file diagnostic. A path whose current access alread
 satisfies the request becomes an "already satisfied" note instead of a duplicate
 addition.
 
-Candidate additions are priced as their estimated content plus the wrapper each
-`<file>` element renders, and compared with the remaining context token budget; the
-number of files a round admits has no separate ceiling. A breach rejects the whole
-addition set and reports the current, requested, and allowed amounts. Additions
+The number of files a round admits has no separate ceiling or token allowance.
+The complete subsequent request is measured before a provider call. Additions
 land in the Auto layer, upgrade access when needed, and never duplicate a pinned
 file.
 
@@ -192,9 +186,8 @@ A search is a Rust regular expression over tracked files, never a disk scan:
 - A symlink escaping the repository is skipped.
 - The requested path is a component scope: the root, one directory, or one file.
 - Absolute paths, `..` components, and NUL bytes are rejected.
-- At most five searches are executed per round; further queries return a limit
-  diagnostic.
-- At most fifty matching files are reported; the remainder is counted.
+- Search results are retained rather than clipped to an independent input-size
+  allowance.
 - Results are sorted by hit count and then by path, so the same query yields the
   same block.
 - A round retains at most `MAX_SEARCHABLE_CORPUS_BYTES` (64 MiB) of searchable
@@ -210,13 +203,13 @@ that names the limitation instead of an opaque engine error.
 
 - `repo_dirs: true` renders the tracked folder tree and marks pinned files. It is the
   navigation view when the eager symbol map is disabled.
-- `repo_maps` renders one subtree's symbols within the outline budget. The target
+- `repo_maps` renders one subtree's symbols without an outline budget. The target
   is matched on whole path components; an unknown prefix yields an explanatory
-  block; at most three distinct targets are honored per round.
+  block.
 - `dir_lists` (`path`, `recursive`) lists tracked files. With `recursive: false` it
   reports the direct files and the names of direct subdirectories with a trailing
   slash; with `recursive: true` it reports every tracked file under the prefix. A
-  listing is capped at 100 entries, and the block states how many entries were
+  listing is returned without an independent input-size cap.
 
 ### 3.5 Declared external documents
 
@@ -260,8 +253,8 @@ Materialization has a fixed sequence:
 - the bytes are validated as UTF-8 and land through the atomic replacement, so a
   reader observes either the previous complete snapshot or the new one.
 
-A document a round requested enters the context read-only, priced exactly like a
-repository file, and remains resident for every later round of the same task. It is released
+A document a round requested enters the context read-only and remains resident
+for every later round of the same task. It is released
 together with the files a round discovered once the turn's change set is committed or the
 isolated step ends. A plan step declares the same kind of document through the `outer_docs`
 field of its leaf, and the harness mounts it before the step turn starts (*Local Plans*).
@@ -350,11 +343,10 @@ diagnostic and lets the model correct itself:
 - an invalid regex names the dialect limitation;
 - an invalid search path names the traversal or absolute-path rule;
 - an empty targeted outline names the requested prefix;
-- a breached budget names the three token amounts;
+- an oversized complete request reports its estimate and limit before a provider call;
 - an uninspectable repository returns a feedback block stating that repository
   facts are unavailable instead of reporting every requested file as missing, and
   the failed listing leaves a warn record;
-- a listing over the cap states how many entries were omitted;
 - a refused declared document names the developer's decision and the declaration
   that would authorize the source, and forbids a retry inside the turn;
 - a failed delivery states what the harness could not obtain and still allows the
@@ -383,12 +375,13 @@ keeps asking for what it already holds cannot loop forever.
   Auto layer; outlines, searches, and documentation live in the journal.
 - **It is not persistent history.** The journal is turn-scoped and discarded when
   the turn ends.
-- **It is not unbounded.** Rounds, queries, outlines, listings, and tokens all have
-  configured ceilings.
+- **It is not unbounded.** Rounds and host resource use are guarded; the
+  complete input has one configured size limit.
 - **It is not a branch of the proposal.** A research round carries discovery
   commands only; a round that proposes a change set carries none, and a mixed
   round is a protocol defect the turn resolves in favor of its change set.
-- **It is not silent truncation.** Every cap is reported in the feedback block.
+- **It is not silent truncation.** Accepted findings stay intact; an oversized
+  next request is refused before provider execution.
 - **It is not a replacement for curation.** Loading known files up front removes
   rounds and spends fewer tokens.
 - **It is not a network client on demand.** Reading a declaration fetches nothing;

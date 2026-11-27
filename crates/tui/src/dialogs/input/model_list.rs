@@ -270,7 +270,7 @@ impl ModelListDialog for ConfirmExecuteReviewState {
     }
 
     fn is_editor_focused(&self) -> bool {
-        self.focus.is_instructions_editor()
+        self.is_single_target() && self.focus.is_instructions_editor()
     }
 
     fn is_actions_focused(&self) -> bool {
@@ -278,15 +278,16 @@ impl ModelListDialog for ConfirmExecuteReviewState {
     }
 
     fn cycle_focus_next(&mut self) {
-        self.focus.cycle_next(self.selector.len());
+        ConfirmExecuteReviewState::cycle_focus_next(self);
     }
 
     fn cycle_focus_prev(&mut self) {
-        self.focus.cycle_prev(self.selector.len());
+        ConfirmExecuteReviewState::cycle_focus_prev(self);
     }
 
     fn instructions_editor(&mut self) -> Option<&mut InputEditor> {
-        Some(&mut self.instructions_editor)
+        self.is_single_target()
+            .then_some(&mut self.instructions_editor)
     }
 }
 

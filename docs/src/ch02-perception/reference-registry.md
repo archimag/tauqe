@@ -104,9 +104,9 @@ repository able to authorize itself would have no boundary at all.
     and it is released together with the Auto layer on the commit of a turn's change set and
     at the boundary of an isolated step, so a snapshot outlives neither the change set it
     served nor the step that requested it.
-13. **Pricing is shared.** A document costs its content plus the wrapper its own `<file>`
-    element renders, under the single `[context].token_budget` ceiling; the layer has no
-    ceiling of its own and evicts nothing.
+13. **Admission is shared.** A document's rendered content counts in the complete
+    provider input under `request.max_input_tokens`; the layer has no separate
+    size allowance and evicts nothing.
 14. **A defect invalidates the declaration.** Configuration validation refuses a
     declaration carrying an unusable entry, a duplicate `id`, or a blank title, and
     reports the reason, so a turn never starts against a declaration the harness could
@@ -448,15 +448,16 @@ access is coerced to read-only whatever the request asked for.
 
 The document then enters the dedicated OuterDocs layer:
 
-- the file must exist, and its cost is estimated from its size like any other context
-  entry: its content plus the wrapper its own `<file>` element renders;
+- the file must exist; its rendered content counts in the complete provider input;
 - the layer stores the logical path of the document and resolves it against the cache root
   whenever it reads, measures, or prunes the snapshot, so the `<file>` element, the prompt
   manifest, and the interface carry `mylib/architecture.md` while the
   `.tauqe/cache/outer_docs/` directory stays inside the storage substrate;
-- it competes with the repository files for the single `[context].token_budget` ceiling
-  (300,000 tokens by default). A request that would breach that ceiling is refused whole,
-  naming every path it asked for, and the snapshot stays in the cache for a later round;
+- it joins repository files under `request.max_input_tokens` admission of the
+  complete serialized provider input, including response schema and adapter
+  framing. The estimate is `ceil(serialized_request_bytes / 4)`, not an exact
+  provider token count. Overflow refuses the request before a provider call
+  without deleting the cached snapshot or truncating admitted context;
 - the layer applies no ceiling of its own, keeps every admitted document, and never evicts
   by recency;
 - a repeated request changes nothing: no rendered byte changes, and the context revision
@@ -583,9 +584,9 @@ so refreshing is an explicit act rather than a background policy.
   commit, a post-hook capture, or the paths the verification command receives.
 - **It is not a merge layer.** Two entries that share an `id` are refused, not reconciled:
   the harness never guesses which of two documents should answer a request.
-- **It is not a per-layer budget.** There is no separate external-document ceiling, no
-  eviction order, and no recency ranking: a document costs what every other context entry
-  costs and lives exactly as long as the transient context that admitted it.
+- **It is not a per-layer budget.** There is no external-document size
+  allowance, eviction order, or recency ranking: only the complete provider
+  input is admitted, while transfer byte guards protect host resources.
 - **It is not durable state the harness protects.** The cache is expendable. Deleting it
   costs one materialization per document, never a lost declaration, and the context entry
   that named it is transient anyway: a committed change set releases it exactly as it

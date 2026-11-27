@@ -4,12 +4,14 @@ pub(crate) mod discussion_prompt;
 
 mod infrastructure;
 pub(crate) use infrastructure::execution::{
-    ArchitectResearchExecution, BoundExecution, CompactionEnvironment, ExecutionSession,
-    PlanExecutionEnvironment, StructuredExecution,
+    ArchitectResearchExecution, BoundExecution, ExecutionSession, PlanExecutionEnvironment,
+    StructuredExecution,
 };
 #[cfg(test)]
 pub(crate) use infrastructure::execution::{ExecutionEnvironment, ExecutionFactory};
-pub(crate) use infrastructure::structured_task;
+// Scenario migrations will consume the prepared accounting scope incrementally.
+#[allow(dead_code)]
+pub(crate) mod execution_scope;
 pub(crate) mod operation;
 pub(crate) mod session;
 
@@ -33,6 +35,7 @@ mod history_compaction;
 pub(crate) mod history_operation;
 
 pub(crate) mod context;
+mod context_publication;
 
 pub(crate) mod context_operation;
 
@@ -94,7 +97,6 @@ impl crate::api::Application {
         crate::workflows::architect::run_contour(
             &self.execution_session(),
             self.context_session(),
-            self.usage_session(),
             operation,
             &environment,
             work,

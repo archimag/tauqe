@@ -4,24 +4,26 @@ use super::AuditResources;
 use crate::api::OperationGuard;
 use crate::application::documents::Documents;
 use crate::application::review_observer::ReviewObserver;
-use crate::application::structured_task::{self, StructuredTaskError};
+use crate::application::usage_totals::UsageReceipt;
 use crate::application::PlanExecutionEnvironment;
 use crate::workflows::architect::ArchitectScope;
+use crate::workflows::structured::{self, StructuredFailure};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
-use tauqe_core::execution::structured::StructuredError;
 use tauqe_core::models::ModelSelection;
 use tauqe_core::providers::{ChatMessage, StreamEvent};
 use tauqe_core::review::build_review_user_prompt;
 use tauqe_core::review::parser::group_review_contract;
 use tauqe_core::review::stream::ReviewStreamUpdate;
-use tauqe_core::review::window::{expand_window, WindowBudgets, WindowContext};
+use tauqe_core::review::window::expand_window;
 use tauqe_core::review::{ReviewGroup, ReviewSession};
+use tauqe_core::stop::HardCancellation;
 use tauqe_core::workflow::batch::{
-    BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome,
+    BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepReport, BatchStepStatus,
+    BatchStop, BatchUsage, QueueInterruption, SoftStopPolicy,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 #[async_trait]
 pub trait GroupAuditObserver: ReviewObserver {
@@ -62,7 +64,6 @@ struct GroupAuditExecutor<'a> {
     groups: &'a [ReviewGroup],
     environment: &'a PlanExecutionEnvironment,
     selection: &'a ModelSelection,
-    budgets: WindowBudgets,
     /// Registered operation, so a stalled streamed call can be aborted by the
     /// hard-cancel watchdog instead of outliving its turn.
     operation: &'a Arc<OperationGuard>,
@@ -70,6 +71,10 @@ struct GroupAuditExecutor<'a> {
     operation_id: String,
     /// Next item ordinal, kept unique across groups.
     next_item_id: u32,
+    /// Receipt is retained even when decoding fails or cancellation wins.
+    completed_receipt: Option<UsageReceipt>,
+    last_receipt: Option<UsageReceipt>,
+    domain_failure: bool,
 }
 
 impl GroupAuditExecutor<'_> {
@@ -79,33 +84,20 @@ impl GroupAuditExecutor<'_> {
     async fn audit_group(
         &mut self,
         group: &ReviewGroup,
-        cancel_rx: &mut watch::Receiver<bool>,
+        cancel_rx: &HardCancellation,
     ) -> Result<usize, GroupFailure> {
         // The group audit expands its declared paths through the same shared
         // projection the plain launch and the read-only preview consume, so a
-        // preset never applies its own selection order or its own limits
+        // preset never applies its own selection order or truncation rules
         // (#c-1, #c-5).
-        let expanded = expand_window(
-            self.repo_root,
-            WindowContext::empty(),
-            &group.paths,
-            self.budgets,
-        )
-        .await
-        .map_err(|error| GroupFailure::Infrastructure(error.to_string()))?;
+        let expanded = expand_window(self.repo_root, None, &group.paths)
+            .await
+            .map_err(|error| GroupFailure::Infrastructure(error.to_string()))?;
 
         self.observer
             .group_started(group, expanded.files.len(), expanded.estimated_tokens);
-        if *cancel_rx.borrow() {
+        if cancel_rx.is_cancelled() {
             return Err(GroupFailure::Cancelled);
-        }
-        if expanded.window.omitted_by_budget > 0 {
-            tracing::warn!(
-                review_id = self.session.id.as_str(),
-                group_id = group.id.as_str(),
-                omitted = expanded.window.omitted_by_budget,
-                "review group expansion exhausted the configured file token budget; remaining matched files were not loaded"
-            );
         }
         if expanded.files.is_empty() {
             return Err(GroupFailure::Domain(format!(
@@ -131,103 +123,72 @@ impl GroupAuditExecutor<'_> {
             .await
             .map_err(|error| GroupFailure::Infrastructure(error.to_string()))?;
 
-        // The guard opens the accounting window before the provider call so the
-        // group reports both the usage the provider returns and the duration the
-        // harness measures itself.
-        let publisher = Arc::clone(&self.observer);
-        let usage_guard = self
-            .resources
-            .usage
-            .begin(
-                &self.resources.context,
-                &self.operation_id,
-                move |id, snapshot| publisher.publish_usage_totals(id, snapshot),
-            )
-            .await;
-
         // Each group owns a fresh request. The structured contract filters JSON
         // and decodes findings; only reasoning is shown during a group audit.
-        let result = structured_task::run_with_session(
+        let publisher = Arc::clone(&self.observer);
+        let pacing_cancel = self.operation.hard_cancellation();
+        let completed = structured::run_bound(
             &self.resources.execution,
+            &self.resources.context,
             self.operation,
             &execution,
             group_review_contract(),
             messages,
             &self.operation_id,
             self.exit_deadline,
+            move |id, snapshot| publisher.publish_usage_totals(id, snapshot),
             |event| {
                 let observer = &self.observer;
-                let usage = &usage_guard;
-                let mut pacing_cancel = cancel_rx.clone();
+                let pacing_cancel = pacing_cancel.clone();
                 async move {
-                    observer.pace(&event, &mut pacing_cancel).await;
-                    match event {
-                        StreamEvent::Usage(reported) => usage.observe(&reported).await,
-                        StreamEvent::ReasoningDelta(delta) => {
-                            observer.publish(ReviewStreamUpdate::Reasoning(delta))
-                        }
-                        _ => {}
+                    observer.pace(&event, &pacing_cancel).await;
+                    if let StreamEvent::ReasoningDelta(delta) = event {
+                        observer.publish(ReviewStreamUpdate::Reasoning(delta));
                     }
                 }
             },
         )
         .await;
 
-        // Account for the tokens, cost, and duration the group consumed before
-        // any early return, so a failed or cancelled group is still charged.
-        // Every report was already folded into the window as it arrived, so the
-        // flush below charges the whole group instead of its last report alone.
-        usage_guard.flush().await;
-        let usage_snapshot = self.resources.usage.snapshot().await;
-        // Both totals are read from the authoritative ledger: the operation scope
-        // the flush just closed and the session scope it was folded into.
-        self.observer.publish_usage(&usage_snapshot);
+        let (result, receipt) = completed.map_err(|error| match error.classify("group audit") {
+            StructuredFailure::Cancelled => GroupFailure::Cancelled,
+            StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                GroupFailure::Infrastructure(message)
+            }
+            StructuredFailure::InputLimit(limit) => GroupFailure::Infrastructure(limit.to_string()),
+            StructuredFailure::Empty => {
+                GroupFailure::Infrastructure("Group audit supervisor returned no result".into())
+            }
+        })?;
+        self.observer.publish_usage(&receipt.snapshot);
+        self.completed_receipt = Some(receipt);
 
-        if *cancel_rx.borrow() {
+        if cancel_rx.is_cancelled() {
             return Err(GroupFailure::Cancelled);
         }
         let mut findings = match result {
             Ok(findings) => findings,
-            Err(
-                StructuredTaskError::Cancelled
-                | StructuredTaskError::Request(StructuredError::Cancelled),
-            ) => {
-                return Err(GroupFailure::Cancelled);
-            }
-            Err(StructuredTaskError::Request(StructuredError::Empty)) => {
-                return Err(GroupFailure::Domain(format!(
-                    "Model returned an empty review for group '{}'",
-                    group.title
-                )));
-            }
-            Err(StructuredTaskError::Request(StructuredError::Decode(error))) => {
-                return Err(GroupFailure::Domain(format!(
-                    "Review group '{}' returned an unparsable payload: {error}",
-                    group.title
-                )));
-            }
-            Err(
-                StructuredTaskError::Stream(error)
-                | StructuredTaskError::Task(error)
-                | StructuredTaskError::Request(StructuredError::Failed(error)),
-            ) => {
-                return Err(GroupFailure::Infrastructure(error));
-            }
-            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
-                return Err(GroupFailure::Infrastructure(
-                    "Structured request closed without Done".into(),
-                ));
-            }
-            Err(StructuredTaskError::ForeignOperation) => {
-                return Err(GroupFailure::Infrastructure(
-                    "group audit requires an active operation for this session".into(),
-                ));
-            }
-            Err(StructuredTaskError::Orphaned) => {
-                return Err(GroupFailure::Infrastructure(
-                    "review group task did not stop within its exit deadline".into(),
-                ));
-            }
+            Err(error) => match error.classify("group audit") {
+                StructuredFailure::Cancelled => return Err(GroupFailure::Cancelled),
+                StructuredFailure::Empty => {
+                    return Err(GroupFailure::Domain(format!(
+                        "Model returned an empty review for group '{}'",
+                        group.title
+                    )));
+                }
+                StructuredFailure::Decode(error) => {
+                    return Err(GroupFailure::Domain(format!(
+                        "Review group '{}' returned an unparsable payload: {error}",
+                        group.title
+                    )));
+                }
+                StructuredFailure::Failed(error) => {
+                    return Err(GroupFailure::Infrastructure(error))
+                }
+                StructuredFailure::InputLimit(error) => {
+                    return Err(GroupFailure::Infrastructure(error.to_string()))
+                }
+            },
         };
 
         // Item identifiers are unique across the whole session: the parser
@@ -271,8 +232,10 @@ impl BatchStepExecutor for GroupAuditExecutor<'_> {
         &mut self,
         step: &BatchStep,
         _stream_tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> anyhow::Result<BatchStepOutcome> {
+        self.completed_receipt = None;
+        self.domain_failure = false;
         // The slice is a shared reference with its own lifetime, so the lookup
         // result does not borrow the executor and `audit_group` can take `&mut self`.
         let groups = self.groups;
@@ -283,24 +246,23 @@ impl BatchStepExecutor for GroupAuditExecutor<'_> {
             )));
         };
 
-        let outcome = match self.audit_group(group, &mut cancel_rx).await {
+        let outcome = match self.audit_group(group, &cancel_rx).await {
             Ok(findings) => {
                 self.observer.group_finished(group, findings, None);
                 BatchStepOutcome::succeeded()
             }
             Err(GroupFailure::Domain(reason)) => {
-                // A domain failure is confined to its own group: the terminal
-                // event carries the diagnostic and the step reports success, so
-                // the supervisor advances to the next group instead of
-                // invalidating work the other groups can still complete.
+                self.domain_failure = true;
+                // The local failure is real even though independent groups can
+                // still run. Continuation is decided by the audit queue below.
                 tracing::warn!(
                     review_id = self.session.id.as_str(),
                     group_id = group.id.as_str(),
                     reason = %reason,
                     "review group audit failed; the batch continues"
                 );
-                self.observer.group_finished(group, 0, Some(reason));
-                BatchStepOutcome::succeeded()
+                self.observer.group_finished(group, 0, Some(reason.clone()));
+                BatchStepOutcome::failed(reason)
             }
             Err(GroupFailure::Infrastructure(reason)) => {
                 tracing::error!(
@@ -324,7 +286,14 @@ impl BatchStepExecutor for GroupAuditExecutor<'_> {
                 BatchStepOutcome::cancelled()
             }
         };
-        Ok(outcome)
+        Ok(match self.completed_receipt.take() {
+            Some(receipt) => {
+                let usage = receipt.batch_usage();
+                self.last_receipt = Some(receipt);
+                outcome.with_usage(usage)
+            }
+            None => outcome,
+        })
     }
 }
 
@@ -336,7 +305,7 @@ pub(super) async fn run_group_audits(
     operation: Arc<OperationGuard>,
     observer: Arc<dyn GroupAuditObserver>,
     exit_deadline: std::time::Duration,
-) -> Result<BatchReport, String> {
+) -> Result<(BatchReport, Option<UsageReceipt>), String> {
     let (environment, selection) = binding;
     if !resources.execution.owns(&operation) {
         return Err("group audit requires an active operation for this session".into());
@@ -347,9 +316,6 @@ pub(super) async fn run_group_audits(
         .map(|group| BatchStep::new(group.id.clone(), group.title.clone()))
         .collect();
 
-    let budgets = WindowBudgets {
-        files_tokens: environment.config().context.token_budget,
-    };
     let mut executor = GroupAuditExecutor {
         resources,
         observer,
@@ -360,7 +326,6 @@ pub(super) async fn run_group_audits(
         groups: &groups,
         environment,
         selection,
-        budgets,
         operation: &operation,
         operation_id: operation.publication_id(),
         next_item_id: session
@@ -370,18 +335,58 @@ pub(super) async fn run_group_audits(
             .max()
             .unwrap_or(0)
             .saturating_add(1),
+        completed_receipt: None,
+        last_receipt: None,
+        domain_failure: false,
     };
 
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
-    // The batch borrows the caller's registered operation, so a cancellation
-    // delivered between groups stops the queue and a soft stop drains it after the
-    // group that is already running — the engine's supervisor semantics.
-    let cancel_rx = operation.cancel_receiver();
-    let soft_stop_rx = operation.soft_stop_receiver();
-
-    let report = BatchExecution::new()
-        .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
-        .await;
+    // Unlike a fail-fast implementation batch, a review audit continues after
+    // a local group failure. Keep the outcome in the report rather than
+    // converting it into success to obtain that continuation.
+    let cancel_rx = operation.hard_cancellation();
+    let stop_token = operation.stop_token();
+    let mut report = BatchReport {
+        executed: Vec::with_capacity(steps.len()),
+        scheduled: steps.len(),
+        stop: BatchStop::Completed,
+        usage: BatchUsage::default(),
+    };
+    for step in &steps {
+        if let Some(interruption) =
+            QueueInterruption::before_next(stop_token.state(), SoftStopPolicy::Observe)
+        {
+            report.stop = match interruption {
+                QueueInterruption::Cancelled => BatchStop::Cancelled,
+                QueueInterruption::Stopped => BatchStop::Stopped,
+            };
+            break;
+        }
+        let outcome = executor
+            .execute_step(step, stream_tx.clone(), cancel_rx.clone())
+            .await
+            .unwrap_or_else(|error| BatchStepOutcome::failed(error.to_string()));
+        report.usage.accumulate_outcome(&outcome);
+        let status = outcome.status;
+        report.executed.push(BatchStepReport {
+            id: step.id.clone(),
+            outcome,
+        });
+        match status {
+            BatchStepStatus::Succeeded => {}
+            BatchStepStatus::Failed if executor.domain_failure => {}
+            BatchStepStatus::Cancelled => {
+                report.stop = BatchStop::Cancelled;
+                break;
+            }
+            _ => {
+                report.stop = BatchStop::Failed {
+                    step_id: step.id.clone(),
+                };
+                break;
+            }
+        }
+    }
 
     tracing::info!(
         review_id = session.id.as_str(),
@@ -392,5 +397,5 @@ pub(super) async fn run_group_audits(
         "review group batch finished"
     );
 
-    Ok(report)
+    Ok((report, executor.last_receipt))
 }

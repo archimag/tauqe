@@ -145,6 +145,60 @@ async fn deleting_a_document_releases_only_its_own_focus() {
     );
 }
 #[tokio::test]
+async fn initial_review_horizon_adapter_preserves_typed_outcomes() {
+    use tauqe_core::models::{ArchitectTier, ModelRef};
+    use tauqe_core::plan::PlanItem;
+    use tauqe_core::review::storage::{InitialGroupHorizon, InitialGroupHorizonError};
+    use tauqe_core::review::{ReviewGroup, ReviewGroupKind};
+
+    let root = tempfile::tempdir().unwrap();
+    let app = application(root.path());
+    let documents = app.documents_at(root.path());
+    let session = ReviewSession {
+        id: "review".into(),
+        groups: vec![ReviewGroup {
+            id: "arch".into(),
+            kind: ReviewGroupKind::Architectural,
+            blocked_reason: Some("old".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root.path(), &session).unwrap();
+    let tier = ArchitectTier::from(ModelRef::openrouter("test/architect"));
+    assert!(matches!(
+        documents
+            .write_initial_group_horizon("review", "arch", vec![], tier.clone())
+            .await,
+        Err(InitialGroupHorizonError::EmptyHorizon)
+    ));
+    let step = PlanItem {
+        id: "1".into(),
+        title: "Repair".into(),
+        files: vec!["src/lib.rs".into()],
+        ..Default::default()
+    };
+    assert!(matches!(
+        documents
+            .write_initial_group_horizon("review", "arch", vec![step], tier.clone())
+            .await,
+        Ok(InitialGroupHorizon::Written(_))
+    ));
+    assert!(matches!(
+        documents
+            .write_initial_group_horizon("review", "arch", vec![], tier.clone())
+            .await,
+        Ok(InitialGroupHorizon::Existing(_))
+    ));
+    assert!(matches!(
+        documents
+            .write_initial_group_horizon("missing", "arch", vec![], tier)
+            .await,
+        Err(InitialGroupHorizonError::MissingTarget { .. })
+    ));
+}
+
+#[tokio::test]
 async fn replan_checks_target_and_done_immutability_before_any_mutation() {
     let root = tempfile::tempdir().unwrap();
     let app = application(root.path());

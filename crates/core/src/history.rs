@@ -16,9 +16,9 @@ use self::entry::record_bytes;
 
 pub use compaction::build_compaction_request;
 pub(crate) use compaction::{
-    build_compacted_history, partition_head_tail, DEFAULT_HISTORY_BUDGET_TOKENS,
-    DEFAULT_TAIL_TURNS_COUNT,
+    build_compacted_history, partition_head_tail, DEFAULT_TAIL_TURNS_COUNT,
 };
+pub use compaction::{CompactionOutcome, PreparedCompaction};
 pub use entry::HistoryEntry;
 pub use storage::SessionStorage;
 
@@ -123,6 +123,7 @@ fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct HistoryManager {
     storage: SessionStorage,
+    budget_tokens: usize,
     listener: Option<HistoryEntryListener>,
     current_max_id: u64,
     /// Bytes the persisted journal occupies, maintained as the manager mutates it.
@@ -136,7 +137,7 @@ pub struct HistoryManager {
 }
 
 impl HistoryManager {
-    pub fn new(repo_root: PathBuf) -> Self {
+    pub fn new(repo_root: PathBuf, budget_tokens: usize) -> Self {
         let storage = SessionStorage::new(repo_root);
         let mut current_max_id = 0;
         let mut journal_bytes = 0;
@@ -157,6 +158,7 @@ impl HistoryManager {
 
         Self {
             storage,
+            budget_tokens,
             listener: None,
             current_max_id,
             journal_bytes,
@@ -282,6 +284,92 @@ impl HistoryManager {
 
     pub fn repo_root(&self) -> &Path {
         self.storage.repo_root()
+    }
+
+    pub fn budget_tokens(&self) -> usize {
+        self.budget_tokens
+    }
+
+    /// Prepare at most one compacted rewrite. The caller may run the Scribe
+    /// while holding no history lock and must compare `original` before writing.
+    /// An active turn, if supplied by a legacy caller, is preserved verbatim;
+    /// normal pre-turn callers pass `None`.
+    pub async fn compact_if_needed<F, Fut, E>(
+        &self,
+        tail_turns: usize,
+        active_turn: Option<u64>,
+        scribe: F,
+    ) -> Result<std::result::Result<CompactionOutcome, E>>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<String, E>>,
+    {
+        let original = self.snapshot()?;
+        let entries = original.entries();
+        let (completed, active) = match active_turn {
+            Some(id) => {
+                let Some((last, completed)) = entries.split_last() else {
+                    anyhow::bail!("History turn {id} is missing");
+                };
+                if !matches!(last, HistoryEntry::Turn { id: Some(found), .. } if *found == id) {
+                    anyhow::bail!("History turn {id} is not the active journal entry");
+                }
+                (completed, Some(last.clone()))
+            }
+            None => (entries, None),
+        };
+        if compaction::entries_tokens(completed) <= self.budget_tokens as u64 {
+            return Ok(Ok(CompactionOutcome::NotNeeded));
+        }
+        let Some((head, tail)) = partition_head_tail(completed, tail_turns) else {
+            return Ok(Ok(CompactionOutcome::BudgetUnreachable));
+        };
+        // Even an empty summary cannot make a retained tail fit.
+        let minimum = build_compacted_history(None, String::new(), tail.clone());
+        if compaction::entries_tokens(&minimum) > self.budget_tokens as u64 {
+            return Ok(Ok(CompactionOutcome::BudgetUnreachable));
+        }
+        let summary = match scribe(build_compaction_request(&head)).await {
+            Ok(summary) => summary,
+            Err(error) => return Ok(Err(error)),
+        };
+        if summary.trim().is_empty() {
+            return Ok(Ok(CompactionOutcome::BudgetUnreachable));
+        }
+        let summary_id = tail
+            .first()
+            .and_then(HistoryEntry::id)
+            .map(|id| id.saturating_sub(1));
+        let mut candidate = build_compacted_history(summary_id, summary, tail);
+        if compaction::entries_tokens(&candidate) > self.budget_tokens as u64 {
+            return Ok(Ok(CompactionOutcome::BudgetUnreachable));
+        }
+        if let Some(active) = active {
+            candidate.push(active);
+        }
+        Ok(Ok(CompactionOutcome::Compacted(PreparedCompaction {
+            original,
+            entries: candidate,
+        })))
+    }
+
+    /// Accept only the candidate prepared from the exact current journal.
+    pub fn accept_compaction(&mut self, prepared: PreparedCompaction) -> Result<HistorySnapshot> {
+        if self.snapshot()? != prepared.original {
+            anyhow::bail!("History changed during compaction");
+        }
+        let summary = match prepared.entries.first() {
+            Some(HistoryEntry::Summary { text, .. }) => text.clone(),
+            _ => anyhow::bail!("Compaction has no summary"),
+        };
+        let tail = prepared.entries.into_iter().skip(1).collect();
+        self.apply_compaction(summary, tail)?;
+        self.snapshot()
+    }
+
+    /// Existing clones retain their budget when the session policy changes.
+    pub fn set_budget_tokens(&mut self, budget_tokens: usize) {
+        self.budget_tokens = budget_tokens;
     }
 
     /// Records a turn prompt without an observed context watermark.
@@ -444,14 +532,6 @@ impl HistoryManager {
         estimate_tokens_from_bytes(self.journal_bytes)
     }
 
-    /// Reports whether the session outgrew `budget_tokens`.
-    ///
-    /// The check reads the maintained estimate, so a session whose turns
-    /// recorded nested rounds reaches the budget exactly as its journal did.
-    pub fn needs_compaction(&self, budget_tokens: u64) -> bool {
-        self.estimated_tokens() > budget_tokens
-    }
-
     /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
     ///
     /// The block comes from the same renderer a turn-scoped
@@ -472,12 +552,37 @@ impl HistoryManager {
     pub fn snapshot(&self) -> Result<HistorySnapshot> {
         Ok(HistorySnapshot::new(self.get_entries()?))
     }
+    /// Freeze completed history without the active turn.
+    pub fn snapshot_before(&self, turn_id: u64) -> Result<HistorySnapshot> {
+        let mut entries = self.get_entries()?;
+        if !matches!(entries.last(), Some(HistoryEntry::Turn { id: Some(id), .. }) if *id == turn_id)
+        {
+            anyhow::bail!("History turn {turn_id} is not the active journal entry");
+        }
+        entries.pop();
+        Ok(HistorySnapshot::new(entries))
+    }
     /// Partitions current history into `(head, tail)` for compaction.
     pub fn prepare_compaction(
         &self,
         keep_tail_turns: usize,
     ) -> Result<Option<(Vec<HistoryEntry>, Vec<HistoryEntry>)>> {
         let entries = self.get_entries()?;
+        Ok(partition_head_tail(&entries, keep_tail_turns))
+    }
+
+    /// Partition completed exchanges without sending the open turn to the Scribe.
+    pub fn prepare_compaction_before(
+        &self,
+        turn_id: u64,
+        keep_tail_turns: usize,
+    ) -> Result<Option<(Vec<HistoryEntry>, Vec<HistoryEntry>)>> {
+        let mut entries = self.get_entries()?;
+        if !matches!(entries.last(), Some(HistoryEntry::Turn { id: Some(id), .. }) if *id == turn_id)
+        {
+            anyhow::bail!("History turn {turn_id} is not the active journal entry");
+        }
+        entries.pop();
         Ok(partition_head_tail(&entries, keep_tail_turns))
     }
 
@@ -551,16 +656,21 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HistoryConfig;
     use crate::history::HistoryFileOperation;
     use std::io::Write;
 
     use tempfile::tempdir;
 
+    fn new_manager(root: PathBuf) -> HistoryManager {
+        HistoryManager::new(root, HistoryConfig::default().budget_tokens)
+    }
+
     #[test]
     fn test_history_manager_flow() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         assert_eq!(hm.format_history_tag().unwrap(), "");
 
@@ -592,7 +702,7 @@ mod tests {
     fn test_history_compaction_flow() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         for i in 1..=4 {
             hm.record_turn(format!("Task {}", i), vec![]).unwrap();
@@ -621,7 +731,7 @@ mod tests {
     fn test_history_manager_rollback_entry() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         let entry1 = hm.record_turn("Task 1", vec![]).unwrap();
         let entry2 = hm.record_turn("Task 2", vec![]).unwrap();
@@ -641,7 +751,7 @@ mod tests {
     fn test_rollback_notifies_typed_record_with_reason() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         let received: Arc<std::sync::Mutex<Vec<HistoryMutation>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -779,7 +889,7 @@ mod tests {
     fn test_history_slice_pagination() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         for i in 1..=5 {
             hm.record_turn(format!("Turn {}", i), vec![]).unwrap();
@@ -841,7 +951,7 @@ mod tests {
         storage.append_entry(&entry2).unwrap();
 
         // Create a new HistoryManager and verify max_id and prompt injection
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
         assert_eq!(hm.current_max_id, 20);
 
         let history_tag = hm.format_history_tag().unwrap();
@@ -856,7 +966,7 @@ mod tests {
     fn test_listener_receives_typed_mutations() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
+        let mut hm = new_manager(root);
 
         let received: Arc<std::sync::Mutex<Vec<HistoryMutation>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -905,7 +1015,7 @@ mod tests {
     fn test_estimated_tokens_does_not_reread_the_journal() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root.clone());
+        let mut hm = new_manager(root.clone());
 
         hm.record_turn("Refactor the parser", vec![]).unwrap();
         hm.record_response("Refactored the parser", None, None, vec![])
@@ -929,14 +1039,14 @@ mod tests {
     fn test_maintained_estimate_matches_a_fresh_derivation() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root.clone());
+        let mut hm = new_manager(root.clone());
 
         for i in 1..=4 {
             hm.record_turn(format!("Task {}", i), vec![]).unwrap();
             hm.record_response(format!("Done {}", i), None, None, vec![])
                 .unwrap();
         }
-        let fresh = || HistoryManager::new(root.clone()).estimated_tokens();
+        let fresh = || new_manager(root.clone()).estimated_tokens();
         assert_eq!(hm.estimated_tokens(), fresh());
 
         let (_, tail) = hm.prepare_compaction(2).unwrap().unwrap();
@@ -987,45 +1097,17 @@ mod tests {
         let storage = SessionStorage::new(root.clone());
 
         storage.append_entry(&turn_with_rounds(Vec::new())).unwrap();
-        let without_rounds = HistoryManager::new(root.clone()).estimated_tokens();
+        let without_rounds = new_manager(root.clone()).estimated_tokens();
         storage.clear().unwrap();
 
         storage
             .append_entry(&turn_with_rounds(vec![round(1), round(2), round(3)]))
             .unwrap();
-        let with_rounds = HistoryManager::new(root).estimated_tokens();
+        let with_rounds = new_manager(root).estimated_tokens();
 
         assert!(
             with_rounds > without_rounds,
             "a turn that recorded rounds costs more than the bare turn: {with_rounds} <= {without_rounds}"
-        );
-    }
-
-    /// The compaction trigger reads the same estimate, so a turn that recorded
-    /// its rounds reaches the budget the bare turn stays below.
-    #[test]
-    fn test_nested_turn_rounds_trigger_compaction_earlier() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let storage = SessionStorage::new(root.clone());
-
-        storage.append_entry(&turn_with_rounds(Vec::new())).unwrap();
-        let bare_budget = HistoryManager::new(root.clone()).estimated_tokens();
-        storage.clear().unwrap();
-        storage
-            .append_entry(&turn_with_rounds(vec![round(1), round(2), round(3)]))
-            .unwrap();
-
-        let mut manager = HistoryManager::new(root.clone());
-        assert!(
-            manager.needs_compaction(bare_budget),
-            "the recorded rounds must count toward the budget"
-        );
-
-        manager.clear().unwrap();
-        assert!(
-            !manager.needs_compaction(bare_budget),
-            "an empty journal is never over budget"
         );
     }
 
@@ -1040,7 +1122,7 @@ mod tests {
             .append_entry(&turn_with_rounds(vec![round(1), round(2)]))
             .unwrap();
 
-        let mut manager = HistoryManager::new(root.clone());
+        let mut manager = new_manager(root.clone());
         let id = manager
             .get_entries()
             .unwrap()
@@ -1057,9 +1139,115 @@ mod tests {
         );
         assert_eq!(manager.estimated_tokens(), 0);
         assert_eq!(
-            HistoryManager::new(root).estimated_tokens(),
+            new_manager(root).estimated_tokens(),
             0,
             "the rewritten journal no longer carries the rounds"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_the_history_budget_boundary() {
+        let dir = tempdir().unwrap();
+        let mut history = HistoryManager::new(dir.path().to_path_buf(), 1);
+        history
+            .record_turn("Earlier task ".repeat(100), vec![])
+            .unwrap();
+        history.record_response("Done", None, None, vec![]).unwrap();
+        history.record_turn("Recent task", vec![]).unwrap();
+        history.record_response("Done", None, None, vec![]).unwrap();
+        let exact = history.estimated_tokens() as usize;
+        for budget in [exact + 1, exact] {
+            history.set_budget_tokens(budget);
+            assert!(matches!(
+                history
+                    .compact_if_needed::<_, _, ()>(1, None, |_| async {
+                        panic!("Scribe must not run")
+                    })
+                    .await
+                    .unwrap(),
+                Ok(CompactionOutcome::NotNeeded)
+            ));
+        }
+        history.set_budget_tokens(exact - 1);
+        assert!(matches!(
+            history
+                .compact_if_needed(1, None, |_| async {
+                    Ok::<_, ()>("Earlier task completed".into())
+                })
+                .await
+                .unwrap(),
+            Ok(CompactionOutcome::Compacted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_refuses_unusable_results_and_stale_adoption() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut history = HistoryManager::new(root.clone(), 1);
+        history
+            .record_turn("Earlier task ".repeat(100), vec![])
+            .unwrap();
+        history.record_response("Done", None, None, vec![]).unwrap();
+        history.record_turn("Recent", vec![]).unwrap();
+        history.record_response("Done", None, None, vec![]).unwrap();
+        let original = history.snapshot().unwrap();
+        assert!(matches!(
+            history
+                .compact_if_needed::<_, _, ()>(2, None, |_| async { panic!("no head") })
+                .await
+                .unwrap(),
+            Ok(CompactionOutcome::BudgetUnreachable)
+        ));
+        assert!(matches!(
+            history
+                .compact_if_needed::<_, _, ()>(1, None, |_| async { panic!("tail cannot fit") })
+                .await
+                .unwrap(),
+            Ok(CompactionOutcome::BudgetUnreachable)
+        ));
+        let minimum = compaction::entries_tokens(&build_compacted_history(
+            None,
+            String::new(),
+            original.entries()[2..].to_vec(),
+        )) as usize;
+        history.set_budget_tokens(minimum + 1);
+        assert!(matches!(
+            history
+                .compact_if_needed(1, None, |_| async { Ok::<_, ()>("  ".into()) })
+                .await
+                .unwrap(),
+            Ok(CompactionOutcome::BudgetUnreachable)
+        ));
+        assert!(matches!(
+            history
+                .compact_if_needed(1, None, |_| async { Ok::<_, ()>("x".repeat(1000)) })
+                .await
+                .unwrap(),
+            Ok(CompactionOutcome::BudgetUnreachable)
+        ));
+        assert!(matches!(
+            history
+                .compact_if_needed(1, None, |_| async { Err::<String, _>("Scribe failed") })
+                .await
+                .unwrap(),
+            Err("Scribe failed")
+        ));
+        assert_eq!(history.snapshot().unwrap(), original);
+        history.set_budget_tokens(history.estimated_tokens() as usize - 1);
+        let outcome = history
+            .compact_if_needed(1, None, |_| async { Ok::<_, ()>("Earlier done".into()) })
+            .await
+            .unwrap()
+            .unwrap();
+        let CompactionOutcome::Compacted(candidate) = outcome else {
+            panic!("expected candidate")
+        };
+        let mut concurrent = HistoryManager::new(root, 100);
+        concurrent
+            .record_response("Concurrent change", None, None, vec![])
+            .unwrap();
+        assert!(history.accept_compaction(candidate).is_err());
+        assert_eq!(history.snapshot().unwrap(), concurrent.snapshot().unwrap());
     }
 }

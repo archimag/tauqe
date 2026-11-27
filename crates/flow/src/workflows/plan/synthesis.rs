@@ -3,36 +3,25 @@ mod replan;
 
 use super::PlanResources;
 use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
-use crate::application::configuration::Configuration;
+use crate::application::configuration::{Configuration, ConfigurationSnapshot};
 use crate::application::documents::Documents;
-use crate::application::structured_task::{self, StructuredTaskError};
-use crate::application::{PlanExecutionEnvironment, StructuredExecution};
-use crate::workflows::architect::{
-    self, publish_architect_started, ArchitectScope, PlanHorizonContour,
+use crate::application::PlanExecutionEnvironment;
+use crate::workflows::architect::refinement::{
+    synthesize_horizon, HorizonSynthesisRequest, WaveFailure,
 };
+use crate::workflows::architect::ArchitectScope;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use replan::{collect_plan_context_files, PlanHorizonError, PlanHorizonFailure};
-use tauqe_core::execution::structured::StructuredError;
-use tauqe_core::models::{ArchitectTier, ModelSelection};
-use tauqe_core::plan::prompt::critique::plan_critique_contract;
-use tauqe_core::plan::prompt::{
-    build_plan_critique_prompt, build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
-    build_plan_reconciliation_prompt, resolve_architect_tier, PlanCritiqueOutput,
-    PlanRefinementOutput, StructuredRefineOutcome, StructuredRefineStatus,
-};
-use tauqe_core::plan::{find_duplicate_item_ids, prompt::format_architect_tier};
+use tauqe_core::models::ModelSelection;
+use tauqe_core::plan::prompt::{build_plan_horizon_system_prompt, build_plan_horizon_user_prompt};
 use tauqe_core::plan::{Plan, PlanItem, PlanSynthesisResult};
-use tauqe_core::providers::{ChatMessage, StreamEvent};
 /// Longest plan title the pipeline derives from developer directives.
 const DERIVED_TITLE_MAX_CHARS: usize = 120;
 
 /// Title of a plan whose directives carry no readable line.
 const FALLBACK_PLAN_TITLE: &str = "Untitled plan";
-
-/// Hint appended to a breached context-budget diagnostic.
-const BUDGET_HINT: &str = "The plan is too broad and should be manually decomposed or scoped down.";
 
 /// One two-phase plan synthesis request.
 ///
@@ -58,58 +47,6 @@ struct TwoPhaseRequest {
     pub creation: bool,
     /// Operation label the run reports in telemetry and session history.
     pub operation_title: &'static str,
-}
-
-/// One Planner beat that produced a horizon the pipeline may issue.
-struct PlannerWave {
-    /// Payload the beat answered with.
-    output: PlanRefinementOutput,
-    /// Architect configuration that produced the payload.
-    tier: ArchitectTier,
-}
-
-/// Category of a beat verdict that issued no horizon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerdictKind {
-    /// The beat refused to plan and stated the exact contradiction.
-    Blocked,
-    /// The beat reported a host condition only the developer can repair.
-    Aborted,
-    /// The beat demanded more context than the configured budget allows.
-    BudgetExceeded,
-}
-
-impl VerdictKind {
-    /// Label the verdict is recorded under in telemetry and session history.
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Blocked => "Blocked",
-            Self::Aborted => "Aborted",
-            Self::BudgetExceeded => "Token Budget Exceeded",
-        }
-    }
-}
-
-/// Terminal failure of a beat that never produced a usable horizon.
-enum WaveFailure {
-    /// The operation was cancelled: the run answers a cancellation.
-    Cancelled,
-    /// The beat could not run at all: a provider or transport failure.
-    Failed(String),
-    /// The beat reported a horizon status without any step.
-    EmptyHorizon,
-    /// The beat reached a typed verdict instead of a horizon.
-    Verdict { kind: VerdictKind, message: String },
-}
-
-/// Terminal failure of the independent critique beat.
-enum CritiqueFailure {
-    /// The operation was cancelled while the critic ran.
-    Cancelled,
-    /// The critic could not run at all: a provider or transport failure.
-    Failed(String),
-    /// The critic answered no payload the response schema accepts.
-    Unreadable(String),
 }
 
 struct Runtime<'a> {
@@ -169,6 +106,49 @@ impl PlanResources {
             .operations
             .begin()
             .map_err(|_| PlanSynthesisError::Busy)?;
+        // Keep the operation and its publication owner alive after the RPC waiter exits.
+        let resources = PlanResources {
+            step: crate::workflows::step::run::StepResources {
+                context: self.step.context.clone(),
+                execution: self.step.execution.clone(),
+            },
+            history: self.history.clone(),
+        };
+        let snapshot = configuration.snapshot().await;
+        tokio::spawn(async move {
+            let context = resources.step.context.clone();
+            let bound = context.activate_manual_publication(&operation, observer.clone());
+            let result = if bound {
+                resources
+                    .synthesize_owned(snapshot, input, observer, exit_deadline, &operation)
+                    .await
+            } else {
+                Err(PlanSynthesisError::Load(
+                    "Could not bind plan synthesis context publication".into(),
+                ))
+            };
+            if bound {
+                if let Err(error) = context.clear_transient_context().await {
+                    tracing::warn!(%error, "Failed to clear plan synthesis context");
+                }
+                context.close_manual_publication(&operation);
+            }
+            result
+        })
+        .await
+        .map_err(|error| {
+            PlanSynthesisError::Load(format!("Plan synthesis supervisor failed: {error}"))
+        })?
+    }
+
+    async fn synthesize_owned(
+        &self,
+        snapshot: ConfigurationSnapshot,
+        input: PlanSynthesisInput,
+        observer: Arc<dyn ApplicationObserver>,
+        exit_deadline: std::time::Duration,
+        operation: &OperationGuard,
+    ) -> Result<PlanSynthesisResult, PlanSynthesisError> {
         let root = self.step.context.repository_root().await;
         let state = Runtime {
             resources: self,
@@ -222,11 +202,10 @@ impl PlanResources {
                 directives,
             } => {
                 let prepared = documents.prepare_plan_replan(plan_id, step_id).await?;
-                let environment =
-                    PlanExecutionEnvironment::new(configuration.snapshot().await, &operation);
+                let environment = PlanExecutionEnvironment::new(snapshot, operation);
                 return Ok(state
                     .execute_plan_horizon(
-                        &operation,
+                        operation,
                         &environment,
                         replan::PlanHorizonRequest {
                             plan: prepared.plan,
@@ -243,34 +222,23 @@ impl PlanResources {
                     .await?);
             }
         };
-        let environment = PlanExecutionEnvironment::new(configuration.snapshot().await, &operation);
-        Ok(execute_two_phase_plan_synthesis(&state, request, &operation, &environment).await?)
+        let environment = PlanExecutionEnvironment::new(snapshot, operation);
+        Ok(execute_two_phase_plan_synthesis(&state, request, operation, &environment).await?)
     }
 }
 
 async fn cleanup_transient_context(state: &Runtime<'_>) {
-    if let Ok(snapshot) = state.resources.clear_transient_context().await {
-        state
-            .observer
-            .publish("", ApplicationEvent::Context(snapshot));
-    }
+    let _ = state.resources.clear_transient_context().await;
 }
 async fn preload_readonly_files(state: &Runtime<'_>, plan: &Plan) {
     let context = &state.resources.step.context;
-    if let Ok(admission) = context
+    let _ = context
         .preload_declared_context(
             context.repository_root().await,
             Vec::new(),
             collect_plan_context_files(plan),
         )
-        .await
-    {
-        if !admission.outcome.added.is_empty() {
-            state
-                .observer
-                .publish("", ApplicationEvent::Context(admission.state));
-        }
-    }
+        .await;
 }
 async fn record_synthesis_history(
     state: &Runtime<'_>,
@@ -296,6 +264,15 @@ async fn execute_two_phase_plan_synthesis(
     operation: &OperationGuard,
     environment: &PlanExecutionEnvironment,
 ) -> Result<PlanSynthesisResult, PlanHorizonError> {
+    execute_two_phase_plan_synthesis_inner(state, request, operation, environment).await
+}
+
+async fn execute_two_phase_plan_synthesis_inner(
+    state: &Runtime<'_>,
+    request: TwoPhaseRequest,
+    operation: &OperationGuard,
+    environment: &PlanExecutionEnvironment,
+) -> Result<PlanSynthesisResult, PlanHorizonError> {
     let TwoPhaseRequest {
         plan,
         directives,
@@ -305,30 +282,11 @@ async fn execute_two_phase_plan_synthesis(
         creation,
         operation_title,
     } = request;
-    let (planner_tier, critic_tier) = {
-        let cfg = environment.config();
-        // A directed modification is not a replanning wave around a blocked step,
-        // so the drafting beat starts from the base rung or from the explicit
-        // developer selection, never from an escalated position.
-        let (planner_tier, _) = resolve_architect_tier(
-            cfg,
-            plan.implementation.architect.as_ref(),
-            planner_model.as_ref(),
-            None,
-            plan.implementation.last_replanned_step.as_deref(),
-        );
-        let critic_tier = critic_model
-            .as_ref()
-            .filter(|_| !skip_critique)
-            .map(|selection| cfg.models.resolve_selection_architect_tier(selection));
-        (planner_tier, critic_tier)
-    };
-
     tracing::info!(
         plan_id = %plan.id,
         operation = operation_title,
         creation = creation,
-        critique = critic_tier.is_some(),
+        critique = critic_model.is_some() && !skip_critique,
         "two-phase plan synthesis started"
     );
 
@@ -341,22 +299,23 @@ async fn execute_two_phase_plan_synthesis(
     let (history_turn_prompt, history_context_paths) =
         capture_history_coordinates(state, operation_title, &plan, directives.as_deref()).await;
 
-    let draft_header = format!(
-        "# {}: [{}] {}\n*Drafting the plan horizon with {}...*\n\n---\n\n",
-        operation_title,
-        plan.id,
-        plan.title,
-        format_architect_tier(&planner_tier)
-    );
-    let mut horizon = match run_planner_wave(
-        state,
+    let horizon = match synthesize_horizon(
+        &state.resources.step.execution,
+        &state.resources.step.context,
         operation,
         environment,
-        compose_draft_task(&plan, directives.as_deref()),
-        draft_header,
-        planner_tier.clone(),
-        ArchitectScope::Plan(plan.id.clone()),
-        BUDGET_HINT,
+        state.observer.clone(),
+        state.exit_deadline,
+        HorizonSynthesisRequest {
+            draft_task: compose_draft_task(&plan, directives.as_deref()),
+            directives: directives.clone(),
+            scope: ArchitectScope::Plan(plan.id.clone()),
+            planner_model,
+            critic_model,
+            skip_critique,
+            operation_title,
+            plan: plan.clone(),
+        },
     )
     .await
     {
@@ -374,93 +333,16 @@ async fn execute_two_phase_plan_synthesis(
         }
     };
 
-    if let Some(critic_tier) = critic_tier.as_ref() {
-        match run_critique_wave(
-            state,
-            operation,
-            environment,
-            &plan,
-            &horizon.output,
-            directives.as_deref(),
-            critic_tier,
-            &ArchitectScope::Plan(plan.id.clone()),
-        )
-        .await
-        {
-            Ok(critique) => {
-                if !critique.is_approved() {
-                    let header = format!(
-                        "# {}: [{}] {}\n*Reconciling the independent critique with {}...*\n\n---\n\n",
-                        operation_title,
-                        plan.id,
-                        plan.title,
-                        format_architect_tier(&planner_tier)
-                    );
-                    match run_planner_wave(
-                        state,
-                        operation,
-                        environment,
-                        compose_reconciliation_task(
-                            &plan,
-                            &horizon.output,
-                            &critique,
-                            directives.as_deref(),
-                        ),
-                        header,
-                        planner_tier.clone(),
-                        ArchitectScope::Plan(plan.id.clone()),
-                        BUDGET_HINT,
-                    )
-                    .await
-                    {
-                        Ok(wave) => horizon = wave,
-                        Err(failure) => {
-                            return finish_wave_failure(
-                                state,
-                                operation_title,
-                                &plan,
-                                &history_turn_prompt,
-                                &history_context_paths,
-                                failure,
-                            )
-                            .await
-                        }
-                    }
-                }
-            }
-            Err(failure) => {
-                return finish_wave_failure(
-                    state,
-                    operation_title,
-                    &plan,
-                    &history_turn_prompt,
-                    &history_context_paths,
-                    failure,
-                )
-                .await
-            }
-        }
-    }
-
     let explanation = horizon.output.explanation.trim().to_string();
     let items = horizon.output.items;
     let architect = horizon.tier;
-
-    if let Some(duplicate) = find_duplicate_item_ids(&items) {
-        cleanup_transient_context(state).await;
-        return Err(PlanHorizonError {
-            kind: PlanHorizonFailure::InvalidTree,
-            message: format!(
-                "The synthesized plan contains a duplicate or empty step ID: '{duplicate}'"
-            ),
-        });
-    }
+    let _receipts = horizon.receipts;
+    let terminal = horizon.terminal;
 
     // The write below is destructive for the uncompleted horizon and exclusive
     // for a creation, so the authoritative cancellation signal is re-checked at
     // the seam where the document reaches disk.
-    if *operation.cancel_receiver().borrow() {
-        cleanup_transient_context(state).await;
+    if operation.hard_cancellation().is_cancelled() {
         tracing::warn!(
             plan_id = %plan.id,
             operation = operation_title,
@@ -483,7 +365,6 @@ async fn execute_two_phase_plan_synthesis(
         match persisted {
             Ok(plan) => (plan, dropped),
             Err(err) => {
-                cleanup_transient_context(state).await;
                 return Err(PlanHorizonError {
                     kind: PlanHorizonFailure::Save,
                     message: err,
@@ -498,7 +379,6 @@ async fn execute_two_phase_plan_synthesis(
         {
             Ok(plan) => (plan, 0usize),
             Err(err) => {
-                cleanup_transient_context(state).await;
                 return Err(PlanHorizonError {
                     kind: PlanHorizonFailure::Save,
                     message: err,
@@ -548,9 +428,7 @@ async fn execute_two_phase_plan_synthesis(
     .await;
 
     publish_plan(state, "", &stored, creation).await;
-
-    // The material the synthesis widened is released with the plan it produced.
-    cleanup_transient_context(state).await;
+    terminal.publish(state.observer.as_ref());
 
     Ok(PlanSynthesisResult::Success {
         plan: Box::new(stored),
@@ -573,280 +451,6 @@ async fn publish_plan(state: &Runtime<'_>, op_id: &str, plan: &Plan, is_save: bo
     }
 }
 
-/// Runs one Planner beat and interprets its typed terminal status.
-#[allow(clippy::too_many_arguments)]
-async fn run_planner_wave(
-    state: &Runtime<'_>,
-    operation: &OperationGuard,
-    environment: &PlanExecutionEnvironment,
-    task: String,
-    intro_header: String,
-    tier: ArchitectTier,
-    scope: ArchitectScope,
-    budget_hint: &str,
-) -> Result<PlannerWave, WaveFailure> {
-    let op_id = format!("op-{}", crate::api::next_operation_id());
-    publish_architect_started(state.observer.as_ref(), &op_id, &tier, false);
-
-    // The contour works on its own clone of the context and owns the auto layer it
-    // widens, so the adapter hands it a snapshot and merges the result back.
-    let step = &state.resources.step;
-    let context_snapshot = step.context.context_for_turn().await;
-    let (result, summary) = architect::run_contour(
-        &step.execution,
-        &step.context,
-        &step.usage,
-        operation,
-        environment,
-        PlanHorizonContour {
-            operation_id: op_id.clone(),
-            task,
-            context: context_snapshot,
-            scope,
-            tier,
-            intro_header,
-            budget_hint: budget_hint.to_string(),
-        },
-        state.observer.clone(),
-    )
-    .await;
-
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            if summary.cancelled {
-                return Err(WaveFailure::Cancelled);
-            }
-            return Err(WaveFailure::Failed(
-                summary.error.unwrap_or_else(|| err.to_string()),
-            ));
-        }
-    };
-
-    if !matches!(outcome.status, StructuredRefineStatus::Cancelled) {
-        state
-            .observer
-            .publish(&op_id, ApplicationEvent::Finished(summary.assistant_text));
-    }
-
-    let StructuredRefineOutcome {
-        output,
-        tier,
-        status,
-    } = outcome;
-    match status {
-        StructuredRefineStatus::Synthesized => match output {
-            Some(output) if output.items.is_empty() => Err(WaveFailure::EmptyHorizon),
-            Some(output) => Ok(PlannerWave { output, tier }),
-            None => Err(WaveFailure::EmptyHorizon),
-        },
-        StructuredRefineStatus::Cancelled => Err(WaveFailure::Cancelled),
-        StructuredRefineStatus::Blocked { reason } => Err(WaveFailure::Verdict {
-            kind: VerdictKind::Blocked,
-            message: reason,
-        }),
-        StructuredRefineStatus::Aborted(report) => Err(WaveFailure::Verdict {
-            kind: VerdictKind::Aborted,
-            message: report.to_message(),
-        }),
-        StructuredRefineStatus::BudgetExceeded { diagnostic } => Err(WaveFailure::Verdict {
-            kind: VerdictKind::BudgetExceeded,
-            message: diagnostic,
-        }),
-    }
-}
-
-/// Runs the independent critique of one draft horizon.
-///
-/// The beat is read-only: the critic receives the whole coordinate it needs (the
-/// requirement, the completed foundation, and the draft) and answers with the
-/// audit payload. A payload that violates the response schema is regenerated on
-/// the same rung within the attempt budget the rung declares; an exhausted budget
-/// blocks the plan instead of issuing it unaudited.
-#[allow(clippy::too_many_arguments)]
-async fn run_critique_wave(
-    state: &Runtime<'_>,
-    operation: &OperationGuard,
-    environment: &PlanExecutionEnvironment,
-    plan: &Plan,
-    draft: &PlanRefinementOutput,
-    directives: Option<&str>,
-    tier: &ArchitectTier,
-    scope: &ArchitectScope,
-) -> Result<PlanCritiqueOutput, WaveFailure> {
-    let execution = match environment
-        .for_structured(&state.resources.step.execution, operation, tier, scope)
-        .await
-    {
-        Ok(execution) => execution,
-        Err(error) => return Err(WaveFailure::Failed(error.to_string())),
-    };
-
-    let op_id = format!("op-{}", crate::api::next_operation_id());
-    publish_architect_started(state.observer.as_ref(), &op_id, tier, false);
-    tracing::info!(plan_id = %plan.id, model = %tier.model, "independent plan critique started");
-
-    match run_critique_rounds(
-        state, operation, &execution, plan, draft, directives, tier, &op_id,
-    )
-    .await
-    {
-        Ok(critique) => {
-            let banner = critique_banner(&critique);
-            state
-                .observer
-                .publish(&op_id, ApplicationEvent::Finished(banner));
-            Ok(critique)
-        }
-        Err(CritiqueFailure::Cancelled) => {
-            state
-                .observer
-                .publish(&op_id, ApplicationEvent::Stream(StreamEvent::Cancelled));
-            Err(WaveFailure::Cancelled)
-        }
-        Err(CritiqueFailure::Failed(message)) => {
-            state.observer.publish(
-                &op_id,
-                ApplicationEvent::Stream(StreamEvent::Error(message.clone())),
-            );
-            Err(WaveFailure::Failed(message))
-        }
-        Err(CritiqueFailure::Unreadable(message)) => {
-            let banner =
-                format!("\n\n---\n⛔ **[Independent Critique Unavailable]** {message}\n\n");
-            state
-                .observer
-                .publish(&op_id, ApplicationEvent::Finished(banner));
-            Err(WaveFailure::Verdict {
-                kind: VerdictKind::Blocked,
-                message,
-            })
-        }
-    }
-}
-
-/// Runs the critique rounds of one beat within the rung's attempt budget.
-#[allow(clippy::too_many_arguments)]
-async fn run_critique_rounds(
-    state: &Runtime<'_>,
-    operation: &OperationGuard,
-    execution: &StructuredExecution,
-    plan: &Plan,
-    draft: &PlanRefinementOutput,
-    directives: Option<&str>,
-    tier: &ArchitectTier,
-    op_id: &str,
-) -> Result<PlanCritiqueOutput, CritiqueFailure> {
-    let budget = tier.attempts().max(1) as usize;
-    let mut messages = vec![ChatMessage::user(build_plan_critique_prompt(
-        plan, draft, directives,
-    ))];
-    let mut last_error = String::new();
-
-    for attempt in 1..=budget {
-        state.observer.publish(
-            op_id,
-            ApplicationEvent::Stream(StreamEvent::TurnPhase {
-                phase: tauqe_core::workflow::turn::TurnPhase::Proposal,
-                round: Some(attempt),
-                max_rounds: Some(budget),
-                detail: Some("Independent plan critique".into()),
-            }),
-        );
-
-        match collect_structured_round(state, operation, execution, messages.clone(), op_id).await {
-            Ok(critique) => return Ok(critique),
-            Err(CritiqueFailure::Unreadable(err)) => {
-                last_error = err;
-                tracing::warn!(
-                    plan_id = %plan.id,
-                    attempt = attempt,
-                    budget = budget,
-                    error = %last_error,
-                    "independent plan critique violated the response schema"
-                );
-                messages.push(ChatMessage::user(critique_healing_directive(&last_error)));
-            }
-            Err(other) => return Err(other),
-        }
-    }
-
-    Err(CritiqueFailure::Unreadable(format!(
-        "The independent critique did not answer a payload the response schema accepts after {budget} attempt(s): {last_error}"
-    )))
-}
-
-/// Collects the typed payload of one structured provider round.
-///
-/// The critique is not streamed to the client, so the round only accumulates the
-/// payload it will decode; a voided attempt drops the payload it had already
-/// accumulated instead of publishing a withdrawal for text nobody saw.
-async fn collect_structured_round(
-    state: &Runtime<'_>,
-    operation: &OperationGuard,
-    execution: &StructuredExecution,
-    messages: Vec<ChatMessage>,
-    op_id: &str,
-) -> Result<PlanCritiqueOutput, CritiqueFailure> {
-    let publisher = state.observer.clone();
-    let step = &state.resources.step;
-    let usage = step
-        .usage
-        .begin(&step.context, op_id, move |id, snapshot| {
-            publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
-        })
-        .await;
-    let completion = structured_task::run_with_session(
-        &step.execution,
-        operation,
-        execution,
-        plan_critique_contract(),
-        messages,
-        op_id,
-        state.exit_deadline,
-        |event| {
-            let usage = &usage;
-            async move {
-                if let StreamEvent::Usage(reported) = event {
-                    usage.observe(&reported).await;
-                }
-            }
-        },
-    )
-    .await;
-    usage.flush().await;
-    match completion {
-        Ok(output) => Ok(output),
-        Err(StructuredTaskError::Cancelled) => Err(CritiqueFailure::Cancelled),
-        Err(StructuredTaskError::Request(
-            error @ (StructuredError::Empty | StructuredError::Incomplete),
-        )) => Err(CritiqueFailure::Unreadable(error.to_string())),
-        Err(StructuredTaskError::Request(StructuredError::Decode(err))) => {
-            Err(CritiqueFailure::Unreadable(err))
-        }
-        Err(StructuredTaskError::Request(StructuredError::Cancelled)) => {
-            Err(CritiqueFailure::Cancelled)
-        }
-        Err(
-            StructuredTaskError::Request(StructuredError::Failed(err))
-            | StructuredTaskError::Stream(err),
-        ) => Err(CritiqueFailure::Failed(err)),
-        Err(StructuredTaskError::ForeignOperation) => Err(CritiqueFailure::Failed(
-            "The independent critique requires an active operation for this session".into(),
-        )),
-        Err(StructuredTaskError::Task(join_error)) => Err(CritiqueFailure::Failed(format!(
-            "The independent critique task terminated unexpectedly: {join_error}"
-        ))),
-        Err(StructuredTaskError::Orphaned) => {
-            let message = format!(
-                "The independent critique task did not stop within the {} ms task-exit deadline",
-                state.exit_deadline.as_millis()
-            );
-            Err(CritiqueFailure::Failed(message))
-        }
-    }
-}
-
 /// Converts a beat that issued no horizon into the terminal response of the run.
 async fn finish_wave_failure(
     state: &Runtime<'_>,
@@ -856,7 +460,6 @@ async fn finish_wave_failure(
     history_context_paths: &[String],
     failure: WaveFailure,
 ) -> Result<PlanSynthesisResult, PlanHorizonError> {
-    cleanup_transient_context(state).await;
     match failure {
         WaveFailure::Cancelled => {
             tracing::warn!(
@@ -876,6 +479,12 @@ async fn finish_wave_failure(
         WaveFailure::EmptyHorizon => Err(PlanHorizonError {
             kind: PlanHorizonFailure::EmptyItems,
             message: ("The synthesis reported a horizon status without any steps").into(),
+        }),
+        WaveFailure::InvalidTree(duplicate) => Err(PlanHorizonError {
+            kind: PlanHorizonFailure::InvalidTree,
+            message: format!(
+                "The synthesized plan contains a duplicate or empty step ID: '{duplicate}'"
+            ),
         }),
         WaveFailure::Verdict { kind, message } => {
             let label = kind.label();
@@ -904,57 +513,6 @@ fn compose_draft_task(plan: &Plan, directives: Option<&str>) -> String {
     task.push_str("\n\n---\n\n");
     task.push_str(&build_plan_horizon_user_prompt(plan, None, directives));
     task
-}
-
-/// Composes the task statement of the reconciliation beat.
-fn compose_reconciliation_task(
-    plan: &Plan,
-    draft: &PlanRefinementOutput,
-    critique: &PlanCritiqueOutput,
-    directives: Option<&str>,
-) -> String {
-    let mut task = build_plan_horizon_system_prompt();
-    task.push_str("\n\n---\n\n");
-    task.push_str(&build_plan_reconciliation_prompt(
-        plan, draft, critique, directives,
-    ));
-    task
-}
-
-/// Renders the developer-facing summary of one independent audit.
-fn critique_banner(critique: &PlanCritiqueOutput) -> String {
-    let mut banner = format!(
-        "\n\n---\n**[Independent Critique]** `{}`\n",
-        critique.verdict.as_str()
-    );
-    let summary = critique.summary.trim();
-    if !summary.is_empty() {
-        banner.push_str(&format!("\n{summary}\n"));
-    }
-    for finding in &critique.findings {
-        let target = finding
-            .target
-            .as_deref()
-            .map(str::trim)
-            .filter(|target| !target.is_empty())
-            .map(|target| format!("#{target}"))
-            .unwrap_or_else(|| "(whole draft)".to_string());
-        banner.push_str(&format!(
-            "\n- [{}] {}: {}",
-            finding.category.as_str(),
-            target,
-            finding.detail.trim()
-        ));
-    }
-    banner.push_str("\n\n");
-    banner
-}
-
-/// Directive appended to the critique conversation after a schema violation.
-fn critique_healing_directive(error: &str) -> String {
-    format!(
-        "<response_directive>\nYour previous reply did not satisfy the response schema ({error}). Regenerate the whole payload strictly according to the specified JSON schema: `verdict`, `summary`, and `findings` are required, the verdict accepts only `approved` and `changes_required`, and every finding requires `category`, `target`, and `detail`.\n</response_directive>"
-    )
 }
 
 /// Captures the prompt and the context paths a synthesis actually observed.

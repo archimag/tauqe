@@ -33,8 +33,9 @@
 use std::time::Duration;
 
 use crate::models::ProviderKind;
+use crate::stop::HardCancellation;
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::LlmProvider;
 #[cfg(test)]
@@ -151,21 +152,22 @@ impl RetryingProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult {
         let max_attempts = self.config.max_attempts.max(1);
         let mut attempt: u32 = 0;
 
         loop {
             attempt += 1;
-            if *cancel_rx.borrow() {
-                let _ = tx.send(StreamEvent::Cancelled).await;
+            if cancel.is_cancelled() {
+                notify_cancelled(&tx);
                 return Ok(());
             }
 
-            let outcome = self.attempt(request.clone(), &tx, &cancel_rx).await;
+            let outcome = self.attempt(request.clone(), &tx, &cancel).await;
 
-            if outcome.cancelled {
+            if outcome.cancelled || cancel.is_cancelled() {
+                notify_cancelled(&tx);
                 return Ok(());
             }
 
@@ -176,8 +178,11 @@ impl RetryingProvider {
             if !retryable || attempt >= max_attempts {
                 // The partial answer of a failed attempt is void, so the client
                 // discards it before the terminal failure is reported.
-                if outcome.emitted_output {
-                    let _ = tx.send(StreamEvent::ResetStream).await;
+                if outcome.emitted_output
+                    && send_unless_cancelled(&tx, StreamEvent::ResetStream, &cancel).await
+                {
+                    notify_cancelled(&tx);
+                    return Ok(());
                 }
                 let _ = tx.send(StreamEvent::Error(reason.clone())).await;
                 tracing::warn!(
@@ -197,8 +202,11 @@ impl RetryingProvider {
 
             // Fragments of two different attempts must never be stitched
             // together, so the client is told to drop what it accumulated.
-            if outcome.emitted_output {
-                let _ = tx.send(StreamEvent::ResetStream).await;
+            if outcome.emitted_output
+                && send_unless_cancelled(&tx, StreamEvent::ResetStream, &cancel).await
+            {
+                notify_cancelled(&tx);
+                return Ok(());
             }
 
             let delay = self.config.delay_for(attempt);
@@ -212,9 +220,7 @@ impl RetryingProvider {
             );
 
             let reason = summarize(&reason);
-            if !wait_with_countdown(delay, attempt, max_attempts, &reason, &tx, &mut cancel_rx)
-                .await
-            {
+            if !wait_with_countdown(delay, attempt, max_attempts, &reason, &tx, &cancel).await {
                 return Ok(());
             }
         }
@@ -231,30 +237,50 @@ impl RetryingProvider {
         &self,
         request: LlmRequest<'_>,
         tx: &mpsc::Sender<StreamEvent>,
-        cancel_rx: &watch::Receiver<bool>,
+        cancel: &HardCancellation,
     ) -> AttemptOutcome {
         let ceiling = self.max_stream_bytes;
         let (inner_tx, mut inner_rx) = mpsc::channel::<StreamEvent>(RELAY_CAPACITY);
-        let mut stream = self.inner.stream(request, inner_tx, cancel_rx.clone());
+        let mut stream = self.inner.stream(request, inner_tx, cancel.clone());
 
         let mut observed = AttemptOutcome::default();
 
         let transport_error = loop {
             tokio::select! {
                 biased;
+                _ = cancel.cancelled() => {
+                    observed.cancelled = true;
+                    break None;
+                }
                 result = &mut stream => break result.err(),
                 Some(event) = inner_rx.recv() => {
-                    if relay_event(&mut observed, event, ceiling, tx).await {
-                        return observed;
+                    if relay_event(&mut observed, event, ceiling, tx, cancel).await {
+                        break None;
                     }
                 }
             }
         };
+        // Drop the provider future before draining. Accepted usage belongs to
+        // this request even when Hard interrupts the provider or its relay.
+        drop(stream);
 
         // The provider may have queued events just before it returned, so they
         // are relayed before the attempt is judged.
         while let Some(event) = inner_rx.recv().await {
-            if relay_event(&mut observed, event, ceiling, tx).await {
+            if observed.cancelled || cancel.is_cancelled() {
+                observed.cancelled = true;
+                if let StreamEvent::Usage(usage) = event {
+                    if tx.send(StreamEvent::Usage(usage)).await.is_err() {
+                        break;
+                    }
+                }
+            } else if relay_event(&mut observed, event, ceiling, tx, cancel).await {
+                // A runaway or disconnected relay needs no more output, but
+                // accepted usage still has to reach the request forwarder.
+                observed.cancelled |= cancel.is_cancelled();
+                while let Ok(StreamEvent::Usage(usage)) = inner_rx.try_recv() {
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
+                }
                 break;
             }
         }
@@ -345,6 +371,7 @@ async fn relay_event(
     event: StreamEvent,
     ceiling: usize,
     tx: &mpsc::Sender<StreamEvent>,
+    cancel: &HardCancellation,
 ) -> bool {
     if observed.observe(&event, ceiling) {
         return true;
@@ -352,7 +379,33 @@ async fn relay_event(
     if matches!(event, StreamEvent::Error(_)) {
         return false;
     }
-    tx.send(event).await.is_err()
+    if matches!(event, StreamEvent::Usage(_)) {
+        return tx.send(event).await.is_err();
+    }
+    if send_unless_cancelled(tx, event, cancel).await {
+        observed.cancelled = cancel.is_cancelled();
+        return true;
+    }
+    false
+}
+
+/// Returns true if Hard or a closed consumer prevented delivery.
+async fn send_unless_cancelled(
+    tx: &mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+    cancel: &HardCancellation,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => true,
+        result = tx.send(event) => result.is_err(),
+    }
+}
+
+fn notify_cancelled(tx: &mpsc::Sender<StreamEvent>) {
+    // Never hold Hard behind a full downstream channel. The request boundary
+    // also observes the same Hard signal after draining accepted receipts.
+    let _ = tx.try_send(StreamEvent::Cancelled);
 }
 
 #[async_trait]
@@ -365,9 +418,9 @@ impl LlmProvider for RetryingProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult {
-        self.run(request, tx, cancel_rx).await
+        self.run(request, tx, cancel).await
     }
 }
 
@@ -382,7 +435,7 @@ async fn wait_with_countdown(
     max_attempts: u32,
     reason: &str,
     tx: &mpsc::Sender<StreamEvent>,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel: &HardCancellation,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
     let mut announced = false;
@@ -399,7 +452,10 @@ async fn wait_with_countdown(
             delay_secs: seconds_ceil(remaining).max(1),
             reason: reason.to_string(),
         };
-        if tx.send(next).await.is_err() {
+        if send_unless_cancelled(tx, next, cancel).await {
+            if cancel.is_cancelled() {
+                notify_cancelled(tx);
+            }
             return false;
         }
         announced = true;
@@ -411,18 +467,9 @@ async fn wait_with_countdown(
 
         tokio::select! {
             _ = tokio::time::sleep(step) => {}
-            changed = cancel_rx.changed() => {
-                match changed {
-                    Ok(()) => {
-                        if *cancel_rx.borrow() {
-                            let _ = tx.send(StreamEvent::Cancelled).await;
-                            return false;
-                        }
-                    }
-                    // The cancellation sender is gone, so no further signal can
-                    // arrive: fall back to a plain sleep instead of spinning.
-                    Err(_) => tokio::time::sleep(step).await,
-                }
+            _ = cancel.cancelled() => {
+                notify_cancelled(tx);
+                return false;
             }
         }
     }
@@ -560,6 +607,7 @@ fn summarize(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::stop::StopSource;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -574,6 +622,7 @@ mod tests {
     struct ScriptedAttempt {
         deltas: Vec<String>,
         reasoning: Vec<String>,
+        usage: Option<super::super::ModelUsageInfo>,
         stream_error: Option<&'static str>,
         transport_error: Option<&'static str>,
     }
@@ -655,7 +704,7 @@ mod tests {
             &self,
             request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
+            _cancel: HardCancellation,
         ) -> ProviderResult {
             self.state.calls.fetch_add(1, Ordering::SeqCst);
             self.state
@@ -687,6 +736,10 @@ mod tests {
                 if tx.send(StreamEvent::ReasoningDelta(delta)).await.is_err() {
                     return Ok(());
                 }
+            }
+
+            if let Some(usage) = attempt.usage {
+                let _ = tx.send(StreamEvent::Usage(usage)).await;
             }
 
             if let Some(message) = attempt.stream_error {
@@ -729,7 +782,7 @@ mod tests {
         max_stream_bytes: usize,
     ) -> (ProviderResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
         let retrying = RetryingProvider::new(Box::new(Arc::clone(provider)), config)
             .with_max_stream_bytes(max_stream_bytes);
 
@@ -748,7 +801,7 @@ mod tests {
                 ..LlmRequest::new("test-model", vec![ChatMessage::user("hi")])
             },
             tx,
-            cancel_rx,
+            source.token().hard_cancellation(),
         );
 
         tokio::join!(stream, collector)
@@ -778,9 +831,9 @@ mod tests {
             &self,
             request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            cancel_rx: watch::Receiver<bool>,
+            cancel: HardCancellation,
         ) -> ProviderResult {
-            self.0.stream(request, tx, cancel_rx).await
+            self.0.stream(request, tx, cancel).await
         }
     }
 
@@ -790,7 +843,7 @@ mod tests {
         config: RetryConfig,
     ) -> (ProviderResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
         let retrying = RetryingProvider::new(Box::new(SharedMock(Arc::clone(mock))), config);
 
         let collector = async {
@@ -807,7 +860,7 @@ mod tests {
                 ..LlmRequest::new("mock-model", vec![ChatMessage::user("hi")])
             },
             tx,
-            cancel_rx,
+            source.token().hard_cancellation(),
         );
 
         tokio::join!(stream, collector)
@@ -839,6 +892,45 @@ mod tests {
             "a failure before any output needs no reset"
         );
         assert_eq!(streamed_text(&events), "Hello");
+    }
+
+    #[tokio::test]
+    async fn retry_reports_usage_from_both_attempts_without_text_reset() {
+        let usage = super::super::ModelUsageInfo {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        let provider = ScriptedProvider::new(vec![
+            ScriptedAttempt {
+                usage: Some(usage.clone()),
+                transport_error: Some("OpenRouter stream ended prematurely without [DONE] marker"),
+                ..Default::default()
+            },
+            ScriptedAttempt {
+                usage: Some(usage),
+                ..Default::default()
+            },
+        ]);
+        let (result, events) = drive(&provider, fast_config(2), None).await;
+        assert!(result.is_ok());
+        assert_eq!(provider.calls(), 2);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ResetStream)));
+        let reports: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports.iter().map(|usage| usage.total_tokens).sum::<u32>(),
+            30
+        );
     }
 
     #[tokio::test]
@@ -1017,7 +1109,8 @@ mod tests {
         };
 
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
         let retrying = RetryingProvider::new(Box::new(Arc::clone(&provider)), config);
 
         let stream = tokio::spawn(async move {
@@ -1025,7 +1118,7 @@ mod tests {
                 .stream(
                     LlmRequest::new("test-model", vec![ChatMessage::user("hi")]),
                     tx,
-                    cancel_rx,
+                    cancel,
                 )
                 .await
         });
@@ -1040,7 +1133,7 @@ mod tests {
         // Let the first attempt fail and the long pause begin.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let cancelled_at = tokio::time::Instant::now();
-        let _ = cancel_tx.send(true);
+        source.request_hard();
 
         let result = tokio::time::timeout(Duration::from_secs(2), stream)
             .await
@@ -1347,7 +1440,8 @@ mod tests {
         };
 
         let (tx, mut rx) = mpsc::channel(RELAY_CAPACITY);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
         let retrying = RetryingProvider::new(Box::new(SharedMock(Arc::clone(&mock))), config);
 
         let stream = tokio::spawn(async move {
@@ -1355,7 +1449,7 @@ mod tests {
                 .stream(
                     LlmRequest::new("mock-model", vec![ChatMessage::user("hi")]),
                     tx,
-                    cancel_rx,
+                    cancel,
                 )
                 .await
         });
@@ -1370,7 +1464,7 @@ mod tests {
         // Let the first attempt fail and the long pause begin.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let cancelled_at = tokio::time::Instant::now();
-        let _ = cancel_tx.send(true);
+        source.request_hard();
 
         let result = tokio::time::timeout(Duration::from_secs(2), stream)
             .await

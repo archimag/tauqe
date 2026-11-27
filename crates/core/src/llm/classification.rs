@@ -36,6 +36,7 @@ pub fn command_capability(command: &LlmCommand) -> Option<LlmCapability> {
         LlmCommand::Abort(_) => Some(LlmCapability::Abort),
         LlmCommand::CustomTool(_) => Some(LlmCapability::CustomTools),
         LlmCommand::ReviewUpdate { .. } => Some(LlmCapability::ReviewUpdate),
+        LlmCommand::ArchitectRound { .. } => Some(LlmCapability::PlanUpdate),
         LlmCommand::ProtocolError { .. } => None,
     }
 }
@@ -188,6 +189,25 @@ mod tests {
         assert_eq!(
             command_capability(&command),
             Some(LlmCapability::ReviewUpdate)
+        );
+    }
+
+    #[test]
+    fn architect_round_uses_the_existing_plan_update_grant() {
+        let command = LlmCommand::ArchitectRound {
+            output: serde_json::from_value(serde_json::json!({
+                "status": "success", "explanation": "Done", "items": []
+            }))
+            .unwrap(),
+            status: crate::plan::prompt::RoundStatus::Success,
+        };
+        assert_eq!(
+            command_capability(&command),
+            Some(LlmCapability::PlanUpdate)
+        );
+        assert_eq!(
+            serde_json::from_str::<LlmCommand>(&serde_json::to_string(&command).unwrap()).unwrap(),
+            command
         );
     }
 

@@ -19,16 +19,44 @@ use crate::config::project::ProjectConfig;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::blocking::StartedOperations;
 use crate::edits::VerificationVerdict;
-#[cfg(test)]
+use tauqe_tools::stop::HardCancellation;
 use tauqe_tools::toolchain::ProjectPostHookResponse;
-use tokio::sync::watch;
 
 pub use tauqe_tools::toolchain::{
     format_diagnostics, format_with_project_config, merge_manifest, run_post_hooks_with_config,
-    run_project_command_with_config, run_toolchain_check, run_toolchain_check_with_timeout, runner,
-    InMemoryFormatOutcome, ToolchainCheckResult, DEFAULT_PROJECT_TIMEOUT_SECS,
+    run_toolchain_check, runner, InMemoryFormatOutcome, ToolchainCheckResult,
+    DEFAULT_PROJECT_TIMEOUT_SECS,
 };
+
+pub async fn run_project_command_with_config(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    name: &str,
+    arguments: &std::collections::BTreeMap<String, String>,
+    cancel: Option<&HardCancellation>,
+) -> Result<ToolchainCheckResult, String> {
+    tauqe_tools::toolchain::run_project_command_with_config(
+        repo_root, project, name, arguments, cancel,
+    )
+    .await
+}
+
+pub async fn run_toolchain_check_with_timeout(
+    repo_root: &Path,
+    command: &str,
+    timeout_secs: u64,
+    cancel: Option<&HardCancellation>,
+) -> ToolchainCheckResult {
+    tauqe_tools::toolchain::run_toolchain_check_with_timeout(
+        repo_root,
+        command,
+        timeout_secs,
+        cancel,
+    )
+    .await
+}
 
 /// Name of the configuration file whose integrity the verification pipeline
 /// checks before any declared project command runs.
@@ -100,7 +128,7 @@ impl From<VerificationStatus> for VerificationVerdict {
 /// untouched instead of contributing a partially trusted command list.
 pub(crate) async fn effective_project_config(
     repo_root: &Path,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> ProjectConfig {
     let root = repo_root.to_path_buf();
     // Reading `tauqe.toml` is blocking filesystem work, so it runs off the async
@@ -113,7 +141,7 @@ pub(crate) async fn effective_project_config(
         return project;
     };
 
-    match runner::load_manifest(runner, repo_root, DEFAULT_PROJECT_TIMEOUT_SECS, cancel_rx).await {
+    match runner::load_manifest(runner, repo_root, DEFAULT_PROJECT_TIMEOUT_SECS, cancel).await {
         Ok(manifest) => runner::merge_manifest(&mut project, manifest),
         Err(err) => {
             tracing::warn!(
@@ -137,10 +165,16 @@ pub(crate) async fn effective_project_config(
 pub async fn run_verification_pipeline(
     repo_root: &Path,
     changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> (VerificationStatus, Vec<ToolchainCheckResult>) {
-    let project = effective_project_config(repo_root, cancel_rx).await;
-    run_verification_pipeline_with_config(repo_root, &project, changed_files, cancel_rx).await
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
+        return (VerificationStatus::Cancelled, Vec::new());
+    }
+    let project = effective_project_config(repo_root, cancel).await;
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
+        return (VerificationStatus::Cancelled, Vec::new());
+    }
+    run_verification_pipeline_with_config(repo_root, &project, changed_files, cancel).await
 }
 
 /// Runs the declared verification lifecycle under an already resolved project
@@ -162,22 +196,62 @@ pub(crate) async fn run_verification_pipeline_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> (VerificationStatus, Vec<ToolchainCheckResult>) {
+    run_verification_pipeline_with_operations(repo_root, project, changed_files, cancel, None).await
+}
+
+/// Runs verification with process completion retained by the transaction owner.
+pub(crate) async fn run_verification_pipeline_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    changed_files: &[String],
+    cancel: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
+) -> (VerificationStatus, Vec<ToolchainCheckResult>) {
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
+        return (VerificationStatus::Cancelled, Vec::new());
+    }
     let config_check = check_project_config(repo_root);
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
+        return (VerificationStatus::Cancelled, Vec::new());
+    }
     if !config_check.success {
         return (VerificationStatus::Failed, vec![config_check]);
     }
 
-    let (passed, results) = tauqe_tools::toolchain::run_verification_pipeline_with_config(
+    let (passed, results) = tauqe_tools::toolchain::run_verification_pipeline_with_operations(
         repo_root,
         project,
         changed_files,
-        cancel_rx,
+        cancel,
+        operations,
     )
     .await;
-    let status = classify_status(passed, &results);
+    let status = if cancel.is_some_and(HardCancellation::is_cancelled) {
+        VerificationStatus::Cancelled
+    } else {
+        classify_status(passed, &results)
+    };
     (status, results)
+}
+
+/// Run the declared post-hook with completion retained by the transaction.
+pub async fn run_post_hooks_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    changed_files: &[String],
+    cancel: Option<&HardCancellation>,
+    operations: &StartedOperations,
+) -> Result<ProjectPostHookResponse, String> {
+    tauqe_tools::toolchain::run_post_hooks_with_operations(
+        repo_root,
+        project,
+        changed_files,
+        cancel,
+        Some(operations),
+    )
+    .await
 }
 
 /// Validates the project configuration file as the zeroth verification step.
@@ -238,10 +312,10 @@ fn classify_status(passed: bool, results: &[ToolchainCheckResult]) -> Verificati
 async fn run_post_hooks(
     repo_root: &Path,
     changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Result<ProjectPostHookResponse, String> {
-    let project = effective_project_config(repo_root, cancel_rx).await;
-    run_post_hooks_with_config(repo_root, &project, changed_files, cancel_rx).await
+    let project = effective_project_config(repo_root, cancel).await;
+    run_post_hooks_with_config(repo_root, &project, changed_files, cancel).await
 }
 
 /// Runs one project command the model may address by name.
@@ -260,10 +334,10 @@ async fn run_project_command(
     repo_root: &Path,
     name: &str,
     arguments: &BTreeMap<String, String>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Result<ToolchainCheckResult, String> {
-    let project = effective_project_config(repo_root, cancel_rx).await;
-    run_project_command_with_config(repo_root, &project, name, arguments, cancel_rx).await
+    let project = effective_project_config(repo_root, cancel).await;
+    run_project_command_with_config(repo_root, &project, name, arguments, cancel).await
 }
 
 /// Streams `content` through the in-memory formatter of the project.
@@ -277,15 +351,66 @@ async fn run_project_command(
 async fn format_staged_content(
     repo_root: &Path,
     content: &str,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Option<InMemoryFormatOutcome> {
-    let project = effective_project_config(repo_root, cancel_rx).await;
-    format_with_project_config(repo_root, &project, content, cancel_rx).await
+    let project = effective_project_config(repo_root, cancel).await;
+    format_with_project_config(repo_root, &project, content, cancel).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stop::StopSource;
+
+    #[tokio::test]
+    async fn soft_stop_does_not_interrupt_runner_resolution() {
+        let dir = repo(Some("[project]\nrunner = 'just'\n"));
+        std::fs::write(
+            dir.path().join("Justfile"),
+            "[group('tauqe')]\nprobe:\n    @echo ready\n",
+        )
+        .unwrap();
+        let stop = StopSource::new();
+        stop.request_soft();
+        let hard = stop.token().hard_cancellation();
+
+        let project = effective_project_config(dir.path(), Some(&hard)).await;
+
+        assert!(!hard.is_cancelled());
+        assert!(project.commands.contains_key("probe"));
+    }
+
+    #[tokio::test]
+    async fn hard_stop_refuses_an_empty_verification_pipeline() {
+        let dir = repo(None);
+        let stop = StopSource::new();
+        let hard = stop.token().hard_cancellation();
+        stop.request_soft();
+        assert_eq!(
+            run_verification_pipeline(dir.path(), &[], Some(&hard))
+                .await
+                .0,
+            VerificationStatus::NotConfigured
+        );
+        stop.request_hard();
+        assert_eq!(
+            run_verification_pipeline(dir.path(), &[], Some(&hard))
+                .await
+                .0,
+            VerificationStatus::Cancelled
+        );
+        assert_eq!(
+            run_verification_pipeline_with_config(
+                dir.path(),
+                &ProjectConfig::default(),
+                &[],
+                Some(&hard),
+            )
+            .await
+            .0,
+            VerificationStatus::Cancelled
+        );
+    }
 
     /// Creates a temporary repository with an optional `tauqe.toml`.
     fn repo(config: Option<&str>) -> tempfile::TempDir {

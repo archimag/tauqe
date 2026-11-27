@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 use tauqe_protocol::{errors, methods, InitializeResult, Request, Response, PROTOCOL_VERSION};
-#[cfg(test)]
-use tokio::sync::watch;
 
 pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
     match req.method.as_str() {
@@ -69,9 +67,13 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REVIEW_LIST => review::handle_review_list(req, state).await,
         methods::REVIEW_GET => review::handle_review_get(req, state).await,
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
+        methods::REVIEW_UPDATE_GROUP_STEP => {
+            review::handle_review_update_group_step(req, state).await
+        }
         methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
         methods::REVIEW_EXECUTE => review::handle_review_execute(req, state).await,
         methods::REVIEW_ANALYZE => review::handle_review_analyze(req, state).await,
+        methods::REVIEW_REFINE_GROUP => review::handle_review_refine_group(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
         methods::PLAN_GET => plan::handle_plan_get(req, state).await,
@@ -172,6 +174,7 @@ mod tests {
     use super::*;
     use crate::handlers::common::test_support::scratch_root;
     use crate::transport::OutChannel;
+    use tauqe_core::stop::{HardCancellation, StopSource};
     use tauqe_protocol::RequestId;
 
     #[tokio::test]
@@ -223,8 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_verification_passes_without_toolchain() {
         let dir = scratch_root("preflight");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+        let verdict = run_preflight_verification(&dir, HardCancellation::never()).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             matches!(verdict, PreflightVerdict::Passed),
@@ -243,8 +245,7 @@ mod tests {
             "[models]\nrepl = [\"openrouter:a/b\"]\n",
         )
         .unwrap();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+        let verdict = run_preflight_verification(&dir, HardCancellation::never()).await;
         assert!(
             matches!(verdict, PreflightVerdict::Passed),
             "a declaration without verification must pass: {verdict:?}"
@@ -260,8 +261,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let (_retry_cancel_tx, retry_cancel_rx) = watch::channel(false);
-        let verdict = run_preflight_verification(&dir, retry_cancel_rx).await;
+        let verdict = run_preflight_verification(&dir, HardCancellation::never()).await;
         let _ = std::fs::remove_dir_all(&dir);
         match verdict {
             PreflightVerdict::Failed(report) => {
@@ -279,8 +279,7 @@ mod tests {
             "[models]\nrepl = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
         )
         .unwrap();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+        let verdict = run_preflight_verification(&dir, HardCancellation::never()).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             matches!(verdict, PreflightVerdict::Passed),
@@ -306,9 +305,10 @@ mod tests {
         )
         .unwrap();
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let stop = StopSource::new();
+        let hard = stop.token().hard_cancellation();
         let root = dir.clone();
-        let gate = tokio::spawn(async move { run_preflight_verification(&root, cancel_rx).await });
+        let gate = tokio::spawn(async move { run_preflight_verification(&root, hard).await });
 
         // Cancel only once the verification command is demonstrably running, so
         // the prompt return proves the teardown instead of a slow start.
@@ -323,7 +323,7 @@ mod tests {
         }
         assert!(running, "the verification command never started");
 
-        let _ = cancel_tx.send(true);
+        stop.request_hard();
         let verdict = tokio::time::timeout(std::time::Duration::from_secs(10), gate)
             .await
             .expect("the cancelled gate must return instead of waiting the suite out")
@@ -440,8 +440,7 @@ mod tests {
         tauqe_core::git::init_repository(Some(&dir), true).unwrap();
         std::fs::write(dir.join(".git").join("index.lock"), "").unwrap();
 
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+        let verdict = run_preflight_verification(&dir, HardCancellation::never()).await;
 
         match verdict {
             PreflightVerdict::Failed(report) => {

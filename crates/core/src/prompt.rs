@@ -138,19 +138,7 @@ pub fn build_squash_commit_prompt(
 
     prompt.push_str("## Cumulative Diff\n");
     prompt.push_str("```diff\n");
-    const MAX_DIFF_CHARS: usize = 30_000;
-    if cumulative_diff.len() > MAX_DIFF_CHARS {
-        let truncate_index = cumulative_diff
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .take_while(|&idx| idx <= MAX_DIFF_CHARS)
-            .last()
-            .unwrap_or(0);
-        prompt.push_str(&cumulative_diff[..truncate_index]);
-        prompt.push_str("\n... [diff truncated for length] ...\n");
-    } else {
-        prompt.push_str(cumulative_diff);
-    }
+    prompt.push_str(cumulative_diff);
     if !cumulative_diff.ends_with('\n') {
         prompt.push('\n');
     }
@@ -465,7 +453,6 @@ pub(crate) struct PromptAssembly {
     active_plan: Option<Plan>,
     pub(crate) turn_brief: Option<TurnBrief>,
     turn_scratchpad: Option<String>,
-    max_scratchpad_chars: usize,
     patch_strategy: PatchStrategy,
     project: Option<crate::config::project::ProjectConfig>,
     outer_docs: Vec<crate::config::OuterDocEntry>,
@@ -493,7 +480,6 @@ impl PromptAssembly {
             active_plan: None,
             turn_brief: None,
             turn_scratchpad: None,
-            max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             patch_strategy: PatchStrategy::default(),
             project: None,
             outer_docs: Vec::new(),
@@ -518,6 +504,7 @@ impl PromptAssembly {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_repo_dirs(mut self, repo_dirs: Option<String>) -> Self {
         self.repo_dirs = repo_dirs;
         self
@@ -669,14 +656,7 @@ impl PromptAssembly {
             if trimmed.is_empty() {
                 None
             } else {
-                let text = if trimmed.chars().count() > self.max_scratchpad_chars {
-                    let truncated: String =
-                        trimmed.chars().take(self.max_scratchpad_chars).collect();
-                    format!("{}\n... [scratchpad truncated for length] ...", truncated)
-                } else {
-                    trimmed.to_string()
-                };
-                Some(format!("<scratchpad>\n{}\n</scratchpad>", text))
+                Some(format!("<scratchpad>\n{}\n</scratchpad>", trimmed))
             }
         })
     }
@@ -794,16 +774,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_squash_commit_prompt_truncation_utf8_safety() {
+    fn test_build_squash_commit_prompt_keeps_complete_unicode_diff() {
         let commits = vec![];
         let pinned = vec![];
         // Multi-byte characters (Cyrillic chars are 2 bytes each)
         let multi_byte_text = "Тестовая строка для проверки обрезки по границе UTF-8. ".repeat(700);
         assert!(multi_byte_text.len() > 30_000);
 
-        // Must not panic on truncation:
         let prompt = build_squash_commit_prompt(&commits, &multi_byte_text, &pinned);
-        assert!(prompt.contains("diff truncated for length"));
+        assert!(prompt.contains(&multi_byte_text));
+        assert!(!prompt.contains("diff truncated for length"));
     }
 
     #[test]
@@ -1774,9 +1754,9 @@ mod tests {
     }
 
     #[test]
-    fn test_turn_scratchpad_truncation_utf8_safety() {
+    fn test_turn_scratchpad_keeps_complete_unicode_text() {
         let multi_byte_text = "Рабочая гипотеза и детали проверки UTF-8 символов. ".repeat(200);
-        assert!(multi_byte_text.len() > crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS);
+        assert!(multi_byte_text.len() > 4_000);
 
         let mut assembly = PromptAssembly::new(
             None,
@@ -1789,7 +1769,8 @@ mod tests {
         );
         assembly.turn_scratchpad = Some(multi_byte_text);
         let block = assembly.format_scratchpad_block().unwrap();
-        assert!(block.contains("... [scratchpad truncated for length] ..."));
+        assert!(block.contains(assembly.turn_scratchpad.as_deref().unwrap().trim()));
+        assert!(!block.contains("truncated for length"));
     }
 
     #[test]

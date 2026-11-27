@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,8 +12,6 @@ pub mod dirs;
 pub mod treesitter;
 
 pub use treesitter::TreeSitterExtractor;
-
-pub const DEFAULT_REPOMAP_TOKEN_BUDGET: usize = 4000;
 
 /// Trait defining a strategy for extracting symbols from repository files.
 ///
@@ -95,47 +92,27 @@ pub enum DetailLevel {
     TopLevelOnly,
 }
 
-/// Generates a semantic repository map outline formatted within `token_budget` using the default Tree-sitter extractor.
-fn generate_repo_map(
-    repo_root: &Path,
-    available_files: &[String],
-    context_files: &[String],
-    token_budget: usize,
-) -> Result<String> {
-    generate_repo_map_with_extractor(
-        repo_root,
-        available_files,
-        context_files,
-        token_budget,
-        treesitter::shared_extractor(),
-    )
+/// Generates the complete top-level repository outline with the default extractor.
+pub fn generate_repo_map(repo_root: &Path, available_files: &[String]) -> Result<String> {
+    generate_repo_map_with_extractor(repo_root, available_files, treesitter::shared_extractor())
 }
 
-/// Generates a semantic repository map outline formatted within `token_budget` using a custom extractor.
+/// Generates the complete top-level repository outline with a custom extractor.
 ///
-/// 1. Excludes files already in active context (`context_files`) and drops paths
-///    under a service directory (`.git`, `.tauqe`, `target`, `node_modules`), so
+/// 1. Drops paths under a service directory (`.git`, `.tauqe`, `target`, `node_modules`), so
 ///    the symbol map reports the same repository shape as the directory outline.
 /// 2. Queries the provided `SymbolExtractor` for supported code files.
-/// 3. Discovers all Git files missing from the symbol outline and includes them in the map.
-/// 4. Formats symbols and file paths into a coherent outline with adaptive token budgeting.
+/// 3. Includes every other tracked path, without truncation.
 pub fn generate_repo_map_with_extractor(
     repo_root: &Path,
     available_files: &[String],
-    context_files: &[String],
-    token_budget: usize,
     extractor: &dyn SymbolExtractor,
 ) -> Result<String> {
     crate::blocking::run_blocking(|| {
-        let context_set: HashSet<&str> = context_files.iter().map(|s| s.as_str()).collect();
-
         let mut all_git_files: Vec<String> = Vec::new();
         let mut eligible_files: Vec<String> = Vec::new();
 
         for path in available_files {
-            if context_set.contains(path.as_str()) {
-                continue;
-            }
             // A service directory is not part of the navigable repository shape,
             // so the symbol map and the directory outline drop the same paths.
             if is_excluded_path(path.as_str()) {
@@ -170,7 +147,7 @@ pub fn generate_repo_map_with_extractor(
             extractor.extract_symbols(repo_root, &eligible_files)?
         };
 
-        let outline = format_repo_map_with_budget(&symbols, &all_git_files, token_budget);
+        let outline = format_repo_map(&symbols, &all_git_files, DetailLevel::TopLevelOnly);
         Ok(outline)
     })
 }
@@ -201,16 +178,12 @@ fn format_map_symlink(path: &str, link: &SymlinkTarget) -> String {
 /// `crates/core-utils/lib.rs`; naming a single file narrows the outline to that
 /// file. An empty prefix covers the whole repository.
 ///
-/// Unlike the eager global map, a targeted map never drops files that are
-/// already in context: the request exists precisely to read the symbols of the
-/// subsystem the model is about to navigate. The outline is rendered through the
-/// same adaptive token budget as the global map, and an unknown prefix yields an
-/// empty string instead of a repository-wide outline.
+/// The target includes files already in context and renders full symbol detail.
+/// An unknown prefix yields an empty string instead of a repository-wide outline.
 pub fn generate_targeted_repo_map(
     repo_root: &Path,
     available_files: &[String],
     target_path: &str,
-    token_budget: usize,
 ) -> Result<String> {
     let prefix = normalize_target_prefix(target_path);
     let targeted: Vec<String> = available_files
@@ -221,7 +194,43 @@ pub fn generate_targeted_repo_map(
     if targeted.is_empty() {
         return Ok(String::new());
     }
-    generate_repo_map(repo_root, &targeted, &[], token_budget)
+    generate_repo_map_at_level(repo_root, &targeted, DetailLevel::Full)
+}
+
+fn generate_repo_map_at_level(
+    repo_root: &Path,
+    available_files: &[String],
+    level: DetailLevel,
+) -> Result<String> {
+    crate::blocking::run_blocking(|| {
+        let mut all_git_files = Vec::new();
+        let mut eligible_files = Vec::new();
+        for path in available_files {
+            if is_excluded_path(path) {
+                continue;
+            }
+            match classify_repo_path(repo_root, path) {
+                RepoPathKind::RegularFile => {
+                    if treesitter::is_supported_path(path) {
+                        eligible_files.push(path.clone());
+                    }
+                    all_git_files.push(path.clone());
+                }
+                RepoPathKind::Symlink(link) => all_git_files.push(format_map_symlink(path, &link)),
+                RepoPathKind::Other => {}
+            }
+        }
+        all_git_files.sort();
+        all_git_files.dedup();
+        eligible_files.sort();
+        eligible_files.dedup();
+        let symbols = if eligible_files.is_empty() {
+            Vec::new()
+        } else {
+            treesitter::shared_extractor().extract_symbols(repo_root, &eligible_files)?
+        };
+        Ok(format_repo_map(&symbols, &all_git_files, level))
+    })
 }
 
 /// Normalizes a requested map path into a repository-relative prefix.
@@ -255,209 +264,30 @@ fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
-#[cfg(test)]
-fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
-    files: &[S],
-    token_budget: usize,
-) -> String {
-    format_repo_map_with_budget(files, &[], token_budget)
-}
-
-/// Formats repository symbols and all other Git files into an outline within `token_budget`.
-///
-/// Every detail level is priced from the byte lengths its blocks and the
-/// remaining plain entries occupy once joined, because the token estimate is a
-/// pure function of that length: a level that does not fit never materializes
-/// the document it would immediately discard, and the winning level is joined
-/// once, into a buffer sized by the count the fit decision already computed.
-///
-/// Accepts both owned payloads and shared `Arc` payloads, so map generation
-/// formats cached symbols without cloning them.
-fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
+/// Renders all symbol blocks and tracked paths in stable path order.
+fn format_repo_map<S: AsRef<RepoFileSymbols>>(
     symbols: &[S],
     all_git_files: &[String],
-    token_budget: usize,
-) -> String {
-    let levels = [
-        DetailLevel::Full,
-        DetailLevel::PublicWithDetails,
-        DetailLevel::OutlinesOnly,
-        DetailLevel::TopLevelOnly,
-    ];
-
-    // The cheapest level also seeds the greedy fallback below, so the last
-    // candidate leaves the loop instead of being rendered a second time.
-    let mut cheapest: Option<Vec<RenderedBlock>> = None;
-
-    for &level in &levels {
-        let blocks = format_all_files(symbols, level);
-        let block_texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
-        let entries = plain_entries(&blocks, all_git_files);
-        let byte_len = combined_bytes(
-            joined_bytes(&block_texts, BLOCK_SEPARATOR),
-            joined_bytes(&entries, ENTRY_SEPARATOR),
-        );
-        if byte_len > 0 && fits_budget(byte_len, token_budget) {
-            return join_document(&block_texts, &entries, byte_len);
-        }
-        cheapest = Some(blocks);
-    }
-
-    // The level list is never empty, so a candidate always exists; the
-    // degenerate answer stays an empty outline instead of a panic.
-    cheapest
-        .map(|blocks| greedy_outline(&blocks, all_git_files, token_budget))
-        .unwrap_or_default()
-}
-
-/// The blank line separating two rendered symbol blocks.
-const BLOCK_SEPARATOR: &str = "\n\n";
-
-/// The newline separating two plain repository entries.
-const ENTRY_SEPARATOR: &str = "\n";
-
-/// One rendered symbol block paired with the repository path it describes.
-///
-/// A rendered header carries a ` (N lines)` suffix and a repository path may
-/// itself contain ` (`, so an outline line cannot be parsed back into a path:
-/// splitting on the first separator truncates such a path and leaves the file
-/// to be listed a second time among the plain entries. The path therefore
-/// travels beside its block, taken from the structured `RepoFileSymbols::path`
-/// field while the block is produced.
-struct RenderedBlock {
-    path: String,
-    text: String,
-}
-
-/// Renders every symbol block at `level`, in repository order.
-fn format_all_files<S: AsRef<RepoFileSymbols>>(
-    files: &[S],
     level: DetailLevel,
-) -> Vec<RenderedBlock> {
-    let mut blocks: Vec<RenderedBlock> = Vec::new();
-    for file in files {
-        let file = file.as_ref();
-        let text = format_file_symbols(file, level);
-        if !text.is_empty() {
-            blocks.push(RenderedBlock {
-                path: file.path.clone(),
-                text,
-            });
-        }
-    }
-    blocks
-}
-
-/// The repository entries the outline does not name, in repository order.
-fn plain_entries<'a>(blocks: &[RenderedBlock], all_git_files: &'a [String]) -> Vec<&'a str> {
-    let rendered: HashSet<&str> = blocks.iter().map(|block| block.path.as_str()).collect();
-    all_git_files
-        .iter()
-        .map(|path| path.as_str())
-        .filter(|path| !rendered.contains(*path))
-        .collect()
-}
-
-/// Byte length a list of items occupies once joined by `separator`.
-fn joined_bytes<T: AsRef<str>>(items: &[T], separator: &str) -> usize {
-    let content: usize = items.iter().map(|item| item.as_ref().len()).sum();
-    let separators = separator.len() * items.len().saturating_sub(1);
-    content + separators
-}
-
-/// Bytes `separator` contributes before an item appended to a non-empty list.
-fn separator_bytes<T>(items: &[T], separator: &str) -> usize {
-    if items.is_empty() {
-        0
-    } else {
-        separator.len()
-    }
-}
-
-/// Byte length of the document assembled from a joined outline and the plain
-/// entries that follow it.
-fn combined_bytes(outline_bytes: usize, entries_bytes: usize) -> usize {
-    let separator = if outline_bytes > 0 && entries_bytes > 0 {
-        BLOCK_SEPARATOR.len()
-    } else {
-        0
-    };
-    outline_bytes + separator + entries_bytes
-}
-
-/// Reports whether a document of `byte_len` bytes fits the token budget.
-///
-/// The token estimate is a pure function of the byte length, so a candidate is
-/// priced from its bytes alone and only a candidate that passes this check is
-/// materialized.
-fn fits_budget(byte_len: usize, token_budget: usize) -> bool {
-    crate::tokens::estimate_tokens_from_bytes(byte_len as u64) <= token_budget as u64
-}
-
-/// Materializes the priced document exactly once, into a buffer sized by the
-/// byte count the fit decision already computed.
-fn join_document(blocks: &[&str], entries: &[&str], byte_len: usize) -> String {
-    let mut document = String::with_capacity(byte_len);
-    let mut pending = "";
-    for block in blocks {
-        document.push_str(pending);
-        document.push_str(block);
-        pending = BLOCK_SEPARATOR;
-    }
-    for entry in entries {
-        document.push_str(pending);
-        document.push_str(entry);
-        pending = ENTRY_SEPARATOR;
-    }
-    document
-}
-
-/// Extends the cheapest rendered outline with the plain entries it leaves out
-/// until the budget is exhausted.
-///
-/// The blocks arrive already rendered at the cheapest level, and every addition
-/// is priced by the byte length the joined document would gain, so the fallback
-/// neither renders the repository a second time nor rounds a per-block token
-/// estimate against a budget that is checked over the whole document.
-fn greedy_outline(
-    blocks: &[RenderedBlock],
-    all_git_files: &[String],
-    token_budget: usize,
 ) -> String {
-    let mut included: Vec<&RenderedBlock> = Vec::new();
-    let mut outline_bytes = 0usize;
-    for block in blocks {
-        let candidate_bytes =
-            outline_bytes + separator_bytes(&included, BLOCK_SEPARATOR) + block.text.len();
-        if !fits_budget(candidate_bytes, token_budget) {
-            break;
+    let mut rendered = std::collections::BTreeMap::new();
+    for file in symbols {
+        let file = file.as_ref();
+        let block = format_file_symbols(file, level);
+        if !block.is_empty() {
+            rendered.insert(file.path.as_str(), block);
         }
-        outline_bytes = candidate_bytes;
-        included.push(block);
     }
-
-    let rendered: HashSet<&str> = included.iter().map(|block| block.path.as_str()).collect();
-    let mut entries: Vec<&str> = Vec::new();
-    let mut entries_bytes = 0usize;
+    let mut entries = Vec::new();
     for path in all_git_files {
-        if rendered.contains(path.as_str()) {
-            continue;
-        }
-        // Listed files are joined by single newlines, so only a file that
-        // already has a predecessor adds a separator byte.
-        let candidate_bytes =
-            entries_bytes + separator_bytes(&entries, ENTRY_SEPARATOR) + path.len();
-        if !fits_budget(combined_bytes(outline_bytes, candidate_bytes), token_budget) {
-            break;
-        }
-        entries_bytes = candidate_bytes;
-        entries.push(path.as_str());
+        // Symlink annotations are plain entries; they are never parsed as symbols.
+        entries.push(
+            rendered
+                .remove(path.as_str())
+                .unwrap_or_else(|| path.clone()),
+        );
     }
-
-    let block_texts: Vec<&str> = included.iter().map(|block| block.text.as_str()).collect();
-    let byte_len = combined_bytes(outline_bytes, entries_bytes);
-    join_document(&block_texts, &entries, byte_len)
+    entries.join("\n\n")
 }
 
 fn format_file_symbols(file: &RepoFileSymbols, level: DetailLevel) -> String {
@@ -693,8 +523,7 @@ mod tests {
             line_count: 10,
         }];
 
-        // Generous budget: includes full outlines and private symbols
-        let full = format_symbols_with_budget(&syms, 500);
+        let full = format_repo_map(&syms, &["src/sample.rs".into()], DetailLevel::Full);
         assert!(full.contains("src/sample.rs (10 lines)"));
         assert!(full.contains("pub struct PublicStruct"));
         assert!(!full.contains("pub id: u64"));
@@ -702,8 +531,8 @@ mod tests {
         assert!(full.contains("pub fn public_func"));
         assert!(!full.contains("pub fn public_func() -> bool"));
 
-        // Tight budget: drops private symbols
-        let restricted = format_symbols_with_budget(&syms, 20);
+        let restricted =
+            format_repo_map(&syms, &["src/sample.rs".into()], DetailLevel::TopLevelOnly);
         assert!(restricted.contains("src/sample.rs"));
         assert!(!restricted.contains("fn private_func"));
         assert!(restricted.contains("pub fn public_func"));
@@ -736,10 +565,13 @@ mod tests {
             },
         ];
 
-        // Budget enough for one file's outline (~6 tokens) but not both (~11 tokens)
-        let formatted = format_symbols_with_budget(&syms, 10);
+        let formatted = format_repo_map(
+            &syms,
+            &["src/a.rs".into(), "src/b.rs".into()],
+            DetailLevel::TopLevelOnly,
+        );
         assert!(formatted.contains("src/a.rs"));
-        assert!(!formatted.contains("src/b.rs"));
+        assert!(formatted.contains("src/b.rs"));
     }
 
     #[test]
@@ -764,7 +596,7 @@ mod tests {
             line_count: 5,
         }];
 
-        let outline = format_symbols_with_budget(&syms, 100);
+        let outline = format_repo_map(&syms, &["src/sample.rs".into()], DetailLevel::Full);
         assert!(outline.contains("impl Greeter for User"));
         assert!(outline.contains("fn greet"));
         assert!(!outline.contains("fn greet(&self) -> String"));
@@ -789,7 +621,7 @@ mod tests {
             "src/main.rs".to_string(),
         ];
 
-        let outline = format_repo_map_with_budget(&syms, &all_files, 500);
+        let outline = format_repo_map(&syms, &all_files, DetailLevel::TopLevelOnly);
         assert!(outline.contains("src/main.rs (1 line)"));
         assert!(outline.contains("pub fn main"));
         assert!(outline.contains("Cargo.toml"));
@@ -813,7 +645,7 @@ mod tests {
             line_count: 6,
         }];
 
-        let outline = format_symbols_with_budget(&syms, 100);
+        let outline = format_repo_map(&syms, &["src/status.rs".into()], DetailLevel::Full);
         assert!(outline.contains("pub enum Status"));
         assert!(outline.contains("Ready"));
         assert!(outline.contains("Running"));
@@ -826,7 +658,7 @@ mod tests {
         let syms: Vec<RepoFileSymbols> = vec![];
         let all_files = vec!["Cargo.toml".to_string(), "tauqe.toml".to_string()];
 
-        let outline = format_repo_map_with_budget(&syms, &all_files, 100);
+        let outline = format_repo_map(&syms, &all_files, DetailLevel::TopLevelOnly);
         assert!(outline.contains("Cargo.toml"));
         assert!(outline.contains("tauqe.toml"));
     }
@@ -856,7 +688,7 @@ mod tests {
             "crates/core-utils/src/lib.rs".to_string(),
         ];
 
-        let map = generate_targeted_repo_map(root, &available, "crates/core", 1000).unwrap();
+        let map = generate_targeted_repo_map(root, &available, "crates/core").unwrap();
         assert!(map.contains("crates/core/src/lib.rs"));
         assert!(map.contains("pub fn core_fn"));
         // A sibling directory sharing only a textual stem is excluded.
@@ -865,43 +697,43 @@ mod tests {
         assert!(!map.contains("pub fn utils_fn"));
 
         // A cosmetic `./` prefix and a trailing slash name the same subtree.
-        let dotted = generate_targeted_repo_map(root, &available, "./crates/core/", 1000).unwrap();
+        let dotted = generate_targeted_repo_map(root, &available, "./crates/core/").unwrap();
         assert_eq!(dotted, map);
 
         // Naming a single file narrows the outline to that file.
         let single =
-            generate_targeted_repo_map(root, &available, "crates/core/src/lib.rs", 1000).unwrap();
+            generate_targeted_repo_map(root, &available, "crates/core/src/lib.rs").unwrap();
         assert!(single.contains("pub fn core_fn"));
         assert!(!single.contains("crates/protocol"));
 
         // An unknown prefix yields an empty outline instead of a full map.
-        assert!(
-            generate_targeted_repo_map(root, &available, "missing", 1000)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(generate_targeted_repo_map(root, &available, "missing")
+            .unwrap()
+            .is_empty());
 
         // An empty prefix covers the whole repository.
-        let whole = generate_targeted_repo_map(root, &available, "", 1000).unwrap();
+        let whole = generate_targeted_repo_map(root, &available, "").unwrap();
         assert!(whole.contains("pub fn core_fn"));
         assert!(whole.contains("pub fn protocol_fn"));
     }
 
     #[test]
-    fn test_generate_targeted_repo_map_honors_the_token_budget() {
+    fn test_generate_targeted_repo_map_retains_full_detail() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "pub fn alpha() {}\nfn private() {}\n",
+        )
+        .unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
         let available = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
 
-        let generous = generate_targeted_repo_map(root, &available, "src", 1000).unwrap();
-        assert!(generous.contains("src/a.rs"));
-        assert!(generous.contains("src/b.rs"));
-
-        let tight = generate_targeted_repo_map(root, &available, "src", 2).unwrap();
-        assert!(crate::tokens::estimate_tokens(&tight) <= 2);
+        let map = generate_targeted_repo_map(root, &available, "src").unwrap();
+        assert!(map.contains("src/a.rs"));
+        assert!(map.contains("src/b.rs"));
+        assert!(map.contains("fn private"));
     }
 
     #[test]
@@ -929,7 +761,7 @@ mod tests {
             "node_modules/pkg/index.rs".to_string(),
         ];
 
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
         assert!(map.contains("src/lib.rs"));
         assert!(map.contains("pub fn kept_fn"));
         assert!(!map.contains("generated.rs"));
@@ -947,12 +779,7 @@ mod tests {
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("main.rs"), "pub fn main() {}\n").unwrap();
         let available = vec!["main.rs".to_string()];
-        let context = vec![];
-
-        let handle =
-            tokio::spawn(
-                async move { generate_repo_map(&root, &available, &context, 1000).unwrap() },
-            );
+        let handle = tokio::spawn(async move { generate_repo_map(&root, &available).unwrap() });
 
         let map = handle.await.unwrap();
         assert!(map.contains("main.rs"));
@@ -998,7 +825,7 @@ mod tests {
         std::os::unix::fs::symlink("lib.rs", root.join("alias.rs")).unwrap();
 
         let available = vec!["alias.rs".to_string(), "lib.rs".to_string()];
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
 
         // The link is never parsed, so the declaration is rendered exactly once.
         assert_eq!(map.matches("pub fn real_fn").count(), 1);
@@ -1014,7 +841,7 @@ mod tests {
         std::os::unix::fs::symlink("missing.rs", root.join("dangling.rs")).unwrap();
 
         let available = vec!["dangling.rs".to_string()];
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
 
         assert!(map.contains("dangling.rs -> missing.rs (broken)"));
     }
@@ -1030,7 +857,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside_file, root.join("secret.rs")).unwrap();
 
         let available = vec!["secret.rs".to_string()];
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
 
         assert!(map.contains("(outside repository)"));
         // The escaping target is never fed to the symbol extractor.
@@ -1047,7 +874,7 @@ mod tests {
         std::os::unix::fs::symlink("src", root.join("crate")).unwrap();
 
         let available = vec!["crate".to_string(), "src/lib.rs".to_string()];
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
 
         // A directory link is never traversed, so its symbols appear once.
         assert_eq!(map.matches("pub fn dir_fn").count(), 1);
@@ -1070,14 +897,14 @@ mod tests {
             "alias.rs".to_string(),
             "lib.rs".to_string(),
         ];
-        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        let map = generate_repo_map(root, &available).unwrap();
 
         assert_eq!(map.matches("alias.rs -> lib.rs").count(), 1);
         assert_eq!(map.matches("pub fn real_fn").count(), 1);
     }
 
     #[test]
-    fn test_format_repo_map_budget_drops_symlink_markers() {
+    fn test_format_repo_map_retains_symlink_markers() {
         let syms = vec![RepoFileSymbols {
             path: "src/a.rs".to_string(),
             symbols: vec![Symbol::new(
@@ -1091,18 +918,13 @@ mod tests {
         }];
         let all_files = vec!["src/a.rs".to_string(), "alias.rs -> lib.rs".to_string()];
 
-        let generous = format_repo_map_with_budget(&syms, &all_files, 500);
-        assert!(generous.contains("src/a.rs (1 line)"));
-        assert!(generous.contains("alias.rs -> lib.rs"));
-
-        // A budget below the cost of the marker drops it instead of overshooting.
-        let tight = format_repo_map_with_budget(&syms, &all_files, 1);
-        assert!(!tight.contains("alias.rs -> lib.rs"));
-        assert!(crate::tokens::estimate_tokens(&tight) <= 1);
+        let map = format_repo_map(&syms, &all_files, DetailLevel::TopLevelOnly);
+        assert!(map.contains("src/a.rs (1 line)"));
+        assert!(map.contains("alias.rs -> lib.rs"));
     }
 
     #[test]
-    fn test_format_repo_map_greedy_truncation_keeps_marker_within_budget() {
+    fn test_format_repo_map_keeps_marker_with_symbols() {
         let symbols_outline = RepoFileSymbols {
             path: "src/a.rs".to_string(),
             symbols: vec![Symbol::new(
@@ -1116,39 +938,20 @@ mod tests {
         };
         let all_files = vec!["src/a.rs".to_string(), "alias.rs -> lib.rs".to_string()];
 
-        // Budget admits the symbol block but not the additional marker entry.
         let outline = std::slice::from_ref(&symbols_outline);
-        let symbol_only = format_repo_map_with_budget(outline, &[], 500);
-        let budget = crate::tokens::estimate_tokens(&symbol_only) + 2;
-        let truncated = format_repo_map_with_budget(outline, &all_files, budget);
+        let map = format_repo_map(outline, &all_files, DetailLevel::TopLevelOnly);
 
-        assert!(truncated.contains("pub fn a"));
-        assert!(!truncated.contains("alias.rs -> lib.rs"));
-        assert!(crate::tokens::estimate_tokens(&truncated) <= budget);
+        assert!(map.contains("pub fn a"));
+        assert!(map.contains("alias.rs -> lib.rs"));
     }
     #[test]
-    fn test_format_repo_map_greedy_other_files_follow_the_exact_byte_budget() {
-        // Without symbols the outline stays empty, so the greedy fallback lists
-        // plain file names and the budget alone decides how many it admits.
+    fn test_format_repo_map_lists_every_plain_file() {
         let symbols: Vec<RepoFileSymbols> = Vec::new();
         let all_files: Vec<String> = (0..10).map(|index| format!("f{index}.rs")).collect();
-
-        // Every name is five bytes, and neighbors are joined by one newline, so
-        // each additional name grows the block by six bytes.
-        let two = "f0.rs\nf1.rs";
-        let three = "f0.rs\nf1.rs\nf2.rs";
-
-        let budget_two = crate::tokens::estimate_tokens(two);
-        let budget_three = crate::tokens::estimate_tokens(three);
-
-        assert_eq!(
-            format_repo_map_with_budget(&symbols, &all_files, budget_two),
-            two
-        );
-        assert_eq!(
-            format_repo_map_with_budget(&symbols, &all_files, budget_three),
-            three
-        );
+        let map = format_repo_map(&symbols, &all_files, DetailLevel::TopLevelOnly);
+        for path in &all_files {
+            assert!(map.contains(path));
+        }
     }
 
     #[test]
@@ -1182,22 +985,10 @@ mod tests {
         let symbols = vec![paren.clone(), big.clone()];
         let all_files = vec![paren.path.clone(), big.path.clone()];
 
-        // A generous budget renders both symbol blocks, so the entry list
-        // stays empty and the path appears exactly once.
-        let full = format_repo_map_with_budget(&symbols, &all_files, 1000);
+        let full = format_repo_map(&symbols, &all_files, DetailLevel::TopLevelOnly);
         assert_eq!(full.matches("src/report (draft).rs").count(), 1);
         assert!(full.contains("src/big.rs (40 lines)"));
-
-        // A budget that admits one symbol block forces the greedy fallback,
-        // which lists the truncated file as a plain entry. The rendered path
-        // must not be listed again beside its own block.
-        let paren_block = format_file_symbols(&symbols[0], DetailLevel::TopLevelOnly);
-        let greedy_bytes = format!("{}\n\n{}\n{}", paren_block, paren.path, big.path);
-        let budget = crate::tokens::estimate_tokens(&greedy_bytes);
-        let truncated = format_repo_map_with_budget(&symbols, &all_files, budget);
-        assert!(truncated.contains("pub fn draft"));
-        assert!(!truncated.contains("pub fn big0"));
-        assert_eq!(truncated.matches("src/report (draft).rs").count(), 1);
-        assert!(truncated.contains("src/big.rs"));
+        assert!(full.contains("pub fn draft"));
+        assert!(full.contains("pub fn big0"));
     }
 }

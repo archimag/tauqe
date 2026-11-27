@@ -3,19 +3,23 @@ use super::refinement::{prepare_implementation_refinement, PreparedImplementatio
 use super::PlanResources;
 use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
 use crate::application::documents::Documents;
+use crate::application::usage_totals::{ReceiptAccumulator, UsageReceipt};
 use crate::application::PlanExecutionEnvironment;
 use crate::workflows::architect::{
-    self, publish_architect_started, ArchitectScope, PlanHorizonContour,
+    self, publish_architect_started, ArchitectScope, HorizonVerdict, PlanHorizonContour,
 };
 use crate::workflows::step::{
-    completion::classify_step_attempt,
+    completion::{classify_step_attempt, step_answer, CoderAttempt},
     run::{SingleStepRequest, StepLoopReport},
 };
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use tauqe_core::config::AppConfig;
 use tauqe_core::workflow::implementation::{
-    classify_refinement, ExecutionScope, RefinementRequest, RefinementResult, StepFailure,
-    StepTurnRequest, StepTurnResult, StepTurnSettlement,
+    ExecutionScope, RefinementRequest, RefinementResult, StepFailure, StepTurnRequest,
+    StepTurnResult,
 };
 
 /// Inputs shared by the coder attempts and Architect waves of one plan.
@@ -26,30 +30,45 @@ pub(super) struct PlanAttempts<'a> {
     pub(super) execution: &'a PlanExecutionEnvironment,
     pub(super) repo_root: &'a Path,
     pub(super) documents: &'a Documents,
+    pub(super) receipts: Mutex<ReceiptAccumulator>,
 }
 
 impl PlanAttempts<'_> {
+    pub(super) fn record_receipt(&self, receipt: &UsageReceipt) {
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .include(receipt);
+    }
+
+    pub(super) fn batch_usage(&self) -> tauqe_core::workflow::batch::BatchUsage {
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage()
+    }
+
     pub(super) fn config(&self) -> &AppConfig {
         self.execution.config()
     }
 
-    pub(super) async fn run_step(&self, request: StepTurnRequest) -> StepTurnSettlement {
+    pub(super) async fn run_step(&self, request: StepTurnRequest) -> CoderAttempt {
         let prompt = match prepare_implementation_step(
             self.resources,
             self.operation,
             self.repo_root,
             self.config(),
-            &self.execution.compaction_environment(),
             &request,
-            |context| {
-                self.observer
-                    .publish("", ApplicationEvent::Context(context))
-            },
         )
         .await
         {
             Ok(prompt) => prompt,
-            Err(error) => return error.into_step_result().into(),
+            Err(error) => {
+                return CoderAttempt {
+                    settlement: error.into_step_result().into(),
+                    answer: String::new(),
+                };
+            }
         };
         let StepTurnRequest {
             scope,
@@ -66,7 +85,7 @@ impl PlanAttempts<'_> {
 
         // The shared turn settles the disk transaction before the implementation
         // pipeline interprets the attempt or schedules another coder.
-        let report = self
+        let (report, receipt) = self
             .resources
             .step
             .run_published_attempt(
@@ -85,25 +104,28 @@ impl PlanAttempts<'_> {
                 self.observer.clone(),
             )
             .await;
+        self.restore_shared_publication();
+        if let Some(receipt) = &receipt {
+            self.record_receipt(receipt);
+        }
 
-        let cancelled = *cancel_rx.borrow();
+        let cancelled = cancel_rx.is_cancelled();
         match report {
             StepLoopReport::Turn(mut result) => {
                 result.cancelled |= cancelled;
-                // A recovery diagnostic means restoration was not confirmed.
-                // Keep this separate from retryable content failures.
-                if let Some(reason) = result.recovery_error.take().filter(|_| !result.cancelled) {
-                    return StepTurnSettlement {
-                        result: StepTurnResult::Failed(StepFailure::unreverted(reason)),
-                        edit: result.edit,
-                    };
+                CoderAttempt {
+                    answer: step_answer(&result),
+                    settlement: classify_step_attempt(&result),
                 }
-                classify_step_attempt(&result)
             }
-            _ if cancelled => StepTurnResult::Cancelled.into(),
-            StepLoopReport::Failed(reason) => {
-                StepTurnResult::Failed(StepFailure::infrastructure(reason)).into()
-            }
+            _ if cancelled => CoderAttempt {
+                settlement: StepTurnResult::Cancelled.into(),
+                answer: String::new(),
+            },
+            StepLoopReport::Failed(reason) => CoderAttempt {
+                settlement: StepTurnResult::Failed(StepFailure::infrastructure(reason)).into(),
+                answer: String::new(),
+            },
         }
     }
 
@@ -131,7 +153,6 @@ impl PlanAttempts<'_> {
             tier,
             task,
             intro_header,
-            budget_hint,
         } = prepared;
         let op_id = self.operation.publication_id();
         let ExecutionScope::Plan { plan_id, .. } = &request.scope else {
@@ -145,10 +166,9 @@ impl PlanAttempts<'_> {
         publish_architect_started(self.observer.as_ref(), &op_id, &tier, true);
         let step = &self.resources.step;
         let context = step.context.context_for_turn().await;
-        let (contour, summary) = architect::run_contour(
+        let (contour, summary) = architect::run_horizon_wave(
             &step.execution,
             &step.context,
-            &step.usage,
             self.operation,
             self.execution,
             PlanHorizonContour {
@@ -158,26 +178,56 @@ impl PlanAttempts<'_> {
                 scope,
                 tier: tier.clone(),
                 intro_header,
-                budget_hint,
             },
             self.observer.clone(),
         )
         .await;
-        if !summary.cancelled {
+        self.restore_shared_publication();
+        if let Some(receipt) = &summary.receipt {
+            self.record_receipt(receipt);
+        }
+        if !matches!(
+            contour,
+            HorizonVerdict::Cancelled | HorizonVerdict::Failed(_)
+        ) {
             self.observer
                 .publish(&op_id, ApplicationEvent::Finished(summary.assistant_text));
         }
 
-        let outcome = match contour {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return RefinementResult::Blocked {
-                    reason: summary.error.unwrap_or_else(|| err.to_string()),
-                    tier,
-                }
-            }
-        };
+        match contour {
+            HorizonVerdict::Synthesized { output, tier } => RefinementResult::Synthesized {
+                items: output.items,
+                tier,
+            },
+            HorizonVerdict::Blocked { reason, tier } => RefinementResult::Blocked { reason, tier },
+            HorizonVerdict::Aborted { report, tier } => RefinementResult::Blocked {
+                reason: report.to_message(),
+                tier,
+            },
+            HorizonVerdict::EmptyHorizon { tier } => RefinementResult::Blocked {
+                reason: "The Architect reported a synthesized horizon without any step".into(),
+                tier,
+            },
+            HorizonVerdict::InvalidTree { duplicate, tier } => RefinementResult::Blocked {
+                reason: format!("duplicate or empty step ID: '{duplicate}'"),
+                tier,
+            },
+            HorizonVerdict::Cancelled => RefinementResult::Blocked {
+                reason: "The Architect wave was cancelled".into(),
+                tier,
+            },
+            HorizonVerdict::Failed(reason) => RefinementResult::Blocked { reason, tier },
+        }
+    }
 
-        classify_refinement(outcome)
+    fn restore_shared_publication(&self) {
+        // A step or Architect contour replaces the shared source with its own
+        // detached generation and closes it on settlement. Resume publication
+        // from the shared manager for the gaps and subsequent preloads.
+        let _ = self
+            .resources
+            .step
+            .context
+            .activate_manual_publication(self.operation, self.observer.clone());
     }
 }

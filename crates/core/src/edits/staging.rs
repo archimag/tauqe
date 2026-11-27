@@ -41,9 +41,25 @@ pub struct StagingState {
     refused_patch: Option<String>,
     /// Number of staging attempts the turn spent.
     attempts: usize,
+    last_step: StagingStep,
 }
 
 impl StagingState {
+    pub fn last_step(&self) -> &StagingStep {
+        &self.last_step
+    }
+
+    pub fn reset_step(&mut self) {
+        self.last_step = StagingStep::default();
+    }
+
+    /// Drop the converged set but retain the result of this request.
+    pub fn clear_accumulated(&mut self) {
+        let step = std::mem::take(&mut self.last_step);
+        *self = Self::default();
+        self.last_step = step;
+    }
+
     pub fn staged_state(&self) -> Option<&StagedEditsState> {
         self.staged_state.as_ref()
     }
@@ -100,10 +116,10 @@ pub fn execute_staging_step(
     ctx: &mut StagingEnvironment<'_>,
     envelope: &mut ResponseEnvelope,
     state: &mut StagingState,
-) -> StagingStep {
+) {
     let commands = envelope.take_any(super::execution::EDIT_CAPABILITIES);
     if commands.is_empty() {
-        return StagingStep::default();
+        return;
     }
 
     state.attempts += 1;
@@ -133,11 +149,12 @@ pub fn execute_staging_step(
                         .unwrap_or_else(|_| path.to_owned())
                 });
                 state.failed.insert(path, error);
-                return StagingStep {
+                state.last_step = StagingStep {
                     addressed: true,
                     refusals: render_failures(&state.failed, ctx.patch_strategy),
                     new_paths: Vec::new(),
                 };
+                return;
             }
         }
     } else {
@@ -146,7 +163,7 @@ pub fn execute_staging_step(
             .filter_map(LlmCommand::into_edit_operation)
             .collect();
         if edits.is_empty() {
-            return StagingStep::default();
+            return;
         }
         let unretried = retain_retried_failed_files(&mut state.failed, ctx.context_manager, &edits);
         for (path, error) in unretried {
@@ -200,11 +217,11 @@ pub fn execute_staging_step(
         "virtual staging attempt completed"
     );
 
-    StagingStep {
+    state.last_step = StagingStep {
         addressed: true,
         refusals: render_failures(&state.failed, ctx.patch_strategy),
         new_paths,
-    }
+    };
 }
 
 /// Renders the refusals of one attempt as a path-sorted diagnostic list.
@@ -298,8 +315,8 @@ mod tests {
         let mut ctx = fixture.context();
         let mut state = StagingState::default();
 
-        let step = execute_staging_step(&mut ctx, &mut envelope, &mut state);
-        assert!(!step.addressed);
+        execute_staging_step(&mut ctx, &mut envelope, &mut state);
+        assert!(!state.last_step().addressed);
         assert_eq!(state.attempts, 0, "an unaddressed round spends no attempt");
         assert_eq!(
             envelope.len(),
@@ -318,9 +335,9 @@ mod tests {
         let mut ctx = fixture.context();
         let mut state = StagingState::default();
 
-        let step = execute_staging_step(&mut ctx, &mut envelope, &mut state);
-        assert!(step.addressed);
-        assert!(step.refusals.is_empty());
+        execute_staging_step(&mut ctx, &mut envelope, &mut state);
+        assert!(state.last_step().addressed);
+        assert!(state.last_step().refusals.is_empty());
         assert!(
             envelope.is_empty(),
             "the change set is drained from the envelope"
@@ -351,8 +368,8 @@ mod tests {
             "pub fn compute() -> i32 { 0 }",
             "pub fn compute() -> i32 { 42 }",
         );
-        let step = execute_staging_step(&mut ctx, &mut repaired, &mut state);
-        assert!(step.refusals.is_empty());
+        execute_staging_step(&mut ctx, &mut repaired, &mut state);
+        assert!(state.last_step().refusals.is_empty());
         assert!(state.failed.is_empty(), "the repair answers the refusal");
         assert_eq!(state.attempts, 2);
     }
@@ -398,12 +415,10 @@ mod tests {
         let mut state = StagingState::default();
         let mut first = replace("{ 0 }", "{ 42 }");
         let mut restore = replace("{ 42 }", "{ 0 }");
-        assert!(execute_staging_step(&mut ctx, &mut first, &mut state)
-            .refusals
-            .is_empty());
-        assert!(execute_staging_step(&mut ctx, &mut restore, &mut state)
-            .refusals
-            .is_empty());
+        execute_staging_step(&mut ctx, &mut first, &mut state);
+        assert!(state.last_step().refusals.is_empty());
+        execute_staging_step(&mut ctx, &mut restore, &mut state);
+        assert!(state.last_step().refusals.is_empty());
         assert_eq!(
             state.staged_state.unwrap().staged_files["a.rs"],
             TARGET.as_bytes()

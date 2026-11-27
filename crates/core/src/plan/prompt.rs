@@ -25,13 +25,15 @@ pub(crate) use discussion::format_active_plan_context;
 pub use discussion::format_plan_discussion_prompt;
 #[cfg(test)]
 use refine::parse_plan_refinement_output;
+#[cfg(test)]
+pub(crate) use refine::plan_refine_response_schema;
 pub use refine::{
-    architect_synthesis_capability_expr, build_plan_horizon_system_prompt,
-    build_plan_horizon_user_prompt, parse_round, AbortReport, PlanHorizonDiagnostics,
-    PlanRefinementAbort, PlanRefinementOutput, RoundStatus, StructuredRefineOutcome,
-    StructuredRefineStatus,
+    architect_synthesis_capability_expr, architect_synthesis_terminal_capability_expr,
+    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, parse_round, AbortReport,
+    PlanHorizonDiagnostics, PlanRefinementAbort, PlanRefinementOutput, RoundStatus,
+    StructuredRefineOutcome, StructuredRefineStatus,
 };
-pub(crate) use refine::{plan_refine_response_schema, plan_refine_response_schema_definition};
+pub(crate) use refine::{plan_refine_response_schema_definition, plan_refine_response_schema_for};
 pub use step::{format_plan_step_execution_prompt, format_plan_step_retry_prompt};
 
 pub use architect::{format_architect_escalation_note, format_architect_tier};

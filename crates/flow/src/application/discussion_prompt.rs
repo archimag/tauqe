@@ -52,6 +52,8 @@ pub(crate) enum DiscussionDocument {
         session: Box<ReviewSession>,
         group: Box<ReviewGroup>,
         findings: Vec<ReviewItem>,
+        focused_steps: Vec<String>,
+        missing_steps: Vec<String>,
     },
 }
 
@@ -234,10 +236,29 @@ async fn resolve_discussion(
                 })
                 .cloned()
                 .collect();
+            let mut focused_steps = Vec::new();
+            let mut missing_steps = Vec::new();
+            for id in focused_items
+                .iter()
+                .filter_map(|id| id.strip_prefix("step:"))
+            {
+                if id.is_empty() {
+                    continue;
+                }
+                if let Some(step) = group.implementation.find_item(id) {
+                    if !focused_steps.contains(&step.id) {
+                        focused_steps.push(step.id.clone());
+                    }
+                } else if !missing_steps.iter().any(|missing| missing == id) {
+                    missing_steps.push(id.to_string());
+                }
+            }
             DiscussionDocument::ReviewGroup {
                 session: Box::new(session),
                 group: Box::new(group),
                 findings,
+                focused_steps,
+                missing_steps,
             }
         }
     };

@@ -21,7 +21,9 @@ pub use dto::{
     ReviewDeleteResult, ReviewExecuteParams, ReviewExecuteTarget, ReviewFindingTarget,
     ReviewFindingsTarget, ReviewGetParams, ReviewGetResult, ReviewGroupTarget, ReviewListResult,
     ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult, ReviewPreviewWindow,
-    ReviewSessionTarget, ReviewStartParams, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewRefineGroupParams, ReviewRefineGroupResult, ReviewSessionTarget, ReviewStartParams,
+    ReviewUpdateGroupStepParams, ReviewUpdateGroupStepResult, ReviewUpdateItemParams,
+    ReviewUpdateItemResult,
 };
 pub use events::{
     ReviewAnalyzeFinishedEvent, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,

@@ -13,9 +13,9 @@
 pub mod analysis;
 pub mod discussion;
 pub(crate) mod group_context;
+mod implementation;
 pub mod refine;
-#[cfg(test)]
-pub(crate) mod step;
+pub mod step;
 
 #[cfg(test)]
 mod group_prompt_tests;
@@ -25,18 +25,16 @@ pub use discussion::{
     format_review_group_discussion_prompt,
 };
 pub(crate) use group_context::apply_group_architectural_context;
+pub use implementation::render_group_implementation;
 
 #[cfg(test)]
 pub(crate) use discussion::format_review_discussion_prompt;
 #[cfg(test)]
-pub(crate) use refine::{
-    build_review_group_refine_system_prompt, build_review_group_refine_user_prompt,
-};
+pub(crate) use refine::build_review_group_refine_system_prompt;
+pub use refine::build_review_group_refine_user_prompt;
 #[cfg(test)]
-pub(crate) use step::{
-    format_review_step_execution_prompt, format_review_step_failure_note,
-    format_review_step_retry_prompt,
-};
+pub(crate) use step::format_review_step_failure_note;
+pub use step::{format_review_step_execution_prompt, format_review_step_retry_prompt};
 
 #[cfg(test)]
 mod tests {

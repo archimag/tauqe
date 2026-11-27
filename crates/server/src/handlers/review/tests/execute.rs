@@ -2,10 +2,16 @@
 //!
 //! Refusals happen before a member starts and leave no operation registered.
 
-use super::{architectural_session, test_item, test_session, test_state, TestDir};
+use super::{
+    architectural_session, horizon_config, horizon_leaf, horizon_response, init_repo_with_file,
+    test_item, test_session, test_state, TestDir,
+};
 
 use super::super::handle_review_execute;
 
+use std::sync::Arc;
+use tauqe_core::plan::PlanItemStatus;
+use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::review::IssueStatus;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{errors, Request};
@@ -378,4 +384,154 @@ async fn execute_refuses_a_group_that_still_poses_an_open_question() {
         !state.is_operation_active(),
         "a refused request releases the operation slot"
     );
+}
+
+/// The public RPC prepares the missing horizon before starting its coder turn.
+#[tokio::test]
+async fn execute_synthesizes_an_empty_group_before_its_coder_turn() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+    let mut session = architectural_session("rev-auto", "arch-1");
+    session.groups[0].blocked_reason = Some("owns no implementation horizon yet".into());
+    session.groups[0].description = Some("One shared root cause".into());
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(horizon_response(serde_json::json!([horizon_leaf("s-1")]))),
+        MockResponse::text(super::batch::json_edit_response(
+            "pub fn target() { let value = 9; }",
+        )),
+    ]));
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = crate::state::AppState::new(horizon_config(), dir.path().into(), history, out);
+    state.application.test_set_provider(provider.clone()).await;
+    let events = execute_and_collect(
+        &state,
+        &mut rx,
+        execute_request(serde_json::json!({
+            "kind": "group", "review_id": "rev-auto", "group_id": "arch-1"
+        })),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.model.as_str())
+            .collect::<Vec<_>>(),
+        ["review/architect", "review/coder"]
+    );
+    let architect_prompt = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(architect_prompt.contains("One shared root cause"));
+    assert!(architect_prompt.contains("Finding 1"));
+    let started: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.method == tauqe_protocol::events::MODEL_STARTED)
+        .collect();
+    assert_eq!(started.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.method == tauqe_protocol::events::MODEL_FINISHED)
+            .count(),
+        2
+    );
+    let prepared = events[started[0].0..started[1].0]
+        .iter()
+        .filter(|e| e.method == tauqe_protocol::events::REVIEW_UPDATED)
+        .map(|e| {
+            serde_json::from_value::<tauqe_protocol::ReviewUpdatedEvent>(e.params.clone().unwrap())
+                .unwrap()
+        })
+        .find(|e| !e.session.groups[0].implementation.items.is_empty())
+        .expect("the horizon is published before coder starts");
+    assert_eq!(
+        prepared.session.groups[0].implementation.items[0].status,
+        tauqe_protocol::PlanItemStatus::Todo
+    );
+    assert!(prepared.session.groups[0].blocked_reason.is_none());
+    let stored = ReviewStorage::load_review(dir.path(), "rev-auto")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.groups[0].implementation.items[0].status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(
+        stored.groups[0]
+            .implementation
+            .architect
+            .as_ref()
+            .unwrap()
+            .model,
+        tauqe_core::models::ModelRef::openrouter("review/architect")
+    );
+    assert!(stored.groups[0]
+        .implementation
+        .last_replanned_step
+        .is_none());
+    assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.method == tauqe_protocol::events::REVIEW_BATCH_FINISHED)
+            .count(),
+        1
+    );
+    assert!(!dir.path().join(".tauqe/plans/rev-auto.json").exists());
+}
+
+#[tokio::test]
+async fn execute_implicit_queues_synthesize_a_group_once_for_multiple_findings() {
+    for kind in ["session", "all_sessions"] {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+        let mut session = architectural_session("rev-implicit", "arch-1");
+        let mut second = test_item(2, IssueStatus::Todo, "src/target.rs");
+        second.group = Some("arch-1".into());
+        session.items.push(second.into());
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(horizon_response(serde_json::json!([horizon_leaf("s-1")]))),
+            MockResponse::text(super::batch::json_edit_response(
+                "pub fn target() { let value = 9; }",
+            )),
+        ]));
+        let (out, mut rx) = crate::transport::OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::state::AppState::new(horizon_config(), dir.path().into(), history, out);
+        state.application.test_set_provider(provider.clone()).await;
+        let events = execute_and_collect(
+            &state,
+            &mut rx,
+            execute_request(serde_json::json!({
+                "kind": kind, "review_id": "rev-implicit"
+            })),
+        )
+        .await;
+        assert_eq!(
+            provider
+                .requests()
+                .iter()
+                .map(|r| r.model.as_str())
+                .collect::<Vec<_>>(),
+            ["review/architect", "review/coder"]
+        );
+        let stored = ReviewStorage::load_review(dir.path(), "rev-implicit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.groups[0].implementation.items.len(), 1);
+        assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Fixed);
+        assert_eq!(stored.find_item(2).unwrap().status, IssueStatus::Fixed);
+        assert_eq!(
+            events.last().unwrap().params.as_ref().unwrap()["summary"]["fixed_count"],
+            2
+        );
+    }
 }

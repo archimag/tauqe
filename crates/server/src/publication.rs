@@ -1,7 +1,7 @@
 //! Converts application publications into the existing RPC events.
 use crate::contracts::Project;
 use crate::transport::OutChannel;
-use tauqe_flow::api::types::StreamEvent;
+use tauqe_flow::api::types::{HardCancellation, StreamEvent};
 use tauqe_flow::api::{ApplicationEvent, ApplicationObserver};
 use tauqe_protocol::{
     events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditHunkEvent, Event,
@@ -14,7 +14,7 @@ pub(crate) struct Publisher {
 
 #[async_trait::async_trait]
 impl ApplicationObserver for Publisher {
-    async fn ready(&self, event: &StreamEvent, cancel: &mut tokio::sync::watch::Receiver<bool>) {
+    async fn ready(&self, event: &StreamEvent, cancel: &HardCancellation) {
         self.out.pace_event(event, cancel).await;
     }
 
@@ -150,9 +150,6 @@ pub(crate) fn publish_stream(out: &OutChannel, op_id: &str, event: StreamEvent) 
                     "delta": delta,
                 })),
             });
-        }
-        StreamEvent::ContextChanged(ctx_state) => {
-            crate::handlers::context::publish_context(out, &ctx_state);
         }
         StreamEvent::EditFileStarted { path, op_type } => {
             out.send_event(&Event {
@@ -509,6 +506,25 @@ fn publish_review_batch(
         events::REVIEW_BATCH_FINISHED,
         serde_json::to_value(ReviewBatchFinishedEvent {
             operation_id: operation_id.into(),
+            deferred_groups: report
+                .deferred_groups
+                .into_iter()
+                .map(|group| tauqe_protocol::DeferredReviewGroup {
+                    review_id: group.review_id,
+                    group_id: group.group_id,
+                    reason: match group.reason {
+                        tauqe_flow::api::ReviewGroupDeferralReason::UnresolvedQuestions => {
+                            tauqe_protocol::ReviewGroupDeferralReason::UnresolvedQuestions
+                        }
+                        tauqe_flow::api::ReviewGroupDeferralReason::NeedsRefinement => {
+                            tauqe_protocol::ReviewGroupDeferralReason::NeedsRefinement
+                        }
+                    },
+                    diagnostic: group.diagnostic,
+                    recovery: group.recovery,
+                    open_findings: group.open_findings,
+                })
+                .collect(),
             summary: BatchFinishSummary {
                 owner_id: report.owner_id,
                 status,

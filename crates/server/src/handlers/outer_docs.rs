@@ -54,12 +54,12 @@ pub async fn handle_outer_docs_cache_remove(req: Request, state: &Arc<AppState>)
             return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid path");
         }
     };
-    let observer = crate::publication::Publisher {
+    let observer = Arc::new(crate::publication::Publisher {
         out: state.out.clone(),
-    };
+    });
     let removed = match state
         .application
-        .remove_cached_documents(params.path, &observer)
+        .remove_cached_documents(params.path, observer)
         .await
     {
         Ok(outcome) => outcome,

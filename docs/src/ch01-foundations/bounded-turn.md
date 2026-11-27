@@ -3,12 +3,19 @@
 A turn is not a conversation with a model. It is a set of deterministic control
 loops that carry one stated objective through research, proposal, staging,
 verification, and healing, and then either commit the result or restore the
-repository.
+repository. Every model request, including structured work, is admitted under
+`request.max_input_tokens` before the provider call. The estimate is
+`ceil(serialized provider input bytes / 4)`, not the provider's exact token
+count; it includes instructions, messages, history, task, files, external
+documents, repository representation, feedback, scratchpad, response schema,
+and adapter framing. A refusal spends no provider-call round and drops no
+accepted materials. Process and transfer guards protect resources separately.
 
 The REPL and isolated plan and review steps share `TurnWorkflow` in
-`crates/flow/src/workflows/`. It drives `RoundWorkflow` for model requests and
-uses the Core research, staging, and edit mechanisms for deterministic work.
-No stage asks the model which stage runs next.
+`crates/flow/src/workflows/`. It calls the free function
+`workflows::round::run_round` for each model request and uses the Core research,
+staging, and edit mechanisms for deterministic work. No stage asks the model
+which stage runs next.
 
 ---
 
@@ -56,7 +63,10 @@ including a discussion anchored on a plan or review finding, uses the tree in
 `core::llm::repl`. An isolated Coder step uses `core::llm::step`. The separate
 Architect synthesis uses its research and synthesis grant in `core::plan::prompt::refine`.
 The shared request executor binds the supplied grant to each request rather than
-inferring the scenario from the prompt.
+inferring the scenario from the prompt. Its only operational entry point is
+`PromptExecutor::execute`, which takes semantic inputs and returns decoded
+`Vec<LlmCommand>` or a typed execution error, never a prepared request for Flow
+to execute.
 
 The dialogue tree is two ambient channels beside one union of branches. The turn
 scratchpad and the single conversational message accompany every round, so they
@@ -98,11 +108,12 @@ no session history, exactly as an isolated step does: neither loop continues the
 developer's dialogue, so neither prompt carries the `<history>` block. Rendering
 is not recording: a step journals the two-sided card of its own event (§3.2.8),
 and a synthesis is recorded by the caller that started it, because only that
-caller knows the projection it produced. The loop is what puts the synthesis on
-the machine as every other turn: the structured Architect contour is a policy
-layer over the same round machinery every contour uses, so it inherits the
-rounds, the prompt head, the discovery journal, the corrective budget of an empty
-answer, and the transport retries instead of re-implementing them.
+caller knows the projection it produced. The Architect contour uses the same
+`run_round` boundary to handle common research commands but retains its own
+research and schema-healing budgets. Its requests are fresh rather than a
+replay of an edit-turn conversation; only frozen read-only evidence passes
+between its phases. It shares the underlying transport and retries without
+inheriting the technical turn's provider-call budget.
 
 The loop also owns the brief of its contour. It hands the assembly a typed
 `TurnBrief` — the kind of the contour, the role the model fills, a short
@@ -156,7 +167,9 @@ Each capability belongs to a phase (`Research`, `Execution`, `Verification`,
 `Outcome`). Model output is decoded into a normalized command list — text, edit,
 context request, repository search, documentation request, plan, review decision,
 scratchpad, a terminal signal, blocked, protocol error — so no consumer ever
-inspects raw markup.
+inspects raw markup. The executor decodes the entire completed response before
+returning commands; a protocol defect does not release partially decoded
+research or edits for execution.
 
 Each atomic `LlmCapability` maps directly in `capabilities/schema.rs`, `capabilities/decode.rs`, and `capabilities/rules.rs` to its `schemars`-backed schema fragment (`capability_schema`), its tree-walking decoder (`decode_capability_expr`), and its contract rule and instruction (`contract_rule`, `structured_instruction`). Because schema generation, prompt composition, and decoding all walk the same `CapabilityExpr` tree under `PromptRenderContext`, the prompt can never advertise a command the decoder rejects, and a disabled capability leaves no trace in either the prompt or the command stream. The strict schema is the single source of the response structure — field names, required-ness, enum values, and the descriptions it carries from the doc comments of the command types — while the prompt text states the direction of the work: the role, the discipline, the semantics of `blocked` and `abort`, and the order of the phases. A rule therefore never restates a structural requirement the schema already declares, and the instruction list is rendered from the same tree, so a narrowed surface withholds a property from the instructions exactly as it withholds it from the schema.
 
@@ -241,7 +254,10 @@ obligation therefore splits:
 ### 3.2.6 Result-Bearing Elements and Auxiliary Channels
 
 A round is judged by what the harness can act upon, not by how much the model
-wrote. One classification decides it:
+wrote. A completed, valid response may decode to an empty command vector; this
+is distinct from a blank provider stream, which is an execution error. The
+workflow decides whether the valid result advances its scenario. The channels
+below describe actionable work rather than transport validity:
 
 | Channel | Elements | Advances the turn? |
 | --- | --- | --- |
@@ -255,11 +271,20 @@ empty as a round carrying nothing at all.
 
 ### 3.2.7 ApplyPolicy
 
-`ApplyPolicy` isolates *how* validated edits reach disk from the state machine. It
-exposes four operations: staging, apply temporary, apply final, and rollback. Two
-implementations cover the supported transaction models: a direct policy that writes
-straight to disk for naive mode and tests, and a Git policy that checkpoints,
-commits a temporary step, and finalizes or rolls back.
+`ApplyPolicy` is the retained boundary for the whole file transaction. Its
+internal state preserves original bytes, accumulated changes, backups and Git
+checkpoint across application and healing passes. The caller chooses the direct
+or Git policy and decides when to apply, verify, heal or finalize; it does not
+assemble a separate backup mechanism or file worker. The policy checks
+cancellation immediately before admitting the irreversible finalization step:
+cancel before admission forbids the commit, while cancellation during an admitted
+operation returns its confirmed result and the cancellation fact rather than
+guessing a rollback or retrying finalization. If computation is aborted or
+panics, the technical supervisor retains the policy, confirms active operations
+have stopped and completes restoration before reporting cancellation. An
+unconfirmed recovery is an explicit incomplete result. This file boundary closes
+before REPL begins any separate plan or review document write; a later document
+cancellation cannot retroactively change a confirmed file commit.
 
 ### 3.2.8 The record, its status, and the three stores
 
@@ -354,9 +379,8 @@ request an authoritative documentation chapter.
 
 Each request is executed by its own registered handler, so a capability owns its
 validation, disk work, and feedback text. The round resolves repository facts once,
-folds every handler's findings into one outcome, and halts as soon as the files
-token budget would be breached — no later capability runs against a context that was
-never widened.
+folds every handler's findings into one outcome. The complete next request
+is admitted before a provider call rather than truncating discovered files.
 
 Two details make the loop cheap. Files preloaded for a step bypass the budget,
 because the caller already decided they are required. And findings that are not
@@ -402,24 +426,19 @@ not answered yet. The round still closes with its terminal success tag, so an
 accepted or declined offer is a completed turn rather than an unfinished one, and
 the plan itself is written only after explicit confirmation (*Local Plans*).
 
-A round that violates the branch exclusion — a change set together with a
-discovery request — is a protocol defect rather than a command, and the control
-loops resolve it without losing work. The change set proceeds to staging, because file
-content the model already produced is work the turn already paid for, while the
-discovery half is reported back as the defect to correct in a later round.
-Precedence belongs to the change set: a proposal about file content is checked by
-staging and verification, whereas a request for more material is checked by
-nothing. Discarding the proposal instead would let a turn that produced code reach
-the boundary looking like a turn that produced nothing, and would report as
-silence exactly the round the machine refuses to accept as silence.
+A round that violates branch exclusion — a change set together with a
+discovery request — is a protocol defect. It is rejected as a whole before
+`run_round` executes research or a scenario stages edits; partially decoded
+commands are not treated as completed work.
 
 ### 3.3.3 Silence Is Re-Asked, Never Accepted
 
 The invariant is enforced once, immediately after a round is decoded and before
 any phase consumes it.
 
-A round whose buckets are all empty is a non-answer rather than a reply, so the
-machine neither fails it nor records it. It issues a corrective request that
+A completed response with no actionable commands is a non-answer for a workflow
+that requires work, even though its decoding and accepted-round record are
+valid. The workflow issues a corrective request that
 states the contract the round violated — the model owes at least one
 result-bearing element, and a status tag alone does not discharge that debt — and
 lets the model answer again. The corrective loop is bounded like every other
@@ -435,12 +454,9 @@ a failed step. Three properties follow.
    project command invocation, a blocked report, an abort, or a terminal outcome
    that carries its payload.
 2. **A status tag is a claim, not a result.** A `success` without a stated
-   `commit_message` is decoded into a command and then fails the same emptiness
-   test as a blank round, so the model cannot close a turn by asserting that it
-   closed.
-3. **No phase observes silence.** Research, Staging, and Healing run only on
-   rounds that already passed the test, so a later phase never has to distinguish
-   "nothing to do" from "nothing was said".
+   `commit_message` cannot close a turn merely by asserting completion.
+3. **A blank stream is not a valid empty command result.** Transport and
+   protocol errors are reported before shared commands can run.
 
 ### 3.3.4 Project Command Execution & Feedback Loop
 
@@ -613,13 +629,29 @@ to change, which is what makes it testable without a network:
 | REPL workflow | `flow::workflows::repl` | dialogue and settlement of plan and review payloads |
 | `StepAttempt` | `flow::workflows::step` | one isolated Coder attempt |
 | `TurnWorkflow` | `flow::workflows::turn` | discovery, staging, application, and healing under one round budget |
-| `RoundWorkflow` | `flow::workflows::round` | one request admission and registration of a valid response |
+| `workflows::round::run_round` | `flow::workflows::round` | one request admission and registration of a valid response |
 | Core mechanisms | `core::workflow::research::step`, `core::edits` | repository discovery, virtual staging, disk application, and verification |
 
 Plan and review scenarios decide which steps run and how their outcomes affect
 the documents. Architect synthesis in Flow has a separate request lifecycle:
 it retains the research journal and uses `PromptExecutor` to prepare requests
 without replaying an edit-turn transcript or opening a transaction.
+
+`run_round` takes workflow context, journal, grant and shared round budget
+through `TurnState` and receives the task's `PromptExecutor` separately. It
+passes semantic inputs, including staged files and created paths, to `execute`,
+then handles common commands through the existing research mechanisms. It
+returns the remaining commands in their original order and the round facts to
+the scenario. It creates no task or lifecycle, stages no edits and does not
+retry requests or access the executor's transcript.
+After the file transaction settles, REPL plan correction calls the same function
+directly with the same state and executor, retaining its conversation and budget.
+
+Architect synthesis also calls `run_round`, but uses fresh requests and frozen
+evidence instead of dialogue replay. Its research and schema-healing limits
+are separate from the technical turn's shared correction budget. Scribe,
+audit and critique retain their own structured contracts over the shared
+request transport rather than being forced into `LlmCommand`.
 
 A scripted provider satisfies this contract without a network call, so multi-round
 scenarios — discovery, a compiler failure, a successful healing patch, a
@@ -634,8 +666,8 @@ surface as distinct terminal statuses.
 
 ### 3.3.10 The turn transcript across rounds
 
-Every round re-sends one growing message sequence, and providers cache the longest
-unchanged token prefix. `TurnState` owns the live `TurnTranscript`. It retains the
+Every dialogue round re-sends one growing message sequence, and providers cache the longest
+unchanged token prefix. The task's `PromptExecutor` owns the private `TurnTranscript`. It retains the
 rendered prefix, the frozen task, accepted replies and feedback, original file
 snapshots, and the grant and history used to render the prefix.
 
@@ -775,19 +807,20 @@ handed a spurious failure for the work it stopped.
 | Guard | Setting |
 | --- | --- |
 | Rounds per turn, every provider call included | `repl.max_turn_rounds` |
-| Context token budget | `context.token_budget` |
-| Repository outline budget | `context.repomap_token_budget` |
+| Complete provider input estimate | `request.max_input_tokens` |
 | Generation attempts per coder rung | `attempts` on the coder entry |
 | Generation attempts per architect rung | `attempts` on the architect entry (2 by default) |
-| Journal budget of a long batch | `history.budget_tokens` |
 | Automated replans | `repl.max_replans` |
 | Outlines per research round | fixed request cap |
 
-No operational limit is hardcoded into a loop: every one of them is configuration
-or the default a model entry declares for its own rung, and no budget silently
-discards work: a breached budget halts with a diagnostic that asks for a narrower
-scope, so the developer learns what to decompose instead of watching a turn fail
-anonymously.
+Round and attempt limits bound workflow progress, while transfer and process
+guards prevent unbounded host resource use. Neither is a hidden quota for
+files, the repository map, scratchpad, or feedback. History has its own
+`history.budget_tokens` limit: before an interactive turn opens, the history
+manager conditionally asks Scribe to summarize the compactable completed head
+while preserving the retained tail. Complete-request admission independently
+checks `request.max_input_tokens` afterwards; an overflow does not trigger
+another compaction or a retry of the input gate.
 
 ---
 
@@ -823,9 +856,8 @@ anonymously.
   commands. A schema never decides by itself whether a turn is finished.
 - **It does not let one round both discover and patch.** A capability surface
   splits into invariant ambient channels and mutually exclusive operational
-  branches, so a round that carries a change set carries no discovery request. A
-  mixed round is a protocol defect, and the loops resolve it in favor of the
-  change set instead of discarding work the turn already paid for.
+  branches. A mixed or otherwise defective round is rejected before any of
+  its commands execute.
 - **It does not let the dialogue language reach the commit.** `commit_message` is
   an English Conventional Commits header whatever language the turn answered in;
   the language of the answer follows the request, never the Git history.

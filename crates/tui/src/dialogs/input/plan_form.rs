@@ -26,6 +26,8 @@ pub(super) trait PlanFormDialog {
     fn planner(&mut self) -> &mut ModelSelector;
     /// The Architect ladder that audits the draft independently.
     fn critic(&mut self) -> &mut ModelSelector;
+    /// Whether the independent critique phase is disabled.
+    fn skip_critique(&self) -> bool;
     /// Flips the independent critique phase.
     fn toggle_skip_critique(&mut self);
     /// The directives or refinement instructions editor.
@@ -70,7 +72,7 @@ pub(super) fn handle_plan_form_key<D: PlanFormDialog>(
     // Planner while another section owns the keyboard, the Critic while its own
     // section does (Conventions §5.2).
     let switched = if focus.is_critic_list() {
-        dialog.critic().handle_key(key, primary, meta, false)
+        !dialog.skip_critique() && dialog.critic().handle_key(key, primary, meta, false)
     } else {
         dialog
             .planner()
@@ -84,7 +86,7 @@ pub(super) fn handle_plan_form_key<D: PlanFormDialog>(
     let list_handled = if focus.is_planner_list() {
         dialog.planner().handle_list_key(key, planner_rows)
     } else if focus.is_critic_list() {
-        dialog.critic().handle_list_key(key, critic_rows)
+        !dialog.skip_critique() && dialog.critic().handle_list_key(key, critic_rows)
     } else {
         false
     };
@@ -219,6 +221,10 @@ fn toggle(button: ConfirmDialogButton) -> ConfirmDialogButton {
 }
 
 impl PlanFormDialog for PlanCreateDialogState {
+    fn skip_critique(&self) -> bool {
+        self.skip_critique
+    }
+
     fn planner(&mut self) -> &mut ModelSelector {
         &mut self.planner
     }
@@ -253,6 +259,10 @@ impl PlanFormDialog for PlanCreateDialogState {
 }
 
 impl PlanFormDialog for PlanRefineDialogState {
+    fn skip_critique(&self) -> bool {
+        self.skip_critique
+    }
+
     fn planner(&mut self) -> &mut ModelSelector {
         &mut self.planner
     }

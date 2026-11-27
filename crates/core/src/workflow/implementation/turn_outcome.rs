@@ -25,10 +25,6 @@ pub fn classify_refinement(outcome: StructuredRefineOutcome) -> RefinementResult
             reason,
             tier: synthesized_tier,
         },
-        StructuredRefineStatus::BudgetExceeded { diagnostic } => RefinementResult::Blocked {
-            reason: diagnostic,
-            tier: synthesized_tier,
-        },
         // An abort is a diagnosis of the same weight as a blocker: the plan
         // or the group records why the horizon could not be reprojected, and
         // the message carries the host action the developer must perform
@@ -107,12 +103,6 @@ mod refinement_tests {
                     reason: "scope blocked".into(),
                 },
                 "scope blocked",
-            ),
-            (
-                StructuredRefineStatus::BudgetExceeded {
-                    diagnostic: "context budget exceeded".into(),
-                },
-                "context budget exceeded",
             ),
             (
                 StructuredRefineStatus::Aborted(AbortReport {

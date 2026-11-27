@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::execution::CancellationToken;
 use crate::plan::{Plan, PlanItemStatus, PlanRejection, PlanSummary};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 use tauqe_tools::atomic_write::write_atomic;
+use tauqe_tools::atomic_write::{BatchError, SiblingBatch};
 
 mod apply;
 mod horizon;
@@ -25,6 +27,38 @@ pub enum PlanMutationMode {
 }
 
 pub struct PlanStorage;
+
+/// A read-only preparation of one document operation. The original bytes cover
+/// the documents used for ID resolution and the active marker used for routing.
+#[derive(Debug)]
+pub struct PreparedPlanBatch {
+    snapshot: PlanBatchSnapshot,
+    pub baseline: HashMap<PathBuf, Vec<u8>>,
+    pub active_before: Option<Vec<u8>>,
+    pub active_after: Option<String>,
+    pub documents: HashMap<PathBuf, Plan>,
+    first_applied: Option<String>,
+}
+
+impl PreparedPlanBatch {
+    pub fn documents(&self) -> &HashMap<PathBuf, Plan> {
+        &self.documents
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlanBatchCommitError {
+    #[error("plan storage changed since preparation: {0}")]
+    Conflict(PathBuf),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Storage(#[from] anyhow::Error),
+    #[error(transparent)]
+    Batch(#[from] BatchError),
+}
 
 /// Process-global lock serializing plan storage mutations.
 ///
@@ -441,37 +475,45 @@ impl PlanStorage {
         normalized.implementation.normalize_lifecycle_provenance();
         normalized.implementation.refresh_parent_statuses();
 
-        let (target_file, existing) = if let Some(snapshot) = snapshot {
-            match snapshot.find(&plan.id) {
-                Some((stored, file)) => (file.to_path_buf(), Some(stored.clone())),
-                // An id the snapshot does not carry owns no storage file yet. A
-                // default target already occupied by another artifact is resolved
-                // from disk, so a sanitized-name collision and a document that
-                // cannot be decoded keep the diagnostics a single save reports.
-                None if !default_target.is_file() => (default_target, None),
-                None => {
-                    let stored = Self::read_plan_file_unlocked(&default_target)?;
-                    (default_target, Some(stored))
+        let (target_file, existing) =
+            if let Some(snapshot) = snapshot {
+                match snapshot.find(&plan.id) {
+                    Some((stored, file)) => (file.to_path_buf(), Some(stored.clone())),
+                    None => {
+                        let staged = snapshot.files.iter().zip(&snapshot.plans).find_map(
+                            |(file, stored)| (file == &default_target).then(|| stored.clone()),
+                        );
+                        // An id the snapshot does not carry owns no storage file yet.
+                        // Check staged names before disk so two new plans cannot claim
+                        // the same sanitized target.
+                        let existing = if staged.is_some() {
+                            staged
+                        } else if default_target.is_file() {
+                            Some(Self::read_plan_file_unlocked(&default_target)?)
+                        } else {
+                            None
+                        };
+                        (default_target, existing)
+                    }
                 }
-            }
-        } else {
-            // Reuse the file that already stores this plan even when its name
-            // differs from the sanitized id (for example after an id casing
-            // change). Writing to the resolved file keeps a single plan per id
-            // on disk instead of spawning a duplicate `{safe_id}.json` beside
-            // the original.
-            let target_file = if default_target.is_file() {
-                default_target
             } else {
-                Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
+                // Reuse the file that already stores this plan even when its name
+                // differs from the sanitized id (for example after an id casing
+                // change). Writing to the resolved file keeps a single plan per id
+                // on disk instead of spawning a duplicate `{safe_id}.json` beside
+                // the original.
+                let target_file = if default_target.is_file() {
+                    default_target
+                } else {
+                    Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
+                };
+                let existing = if target_file.is_file() {
+                    Some(Self::read_plan_file_unlocked(&target_file)?)
+                } else {
+                    None
+                };
+                (target_file, existing)
             };
-            let existing = if target_file.is_file() {
-                Some(Self::read_plan_file_unlocked(&target_file)?)
-            } else {
-                None
-            };
-            (target_file, existing)
-        };
 
         if let Some(existing_plan) = existing {
             if !existing_plan.id.eq_ignore_ascii_case(&plan.id) {

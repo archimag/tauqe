@@ -1,7 +1,7 @@
 # The Context Model
 
 The context is the model's working set for one turn: the files it may read, the
-files it may modify, and the budgets that keep that set affordable. TAUQE
+files it may modify, and the complete-request admission that keeps it affordable. TAUQE
 classifies every file into one of four layers under one shared permission
 vocabulary, so the working set stays explicit, auditable, and cheap to widen.
 
@@ -54,9 +54,9 @@ the end of the turn.
    document enters it only through the materialization a declared external reference
    produced, it stays read-only for as long as it is resident, and it leaves together
    with the Auto layer once the change set is committed or the isolated step ends.
-6. **Budgets are measured, not guessed.** File cost is its estimated content plus
-   the estimated wrapper its `<file>` element renders, and the aggregate is checked
-   against a configured ceiling before anything is added.
+6. **The whole request is measured, not a file slice.** No separate context
+   allowance drops admitted files. The complete serialized provider input is
+   refused before a call if it exceeds `request.max_input_tokens`.
 7. **Order is deterministic and belongs to the chronological transcript.** Every entry
    carries a monotonic insertion watermark, so a file's position derives from
    when it arrived, never from its name or from hash iteration order. The transcript
@@ -119,7 +119,9 @@ before it can be touched.
   provided so the model can decide, released as one unit once that decision is committed.
 - **Revision** — a counter advanced only when layer contents actually change, so a
   no-op mutation never disturbs clients.
-- **Estimated tokens** — `size_bytes / 4`, the single estimate every budget uses.
+- **Estimated input tokens** — `ceil(serialized provider input bytes / 4)`;
+  this includes response schema and adapter framing and is not an exact
+  provider tokenizer count.
 - **Dialogue session** — the provider-level identity an interactive dialogue
   binds its requests to. It routes related requests to the same cache-warm node
   and lives exactly as long as the prompt prefix it warmed.
@@ -133,7 +135,8 @@ before it can be touched.
 State is emitted in pinned → outer_docs → user → auto order. Each path appears exactly
 once: the first owning layer wins, and the merged effective access is applied to
 that single row. The aggregate estimated token count is summed over the emitted
-rows, and the revision advances only when something actually changed.
+rows, and the revision advances only when something actually changed. This
+context statistic does not gate intake; admission measures the full request.
 
 The context files of a turn are rendered from readable files inside the repository,
 and a path that escapes the repository, has been deleted, or cannot be decoded as
@@ -239,12 +242,10 @@ declared entry, the entry is materialized, the request is rewritten to its cache
 path, and the resulting file joins the layer read-only whatever access the request
 named. A manual addition is refused, because the layer is registry-managed.
 
-**Cost.** A document is priced exactly like a repository file: its estimated
-content plus the wrapper its own `<file>` element renders, spent against the single
-`context.token_budget` ceiling. The layer applies no ceiling of its own, so it never
-evicts a document and never refuses one: a request that would breach the aggregate
-budget is refused whole by the research round that made it, and the snapshot stays in
-the cache for a later round. A repeated request is a no-op: the snapshot is immutable
+**Cost.** A document has no separate context or layer quota. Its rendered
+content counts toward complete-request admission; an oversized request is
+refused before the provider call rather than evicting the document. A repeated
+request is a no-op: the snapshot is immutable
 for the whole task, so no rendered byte changes and the revision stays put.
 
 **Release.** The layer is transient: it is material provided so the model can decide,
@@ -271,33 +272,26 @@ moved, and no operation promotes a snapshot to editable. An explicit removal is
 the one mutation the developer owns, because dropping one document is a deliberate
 act rather than a curation of the project.
 
-### 3.5 Budgets and pattern intake
+### 3.5 Complete-request admission and pattern intake
 
-Per-file cost is the estimated content plus the estimated wrapper its own `<file>`
-element renders — the opening header carrying its path and access attribute and the
-closing footer — priced by the same builder that renders the `<context>` block, so the
-estimate and the rendered element cannot disagree. The assembled context reports an
-aggregate `total_estimated_tokens`, and `context.token_budget` (300,000 by
-default) bounds that aggregate. The check runs inside research: current tokens plus
-the estimated cost of the candidate additions are compared with the budget
-before a single file is added. A breach rejects the whole addition set, halts the
-round with a diagnostic naming the current, requested, and allowed amounts, and
-lets the developer scope the task down instead of watching the turn fail
-anonymously.
+The executor measures the entire serialized provider input, including
+instructions, task, history, files, external documents, repository outline,
+feedback, scratchpad, response schema, and adapter framing. Its estimate is
+`ceil(serialized_request_bytes / 4)`, not an exact provider token count. When
+it exceeds `request.max_input_tokens`, admission refuses the request before a
+provider call or round charge; it does not truncate files or accepted history.
+History has a separate `history.budget_tokens` limit, checked before an
+interactive turn opens. An oversized full request does not trigger compaction
+of history that already fits its own budget.
 
 A whole family of files can be loaded by glob pattern or directory prefix in one
 batch. The intake matches the tracked file list, skips paths already curated in
-the User layer, sorts matches for determinism, and admits them until
-`context.token_budget` is exhausted. The token budget is the only measure of
-volume: a thousand small headers can cost less than one generated bundle, so only
-the priced total decides. When the budget drops a match, the outcome reports
-truncation, so the omission is never silent.
+the User layer, and sorts matches for determinism. It does not truncate matches
+to fit a separate file allowance; the resulting request must pass complete-input
+admission.
 
-Two further budgets belong to neighbouring mechanics:
-`context.max_research_rounds` bounds widening rounds (see *Research Engine*), and
-`context.repomap_token_budget` bounds the repository outline (see *Repository Map
-and Blinkers*). External documents are not a separate working set: they are priced
-by the same `token_budget` as every repository file.
+Round and transfer guards belong to neighbouring mechanics (see *Research Engine*).
+External documents and repository outlines have no separate size budgets.
 
 ### 3.6 Turn merge and reconciliation
 
@@ -353,10 +347,10 @@ This keeps clients honest: a revision bump always means the visible state moved.
   entries; the interface cannot add, remove, or re-permission a pinned path.
 - **It is not sorted.** Alphabetical order is never imposed, because stable
   insertion order is what keeps the prompt prefix cacheable.
-- **It is not unlimited.** A breached budget halts the round with a diagnostic
-  instead of silently dropping files.
-- **It is not bounded by a file count.** The file token budget is the only measure
-  of volume; the number of files one request may admit has no separate ceiling.
+- **It is not unlimited.** An oversized complete request is refused before
+  the provider call rather than silently dropping files.
+- **It is not bounded by a file count or file-token allowance.** The complete
+  provider input is the unit of admission.
 - **It is not a substitute for curation.** The model can discover files
   autonomously, but loading the task-relevant files up front removes research
   rounds and spends fewer tokens.

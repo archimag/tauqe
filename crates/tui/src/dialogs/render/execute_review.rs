@@ -11,8 +11,9 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use tauqe_tui::projection::{PlanItemProjection, ReviewProjection};
 
-use crate::app::AppState;
+use crate::app::{AppState, ConfirmExecuteReviewState};
 use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -26,8 +27,15 @@ const EXECUTE_REVIEW_DIALOG_HEIGHT: u16 = 56;
 const EXECUTE_REVIEW_HEADER_HEIGHT: u16 = 4;
 
 /// Full drawn confirm-button label, resolved from the runtime locale (c-1).
-fn execute_review_confirm_label() -> String {
-    format!(" [ {} ] ", active_t("dialog.button.resolve"))
+fn execute_review_confirm_label(target: &ConfirmExecuteReviewState) -> String {
+    let key = if target.is_single_target() {
+        "dialog.button.resolve"
+    } else if target.group_id.is_some() {
+        "dialog.button.execute"
+    } else {
+        "dialog.button.resolve_queue"
+    };
+    format!(" [ {} ] ", active_t(key))
 }
 
 /// Full drawn cancel-button label, resolved from the runtime locale (c-1).
@@ -46,6 +54,8 @@ pub struct ExecuteReviewDialogGeometry {
     pub model_rows: Rect,
     /// The directives editor block.
     pub editor_area: Rect,
+    /// Scope description in place of the point-only editor.
+    pub scope_area: Rect,
     /// Confirm button.
     pub confirm_button: Rect,
     /// Cancel button.
@@ -57,31 +67,177 @@ pub struct ExecuteReviewDialogGeometry {
 /// the clickable ones (Conventions §6, §7).
 pub fn execute_review_dialog_geometry(
     term: Rect,
-    entry_count: usize,
+    target: &ConfirmExecuteReviewState,
 ) -> ExecuteReviewDialogGeometry {
     let area = crate::ui::centered_rect(
         EXECUTE_REVIEW_DIALOG_WIDTH,
         EXECUTE_REVIEW_DIALOG_HEIGHT,
         term,
     );
-    let chunks = super::picker_dialog_chunks(area, entry_count, EXECUTE_REVIEW_HEADER_HEIGHT, 0);
+    let chunks =
+        super::picker_dialog_chunks(area, target.selector.len(), EXECUTE_REVIEW_HEADER_HEIGHT, 0);
     let model_rows = super::inset(chunks.list);
+    let empty = Rect::new(chunks.editor.x, chunks.editor.y, chunks.editor.width, 0);
+    let (editor_area, scope_area) = if target.is_single_target() {
+        (chunks.editor, empty)
+    } else {
+        (empty, chunks.editor)
+    };
 
     // The button geometry is measured from the same localized labels the
     // renderer draws, so hit-testing never desynchronizes from the drawing.
     let (confirm_button, cancel_button) = super::picker_button_rects(
         chunks.buttons,
-        &execute_review_confirm_label(),
+        &execute_review_confirm_label(target),
         &execute_review_cancel_label(),
     );
 
     ExecuteReviewDialogGeometry {
         area,
         model_rows,
-        editor_area: chunks.editor,
+        editor_area,
+        scope_area,
         confirm_button,
         cancel_button,
     }
+}
+
+/// Counts the executable leaves in the saved group horizon, if present.
+fn group_plan_steps(state: &AppState, review_id: Option<&str>, group_id: &str) -> usize {
+    fn leaves(items: &[tauqe_protocol::PlanItem]) -> usize {
+        items
+            .iter()
+            .map(|item| {
+                if item.is_leaf() {
+                    1
+                } else {
+                    leaves(&item.children)
+                }
+            })
+            .sum()
+    }
+    state
+        .review
+        .sessions
+        .iter()
+        .chain(state.review.session.iter())
+        .find(|session| Some(session.id.as_str()) == review_id)
+        .and_then(|session| {
+            session
+                .effective_groups()
+                .into_iter()
+                .find(|g| g.id == group_id)
+        })
+        .map(|group| leaves(&group.implementation.items))
+        .unwrap_or(0)
+}
+
+/// Keeps the queue preview within the available band, reserving its trailing
+/// explanation and an accurate count of entries omitted from the preview.
+fn queue_scope_lines(
+    state: &AppState,
+    target: &ConfirmExecuteReviewState,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let group = target.group_id.is_some();
+    let heading = if target.review_id.is_none() {
+        "dialog.execute_review.heading_all"
+    } else if group {
+        "dialog.execute_review.heading_group"
+    } else {
+        "dialog.execute_review.heading_session"
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            active_t(heading),
+            engine.fg(palette.status_info).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(
+                active_t("dialog.execute_review.review_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                truncate_to_width(&target.review_title, 38),
+                engine.fg(palette.text_primary).bold(),
+            ),
+            Span::styled(
+                target
+                    .review_id
+                    .as_ref()
+                    .map(|id| format!(" [{id}]"))
+                    .unwrap_or_default(),
+                engine.fg(palette.text_muted),
+            ),
+        ]),
+    ];
+    if group {
+        lines.push(Line::from(vec![
+            Span::styled(
+                active_t("dialog.execute_review.group_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                truncate_to_width(&target.group_title, 38),
+                engine.fg(palette.status_warning).bold(),
+            ),
+        ]));
+        let count = group_plan_steps(
+            state,
+            target.review_id.as_deref(),
+            target.group_id.as_deref().unwrap_or_default(),
+        );
+        lines.push(Line::raw(if count == 0 {
+            active_t("dialog.execute_review.jit_note")
+        } else {
+            active_t("dialog.execute_review.plan_steps_count").replacen("{}", &count.to_string(), 1)
+        }));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                active_t("dialog.execute_review.scope_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                truncate_to_width(&target.scope_title, 38),
+                engine.fg(palette.status_warning).bold(),
+            ),
+            Span::raw(active_t("dialog.execute_review.scope_count").replacen(
+                "{}",
+                &target.items.len().to_string(),
+                1,
+            )),
+        ]));
+        lines.push(Line::raw(active_t("dialog.execute_review.queue_header")));
+        let shown = target
+            .items
+            .len()
+            .min(4)
+            .min(height.saturating_sub(lines.len() + 3));
+        for (index, item) in target.items.iter().take(shown).enumerate() {
+            lines.push(Line::raw(format!(
+                "   {}. [{}] #{} {}",
+                index + 1,
+                item.issue_type,
+                item.id,
+                truncate_to_width(&item.title, 36)
+            )));
+        }
+        if target.items.len() > shown {
+            lines.push(Line::raw(
+                active_t("dialog.execute_review.queue_more").replacen(
+                    "{}",
+                    &(target.items.len() - shown).to_string(),
+                    1,
+                ),
+            ));
+        }
+    }
+    lines.push(Line::raw(active_t("dialog.execute_review.note")));
+    lines.push(Line::raw(active_t("dialog.execute_review.fail_fast")));
+    lines
 }
 
 /// Renders the single-target review-execution confirmation.
@@ -100,17 +256,22 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     let palette = engine.palette();
     let dim = engine.fg(palette.text_muted);
     let entry_count = target.selector.len();
-    let area = crate::ui::centered_rect(
-        EXECUTE_REVIEW_DIALOG_WIDTH,
-        EXECUTE_REVIEW_DIALOG_HEIGHT,
-        frame.area(),
-    );
+    let geometry = execute_review_dialog_geometry(frame.area(), target);
+    let area = geometry.area;
     frame.render_widget(Clear, area);
 
     let outer_block = Block::default()
         .title(format!(
             " {} ",
-            active_t("dialog.execute_review.title_point")
+            active_t(if target.is_single_target() {
+                "dialog.execute_review.title_point"
+            } else if target.review_id.is_none() {
+                "dialog.execute_review.title_all"
+            } else if target.group_id.is_some() {
+                "dialog.execute_review.title_group"
+            } else {
+                "dialog.execute_review.title_session"
+            })
         ))
         .borders(Borders::ALL)
         .border_style(engine.fg(palette.button_active_bg))
@@ -139,7 +300,7 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     }
     let mut header_lines = vec![Line::from(review_spans)];
 
-    if let Some(item) = target.items.first() {
+    if let Some(item) = target.items.first().filter(|_| target.is_single_target()) {
         header_lines.push(Line::from(vec![
             Span::styled(active_t("dialog.execute_review.finding_label"), dim),
             Span::styled(
@@ -163,6 +324,17 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     // into the model list below it.
     header_lines.truncate(EXECUTE_REVIEW_HEADER_HEIGHT as usize);
     frame.render_widget(Paragraph::new(header_lines), header_area);
+
+    if !target.is_single_target() {
+        frame.render_widget(
+            Paragraph::new(queue_scope_lines(
+                state,
+                target,
+                geometry.scope_area.height as usize,
+            )),
+            geometry.scope_area,
+        );
+    }
 
     // Coder list. The shared `ModelSelector` owns the rows, numbering, scrolling,
     // and empty-list safety; the block adds framing and the focus color.
@@ -200,45 +372,47 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
-    // Directives editor. The cursor is drawn only when the editor owns focus.
-    let show_cursor = target.focus.is_instructions_editor();
-    let mut editor_content = Vec::new();
-    if target.instructions_editor.is_empty() {
-        let mut spans = vec![Span::raw("> ")];
-        if show_cursor {
-            spans.push(Span::styled("█", engine.fg(palette.status_warning)));
-        }
-        spans.push(Span::styled(
-            active_t("dialog.execute_review.editor_placeholder"),
-            dim,
-        ));
-        editor_content.push(Line::from(spans));
-    } else {
-        for line in super::editor_lines(&target.instructions_editor, show_cursor) {
+    // Only a point finding exposes the directives editor.
+    if target.is_single_target() {
+        let show_cursor = target.focus.is_instructions_editor();
+        let mut editor_content = Vec::new();
+        if target.instructions_editor.is_empty() {
             let mut spans = vec![Span::raw("> ")];
-            spans.extend(line.spans);
+            if show_cursor {
+                spans.push(Span::styled("█", engine.fg(palette.status_warning)));
+            }
+            spans.push(Span::styled(
+                active_t("dialog.execute_review.editor_placeholder"),
+                dim,
+            ));
             editor_content.push(Line::from(spans));
+        } else {
+            for line in super::editor_lines(&target.instructions_editor, show_cursor) {
+                let mut spans = vec![Span::raw("> ")];
+                spans.extend(line.spans);
+                editor_content.push(Line::from(spans));
+            }
         }
+        let editor_border = if target.focus.is_instructions_editor() {
+            engine.fg(palette.status_success).bold()
+        } else {
+            engine.fg(palette.border)
+        };
+        let editor_block = Block::default()
+            .title(format!(
+                " {} ",
+                active_t("dialog.execute_review.editor_title")
+            ))
+            .borders(Borders::ALL)
+            .border_style(editor_border)
+            .style(Style::default().bg(engine.color(palette.surface)));
+        frame.render_widget(
+            Paragraph::new(editor_content)
+                .block(editor_block)
+                .wrap(Wrap { trim: false }),
+            editor_area,
+        );
     }
-    let editor_border = if target.focus.is_instructions_editor() {
-        engine.fg(palette.status_success).bold()
-    } else {
-        engine.fg(palette.border)
-    };
-    let editor_block = Block::default()
-        .title(format!(
-            " {} ",
-            active_t("dialog.execute_review.editor_title")
-        ))
-        .borders(Borders::ALL)
-        .border_style(editor_border)
-        .style(Style::default().bg(engine.color(palette.surface)));
-    frame.render_widget(
-        Paragraph::new(editor_content)
-            .block(editor_block)
-            .wrap(Wrap { trim: false }),
-        editor_area,
-    );
 
     // Action bar with focus-aware styling.
     let in_actions = target.focus.is_actions();
@@ -276,7 +450,7 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
         )
     };
     let actions = Line::from(vec![
-        Span::styled(execute_review_confirm_label(), confirm_style),
+        Span::styled(execute_review_confirm_label(target), confirm_style),
         Span::raw("    "),
         Span::styled(execute_review_cancel_label(), cancel_style),
     ]);

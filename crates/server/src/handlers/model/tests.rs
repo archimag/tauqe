@@ -15,8 +15,9 @@ use tauqe_core::models::{ModelRef, ModelSelection, ProviderKind};
 use tauqe_core::plan::DiscussionPlanAction;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
+use tauqe_core::stop::StopState;
 use tauqe_protocol::{DiscussionFocus, Request};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::{handle_model_cancel, handle_model_clear_history, handle_model_select};
 use crate::handlers::common::test_support::scratch_root;
@@ -370,8 +371,11 @@ async fn preflight_with(config: Option<&str>) -> PreflightVerdict {
     if let Some(config) = config {
         std::fs::write(dir.join("tauqe.toml"), config).expect("write the project declaration");
     }
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let verdict = crate::handlers::run_preflight_verification(&dir, cancel_rx).await;
+    let verdict = crate::handlers::run_preflight_verification(
+        &dir,
+        tauqe_core::stop::HardCancellation::never(),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&dir);
     verdict
 }
@@ -491,10 +495,10 @@ impl LlmProvider for StallingProvider {
         &self,
         request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         if self.first.requests().is_empty() {
-            return self.first.stream(request, tx, cancel_rx).await;
+            return self.first.stream(request, tx, cancel.clone()).await;
         }
         // Inspect the public captured request without exposing LlmRequest's
         // private fields or forwarding the recorder's Done into the live turn.
@@ -502,9 +506,7 @@ impl LlmProvider for StallingProvider {
             tauqe_core::providers::mock::MockResponse::text(""),
         ]);
         let (capture_tx, _capture_rx) = mpsc::channel(1);
-        recorder
-            .stream(request, capture_tx, cancel_rx.clone())
-            .await?;
+        recorder.stream(request, capture_tx, cancel.clone()).await?;
         let request = recorder.last_request().expect("continuation captured");
         assert!(request
             .messages
@@ -529,11 +531,7 @@ impl LlmProvider for StallingProvider {
         let _ = self.entered.send(());
         // Park until the harness cancels the turn: the request loop has to stay
         // free to deliver `model/cancel` while this stream is open.
-        while !*cancel_rx.borrow() {
-            if cancel_rx.changed().await.is_err() {
-                break;
-            }
-        }
+        cancel.cancelled().await;
         self.parked.store(false, Ordering::SeqCst);
         let _ = tx.send(StreamEvent::Cancelled).await;
         Ok(())
@@ -577,8 +575,7 @@ async fn model_cancel_refuses_a_malformed_payload_without_cancelling() {
     let operation = state
         .try_begin_operation()
         .expect("operation slot must be free");
-    let cancel_rx = operation.cancel_receiver();
-    let soft_rx = operation.soft_stop_receiver();
+    let stop = operation.stop_token();
 
     // An unknown mode string and a wrongly typed field are both malformed
     // payloads, so both are answered with the parameter error.
@@ -595,11 +592,11 @@ async fn model_cancel_refuses_a_malformed_payload_without_cancelling() {
             tauqe_protocol::errors::INVALID_PARAMS
         );
         assert!(
-            !*cancel_rx.borrow(),
+            stop.state() == StopState::Running,
             "a refused payload must not hard-cancel the operation"
         );
         assert!(
-            !*soft_rx.borrow(),
+            stop.state() == StopState::Running,
             "a refused payload must not request a soft stop"
         );
     }
@@ -623,8 +620,7 @@ async fn model_cancel_soft_payload_drains_and_absent_payload_hard_cancels() {
     let operation = state
         .try_begin_operation()
         .expect("operation slot must be free");
-    let cancel_rx = operation.cancel_receiver();
-    let soft_rx = operation.soft_stop_receiver();
+    let stop = operation.stop_token();
     let soft = handle_model_cancel(
         cancel_request_with(serde_json::json!({ "mode": "soft" })),
         &state,
@@ -635,8 +631,7 @@ async fn model_cancel_soft_payload_drains_and_absent_payload_hard_cancels() {
         "a soft stop must be accepted: {:?}",
         soft.error
     );
-    assert!(*soft_rx.borrow(), "the soft stop must reach the supervisor");
-    assert!(!*cancel_rx.borrow(), "a soft stop must not hard-cancel");
+    assert_eq!(stop.state(), StopState::Soft);
     assert!(
         state.is_operation_active(),
         "a soft stop leaves the operation registered"
@@ -646,7 +641,7 @@ async fn model_cancel_soft_payload_drains_and_absent_payload_hard_cancels() {
     let operation = state
         .try_begin_operation()
         .expect("operation slot must be free");
-    let cancel_rx = operation.cancel_receiver();
+    let stop = operation.stop_token();
     let hard = handle_model_cancel(cancel_request(), &state).await;
     assert!(
         hard.error.is_none(),
@@ -654,7 +649,7 @@ async fn model_cancel_soft_payload_drains_and_absent_payload_hard_cancels() {
         hard.error
     );
     assert!(
-        *cancel_rx.borrow(),
+        stop.state() == StopState::Hard,
         "an absent payload must raise the hard-cancel signal"
     );
     drop(operation);

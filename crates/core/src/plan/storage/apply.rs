@@ -4,7 +4,8 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use super::{
-    PlanApplicationOutcome, PlanBatchSnapshot, PlanMutationMode, PlanPreparationError, PlanStorage,
+    CancellationToken, PlanApplicationOutcome, PlanBatchCommitError, PlanBatchSnapshot,
+    PlanMutationMode, PlanPreparationError, PlanStorage, PreparedPlanBatch, SiblingBatch,
 };
 
 /// Contract of one applied mutation of a plan batch.
@@ -13,7 +14,6 @@ enum MutationCommit {
     /// The mutation is written to storage.
     Persist,
     /// The mutation is validated and recorded in the batch snapshot only.
-    #[cfg(test)]
     Probe,
 }
 
@@ -22,7 +22,6 @@ impl MutationCommit {
     fn persists(self) -> bool {
         match self {
             Self::Persist => true,
-            #[cfg(test)]
             Self::Probe => false,
         }
     }
@@ -175,6 +174,152 @@ struct PlanMutationTag {
 }
 
 impl PlanStorage {
+    /// Persist the final prepared view only when every observed file and the
+    /// active marker still carry their preparation-time bytes.
+    pub fn commit_prepared_batch(
+        repo_root: &Path,
+        batch: PreparedPlanBatch,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Plan>, PlanBatchCommitError> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let current = PlanBatchSnapshot::load_unlocked(repo_root, true)?;
+            let mut paths: std::collections::HashSet<_> = batch.baseline.keys().cloned().collect();
+            paths.extend(current.files);
+            paths.extend(batch.documents.keys().cloned());
+            for path in paths {
+                let observed = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if observed.as_deref() != batch.baseline.get(&path).map(Vec::as_slice) {
+                    return Err(PlanBatchCommitError::Conflict(path));
+                }
+            }
+            let marker = Self::plans_dir(repo_root).join("active");
+            let active = match std::fs::read(&marker) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if active != batch.active_before {
+                return Err(PlanBatchCommitError::Conflict(marker));
+            }
+            let mut files = SiblingBatch::default();
+            let mut plans = Vec::new();
+            for (path, plan) in batch.documents {
+                files.replace(path, Some(serde_json::to_vec_pretty(&plan)?));
+                plans.push(plan);
+            }
+            if let Some(id) = batch.active_after {
+                files.replace(marker, Some(id.into_bytes()));
+            }
+            if !plans.is_empty() {
+                Self::ensure_plans_dir(repo_root)?;
+            }
+            files.apply(|| cancel.is_cancelled(), || !cancel.is_cancelled())?;
+            Ok(plans)
+        })
+    }
+
+    /// Freeze the strict storage view before any model correction begins.
+    pub fn prepare_plan_batch(repo_root: &Path) -> anyhow::Result<PreparedPlanBatch> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let snapshot = PlanBatchSnapshot::load_unlocked(repo_root, true)?;
+            let mut baseline = std::collections::HashMap::new();
+            for file in &snapshot.files {
+                baseline.insert(file.clone(), std::fs::read(file)?);
+            }
+            let active = Self::plans_dir(repo_root).join("active");
+            let active_before = match std::fs::read(active) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok(PreparedPlanBatch {
+                snapshot,
+                baseline,
+                active_before,
+                active_after: None,
+                documents: Default::default(),
+                first_applied: None,
+            })
+        })
+    }
+
+    /// Advance an in-memory batch, retaining accepted documents across repairs.
+    pub fn prepare_plan_updates(
+        repo_root: &Path,
+        batch: &mut PreparedPlanBatch,
+        updates: &[DiscussionPlanUpdate],
+        mode: PlanMutationMode,
+    ) -> Vec<PlanApplicationOutcome> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let mut outcomes = Vec::with_capacity(updates.len());
+            for update in updates {
+                let explicit_id = update
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                let active_id = if explicit_id.is_none() {
+                    batch
+                        .active_before
+                        .as_deref()
+                        .and_then(|bytes| {
+                            std::str::from_utf8(bytes)
+                                .ok()
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_string)
+                        })
+                        .or_else(|| batch.first_applied.clone())
+                } else {
+                    None
+                };
+                let tag = match Self::resolve_discussion_update(
+                    update,
+                    explicit_id,
+                    active_id,
+                    batch.snapshot.plans(),
+                ) {
+                    Ok(tag) => tag,
+                    Err(rejection) => {
+                        outcomes.push(PlanApplicationOutcome {
+                            errors: vec![rejection],
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                };
+                let outcome = Self::apply_tags_with_snapshot_unlocked(
+                    repo_root,
+                    &mut batch.snapshot,
+                    vec![tag],
+                    Vec::new(),
+                    mode,
+                    MutationCommit::Probe,
+                );
+                for plan in &outcome.applied {
+                    if let Some((_, path)) = batch.snapshot.find(&plan.id) {
+                        batch.documents.insert(path.to_path_buf(), plan.clone());
+                    }
+                    batch.first_applied.get_or_insert_with(|| plan.id.clone());
+                    batch.active_after = Some(plan.id.clone());
+                }
+                let failed = outcome.storage_error.is_some();
+                outcomes.push(outcome);
+                if failed {
+                    break;
+                }
+            }
+            outcomes
+        })
+    }
+
     fn apply_tags_with_snapshot_unlocked(
         repo_root: &Path,
         snapshot: &mut PlanBatchSnapshot,
@@ -1130,6 +1275,63 @@ mod tests {
                 .title,
             "Step 1"
         );
+    }
+
+    #[test]
+    fn prepared_batch_keeps_valid_mutations_private_when_a_later_one_is_invalid() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let existing = probe_payload("existing", vec![probe_leaf("1", "src/existing.rs")]);
+        PlanStorage::apply_discussion_plan_update(root, &existing);
+        let file = PlanStorage::plans_dir(root).join("existing.json");
+        let marker = PlanStorage::plans_dir(root).join("active");
+        let original = std::fs::read(&file).unwrap();
+        let active = std::fs::read(&marker).unwrap();
+
+        let mut batch = PlanStorage::prepare_plan_batch(root).unwrap();
+        let valid = probe_payload("first", vec![probe_leaf("1", "src/first.rs")]);
+        let invalid = probe_payload(
+            "second",
+            vec![
+                probe_leaf("1", "src/second.rs"),
+                probe_leaf("1", "src/duplicate.rs"),
+            ],
+        );
+        let outcomes = PlanStorage::prepare_plan_updates(
+            root,
+            &mut batch,
+            &[valid, invalid],
+            PlanMutationMode::Discussion,
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].applied.len(), 1);
+        assert_eq!(outcomes[1].errors.len(), 1);
+        assert_eq!(batch.documents().len(), 1);
+        assert!(!PlanStorage::plans_dir(root).join("first.json").exists());
+        assert!(!PlanStorage::plans_dir(root).join("second.json").exists());
+        assert_eq!(std::fs::read(file).unwrap(), original);
+        assert_eq!(std::fs::read(marker).unwrap(), active);
+    }
+
+    #[test]
+    fn failed_active_marker_commit_restores_the_new_plan() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut batch = PlanStorage::prepare_plan_batch(root).unwrap();
+        let valid = probe_payload("first", vec![probe_leaf("1", "src/first.rs")]);
+        assert_eq!(
+            PlanStorage::prepare_plan_updates(root, &mut batch, &[valid], PlanMutationMode::Repl)
+                [0]
+            .applied
+            .len(),
+            1
+        );
+        let marker = PlanStorage::plans_dir(root).join("active");
+        std::fs::create_dir_all(&marker).unwrap();
+        let result = PlanStorage::commit_prepared_batch(root, batch, &CancellationToken::never());
+        assert!(result.is_err());
+        assert!(!PlanStorage::plans_dir(root).join("first.json").exists());
+        assert!(marker.is_dir());
     }
 
     #[test]

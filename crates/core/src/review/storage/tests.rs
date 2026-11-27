@@ -1,7 +1,7 @@
 use super::*;
 use crate::discussion::DiscussionTarget;
 use crate::models::ArchitectTier;
-use crate::plan::{PlanImplementation, PlanItem};
+use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 use crate::review::{
     IssueStatus, IssueType, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
     ReviewSeverity, DEFAULT_REVIEW_GROUP_ID,
@@ -1090,7 +1090,10 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
             ..Default::default()
         },
     ];
-    ReviewStorage::save_session(root, &grouped_layer_session(review, existing)).unwrap();
+    let mut session = grouped_layer_session(review, existing);
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    let snapshot = session.groups[0].clone();
+    ReviewStorage::save_session(root, &session).unwrap();
 
     let new_horizon = vec![
         PlanItem {
@@ -1112,12 +1115,12 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
         root,
         review,
         "arch-1",
+        &snapshot,
+        &[],
         new_horizon,
         test_architect(),
-        Some("s-2".to_string()),
     )
     .unwrap();
-    let updated = updated.expect("the group accepts a horizon");
     assert_eq!(updated.implementation.items.len(), 2);
     let finished = &updated.implementation.items[0];
     let synthesized = &updated.implementation.items[1];
@@ -1125,10 +1128,7 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
     assert_eq!(finished.status, crate::plan::PlanItemStatus::Done);
     assert_eq!(synthesized.id, "s-3");
     assert_eq!(updated.implementation.architect, Some(test_architect()));
-    assert_eq!(
-        updated.implementation.last_replanned_step.as_deref(),
-        Some("s-2")
-    );
+    assert!(updated.implementation.last_replanned_step.is_none());
 
     // The provenance and the preserved foundation survive a reload, so a
     // later wave derives escalation from disk state.
@@ -1137,22 +1137,358 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
     assert_eq!(group.implementation.items.len(), 2);
     assert_eq!(group.implementation.items[0].id, "s-1");
     assert_eq!(group.implementation.architect, Some(test_architect()));
-    assert_eq!(
-        group.implementation.last_replanned_step.as_deref(),
-        Some("s-2")
-    );
+    assert!(group.implementation.last_replanned_step.is_none());
 
     // An unknown group resolves to nothing instead of accepting a horizon.
     let missing = ReviewStorage::replace_uncompleted_group_subplan(
         root,
         review,
         "arch-9",
+        &snapshot,
+        &[],
         Vec::new(),
         test_architect(),
-        None,
+    );
+    assert!(matches!(
+        missing,
+        Err(GroupHorizonReplacementError::MissingTarget { .. })
+    ));
+}
+
+#[test]
+fn refined_group_horizon_preserves_nested_done_and_unrelated_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut session = grouped_layer_session(
+        "refinement",
+        vec![PlanItem {
+            id: "phase".into(),
+            title: "Old phase".into(),
+            children: vec![
+                PlanItem {
+                    id: "done".into(),
+                    title: "Finished".into(),
+                    status: PlanItemStatus::Done,
+                    commit: Some("0123456789abcdef".into()),
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "blocked".into(),
+                    title: "Blocked".into(),
+                    status: PlanItemStatus::Blocked,
+                    blocked_reason: Some("Need decision".into()),
+                    files: vec!["src/old.rs".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+    );
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    session.groups[0].blocked_reason = Some("Old group blocker".into());
+    session.groups[0].resolution_notes = Some("Decision recorded".into());
+    session.groups[0].implementation.last_replanned_step = Some("blocked".into());
+    session.groups.push(simple_group("other"));
+    session.items = vec![
+        finding_with(1, Some("arch-1"), IssueStatus::Todo, Some("Keep note")),
+        finding_with(2, Some("arch-1"), IssueStatus::Fixed, Some("Fixed earlier")),
+        group_finding(3, Some("other")),
+    ];
+    session.items[1].commit = Some("previous-commit".into());
+    let expected_group = session.groups[0].clone();
+    let expected_findings = session.items[..2].to_vec();
+    ReviewStorage::save_session(root, &session).unwrap();
+
+    session.groups[1].title = "Updated neighbor".into();
+    session.items[2].status = IssueStatus::Skipped;
+    ReviewStorage::save_session(root, &session).unwrap();
+    let horizon = vec![PlanItem {
+        id: "next".into(),
+        title: "Finish repair".into(),
+        status: PlanItemStatus::Todo,
+        depends_on: vec!["done".into()],
+        files: vec!["src/next.rs".into()],
+        ..Default::default()
+    }];
+    let updated = ReviewStorage::replace_uncompleted_group_subplan(
+        root,
+        "refinement",
+        "arch-1",
+        &expected_group,
+        &expected_findings,
+        horizon,
+        test_architect(),
     )
     .unwrap();
-    assert!(missing.is_none());
+    assert_eq!(
+        updated.implementation.items[0],
+        expected_group.implementation.items[0].children[0]
+    );
+    assert_eq!(updated.implementation.items[1].id, "next");
+    assert_eq!(updated.implementation.architect, Some(test_architect()));
+    assert!(updated.implementation.last_replanned_step.is_none());
+    assert!(updated.blocked_reason.is_none());
+    assert_eq!(updated.resolution_notes, expected_group.resolution_notes);
+    let stored = ReviewStorage::load_review(root, "refinement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.groups[0], updated);
+    assert_eq!(stored.groups[1], session.groups[1]);
+    assert_eq!(stored.items, session.items);
+}
+
+#[test]
+fn refined_group_horizon_refusals_do_not_rewrite_the_session() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut session = grouped_layer_session(
+        "refused",
+        vec![PlanItem {
+            id: "done".into(),
+            title: "Finished".into(),
+            status: PlanItemStatus::Done,
+            commit: Some("0123456789abcdef".into()),
+            ..Default::default()
+        }],
+    );
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    session.groups[0].blocked_reason = Some("Keep blocker".into());
+    session.items.push(group_finding(1, Some("arch-1")));
+    ReviewStorage::save_session(root, &session).unwrap();
+    let group = session.groups[0].clone();
+    let findings = session.items.clone();
+    let path = ReviewStorage::reviews_dir(root).join("refused.json");
+    let step = |id: &str, deps: Vec<&str>| PlanItem {
+        id: id.into(),
+        title: id.into(),
+        depends_on: deps.into_iter().map(str::to_string).collect(),
+        files: vec!["src/repair.rs".into()],
+        ..Default::default()
+    };
+    for (candidate, empty) in [
+        (vec![], true),
+        (vec![step("a", vec!["b"]), step("b", vec!["a"])], false),
+        (vec![step("a", vec!["ghost"])], false),
+        (vec![step("done", vec![])], false),
+    ] {
+        let before = std::fs::read(&path).unwrap();
+        let result = ReviewStorage::replace_uncompleted_group_subplan(
+            root,
+            "refused",
+            "arch-1",
+            &group,
+            &findings,
+            candidate,
+            test_architect(),
+        );
+        if empty {
+            assert!(matches!(
+                result,
+                Err(GroupHorizonReplacementError::EmptyHorizon)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(GroupHorizonReplacementError::InvalidTree(_))
+            ));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    let mut stale_group = group.clone();
+    stale_group.title = "Earlier title".into();
+    let mut stale_findings = findings.clone();
+    stale_findings[0].status = IssueStatus::Discussion;
+    for (expected_group, expected_findings) in [
+        (&stale_group, findings.as_slice()),
+        (&group, stale_findings.as_slice()),
+        (&group, &[][..]),
+    ] {
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            ReviewStorage::replace_uncompleted_group_subplan(
+                root,
+                "refused",
+                "arch-1",
+                expected_group,
+                expected_findings,
+                vec![step("next", vec![])],
+                test_architect(),
+            ),
+            Err(GroupHorizonReplacementError::StaleSnapshot(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    let mut simple = session.clone();
+    simple.groups[0].kind = ReviewGroupKind::Simple;
+    ReviewStorage::save_session(root, &simple).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        ReviewStorage::replace_uncompleted_group_subplan(
+            root,
+            "refused",
+            "arch-1",
+            &group,
+            &findings,
+            vec![step("next", vec![])],
+            test_architect(),
+        ),
+        Err(GroupHorizonReplacementError::NotArchitectural(_))
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn initial_group_horizon_is_atomic_and_preserves_other_members() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "initial-horizon";
+    let mut session = grouped_layer_session(review, vec![]);
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    session.groups[0].blocked_reason = Some("Previous failure".into());
+    session.groups.push(simple_group("local"));
+    session.items = vec![
+        group_finding(1, Some("arch-1")),
+        group_finding(2, Some("local")),
+    ];
+    let neighbors = (session.groups[1].clone(), session.items.clone());
+    ReviewStorage::save_session(root, &session).unwrap();
+    let step = PlanItem {
+        id: "new".into(),
+        title: "Remove the root cause".into(),
+        files: vec!["src/repair.rs".into()],
+        ..Default::default()
+    };
+    let written = ReviewStorage::write_initial_group_horizon(
+        root,
+        review,
+        "arch-1",
+        vec![step.clone()],
+        test_architect(),
+    )
+    .unwrap();
+    let InitialGroupHorizon::Written(group) = written else {
+        panic!("expected write")
+    };
+    assert_eq!(group.implementation.items, [step]);
+    assert_eq!(group.implementation.architect, Some(test_architect()));
+    assert!(group.implementation.last_replanned_step.is_none());
+    assert!(group.blocked_reason.is_none());
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    assert_eq!(stored.groups[0], group);
+    assert_eq!((stored.groups[1].clone(), stored.items), neighbors);
+    assert!(crate::plan::storage::PlanStorage::load_plan(root, review)
+        .unwrap()
+        .is_none());
+
+    let path = ReviewStorage::reviews_dir(root).join("initial-horizon.json");
+    let before = std::fs::read(&path).unwrap();
+    let existing = ReviewStorage::write_initial_group_horizon(
+        root,
+        review,
+        "arch-1",
+        vec![],
+        test_architect(),
+    )
+    .unwrap();
+    assert_eq!(existing, InitialGroupHorizon::Existing(group));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn initial_group_horizon_rejects_invalid_and_missing_targets_without_writing() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "initial-rejection";
+    let mut session = grouped_layer_session(review, vec![]);
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    session.groups[0].blocked_reason = Some("Old blocker".into());
+    session.groups.push(simple_group("local"));
+    ReviewStorage::save_session(root, &session).unwrap();
+    let path = ReviewStorage::reviews_dir(root).join("initial-rejection.json");
+    let before = std::fs::read(&path).unwrap();
+    let step = |id: &str, deps: Vec<&str>| PlanItem {
+        id: id.into(),
+        title: id.into(),
+        depends_on: deps.into_iter().map(str::to_string).collect(),
+        files: vec!["src/repair.rs".into()],
+        ..Default::default()
+    };
+    for (items, expected) in [
+        (vec![], "empty"),
+        (vec![step("a", vec![]), step("a", vec![])], "duplicate"),
+        (vec![step("a", vec!["b"]), step("b", vec!["a"])], "cycle"),
+    ] {
+        let error = ReviewStorage::write_initial_group_horizon(
+            root,
+            review,
+            "arch-1",
+            items,
+            test_architect(),
+        )
+        .unwrap_err();
+        match expected {
+            "empty" => assert!(matches!(error, InitialGroupHorizonError::EmptyHorizon)),
+            _ => assert!(matches!(error, InitialGroupHorizonError::InvalidTree(_))),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    for (review_id, group_id) in [("missing", "arch-1"), (review, "missing")] {
+        assert!(matches!(
+            ReviewStorage::write_initial_group_horizon(
+                root,
+                review_id,
+                group_id,
+                vec![step("a", vec![])],
+                test_architect()
+            ),
+            Err(InitialGroupHorizonError::MissingTarget { .. })
+        ));
+    }
+    assert!(matches!(
+        ReviewStorage::write_initial_group_horizon(
+            root,
+            review,
+            "local",
+            vec![step("a", vec![])],
+            test_architect()
+        ),
+        Err(InitialGroupHorizonError::NotArchitectural(_))
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn initial_group_horizon_does_not_replace_a_completed_step() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut done = PlanItem {
+        id: "finished".into(),
+        title: "Finished".into(),
+        status: crate::plan::PlanItemStatus::Done,
+        commit: Some("0123456789abcdef".into()),
+        ..Default::default()
+    };
+    let mut session = grouped_layer_session("existing-horizon", vec![done.clone()]);
+    session.groups[0].kind = ReviewGroupKind::Architectural;
+    session.groups[0].blocked_reason = Some("Keep this blocker".into());
+    ReviewStorage::save_session(root, &session).unwrap();
+    let path = ReviewStorage::reviews_dir(root).join("existing-horizon.json");
+    let before = std::fs::read(&path).unwrap();
+    done.title = "Incorrect replacement".into();
+    let outcome = ReviewStorage::write_initial_group_horizon(
+        root,
+        "existing-horizon",
+        "arch-1",
+        vec![done],
+        test_architect(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        InitialGroupHorizon::Existing(session.groups[0].clone())
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 /// Finding of a grouped session, carrying every field the mass-status

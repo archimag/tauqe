@@ -15,7 +15,6 @@ impl Application {
             context: self.context_session().clone(),
             execution: self.execution_session(),
             history: self.history_session().clone(),
-            usage: self.usage_session().clone(),
         }
     }
 
@@ -52,7 +51,6 @@ impl Application {
             context: self.context_session(),
             execution: &execution,
             history: self.history_session(),
-            usage: self.usage_session(),
         }
         .analyze(self.configuration_session(), id, model, observer, deadline)
         .await
@@ -75,7 +73,6 @@ impl Application {
             context: self.context_session(),
             execution: &execution,
             history: self.history_session(),
-            usage: self.usage_session(),
         }
         .test_run_review_analysis(
             self.configuration_session(),

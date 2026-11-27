@@ -179,7 +179,7 @@ mod tests {
     async fn watchdog_cancels_immediately_and_reaps_the_registered_task() {
         let app = Application::default();
         let guard = Arc::new(app.try_begin_operation().unwrap());
-        let cancel = guard.cancel_receiver();
+        let cancel = guard.hard_cancellation();
         let owned = Arc::clone(&guard);
         let task = tokio::spawn(async move {
             let _guard = owned;
@@ -188,7 +188,7 @@ mod tests {
         guard.set_abort_handle(task.abort_handle());
         drop(guard);
         app.hard_cancel_active_operation(Duration::ZERO, Duration::from_secs(1));
-        assert!(*cancel.borrow());
+        assert!(cancel.is_cancelled());
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(app.active_operation_id(), None);
     }

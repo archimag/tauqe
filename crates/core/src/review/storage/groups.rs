@@ -1,8 +1,8 @@
 use crate::models::ArchitectTier;
-use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus, PlanScopeEvaluation};
 use crate::review::{
-    IssueStatus, ReviewGroup, ReviewIssue, ReviewItem, ReviewSession, ReviewUpdateProposal,
-    DEFAULT_REVIEW_GROUP_ID,
+    IssueStatus, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
+    ReviewUpdateProposal, DEFAULT_REVIEW_GROUP_ID,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -17,7 +17,172 @@ pub enum GroupCompletion {
     Closed(usize),
 }
 
+/// Result of an initial horizon write. An existing horizon is never replaced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InitialGroupHorizon {
+    Written(ReviewGroup),
+    Existing(ReviewGroup),
+}
+
+/// A rejected initial synthesis is distinct from an I/O failure.
+#[derive(Debug, thiserror::Error)]
+pub enum InitialGroupHorizonError {
+    #[error("Review group '{group_id}' of session '{review_id}' does not exist")]
+    MissingTarget { review_id: String, group_id: String },
+    #[error("Review group '{0}' is not architectural")]
+    NotArchitectural(String),
+    #[error("The synthesized group horizon is empty")]
+    EmptyHorizon,
+    #[error("Invalid synthesized group horizon: {0}")]
+    InvalidTree(#[source] anyhow::Error),
+    #[error("Failed to store the synthesized group horizon: {0}")]
+    Storage(#[source] anyhow::Error),
+}
+
+/// A refused refinement leaves the stored session unchanged.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupHorizonReplacementError {
+    #[error("Review group '{group_id}' of session '{review_id}' does not exist")]
+    MissingTarget { review_id: String, group_id: String },
+    #[error("Review group '{0}' is not architectural")]
+    NotArchitectural(String),
+    #[error("The refined group horizon is empty")]
+    EmptyHorizon,
+    #[error("Invalid refined group horizon: {0}")]
+    InvalidTree(#[source] anyhow::Error),
+    #[error("Review group '{0}' changed since refinement began")]
+    StaleSnapshot(String),
+    #[error("Failed to store the refined group horizon: {0}")]
+    Storage(#[source] anyhow::Error),
+}
+
+/// A refused manual step update leaves the stored review unchanged.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupStepStatusError {
+    #[error("Review session '{0}' does not exist")]
+    MissingSession(String),
+    #[error("Review group '{group_id}' of session '{review_id}' does not exist")]
+    MissingGroup { review_id: String, group_id: String },
+    #[error("Review group '{0}' is not architectural")]
+    NotArchitectural(String),
+    #[error("Step '{0}' does not exist in the review group")]
+    MissingStep(String),
+    #[error("Invalid step status transition: {0}")]
+    InvalidTransition(#[source] anyhow::Error),
+    #[error("Invalid resulting group horizon: {0}")]
+    InvalidTree(#[source] anyhow::Error),
+    #[error("Failed to store the group step status: {0}")]
+    Storage(#[source] anyhow::Error),
+}
+
 impl ReviewStorage {
+    /// Updates one leaf of an existing architectural group under the storage lock.
+    /// An unchanged status is a complete no-op, including its lifecycle fields.
+    pub fn update_group_step_status(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        step_id: &str,
+        status: PlanItemStatus,
+    ) -> std::result::Result<ReviewGroup, GroupStepStatusError> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            let (path, mut session) = Self::resolve_session_file_unlocked(repo_root, review_id)
+                .map_err(GroupStepStatusError::Storage)?
+                .ok_or_else(|| GroupStepStatusError::MissingSession(review_id.into()))?;
+            let group = find_group_mut(&mut session, group_id).ok_or_else(|| {
+                GroupStepStatusError::MissingGroup {
+                    review_id: review_id.into(),
+                    group_id: group_id.into(),
+                }
+            })?;
+            if group.kind != ReviewGroupKind::Architectural {
+                return Err(GroupStepStatusError::NotArchitectural(group_id.into()));
+            }
+            let step = group
+                .implementation
+                .find_item(step_id)
+                .ok_or_else(|| GroupStepStatusError::MissingStep(step_id.into()))?;
+            if !step.is_leaf() {
+                return Err(GroupStepStatusError::InvalidTransition(anyhow::anyhow!(
+                    "Step '{}' is a container",
+                    step.id
+                )));
+            }
+            if step.status == status {
+                return Ok(group.clone());
+            }
+            group
+                .implementation
+                .transition_leaf(step_id, status, None, None)
+                .map_err(|error| GroupStepStatusError::InvalidTransition(error.into()))?;
+            group
+                .implementation
+                .validate_structure()
+                .map_err(|errors| {
+                    GroupStepStatusError::InvalidTree(anyhow::anyhow!(
+                        "{}",
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ))
+                })?;
+            let updated = group.clone();
+            Self::write_session_unlocked(repo_root, &path, &session)
+                .map_err(GroupStepStatusError::Storage)?;
+            Ok(updated)
+        })
+    }
+
+    /// Commits an initial architectural horizon and clears its stale blocker in
+    /// the same atomic session write. A competing writer's horizon wins.
+    pub fn write_initial_group_horizon(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        items: Vec<PlanItem>,
+        architect: ArchitectTier,
+    ) -> std::result::Result<InitialGroupHorizon, InitialGroupHorizonError> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            let (path, mut session) = Self::resolve_session_file_unlocked(repo_root, review_id)
+                .map_err(InitialGroupHorizonError::Storage)?
+                .ok_or_else(|| InitialGroupHorizonError::MissingTarget {
+                    review_id: review_id.into(),
+                    group_id: group_id.into(),
+                })?;
+            let group = find_group_mut(&mut session, group_id).ok_or_else(|| {
+                InitialGroupHorizonError::MissingTarget {
+                    review_id: review_id.into(),
+                    group_id: group_id.into(),
+                }
+            })?;
+            if group.kind != ReviewGroupKind::Architectural {
+                return Err(InitialGroupHorizonError::NotArchitectural(group_id.into()));
+            }
+            if !group.implementation.items.is_empty() {
+                return Ok(InitialGroupHorizon::Existing(group.clone()));
+            }
+            if items.is_empty() {
+                return Err(InitialGroupHorizonError::EmptyHorizon);
+            }
+            let merged = crate::plan::storage::merge_subplan(&group.implementation.items, items)
+                .map_err(InitialGroupHorizonError::InvalidTree)?;
+            if merged.is_empty() {
+                return Err(InitialGroupHorizonError::EmptyHorizon);
+            }
+            group.implementation.items = merged;
+            group.implementation.architect = Some(architect);
+            group.implementation.last_replanned_step = None;
+            group.blocked_reason = None;
+            let updated = group.clone();
+            Self::write_session_unlocked(repo_root, &path, &session)
+                .map_err(InitialGroupHorizonError::Storage)?;
+            Ok(InitialGroupHorizon::Written(updated))
+        })
+    }
     /// Applies a leaf transition to the current stored group horizon.
     ///
     /// Lookup, domain validation, and persistence share one storage lock.
@@ -62,9 +227,8 @@ impl ReviewStorage {
         })
     }
 
-    /// Replaces the unified remediation subplan of one review group's
-    /// architectural root cause while preserving the immutable `Done`
-    /// foundation.
+    /// Replaces only the unfinished horizon of an architectural group while
+    /// preserving the immutable `Done` foundation.
     ///
     /// A group is the operational unit of remediation: one root cause is fixed
     /// by one coherent change set, so its horizon is synthesized exactly like a
@@ -76,31 +240,29 @@ impl ReviewStorage {
     /// dependency cycle or leave no ready step is rejected before anything
     /// reaches disk.
     ///
-    /// `architect` is the configuration that produced the horizon and
-    /// `last_replanned_step` names the sub-step whose horizon this wave
-    /// reprojects. Both are recorded on the group, so a later wave reads them
-    /// from disk instead of in-memory supervisor state. An initial synthesis
-    /// passes `None`.
-    ///
-    /// Returns `None` when the named session does not exist or declares no
-    /// group with that identifier.
+    /// The expected group and its member findings are the synthesis snapshot.
+    /// Changes elsewhere in the session do not invalidate that snapshot.
+    /// Refusals never write; a successful manual refinement clears the group
+    /// blocker and the previous replanned-step marker in the same write.
     pub fn replace_uncompleted_group_subplan(
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
+        expected_group: &ReviewGroup,
+        expected_findings: &[ReviewItem],
         new_subplan: Vec<PlanItem>,
         architect: ArchitectTier,
-        last_replanned_step: Option<String>,
-    ) -> Result<Option<ReviewGroup>> {
+    ) -> std::result::Result<ReviewGroup, GroupHorizonReplacementError> {
         crate::blocking::run_blocking(move || {
             let _guard = Self::lock();
             Self::replace_uncompleted_group_subplan_unlocked(
                 repo_root,
                 review_id,
                 group_id,
+                expected_group,
+                expected_findings,
                 new_subplan,
                 architect,
-                last_replanned_step,
             )
         })
     }
@@ -111,29 +273,66 @@ impl ReviewStorage {
         repo_root: &Path,
         review_id: &str,
         group_id: &str,
+        expected_group: &ReviewGroup,
+        expected_findings: &[ReviewItem],
         new_subplan: Vec<PlanItem>,
         architect: ArchitectTier,
-        last_replanned_step: Option<String>,
-    ) -> Result<Option<ReviewGroup>> {
-        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
-            Some(session) => session,
-            None => return Ok(None),
+    ) -> std::result::Result<ReviewGroup, GroupHorizonReplacementError> {
+        let (path, mut session) = Self::resolve_session_file_unlocked(repo_root, review_id)
+            .map_err(GroupHorizonReplacementError::Storage)?
+            .ok_or_else(|| GroupHorizonReplacementError::MissingTarget {
+                review_id: review_id.into(),
+                group_id: group_id.into(),
+            })?;
+        let group_index = session
+            .groups
+            .iter()
+            .position(|group| group.id == group_id)
+            .ok_or_else(|| GroupHorizonReplacementError::MissingTarget {
+                review_id: review_id.into(),
+                group_id: group_id.into(),
+            })?;
+        let group = &session.groups[group_index];
+        if group.kind != ReviewGroupKind::Architectural {
+            return Err(GroupHorizonReplacementError::NotArchitectural(
+                group_id.into(),
+            ));
+        }
+        if group != expected_group
+            || !session
+                .items
+                .iter()
+                .filter(|item| finding_in_group(item, group_id))
+                .eq(expected_findings.iter())
+        {
+            return Err(GroupHorizonReplacementError::StaleSnapshot(group_id.into()));
+        }
+        if new_subplan.is_empty() {
+            return Err(GroupHorizonReplacementError::EmptyHorizon);
+        }
+        let merged = crate::plan::storage::merge_subplan(&group.implementation.items, new_subplan)
+            .map_err(GroupHorizonReplacementError::InvalidTree)?;
+        let implementation = PlanImplementation {
+            items: merged,
+            ..Default::default()
         };
-
-        // A group horizon lives on the group itself, so a session that does not
-        // declare the group has nothing to reproject and reports that it
-        // changed nothing instead of inventing one.
-        let Some(group) = find_group_mut(&mut session, group_id) else {
-            return Ok(None);
-        };
-        group.implementation.items =
-            crate::plan::storage::merge_subplan(&group.implementation.items, new_subplan)?;
+        if !matches!(
+            implementation.evaluate_scope(None),
+            PlanScopeEvaluation::Ready(_)
+        ) {
+            return Err(GroupHorizonReplacementError::InvalidTree(anyhow::anyhow!(
+                "Refined group horizon has no executable remaining work"
+            )));
+        }
+        let group = &mut session.groups[group_index];
+        group.implementation.items = implementation.items;
         group.implementation.architect = Some(architect);
-        group.implementation.last_replanned_step = last_replanned_step;
+        group.implementation.last_replanned_step = None;
+        group.blocked_reason = None;
         let updated = group.clone();
-
-        Self::save_session_unlocked(repo_root, &session)?;
-        Ok(Some(updated))
+        Self::write_session_unlocked(repo_root, &path, &session)
+            .map_err(GroupHorizonReplacementError::Storage)?;
+        Ok(updated)
     }
 
     /// Replaces the unified remediation subplan of one review group without

@@ -58,6 +58,7 @@ fn queue_error_code(kind: ReviewQueueFailure) -> &'static str {
             errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED
         }
         ReviewQueueFailure::GroupUnresolvedQuestions => errors::GROUP_UNRESOLVED_QUESTIONS,
+        ReviewQueueFailure::GroupNeedsRefinement => errors::GROUP_NEEDS_REFINEMENT,
         ReviewQueueFailure::InvalidParams => errors::INVALID_PARAMS,
         ReviewQueueFailure::ItemInDiscussion => errors::ITEM_IN_DISCUSSION,
         ReviewQueueFailure::ItemRejected => errors::ITEM_REJECTED,

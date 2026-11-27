@@ -6,8 +6,8 @@ use crate::application::edit_cycle::EditCycleEvent;
 use tauqe_core::context::ContextState;
 use tauqe_core::models::{ModelRef, ModelRole, ReasoningEffort};
 use tauqe_core::providers::StreamEvent;
+use tauqe_core::stop::HardCancellation;
 use tauqe_core::workflow::turn::{ModelTurnPlanContext, TurnWorkContext};
-use tokio::sync::watch;
 
 pub enum ApplicationEvent {
     ConfigurationChanged(Box<crate::api::ConfigurationView>),
@@ -65,5 +65,5 @@ pub enum ApplicationEvent {
 pub trait ApplicationObserver: Send + Sync + 'static {
     fn publish(&self, operation_id: &str, event: ApplicationEvent);
 
-    async fn ready(&self, _event: &StreamEvent, _cancel: &mut watch::Receiver<bool>) {}
+    async fn ready(&self, _event: &StreamEvent, _cancel: &HardCancellation) {}
 }

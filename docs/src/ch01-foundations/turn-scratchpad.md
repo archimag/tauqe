@@ -35,7 +35,8 @@ developer is reading.
    never renders it.
 4. **No capability.** It moves no bytes and executes nothing; it is memory, not a
    tool.
-5. **Bounded.** It is capped so it cannot become a second context window.
+5. **Included in admission.** Accepted notes are not silently truncated to a
+   scratchpad quota; they count toward the complete provider request limit.
 
 ---
 
@@ -50,8 +51,8 @@ enough to describe it:
 - **Recorded note** — the text a round records for itself. It travels back to the
   model inside the assistant answer the turn transcript replays, so the working state of
   a turn is read from the dialogue rather than re-rendered into the system head.
-- **Budget** — a hard character cap on the buffer, with truncation on a character
-  boundary so multi-byte text is never split.
+- **Admission** — the complete provider input, including the scratchpad, is
+  measured under `request.max_input_tokens` before the provider call.
 
 It is deliberately *not* the plan. A plan is durable, structured, user-visible, and
 owned by the developer; the scratchpad is ephemeral, unstructured, and owned by the
@@ -73,9 +74,10 @@ turn.
    assistant message of its round, so the model reads its own notes back from the
    dialogue it produced. Keeping them out of the head is what holds the provider's
    cached prefix byte-identical inside a phase.
-4. **Bound.** The buffer is capped at 4,000 characters. Truncation lands on a
-   character boundary, and the prompt instructions ask for dense bullets instead of
-   prose so the cap is reached rarely.
+4. **Admit.** Notes remain intact. The executor estimates the complete
+   serialized input as `ceil(serialized_request_bytes / 4)`, including the
+   response schema and adapter framing. This is not the provider's exact token
+   count. Overflow refuses the request rather than shortening the scratchpad.
 5. **Discard.** When the turn ends — success, error, blocked, or cancellation — the
    buffer is dropped with the rest of the turn state.
 

@@ -344,22 +344,45 @@ async fn public_plan_repairs_and_verifies_in_one_turn_before_committing() {
         .iter()
         .enumerate()
         .filter(|(_, event)| event["method"] == events::TOOLCHAIN_FINISHED)
-        .map(|(index, event)| (index, event["params"]["success"].as_bool().unwrap()))
+        .map(|(index, event)| {
+            (
+                index,
+                event["params"]["command"].as_str().unwrap(),
+                event["params"]["success"].as_bool().unwrap(),
+            )
+        })
         .collect();
     assert_eq!(
         verification
             .iter()
-            .map(|(_, passed)| *passed)
+            .map(|(_, command, passed)| (*command, *passed))
             .collect::<Vec<_>>(),
-        [false, true]
+        [("pre-flight", true), ("verify", false), ("verify", true)]
     );
+    let model_started = observed
+        .iter()
+        .position(|event| event["method"] == events::MODEL_STARTED)
+        .expect("the admitted step starts a model turn");
+    assert!(verification[0].0 < model_started);
+    let preflight_started: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["method"] == events::TOOLCHAIN_STARTED
+                && event["params"]["command"] == "pre-flight"
+        })
+        .collect();
+    assert_eq!(preflight_started.len(), 1);
+    assert!(preflight_started[0].0 < verification[0].0);
+    assert_eq!(preflight_started[0].1["params"]["operation_id"], id);
+    assert_eq!(observed[verification[0].0]["params"]["operation_id"], id);
     let edits: Vec<_> = observed
         .iter()
         .enumerate()
         .filter(|(_, event)| event["method"] == events::EDIT_FINISHED)
         .collect();
     assert_eq!(edits.len(), 1);
-    assert!(verification[1].0 < edits[0].0);
+    assert!(verification[2].0 < edits[0].0);
     let hash = run.assert_committed();
     assert_eq!(edits[0].1["params"]["commit_hash"], hash);
     assert_eq!(
@@ -1486,11 +1509,7 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 2);
     // The context feedback extends the task message, which closes the round.
-    let feedback_prompt = &requests[1]
-        .messages
-        .last()
-        .expect("the round carries a task message")
-        .content;
+    let feedback_prompt = round_text(&requests[1].messages);
     assert!(feedback_prompt.contains("<context_feedback>"));
     assert!(feedback_prompt.contains("already loaded in context"));
 
@@ -1877,6 +1896,356 @@ async fn plan_creation_runs_only_the_requested_phases_and_publishes_once() {
     }
 }
 
+/// Mutate the source at the critic boundary, after the Planner's final draft.
+/// The critic and reconciliation must consume the frozen evidence instead.
+struct MutateAtCritique {
+    provider: MockLlmProvider,
+    source: std::path::PathBuf,
+    original: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl tauqe_core::providers::LlmProvider for MutateAtCritique {
+    fn kind(&self) -> tauqe_core::models::ProviderKind {
+        tauqe_core::models::ProviderKind::OpenRouter
+    }
+
+    async fn stream(
+        &self,
+        request: tauqe_core::providers::LlmRequest<'_>,
+        tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
+        cancel: tauqe_core::stop::HardCancellation,
+    ) -> tauqe_core::providers::ProviderResult {
+        let critique = self.calls.fetch_add(1, Ordering::SeqCst) == 2;
+        if critique {
+            std::fs::write(&self.source, "changed after draft\n").unwrap();
+        }
+        let result = self.provider.stream(request, tx, cancel).await;
+        if critique {
+            std::fs::write(&self.source, &self.original).unwrap();
+        }
+        result
+    }
+}
+
+fn horizon_reply(title: &str) -> MockResponse {
+    MockResponse::text(
+        serde_json::json!({
+            "status": "success", "explanation": "Complete horizon", "items": [{
+                "id": "2", "title": title, "status": "todo", "files": ["target.rs"],
+                "readonly_files": [], "concept_refs": [], "depends_on": [], "children": []
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn critique_reply(verdict: &str) -> MockResponse {
+    MockResponse::text(
+        serde_json::json!({
+            "verdict": verdict, "summary": "Review of the complete draft",
+            "findings": if verdict == "approved" { vec![] } else {
+                vec![serde_json::json!({"category": "invariant_gap", "target": "2",
+                    "detail": "Include the additional contract in step 2"})]
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn synthesis_request(method: &str, params: serde_json::Value) -> Request {
+    Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: method.into(),
+        params: Some(params),
+    }
+}
+
+fn synthesis_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> Vec<serde_json::Value> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn plan_creation_keeps_research_through_critique_and_reconciliation() {
+    const ORIGINAL: &str = "pub fn unique_contract_marker() -> u32 { 17 }\n";
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    for (file, body) in [
+        ("contract.rs", ORIGINAL),
+        ("target.rs", "pub fn target() {}\n"),
+        ("additional.rs", "pub fn additional_evidence() {}\n"),
+    ] {
+        std::fs::write(dir.path().join(file), body).unwrap();
+    }
+    tauqe_core::git::cmd::stage_files(
+        dir.path(),
+        &[
+            "contract.rs".into(),
+            "target.rs".into(),
+            "additional.rs".into(),
+        ],
+    )
+    .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let research = |file: &str, search: bool| {
+        MockResponse::text(
+            serde_json::json!({
+                "status": "needs_context", "explanation": "Inspect contract",
+                "context_requests": [file],
+                "repo_searches": if search {
+                    vec![serde_json::json!({"path": "", "regex": "unique_contract_marker"})]
+                } else { vec![] },
+                "items": []
+            })
+            .to_string(),
+        )
+    };
+    let scripts = [
+        research("contract.rs", true),
+        horizon_reply("Draft title"),
+        critique_reply("changes_required"),
+        research("additional.rs", false),
+        horizon_reply("Reconciled title"),
+    ]
+    .map(|response| {
+        response.with_usage(tauqe_core::providers::ModelUsageInfo {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            total_tokens: 7,
+            ..Default::default()
+        })
+    });
+    let provider = Arc::new(MutateAtCritique {
+        provider: MockLlmProvider::scripted(scripts),
+        source: dir.path().join("contract.rs"),
+        original: ORIGINAL.into(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (out, mut rx) = OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(Default::default(), dir.path().to_path_buf(), history, out);
+    state.application.test_set_provider(provider.clone()).await;
+    let res = super::two_phase::handle_plan_create_pipeline(
+        synthesis_request(
+            tauqe_protocol::methods::PLAN_CREATE_PIPELINE,
+            serde_json::json!({
+                "directives": "Build a contract-aware plan",
+                "planner_model": tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("planner/model")),
+                "critic_model": tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("critic/model"))
+            }),
+        ),
+        &state,
+    )
+    .await;
+    assert!(res.error.is_none(), "{:?}", res.error);
+    let requests = provider.provider.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.model.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "planner/model",
+            "planner/model",
+            "critic/model",
+            "planner/model",
+            "planner/model"
+        ]
+    );
+    let critique = round_text(&requests[2].messages);
+    for expected in [
+        ORIGINAL,
+        "<search_feedback",
+        "Draft title",
+        "Build a contract-aware plan",
+    ] {
+        assert!(critique.contains(expected), "critic lacks {expected}");
+    }
+    assert!(!critique.contains("changed after draft"));
+    assert!(!critique.contains("<scratchpad>"));
+    let reconciliation = round_text(&requests[3].messages);
+    for expected in [
+        ORIGINAL,
+        "Draft title",
+        "Include the additional contract in step 2",
+    ] {
+        assert!(
+            reconciliation.contains(expected),
+            "reconciliation lacks {expected}"
+        );
+    }
+    assert!(!reconciliation.contains("changed after draft"));
+    assert!(!reconciliation.contains("<file path=\"additional.rs\""));
+    assert!(round_text(&requests[4].messages).contains("<file path=\"additional.rs\""));
+    assert!(round_text(&requests[4].messages).contains("pub fn additional_evidence"));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.model == "critic/model")
+            .count(),
+        1
+    );
+    let events = synthesis_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["method"] == events::PLAN_UPDATED)
+            .count(),
+        1
+    );
+    let usage = state.application.usage_snapshot().await;
+    assert_eq!(usage.session.total_tokens, 35);
+    assert!(usage.cur.is_none());
+    let entries = state
+        .application
+        .test_mutate_history(|h| h.get_entries())
+        .await
+        .unwrap()
+        .unwrap();
+    let recorded = format!("{entries:?}");
+    assert!(!recorded.contains(ORIGINAL));
+    assert!(!recorded.contains("additional_evidence"));
+}
+
+#[tokio::test]
+async fn plan_refine_preserves_done_foundation_and_does_not_reuse_prior_research() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(
+        dir.path().join("evidence.rs"),
+        "pub fn previous_evidence() {}\n",
+    )
+    .unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["evidence.rs".into()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+    let mut done = test_item("1", PlanItemStatus::Done);
+    done.title = "Completed foundation".into();
+    done.commit = Some("existing-commit".into());
+    let plan = Plan::from_parts(
+        "continuity".into(),
+        "Continuity".into(),
+        None,
+        1,
+        1,
+        vec![],
+        vec![done],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(
+            r#"{"status":"needs_context","explanation":"Read evidence","context_requests":["evidence.rs"],"items":[]}"#,
+        ),
+        horizon_reply("First horizon"),
+        critique_reply("approved"),
+        horizon_reply("Second horizon"),
+    ]));
+    let (out, mut rx) = OutChannel::new();
+    let (history, _) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(Default::default(), dir.path().to_path_buf(), history, out);
+    state.application.test_set_provider(provider.clone()).await;
+    for (index, critic) in [true, false].into_iter().enumerate() {
+        let critic_model = critic.then(|| {
+            tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
+                "critic/model",
+            ))
+        });
+        let res = handle_plan_refine(
+            synthesis_request(
+                tauqe_protocol::methods::PLAN_REFINE,
+                serde_json::json!({"plan_id": "continuity", "critic_model": critic_model}),
+            ),
+            &state,
+        )
+        .await;
+        assert!(res.error.is_none(), "{:?}", res.error);
+        let requests = provider.requests();
+        if index == 0 {
+            assert_eq!(requests.len(), 3, "approval skips reconciliation");
+            assert!(round_text(&requests[2].messages).contains("previous_evidence"));
+            assert!(round_text(&requests[2].messages).contains("Completed foundation"));
+        } else {
+            assert_eq!(requests.len(), 4, "disabled critique makes no request");
+            assert!(!round_text(&requests[3].messages).contains("<file path=\"evidence.rs\""));
+        }
+        let stored = PlanStorage::load_plan(dir.path(), "continuity")
+            .unwrap()
+            .unwrap();
+        let foundation = stored.implementation.find_item("1").unwrap();
+        assert_eq!(foundation.status, PlanItemStatus::Done);
+        assert_eq!(foundation.commit.as_deref(), Some("existing-commit"));
+        assert_eq!(
+            synthesis_events(&mut rx)
+                .iter()
+                .filter(|e| e["method"] == events::PLAN_UPDATED)
+                .count(),
+            1
+        );
+    }
+    assert!(state.context_snapshot().await.auto_files().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_critique_ends_after_one_request_without_writing_the_draft() {
+    for reply in ["", "not a critique"] {
+        let dir = TestDir::new();
+        let plan = Plan::from_parts(
+            "invalid-critique".into(),
+            "Invalid Critique".into(),
+            None,
+            1,
+            1,
+            vec![],
+            vec![test_item("1", PlanItemStatus::Todo)],
+        );
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        let provider = Arc::new(MockLlmProvider::scripted([
+            horizon_reply("Unaudited draft"),
+            MockResponse::text(reply),
+        ]));
+        let (out, mut rx) = OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(Default::default(), dir.path().to_path_buf(), history, out);
+        state.application.test_set_provider(provider.clone()).await;
+        let res = handle_plan_refine(
+            synthesis_request(
+                tauqe_protocol::methods::PLAN_REFINE,
+                serde_json::json!({"plan_id": "invalid-critique",
+                "critic_model": tauqe_protocol::ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("critic/model"))}),
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            res.error.is_some()
+                || matches!(
+                    serde_json::from_value::<PlanRefineResult>(res.result.unwrap()).unwrap(),
+                    PlanRefineResult::Blocked { .. }
+                )
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].model, "critic/model");
+        let stored = PlanStorage::load_plan(dir.path(), "invalid-critique")
+            .unwrap()
+            .unwrap();
+        assert!(stored.implementation.find_item("2").is_none());
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
+        assert!(synthesis_events(&mut rx)
+            .iter()
+            .all(|e| e["method"] != events::PLAN_UPDATED));
+        assert!(state.context_snapshot().await.auto_files().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn test_plan_horizon_synthesis_history_transactionality() {
     let dir = TestDir::new();
@@ -2125,6 +2494,8 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(blocked.clone()),
         MockResponse::text(replan_output.to_string()),
+        MockResponse::text(blocked.clone()),
+        MockResponse::text(replan_output.to_string()),
         MockResponse::text(blocked),
         MockResponse::text(replan_output.to_string()),
         MockResponse::text(success),
@@ -2133,7 +2504,7 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     let mut config = tauqe_core::config::AppConfig::default();
     config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
     config.repl.max_replans = 2;
-    config.models.auto_level_up = false;
+    config.models.auto_level_up = true;
     config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![
         tauqe_core::models::ModelEntry::new(
@@ -2164,11 +2535,12 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     // The first replanning wave keeps the Architect that planned the horizon.
     assert_eq!(requests[1].model, "planner/one");
-    // Only the repeated failure of the same step escalates one rung.
-    assert_eq!(requests[3].model, "planner/two");
+    // Both repair waves are tried by the coder before the next blocker promotes.
+    assert_eq!(requests[3].model, "planner/one");
+    assert_eq!(requests[5].model, "planner/two");
 
     let reloaded = PlanStorage::load_plan(dir.path(), "lazy-level-up")
         .unwrap()
@@ -2181,6 +2553,118 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
         std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
         "pub fn value() -> i32 { 7 }\n"
     );
+}
+
+/// Renaming a stalled leaf cannot replenish its budget, while a newly completed
+/// leaf does replenish it even when the next blocker occurs in the same queue.
+#[tokio::test]
+async fn test_plan_replanning_tracks_progress_instead_of_step_names_or_total_calls() {
+    for makes_progress in [false, true] {
+        let dir = TestDir::new();
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::write(dir.path().join("src.rs"), "pub fn value() {}\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".into()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+        let leaf = |id: &str| tauqe_core::plan::PlanItem {
+            files: vec!["src.rs".into()],
+            ..test_item(id, PlanItemStatus::Todo)
+        };
+        let plan = Plan::from_parts(
+            "progress-budget".into(),
+            "Progress budget".into(),
+            None,
+            1,
+            1,
+            vec![],
+            vec![leaf("initial")],
+        );
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        let blocked = || {
+            MockResponse::text(
+                serde_json::json!({
+                    "message": "Blocked", "action": {"kind": "blocked", "blocked": {
+                        "is_blocked": true, "reason": "Design still needs repair", "details": ""
+                    }}
+                })
+                .to_string(),
+            )
+        };
+        let complete =
+            || {
+                MockResponse::text(serde_json::json!({
+            "message": "Already satisfied", "action": {"kind": "edit", "patch": "",
+                "commit_message": "", "error_message": "", "reason": "Already implemented"}
+        }).to_string())
+            };
+        let mut responses = vec![blocked()];
+        for wave in 1..=3 {
+            let mut items = Vec::new();
+            if makes_progress {
+                items.push(leaf(&format!("done-{wave}")));
+            }
+            items.push(leaf(&format!("renamed-{wave}")));
+            responses.push(MockResponse::text(
+                serde_json::json!({
+                    "status": "success", "explanation": "Replaced remaining horizon", "items": items
+                })
+                .to_string(),
+            ));
+            if makes_progress {
+                responses.push(complete());
+            }
+            responses.push(blocked());
+        }
+        // After three productive waves, explicitly stop the Architect. With no
+        // progress the run must stop earlier, before consuming the third wave.
+        if makes_progress {
+            responses.push(MockResponse::text(
+                serde_json::json!({
+                    "status": "blocked", "explanation": "Stop fixture", "reason": "Fixture complete"
+                })
+                .to_string(),
+            ));
+        }
+        let provider = Arc::new(MockLlmProvider::scripted(responses));
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.repl.workflow = tauqe_core::workflow::WorkflowKind::Naive;
+        config.repl.max_replans = 2;
+        config.models.auto_level_up = true;
+        config.models.repl = vec![tauqe_core::models::ModelRef::openrouter("coder/model").into()];
+        config.models.architect = Some(vec![tier_with_attempts("planner/one", 2)]);
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+        let operation = Arc::new(state.try_begin_operation().unwrap());
+        let outcome = run_plan_batch(
+            &state,
+            "progress-budget",
+            vec!["initial".into()],
+            operation,
+            PlanBatchOptions::default(),
+        )
+        .await;
+        let BatchOutcome::Blocked {
+            completed, reason, ..
+        } = outcome
+        else {
+            panic!("expected a blocked run, got {outcome:?}");
+        };
+        let requests = provider.requests();
+        let architect_calls = requests
+            .iter()
+            .filter(|request| request.model == "planner/one")
+            .count();
+        if makes_progress {
+            assert_eq!(completed, 3);
+            assert_eq!(architect_calls, 4);
+            assert!(reason.contains("Fixture complete"), "{reason}");
+        } else {
+            assert_eq!(completed, 0);
+            assert_eq!(architect_calls, 2);
+            assert!(
+                reason.contains("without implementation progress"),
+                "{reason}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2506,7 +2990,7 @@ impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
         &self,
         _request: tauqe_core::providers::LlmRequest<'_>,
         tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
-        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        _cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         let _ = tx.send(tauqe_core::providers::StreamEvent::Cancelled).await;
         Ok(())
@@ -2892,7 +3376,7 @@ async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
     // architect round instead of being treated as a dead end.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 2);
-    let feedback_prompt = &requests[1].messages[1].content;
+    let feedback_prompt = round_text(&requests[1].messages);
     assert!(feedback_prompt.contains("<repomap_feedback path=\"src\">"));
     assert!(feedback_prompt.contains("pub fn target"));
 
@@ -2979,7 +3463,7 @@ async fn test_plan_refine_loads_requested_file_and_saves_horizon_without_edits()
 }
 
 #[tokio::test]
-async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disabled() {
+async fn test_handle_plan_refine_renders_complete_map_despite_legacy_toggle() {
     let dir = TestDir::new();
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
     std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
@@ -3038,15 +3522,13 @@ async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disable
     let res = handle_plan_refine(req, &state).await;
     assert!(res.error.is_none(), "refine failed: {:?}", res.error);
 
-    // With eager symbol maps disabled the architect still learns where the
-    // subsystems live from the compact directory tree, never from an absent
-    // contour section: the turn kernel renders exactly one outline in the stable
-    // head of the round.
+    // The retired toggle cannot replace the automatic map with a directory
+    // tree: the full tracked-file contour remains in the stable prompt head.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
     let system_prompt = &requests[0].messages[0].content;
-    assert!(system_prompt.contains("src\n  nested"));
-    assert!(!system_prompt.contains("## Codebase Symbol Contours"));
+    assert!(system_prompt.contains("src/nested/helper.rs"));
+    assert!(system_prompt.contains("pub fn helper"));
 }
 
 #[tokio::test]
@@ -3115,7 +3597,7 @@ async fn test_plan_refine_heals_the_schema_then_loads_evidence() {
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 3);
     let correction = round_text(&requests[1].messages);
-    assert!(correction.contains("did not satisfy the response schema"));
+    assert!(correction.contains("did not satisfy the active response schema"));
     assert!(!correction.contains("The research round limit is exhausted"));
     assert!(!correction.contains(EVIDENCE));
     assert!(requests[1]
@@ -3126,7 +3608,7 @@ async fn test_plan_refine_heals_the_schema_then_loads_evidence() {
     // Loaded files arrive as file messages; the missing path produces feedback.
     assert!(continuation.contains("<context_feedback>"));
     assert!(continuation.contains("missing-evidence.txt"));
-    assert!(!continuation.contains("did not satisfy the response schema"));
+    assert!(!continuation.contains("did not satisfy the active response schema"));
     assert!(requests[2].messages.iter().any(|message| {
         message
             .content
@@ -3388,7 +3870,9 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
         assert!(prompt.contains("not-present.txt"));
         assert!(prompt.contains("The research round limit is exhausted"));
     }
-    assert!(round_text(&requests[3].messages).contains("did not satisfy the response schema"));
+    assert!(
+        round_text(&requests[3].messages).contains("did not satisfy the active response schema")
+    );
 
     // The transition is published, so the developer sees which rung answered.
     let mut emitted = Vec::new();
@@ -4368,7 +4852,7 @@ impl tauqe_core::providers::LlmProvider for ParkingProvider {
         &self,
         _request: tauqe_core::providers::LlmRequest<'_>,
         _tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
-        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        _cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         let _ = self.entered.send(());
         std::future::pending::<()>().await;
@@ -4732,7 +5216,7 @@ impl tauqe_core::providers::LlmProvider for CancellingFinalRoundProvider {
         &self,
         _request: tauqe_core::providers::LlmRequest<'_>,
         tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
-        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        _cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         let _ = self.entered.send(());
         self.release.notified().await;

@@ -2,7 +2,6 @@ use crate::escape::{escape_xml_text, single_line};
 use crate::review::ReviewSession;
 use crate::workflow::EditProtocolKind;
 
-#[cfg(test)]
 const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
 
 /// Renders repository paths as escaped, backticked breadcrumbs.
@@ -23,8 +22,7 @@ fn render_paths(paths: &[String]) -> String {
 /// turn: the structured contour asks for a change set and a successful
 /// `outcome`, while the tagged contour asks for an edit block and the success
 /// tag bound to `marker`.
-#[cfg(test)]
-pub(crate) fn format_review_step_retry_prompt(
+pub fn format_review_step_retry_prompt(
     assistant_text: &str,
     error: Option<&str>,
     _protocol: EditProtocolKind,
@@ -64,7 +62,6 @@ pub(crate) fn format_review_step_retry_prompt(
     out
 }
 
-#[cfg(test)]
 const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
 
 /// Formats a targeted prompt for resolving an isolated review finding.
@@ -82,8 +79,7 @@ const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
 /// `blocked`, `context_requests`, `verify`), while the tagged contour names its
 /// control tags bound to `marker`. A structured turn emits no command tag, so
 /// the marker it carries is never used.
-#[cfg(test)]
-pub(crate) fn format_review_step_execution_prompt(
+pub fn format_review_step_execution_prompt(
     session: &ReviewSession,
     item_id: u32,
     _protocol: EditProtocolKind,
@@ -174,7 +170,7 @@ pub(crate) fn format_review_step_execution_prompt(
     out.push_str(
         "4. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n",
     );
-    out.push_str("5. Keep changes minimal and coherent. Propose code modifications in the `changes` array. Toolchain verification is handled automatically and deterministically by the harness; do NOT fill the `verify` field.\n");
+    out.push_str("5. Keep changes minimal and coherent. Propose code modifications in the `patch` field. Toolchain verification is handled automatically and deterministically by the harness; do NOT select or skip verification.\n");
     out.push_str("6. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `commit_message` with the English Conventional Commits commit message of the resolved finding.\n");
     out.push_str("7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead set the `outcome` field to status \"skip\" and fill in `reason` with a detailed explanation.\n");
     out.push_str("8. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:crates/x/src/parser.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting research rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n");
@@ -184,6 +180,7 @@ pub(crate) fn format_review_step_execution_prompt(
 }
 
 /// Prefix recorded in `resolution_notes` when a domain failure skips a finding.
+#[cfg(test)]
 const REVIEW_STEP_FAILURE_NOTE_PREFIX: &str = "Skipped after execution failure";
 
 /// Builds the `resolution_notes` diagnostic recorded when a finding is skipped
@@ -285,7 +282,7 @@ mod tests {
         assert!(prompt.contains("`outcome`"));
         assert!(prompt.contains("`blocked`"));
         assert!(prompt.contains("`context_requests`"));
-        assert!(prompt.contains("`verify`"));
+        assert!(prompt.contains("`patch`"));
 
         // Payload blocks the model reads stay in both contours.
         assert!(prompt.contains("<repo_map>"));
@@ -322,7 +319,7 @@ mod tests {
         let prompt =
             format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Structured, None)
                 .expect("prompt");
-        assert!(prompt.contains("`changes`"));
+        assert!(prompt.contains("`patch`"));
         assert!(prompt.contains("`outcome`"));
     }
 

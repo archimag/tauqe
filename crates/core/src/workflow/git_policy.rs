@@ -2,24 +2,30 @@
 
 use crate::config::project::ProjectConfig;
 
+mod operations;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::edits::EditOperation;
 use async_trait::async_trait;
-use tokio::sync::watch;
+use tokio::sync::Mutex;
 
-use super::policy::ApplyPolicy;
+use crate::blocking::StartedOperations;
+use operations::GitOperation;
+
+use super::policy::{ApplyPolicy, FinalizationStatus, PolicyRollback};
 use crate::context::ContextManager;
 use crate::edits::{
-    apply_edit_proposal_with_config, prepare_staged_edits_with_config, StageEditsResult,
-    StagedEditsState,
+    apply_edit_proposal_with_config_and_operations, prepare_staged_edits_with_config,
+    StageEditsResult, StagedEditsState,
 };
 use crate::git::{
     create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit,
     restore_checkpoint, CheckpointInfo,
 };
+use crate::stop::HardCancellation;
 
 /// Transactional apply policy that records every applied change set as a
 /// recoverable Git transaction.
@@ -44,12 +50,36 @@ use crate::git::{
 /// the turn already decided, and completing them under the wall-clock budget is
 /// what leaves the working tree in a known state and what makes the deferred
 /// force-abort of a stalled turn deterministic instead of open-ended.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct GitTransactionPolicy {
-    checkpoint: Option<CheckpointInfo>,
+    state: Arc<Mutex<GitState>>,
     guard: Option<Arc<AtomicBool>>,
     /// Turn-scoped cancellation signal the capture and the step commit observe.
-    cancel: Option<watch::Receiver<bool>>,
+    cancel: Option<HardCancellation>,
+}
+
+#[derive(Default)]
+struct GitState {
+    operations: StartedOperations,
+    publication: StartedOperations,
+    checkpoint: Option<CheckpointInfo>,
+    capture: GitOperation<CheckpointInfo>,
+    step: GitOperation<String>,
+    pending_step: Option<Vec<String>>,
+    finalization: GitOperation<String>,
+    restoration: GitOperation<()>,
+    applying: bool,
+    closed: bool,
+}
+
+impl Default for GitTransactionPolicy {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(GitState::default())),
+            guard: None,
+            cancel: None,
+        }
+    }
 }
 
 impl GitTransactionPolicy {
@@ -59,9 +89,9 @@ impl GitTransactionPolicy {
 
     /// Creates a policy that reports an open transaction through `guard` and
     /// observes the turn's cancellation signal while capturing and committing.
-    pub fn with_guard_and_cancel(guard: Arc<AtomicBool>, cancel: watch::Receiver<bool>) -> Self {
+    pub fn with_guard_and_cancel(guard: Arc<AtomicBool>, cancel: HardCancellation) -> Self {
         Self {
-            checkpoint: None,
+            state: Arc::new(Mutex::new(GitState::default())),
             guard: Some(guard),
             cancel: Some(cancel),
         }
@@ -70,7 +100,7 @@ impl GitTransactionPolicy {
     /// Publishes the current transaction state to the shared guard, if any.
     fn publish_transaction_state(&self) {
         if let Some(guard) = &self.guard {
-            guard.store(self.checkpoint.is_some(), Ordering::SeqCst);
+            guard.store(true, Ordering::SeqCst);
         }
     }
 
@@ -79,20 +109,6 @@ impl GitTransactionPolicy {
         if let Some(guard) = &self.guard {
             guard.store(false, Ordering::SeqCst);
         }
-    }
-}
-
-/// A policy that is dropped without settling its transaction no longer holds an
-/// open transaction.
-///
-/// The checkpoint and the step commits it captured are left to the checkpoint
-/// recovery pass, which resolves exactly that residue, while the shared guard
-/// must stop reporting an open transaction: a supervisor that kept deferring a
-/// hard cancel for a policy nobody holds would wait out the whole deferral
-/// limit for a transaction that can never close.
-impl Drop for GitTransactionPolicy {
-    fn drop(&mut self) {
-        self.clear_transaction_state();
     }
 }
 
@@ -105,7 +121,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         context_manager: &ContextManager,
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
-        cancel_rx: Option<&watch::Receiver<bool>>,
+        cancel_rx: Option<&HardCancellation>,
     ) -> StageEditsResult {
         prepare_staged_edits_with_config(
             repo_root,
@@ -125,38 +141,92 @@ impl ApplyPolicy for GitTransactionPolicy {
         context_manager: &mut ContextManager,
         batches: &[&[EditOperation]],
     ) -> anyhow::Result<Vec<String>> {
+        self.apply_temporary_batches_owned(repo_root, project, context_manager, batches, None)
+            .await
+    }
+
+    async fn apply_temporary_batches_owned(
+        &mut self,
+        repo_root: &Path,
+        project: &ProjectConfig,
+        context_manager: &mut ContextManager,
+        batches: &[&[EditOperation]],
+        cancel_rx: Option<&HardCancellation>,
+    ) -> anyhow::Result<Vec<String>> {
         // Capture the pre-edit checkpoint exactly once. The verification-healing
         // loop calls this method repeatedly; recreating the checkpoint on every
         // call would advance its base onto the previous temporary step commit,
         // so a later rollback or finalization could no longer return the working
         // tree to its true pre-turn state.
-        if self.checkpoint.is_none() {
+        let mut state = self.state.lock().await;
+        anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
+        anyhow::ensure!(!state.applying, "Git application is already in progress");
+        state.applying = true;
+        if state.checkpoint.is_none() {
             let root = repo_root.to_path_buf();
             // The receiver is cloned into the offload because the closure owns
             // everything it touches; the clone shares the turn's channel, so the
             // capture observes exactly the signal the turn raises.
             let cancel = self.cancel.clone();
-            let checkpoint = crate::blocking::run_blocking_async(move || {
-                create_checkpoint(&root, cancel.as_ref())
-            })
-            .await??;
-            self.checkpoint = Some(checkpoint);
+            self.publish_transaction_state();
+            let owner = state.operations.clone();
+            state
+                .capture
+                .start(&owner, move || create_checkpoint(&root, cancel.as_ref()))?;
+            let capture = state.capture.clone();
+            drop(state);
+            let checkpoint = capture.result().await?;
+            state = self.state.lock().await;
+            anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
+            state.checkpoint = Some(checkpoint);
         }
-        self.publish_transaction_state();
 
-        let changed_files =
-            apply_edit_proposal_with_config(repo_root, project, context_manager, batches).await?;
+        if let Some(files) = state.pending_step.clone() {
+            let step = state.step.clone();
+            drop(state);
+            step.result().await?;
+            state = self.state.lock().await;
+            anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
+            state.pending_step = None;
+            state.step = GitOperation::Idle;
+            state.applying = false;
+            return Ok(files);
+        }
 
+        let publication = state.publication.clone();
+        drop(state);
+
+        let changed_files = apply_edit_proposal_with_config_and_operations(
+            repo_root,
+            project,
+            context_manager,
+            batches,
+            cancel_rx,
+            &publication,
+        )
+        .await?;
+
+        let mut state = self.state.lock().await;
+        anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
         if !changed_files.is_empty() {
             let root = repo_root.to_path_buf();
             let files = changed_files.clone();
             let cancel = self.cancel.clone();
-            crate::blocking::run_blocking_async(move || {
+            let owner = state.operations.clone();
+            state.step.start(&owner, move || {
                 create_step_commit(&root, &files, "initial attempt", cancel.as_ref())
-            })
-            .await??;
+            })?;
+            state.pending_step = Some(changed_files.clone());
+            let step = state.step.clone();
+            drop(state);
+            step.result().await?;
+            state = self.state.lock().await;
+            anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
+            state.pending_step = None;
+            state.step = GitOperation::Idle;
         }
 
+        state.applying = false;
         Ok(changed_files)
     }
 
@@ -166,6 +236,120 @@ impl ApplyPolicy for GitTransactionPolicy {
         changed_files: &[String],
         commit_message: &str,
     ) -> anyhow::Result<Option<String>> {
+        self.finalize_resumable(repo_root, changed_files, commit_message, None)
+            .await?
+            .into_result()
+    }
+
+    async fn stop_and_wait(&mut self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.finalization.started() {
+            state.closed = true;
+        }
+        state.publication.close();
+        let publication = state.publication.clone();
+        let operations = state.operations.clone();
+        drop(state);
+        let published = publication.wait().await;
+        let git = operations.wait().await;
+        anyhow::ensure!(
+            published.unconfirmed == 0 && git.unconfirmed == 0,
+            "file or Git operation completion could not be confirmed"
+        );
+        Ok(())
+    }
+
+    async fn finalize_resumable(
+        &mut self,
+        repo_root: &Path,
+        changed_files: &[String],
+        commit_message: &str,
+        cancel: Option<&HardCancellation>,
+    ) -> anyhow::Result<FinalizationStatus> {
+        self.finalize_with_admission(repo_root, changed_files, commit_message, cancel, true)
+            .await
+    }
+
+    async fn finalization_result(
+        &mut self,
+        repo_root: &Path,
+        changed_files: &[String],
+        commit_message: &str,
+        cancel: Option<&HardCancellation>,
+    ) -> anyhow::Result<FinalizationStatus> {
+        self.finalize_with_admission(repo_root, changed_files, commit_message, cancel, false)
+            .await
+    }
+
+    async fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<PolicyRollback> {
+        // Rollback stays cancel-blind for the same reason as finalization: it has
+        // to return the tree to the recorded base even when the turn was cancelled.
+        let mut state = self.state.lock().await;
+        state.closed = true;
+        state.publication.close();
+        let publication_owner = state.publication.clone();
+        let capture = state.capture.clone();
+        let step = state.step.clone();
+        let checkpoint = state.checkpoint.clone();
+        let finalization_started = state.finalization.started();
+        drop(state);
+        let publication = publication_owner.wait().await;
+        anyhow::ensure!(
+            publication.unconfirmed == 0,
+            "file publication could not be confirmed"
+        );
+        anyhow::ensure!(
+            !finalization_started,
+            "Git finalization already started; retrieve its result before recovery"
+        );
+        let checkpoint = if checkpoint.is_none() && capture.started() {
+            Some(capture.result().await?)
+        } else {
+            checkpoint
+        };
+        if step.started() {
+            let _ = step.result().await;
+        }
+        let mut state = self.state.lock().await;
+        if let Some(checkpoint) = checkpoint {
+            let root = repo_root.to_path_buf();
+            let owner = state.operations.clone();
+            state
+                .restoration
+                .start(&owner, move || restore_checkpoint(&root, &checkpoint))?;
+            let restoration = state.restoration.clone();
+            drop(state);
+            restoration.result().await?;
+            state = self.state.lock().await;
+            state.checkpoint = None;
+            state.closed = false;
+            state.capture = GitOperation::Idle;
+            state.step = GitOperation::Idle;
+            state.pending_step = None;
+            state.applying = false;
+            state.restoration = GitOperation::Idle;
+            state.publication = StartedOperations::default();
+            self.clear_transaction_state();
+            Ok(PolicyRollback::RestoredCheckpoint)
+        } else {
+            state.closed = false;
+            state.applying = false;
+            state.publication = StartedOperations::default();
+            self.clear_transaction_state();
+            Ok(PolicyRollback::NoCheckpoint)
+        }
+    }
+}
+
+impl GitTransactionPolicy {
+    async fn finalize_with_admission(
+        &mut self,
+        repo_root: &Path,
+        changed_files: &[String],
+        commit_message: &str,
+        cancel: Option<&HardCancellation>,
+        admit: bool,
+    ) -> anyhow::Result<FinalizationStatus> {
         // Finalization stays cancel-blind: it settles an outcome the turn already
         // decided, and completing it under the wall-clock budget is what leaves the
         // tree in a known state and lets the server's deferred force-abort wait for
@@ -173,43 +357,77 @@ impl ApplyPolicy for GitTransactionPolicy {
         let root = repo_root.to_path_buf();
         let files = changed_files.to_vec();
         let commit_message_owned = commit_message.to_string();
-        let checkpoint = self.checkpoint.take();
-
-        let res = crate::blocking::run_blocking_async(move || {
-            if let Some(checkpoint) = checkpoint {
-                finalize_ai_commit(&root, &checkpoint, &files, &commit_message_owned).map(Some)
-            } else {
-                create_ai_commit(&root, &files, &commit_message_owned).map(Some)
+        let mut state = self.state.lock().await;
+        if !admit && !state.finalization.started() {
+            return Ok(FinalizationStatus::NotAdmitted);
+        }
+        anyhow::ensure!(!state.applying, "Git application is already in progress");
+        if state.pending_step.is_some() {
+            let step = state.step.clone();
+            drop(state);
+            step.result().await?;
+            state = self.state.lock().await;
+            state.pending_step = None;
+            state.step = GitOperation::Idle;
+        }
+        anyhow::ensure!(
+            !state.restoration.started(),
+            "Git restoration already started"
+        );
+        if !state.finalization.started() {
+            anyhow::ensure!(!state.closed, "Git transaction is closed to new work");
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(HardCancellation::is_cancelled)
+                || cancel.is_some_and(HardCancellation::is_cancelled)
+            {
+                return Ok(FinalizationStatus::NotAdmitted);
             }
-        })
-        .await;
+            state.closed = true;
+        }
+        let checkpoint = state.checkpoint.clone();
+        let owner = state.operations.clone();
+        state.finalization.start(&owner, move || {
+            if let Some(checkpoint) = checkpoint {
+                finalize_ai_commit(&root, &checkpoint, &files, &commit_message_owned)
+            } else {
+                create_ai_commit(&root, &files, &commit_message_owned)
+            }
+        })?;
+        let finalization = state.finalization.clone();
+        drop(state);
+        let res = finalization.result().await;
 
-        self.clear_transaction_state();
-        match res? {
+        let status = match res {
             // A verified change set can live entirely outside Git — the
             // `.tauqe/mockups/` sandbox is the documented case — so finalization
             // reports the absence of a commit rather than a hash the caller
             // would try to resolve.
-            Ok(hash) => Ok(hash.filter(|hash| !hash.is_empty())),
+            Ok(hash) => {
+                self.clear_transaction_state();
+                FinalizationStatus::Completed {
+                    result: Ok((!hash.is_empty()).then_some(hash)),
+                    cancelled: self
+                        .cancel
+                        .as_ref()
+                        .is_some_and(HardCancellation::is_cancelled)
+                        || cancel.is_some_and(HardCancellation::is_cancelled),
+                }
+            }
             Err(err) => {
                 tracing::warn!("Failed to finalize squashed AI commit: {}", err);
-                Err(err)
+                FinalizationStatus::Completed {
+                    result: Err(format!("{err:#}")),
+                    cancelled: self
+                        .cancel
+                        .as_ref()
+                        .is_some_and(HardCancellation::is_cancelled)
+                        || cancel.is_some_and(HardCancellation::is_cancelled),
+                }
             }
-        }
-    }
-
-    async fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool> {
-        // Rollback stays cancel-blind for the same reason as finalization: it has
-        // to return the tree to the recorded base even when the turn was cancelled.
-        self.clear_transaction_state();
-        if let Some(checkpoint) = self.checkpoint.take() {
-            let root = repo_root.to_path_buf();
-            crate::blocking::run_blocking_async(move || restore_checkpoint(&root, &checkpoint))
-                .await??;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        };
+        Ok(status)
     }
 }
 
@@ -217,15 +435,15 @@ impl ApplyPolicy for GitTransactionPolicy {
 mod tests {
     use crate::config::project::ProjectConfig;
     use crate::context::ContextAccess;
+    use crate::stop::StopSource;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    use super::{ApplyPolicy, GitTransactionPolicy};
+    use super::{ApplyPolicy, GitTransactionPolicy, PolicyRollback};
     use crate::context::ContextManager;
     use crate::edits::EditOperation;
     use crate::edits::EditProposal;
     use crate::edits::EditReplace;
-    use tokio::sync::watch;
 
     /// Project configuration the policy tests stage under: no formatter, no hook.
     fn project() -> ProjectConfig {
@@ -262,8 +480,11 @@ mod tests {
 
         let edits = replace_edit();
         let active = Arc::new(AtomicBool::new(false));
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = GitTransactionPolicy::with_guard_and_cancel(active.clone(), cancel_rx);
+        let stop = StopSource::new();
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(
+            active.clone(),
+            stop.token().hard_cancellation(),
+        );
         assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         let staged = policy
             .staging(root, &project(), &cm, &edits, None, None)
@@ -300,8 +521,11 @@ mod tests {
 
         let edits = replace_edit();
         let active = Arc::new(AtomicBool::new(false));
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = GitTransactionPolicy::with_guard_and_cancel(active.clone(), cancel_rx);
+        let stop = StopSource::new();
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(
+            active.clone(),
+            stop.token().hard_cancellation(),
+        );
         assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
@@ -315,7 +539,10 @@ mod tests {
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
-        assert!(policy.rollback(root).await.unwrap());
+        assert_eq!(
+            policy.rollback(root).await.unwrap(),
+            PolicyRollback::RestoredCheckpoint
+        );
         assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
     }
@@ -377,7 +604,10 @@ mod tests {
 
         // Rolling back after several temporary applications must return the
         // tree to its pristine pre-turn state and drop the whole transaction.
-        assert!(policy.rollback(root).await.unwrap());
+        assert_eq!(
+            policy.rollback(root).await.unwrap(),
+            PolicyRollback::RestoredCheckpoint
+        );
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
         assert_eq!(head_subject(root), "Initial commit");
         // The fixture already carries `chore: initial commit` and the
@@ -459,9 +689,12 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
-        assert!(policy.rollback(root).await.unwrap());
+        assert_eq!(
+            policy.rollback(root).await.unwrap(),
+            PolicyRollback::RestoredCheckpoint
+        );
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
-        assert!(policy.checkpoint.is_none());
+        assert!(policy.state.lock().await.checkpoint.is_none());
 
         // Developer makes an uncommitted modification between attempts
         std::fs::write(root.join("a.rs"), "developer edit\n").unwrap();
@@ -555,12 +788,13 @@ mod tests {
         install_sleeping_hook(root);
         let mut cm = editable_context(root);
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let stop = StopSource::new();
+        let cancel = stop.token().hard_cancellation();
         let marker = root.join("hook-started.log");
         let canceller = std::thread::spawn(move || {
             for _ in 0..400 {
                 if marker.exists() {
-                    let _ = cancel_tx.send(true);
+                    stop.request_hard();
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -569,7 +803,7 @@ mod tests {
         });
 
         let guard = Arc::new(AtomicBool::new(false));
-        let mut policy = GitTransactionPolicy::with_guard_and_cancel(guard, cancel_rx);
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(guard, cancel);
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
             edits: replace_edit(),
@@ -607,9 +841,11 @@ mod tests {
         std::fs::write(root.join("notes.txt"), "uncommitted work\n").unwrap();
         let mut cm = editable_context(root);
 
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        let stop = StopSource::new();
+        stop.request_hard();
         let guard = Arc::new(AtomicBool::new(false));
-        let mut policy = GitTransactionPolicy::with_guard_and_cancel(guard, cancel_rx);
+        let mut policy =
+            GitTransactionPolicy::with_guard_and_cancel(guard, stop.token().hard_cancellation());
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
             edits: replace_edit(),

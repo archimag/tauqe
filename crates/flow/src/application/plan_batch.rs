@@ -83,7 +83,6 @@ impl Application {
         PlanResources {
             step: self.step_resources(),
             history: self.history_session().clone(),
-            dialogue: self.dialogue_session().clone(),
         }
     }
 
@@ -130,7 +129,10 @@ impl Application {
         observer: Arc<dyn crate::api::ApplicationObserver>,
     ) -> BatchOutcome {
         let execution = super::PlanExecutionEnvironment::new(self.configuration().await, operation);
-        plan::run_batch(
+        assert!(self
+            .context_session()
+            .activate_manual_publication(operation, observer.clone()));
+        let outcome = plan::run_batch(
             &self.plan_resources(),
             &execution,
             plan_id,
@@ -138,7 +140,9 @@ impl Application {
             options,
             observer,
         )
-        .await
+        .await;
+        self.context_session().close_manual_publication(operation);
+        outcome
     }
 
     #[cfg(feature = "test-support")]
@@ -148,24 +152,23 @@ impl Application {
         root: &std::path::Path,
         config: &tauqe_core::config::AppConfig,
         request: &tauqe_core::workflow::implementation::StepTurnRequest,
-        publish: impl Fn(tauqe_core::context::ContextState) + Send,
+        observer: Arc<dyn crate::api::ApplicationObserver>,
     ) -> Result<String, plan::StepPreparationError> {
-        let execution = super::PlanExecutionEnvironment::new(
-            super::configuration::ConfigurationSnapshot {
-                config: config.clone(),
-                selection: config.default_selection(),
-            },
-            operation,
-        );
-        plan::prepare_implementation_step(
+        if !self.step_resources().execution.owns(operation) {
+            return Err(plan::StepPreparationError::OperationNotOwned);
+        }
+        assert!(self
+            .context_session()
+            .activate_manual_publication(operation, observer));
+        let result = plan::prepare_implementation_step(
             &self.plan_resources(),
             operation,
             root,
             config,
-            &execution.compaction_environment(),
             request,
-            publish,
         )
-        .await
+        .await;
+        self.context_session().close_manual_publication(operation);
+        result
     }
 }

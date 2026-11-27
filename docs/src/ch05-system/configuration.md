@@ -4,7 +4,7 @@ TAUQE configuration is a **single project surface with two audiences**, and the
 section boundary between them is the concept.
 
 - The **harness-policy sections** of `tauqe.toml` declare how the environment
-  behaves: model roles, context budgets, retry and replan limits, verification
+  behaves: model roles, complete-request admission, retry and replan limits, verification
   policy.
 - The **`[project]` declaration** of the same file declares how the repository is
   built and verified: the mandatory verification command, the optional external task
@@ -140,8 +140,9 @@ it runs a declared command line and reads its exit status.
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
 | `[repl]` | the turn round budget, the replan budget, workflow mode, edit protocol, patch strategy |
-| `[history]` | token budget and uncompressed tail length |
-| `[context]` | research rounds, the aggregate token budget, the outline budget, report caps, pinned patterns |
+| `[history]` | independent history token budget and retained tail length |
+| `[request]` | maximum estimated tokens of the complete provider input |
+| `[context]` | resource guards and pinned patterns |
 | `[[review.presets]]` | named review presets, audited path slices, and post-analysis timing |
 The `[repl]` section also selects the wire format of the model exchange through
 its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
@@ -280,29 +281,25 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 | Key | Documented default | Bounds |
 | --- | --- | --- |
 | `repl.max_turn_rounds` | 16 | physical provider calls one turn may spend: discovery, patch retry, healing, and the correction of an empty answer alike |
-| `context.token_budget` | 300,000 | aggregate cost of the context: repository files and external documents alike |
-| `context.repomap_token_budget` | 4,000 | the repository outline |
-| `history.budget_tokens` | 20,000 | session history before compaction |
+| `request.max_input_tokens` | see the shipped archetype | maximum estimated tokens of the complete serialized provider input |
 | `history.tail_turns` | 10 | turns kept uncompressed |
-| `repl.max_replans` | 2 | automated replans after a blocked step |
+| `history.budget_tokens` | 20,000 | maximum estimated tokens of the session journal, including nested rounds; checked before a new interactive turn |
+| `repl.max_replans` | 2 | repair waves per Architect rung without a newly completed leaf during a plan run; progress resets the counter, exhaustion promotes when enabled and available, zero disables automatic repairs |
 | project entry `timeout_secs` | 600 | one verification, format, post-hook, or named-command invocation |
-Keys renamed by a later revision keep their former spelling as a permanent
-deserialization alias, so an existing `tauqe.toml` keeps loading unchanged:
-`context.files_token_budget` remains accepted as an alias of
-`context.token_budget`, and the former `[develop]` and `[edit]` section names remain
+The former `[develop]` and `[edit]` section names remain
 accepted as aliases of `[repl]`. Those retired names appear nowhere else in this
 book.
 The round budgets retired with the unified turn loop carry no alias: they are absent
 from the typed contract, and `repl.max_turn_rounds` is the single pool they were
 replaced by.
 A project entry's own `timeout_secs` overrides the harness budget for that entry
-alone. A repository may override any documented default, and this repository does
-(section 3.6). The point is not the numbers but their addressability: a small library
-tolerates a wide context and a monorepo does not, so a hardcoded limit forces either
-a generous default that burns budget or a restrictive one that blocks legitimate
-work. Volume is measured in tokens only: no parameter bounds how many files a
-request may admit, and each file is priced as its content plus the wrapper its
-`<file>` element renders, so the budget compares what the prompt actually carries.
+alone. Input size is estimated as `ceil(serialized provider input bytes / 4)`,
+not counted by the provider's tokenizer. Instructions, messages, history, task,
+files, external documents, repository representation, feedback, scratchpad,
+response schema, and adapter framing count. Diagnostic components are rounded
+separately and may not sum to the total. Overflow refuses the request before
+the provider call without truncating admitted files or history. Process and
+transfer guards protect resources independently of input-size policy.
 
 ### 2.6 The archetype and the operational configuration
 
@@ -486,24 +483,26 @@ worth distinguishing from a stale search block.
 
 ### 3.6 Context budgets and hierarchical pinned resolution
 
-`[context]` sets the research round cap, the aggregate token budget, the outline
-budget, and whether the eager symbol map is rendered (`include_repo_map`). When the
+`[context]` configures resource guards and whether the eager symbol map is
+rendered (`include_repo_map`). When the
 eager map is disabled, the prompt carries the compact directory tree instead; the two
-outlines are mutually exclusive by design. This repository widens the documented
-defaults (12 rounds, 1,000,000 tokens, 40,000 outline tokens), which is exactly why
-they are configuration rather than constants.
+outlines are mutually exclusive by design. Neither has a separate size budget:
+the complete input must pass `request.max_input_tokens` admission.
 
-The token budget is the single measure of volume, and it prices both kinds of
-context entry the same way. No key bounds how many files one request may admit, and
-so a later round can request it again.
+No independent context-token or file-count quota limits intake. Core loads
+admitted materials and refuses an oversized complete request before contacting
+the provider. History has its own `history.budget_tokens` limit: before an
+interactive turn is recorded, the history manager conditionally compacts its
+completed records. This budget is not calculated from the remaining space in
+`request.max_input_tokens`; overflow from files or other input cannot trigger
+compaction of history already within its own budget.
 
-The same ceiling bounds the external documents a project declares in `[[outer_docs]]`. That
+The complete-request limit also covers external documents declared in `[[outer_docs]]`. That
 declaration is a top-level array of tables, so a modular layer extends it exactly like any
 other; each entry names one document through the single `source` key — an `http(s)` address
 or a local path — together with the `id` a request addresses and a `title` the catalog
 renders. A plan step declares the entries it obeys through the `outer_docs` field of its
-leaf, and the harness mounts them before the step turn starts, priced by the rule above and
-bounded by the same budget. *External Project Documentation* owns the layer, the
+leaf, and the harness mounts them before the step turn starts. *External Project Documentation* owns the layer, the
 declaration, and the trust boundary that decides what may be read.
 
 `pinned` names files that travel with every prompt, and resolution is hierarchical

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-fn default_history_budget_tokens() -> u64 {
-    crate::history::DEFAULT_HISTORY_BUDGET_TOKENS
+/// Default history ceiling documented by the project archetype and manifest.
+pub const DEFAULT_BUDGET_TOKENS: usize = 20_000;
+
+fn default_budget_tokens() -> usize {
+    DEFAULT_BUDGET_TOKENS
 }
 
 fn default_tail_turns() -> usize {
@@ -10,8 +13,8 @@ fn default_tail_turns() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryConfig {
-    #[serde(default = "default_history_budget_tokens")]
-    pub budget_tokens: u64,
+    #[serde(default = "default_budget_tokens")]
+    pub budget_tokens: usize,
     #[serde(default = "default_tail_turns")]
     pub tail_turns: usize,
 }
@@ -19,7 +22,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
-            budget_tokens: default_history_budget_tokens(),
+            budget_tokens: default_budget_tokens(),
             tail_turns: default_tail_turns(),
         }
     }

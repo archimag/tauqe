@@ -4,11 +4,14 @@ use super::attempts::{LeafExecutor, LeafOutcome};
 use super::completion::step_status_error;
 use async_trait::async_trait;
 use tauqe_core::providers::StreamEvent;
+use tauqe_core::stop::HardCancellation;
+use tauqe_core::stop::StopToken;
 use tauqe_core::workflow::batch::{
     BatchExecution, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepStatus, BatchStop,
+    SoftStopPolicy,
 };
 use tauqe_core::workflow::implementation::{StepFailure, StepTurnResult, StepTurnSettlement};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 pub(crate) enum QueueStop {
     Completed,
@@ -39,8 +42,8 @@ pub(crate) struct QueueReport {
 pub(crate) async fn run_queue(
     leaf: LeafExecutor<'_>,
     stream_tx: &mpsc::Sender<StreamEvent>,
-    cancel_rx: &watch::Receiver<bool>,
-    soft_stop_rx: &watch::Receiver<bool>,
+    stop: &StopToken,
+    soft_policy: SoftStopPolicy,
 ) -> QueueReport {
     let steps: Vec<_> = leaf
         .config
@@ -54,7 +57,7 @@ pub(crate) async fn run_queue(
         completed: Vec::new(),
     };
     let batch = BatchExecution::new()
-        .run(&steps, &mut executor, stream_tx, cancel_rx, soft_stop_rx)
+        .run(&steps, &mut executor, stream_tx, stop, soft_policy)
         .await;
     let stop = match batch.stop {
         BatchStop::Completed => QueueStop::Completed,
@@ -104,7 +107,7 @@ impl BatchStepExecutor for QueueExecutor<'_> {
         &mut self,
         step: &BatchStep,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> anyhow::Result<BatchStepOutcome> {
         let outcome = self.leaf.run(&step.id, stream_tx, cancel_rx).await;
         let batch_outcome = match outcome {
@@ -171,10 +174,9 @@ pub(crate) fn failure_reason(outcome: &LeafOutcome) -> String {
 mod tests {
     use super::*;
     use crate::workflows::step::attempts::{ImplementationRunConfig, LeafOperations};
+    use crate::workflows::step::completion::CoderAttempt;
     use tauqe_core::plan::{Plan, PlanImplementation, PlanItem};
-    use tauqe_core::workflow::implementation::{
-        ImplementationFrame, StepTurnRequest, StepTurnSettlement,
-    };
+    use tauqe_core::workflow::implementation::{ImplementationFrame, StepTurnRequest};
     use tauqe_core::workflow::EditProtocolKind;
 
     struct RefuseCompletion(Plan);
@@ -183,6 +185,30 @@ mod tests {
     impl LeafOperations for RefuseCompletion {
         async fn read(&self) -> Result<ImplementationFrame, StepFailure> {
             Ok(ImplementationFrame::from_plan(self.0.clone(), None))
+        }
+
+        async fn task(
+            &self,
+            frame: &ImplementationFrame,
+            leaf: &PlanItem,
+        ) -> Result<String, StepFailure> {
+            tauqe_core::plan::prompt::format_plan_step_execution_prompt(
+                &frame.plan,
+                &leaf.id,
+                EditProtocolKind::Structured,
+                None,
+            )
+            .map_err(StepFailure::infrastructure)
+        }
+
+        fn retry_task(&self, task: &str, answer: &str, error: &str) -> String {
+            tauqe_core::plan::prompt::format_plan_step_retry_prompt(
+                task,
+                answer,
+                Some(error),
+                EditProtocolKind::Structured,
+                None,
+            )
         }
 
         fn session_id(&self) -> String {
@@ -202,16 +228,16 @@ mod tests {
             Err(StepFailure::infrastructure("completion write refused"))
         }
 
-        async fn attempt(&self, request: StepTurnRequest) -> (StepTurnSettlement, String) {
+        async fn attempt(&self, request: StepTurnRequest) -> CoderAttempt {
             assert_eq!(request.queue.active_index, 0);
-            (
-                StepTurnResult::Success {
+            CoderAttempt {
+                settlement: StepTurnResult::Success {
                     summary: "verified".into(),
                     commit: Some("abc1234".into()),
                 }
                 .into(),
-                String::new(),
-            )
+                answer: String::new(),
+            }
         }
     }
 
@@ -237,23 +263,21 @@ mod tests {
         let operations = RefuseCompletion(plan);
         let config = ImplementationRunConfig {
             models: Default::default(),
-            protocol: EditProtocolKind::Structured,
             marker: None,
             selection: None,
             instructions: None,
             queue: vec!["1".into(), "2".into()],
         };
         let (stream_tx, _stream_rx) = mpsc::channel(1);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_stop_tx, stop_rx) = watch::channel(false);
+        let stop = tauqe_core::stop::StopSource::new();
         let report = run_queue(
             LeafExecutor {
                 operations: &operations,
                 config: &config,
             },
             &stream_tx,
-            &cancel_rx,
-            &stop_rx,
+            &stop.token(),
+            SoftStopPolicy::Observe,
         )
         .await;
 

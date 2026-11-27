@@ -6,9 +6,10 @@ use tauqe_core::config::AppConfig;
 use std::path::PathBuf;
 use tauqe_core::context::ContextFileContent;
 use tauqe_core::models::{ModelRef, ModelRole, ModelSelection};
-use tauqe_core::review::window::{expand_window, WindowBudgets, WindowContext};
+use tauqe_core::review::window::expand_window;
 
 pub struct ResolvedReviewSynthesis {
+    #[cfg(test)]
     config: AppConfig,
     pub model: ModelRef,
 }
@@ -22,6 +23,8 @@ pub struct PreparedReviewSynthesisWindow {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewSynthesisPreparationError {
+    #[error("Failed to prepare the audit window: {0}")]
+    Read(String),
     #[error("Review path patterns matched no repository files: {0}")]
     NoPatternMatches(String),
     #[error("Context is empty: add files to review first")]
@@ -37,35 +40,22 @@ impl ResolvedReviewSynthesis {
             .cloned()
             .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
         let model = config.resolve_model(&selection);
-        ResolvedReviewSynthesis { config, model }
+        ResolvedReviewSynthesis {
+            #[cfg(test)]
+            config,
+            model,
+        }
     }
 }
 
 impl AuditResources {
     pub(super) async fn prepare_review_synthesis_window(
         &self,
-        resolved: &ResolvedReviewSynthesis,
+        _resolved: &ResolvedReviewSynthesis,
         path_patterns: &[String],
     ) -> Result<PreparedReviewSynthesisWindow, ReviewSynthesisPreparationError> {
-        let budgets = WindowBudgets {
-            files_tokens: resolved.config.context.token_budget,
-        };
-        let (repo_root, ctx_snapshot, mut estimated_tokens) = {
-            let ctx = self.context.context_for_turn().await;
-            let root = ctx.repo_root().to_path_buf();
-            let tokens = ctx.get_state().total_estimated_tokens as usize;
-            (root, ctx, tokens)
-        };
-
-        let mut files = match tokio::task::spawn_blocking(move || ctx_snapshot.read_context_files())
-            .await
-        {
-            Ok(files) => files,
-            Err(err) => {
-                tracing::warn!(error = %format!("blocking task failed: {err}"), "Failed to read context files in offload");
-                Vec::new()
-            }
-        };
+        let ctx_snapshot = self.context.context_for_turn().await;
+        let repo_root = ctx_snapshot.repo_root().to_path_buf();
 
         // The audit window is the union of the active context and every declared
         // line: a repository file is selected as soon as one pattern matches it, so
@@ -78,72 +68,31 @@ impl AuditResources {
             .map(str::to_string)
             .collect();
 
-        // Pattern-matched files the configured budgets kept out of the audit.
-        // Reported on the started event so a truncated expansion is never silent.
-        let mut omitted_files = 0usize;
-
+        let expanded = expand_window(&repo_root, Some(ctx_snapshot), &patterns)
+            .await
+            .map_err(|error| ReviewSynthesisPreparationError::Read(error.to_string()))?;
         if !patterns.is_empty() {
             // The expansion is the single deterministic projection of the audit
             // window: the preset launch and the read-only preview read the same
             // function, so the window the developer previewed is the window this
             // launch reads (#c-1, #c-4).
-            let expanded = expand_window(
-                &repo_root,
-                WindowContext {
-                    files: &files,
-                    tokens: estimated_tokens,
-                },
-                &patterns,
-                budgets,
-            )
-            .await;
-
-            match expanded {
-                Ok(expanded) => {
-                    // A pattern that selects nothing is a mistyped or unsupported
-                    // path, never a narrower audit: launching anyway would review a
-                    // different file set while the developer believes the pattern
-                    // chose it. A partial selection stays a lawful run reported
-                    // through `omitted_files`, so only a zero match is refused.
-                    if expanded.selected_nothing() {
-                        return Err(ReviewSynthesisPreparationError::NoPatternMatches(
-                            patterns.join(", "),
-                        ));
-                    }
-                    estimated_tokens = expanded.estimated_tokens;
-                    omitted_files = expanded.window.omitted_by_budget;
-                    if omitted_files > 0 {
-                        tracing::warn!(
-                        omitted = omitted_files,
-                        selected = expanded.window.selected_files,
-                        matched = expanded.window.matched_files,
-                        "path pattern expansion exhausted the configured file token budget; remaining matched files were not loaded"
-                    );
-                    }
-                    files.extend(expanded.files);
-                }
-                Err(err) => {
-                    // The listing failed at the infrastructure level, which says
-                    // nothing about the pattern itself: the audit proceeds with the
-                    // context files already loaded instead of rejecting a pattern the
-                    // harness never evaluated.
-                    tracing::warn!(
-                        error = %err,
-                        "Failed to list repository files for the review path pattern"
-                    );
-                }
+            // A pattern that selects nothing is refused rather than auditing
+            // only the already loaded context.
+            if expanded.selected_nothing() {
+                return Err(ReviewSynthesisPreparationError::NoPatternMatches(
+                    patterns.join(", "),
+                ));
             }
         }
-
-        if files.is_empty() {
+        if expanded.files.is_empty() {
             return Err(ReviewSynthesisPreparationError::EmptyContext);
         }
 
         Ok(PreparedReviewSynthesisWindow {
             root: repo_root,
-            files,
-            estimated_tokens,
-            omitted_by_budget: omitted_files,
+            files: expanded.files,
+            estimated_tokens: expanded.estimated_tokens,
+            omitted_by_budget: 0,
         })
     }
 }
@@ -291,7 +240,7 @@ mod tests {
         let app = application(root.path());
         let frozen = app.resolve_review_synthesis(None).await;
         let mut changed = config();
-        changed.context.token_budget = 0;
+        changed.request.max_input_tokens = 1;
         changed.providers.openrouter = Some(OpenRouterConfig {
             api_key: Some("test-key".into()),
             ..Default::default()
@@ -321,16 +270,19 @@ mod tests {
             .provider(&app, current.model.provider)
             .await
             .is_ok());
-        assert!(matches!(
+        assert_eq!(
             app.audit_resources()
                 .prepare_review_synthesis_window(&current, &["audit.rs".into()])
-                .await,
-            Err(ReviewSynthesisPreparationError::EmptyContext)
-        ));
+                .await
+                .unwrap()
+                .files
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn exhausted_context_budget_reports_omissions_without_dropping_the_context() {
+    async fn full_window_keeps_context_and_every_match() {
         let root = tempfile::tempdir().unwrap();
         track(
             root.path(),
@@ -340,7 +292,7 @@ mod tests {
         add_context(&app, "held.rs").await;
         let spent = app.context_state().await.total_estimated_tokens as usize;
         let mut changed = config();
-        changed.context.token_budget = spent;
+        changed.request.max_input_tokens = 1;
         app.replace_configuration(changed, ReloadSelection::Preserve)
             .await;
         let resolved = app.resolve_review_synthesis(None).await;
@@ -349,9 +301,15 @@ mod tests {
             .prepare_review_synthesis_window(&resolved, &["a.rs".into(), "b.rs".into()])
             .await
             .unwrap();
-        assert_eq!(window.files.len(), 1);
-        assert_eq!(window.files[0].path, "held.rs");
-        assert_eq!(window.estimated_tokens, spent);
-        assert_eq!(window.omitted_by_budget, 2);
+        assert_eq!(
+            window
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["held.rs", "a.rs", "b.rs"]
+        );
+        assert!(window.estimated_tokens > spent);
+        assert_eq!(window.omitted_by_budget, 0);
     }
 }

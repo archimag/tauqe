@@ -13,9 +13,10 @@
 
 use crate::config::project::ProjectConfig;
 use std::path::Path;
+use tauqe_tools::blocking::StartedOperations;
 
 use crate::edits::EditOperation;
-use tokio::sync::watch;
+use tauqe_tools::stop::HardCancellation;
 
 use super::{StageEditsResult, StagedEditsState};
 use crate::context::ContextManager;
@@ -193,7 +194,7 @@ pub async fn prepare_staged_edits_with_config(
     context_manager: &ContextManager,
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> StageEditsResult {
     prepare_edit_batches(
         repo_root,
@@ -212,7 +213,7 @@ pub(super) async fn prepare_edit_batches(
     context_manager: &ContextManager,
     batches: &[&[EditOperation]],
     initial_staged: Option<&StagedEditsState>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> StageEditsResult {
     let context: Vec<String> = context_manager
         .get_state()
@@ -242,4 +243,86 @@ pub(super) async fn prepare_edit_batches(
     )
     .await
     .into()
+}
+
+/// Publication preparation retains every blocking staging operation and every
+/// formatter process with the caller's transaction owner.
+pub(super) async fn prepare_edit_batches_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    context_manager: &ContextManager,
+    batches: &[&[EditOperation]],
+    initial_staged: Option<&StagedEditsState>,
+    cancel_rx: Option<&HardCancellation>,
+    operations: &StartedOperations,
+) -> Result<StageEditsResult, String> {
+    let context: Vec<String> = context_manager
+        .get_state()
+        .items
+        .into_iter()
+        .map(|item| item.path)
+        .collect();
+    let batches: Vec<Vec<_>> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .cloned()
+                .map(super::substrate::tool_operation)
+                .collect()
+        })
+        .collect();
+    let slices: Vec<_> = batches.iter().map(Vec::as_slice).collect();
+    tauqe_tools::edits::prepare_edit_batches_with_operations(
+        repo_root,
+        project,
+        &context,
+        &slices,
+        initial_staged,
+        Some(validate_project_config),
+        cancel_rx,
+        operations,
+    )
+    .await
+    .map(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContextAccess;
+    use crate::edits::EditReplace;
+    use crate::stop::StopSource;
+
+    #[tokio::test]
+    async fn soft_stop_allows_file_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::write(dir.path().join("a.rs"), "original\n").unwrap();
+        let mut context = ContextManager::new(dir.path().to_path_buf());
+        context.add_file("a.rs", ContextAccess::Editable).unwrap();
+        let edits = [EditOperation::Replace(EditReplace {
+            path: "a.rs".into(),
+            old_text: "original\n".into(),
+            new_text: "changed\n".into(),
+        })];
+        let stop = StopSource::new();
+        stop.request_soft();
+        let hard = stop.token().hard_cancellation();
+        let result = prepare_staged_edits_with_config(
+            dir.path(),
+            &ProjectConfig::default(),
+            &context,
+            &edits,
+            None,
+            Some(&hard),
+        )
+        .await;
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(result.staged_state.staged_files["a.rs"], b"changed\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("a.rs")).unwrap(),
+            b"original\n"
+        );
+    }
 }

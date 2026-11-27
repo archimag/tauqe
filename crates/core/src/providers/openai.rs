@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::sse::{find_sse_event_boundary, MAX_SSE_EVENT_BYTES};
 use super::{
@@ -20,6 +20,7 @@ use super::{
     StreamEvent,
 };
 use crate::models::ProviderKind;
+use crate::stop::HardCancellation;
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
 
@@ -60,6 +61,10 @@ fn request_body(request: LlmRequest<'_>) -> Value {
         body["text"] = json!({"format":format});
     }
     body
+}
+/// Provider-facing projection shared with pre-dispatch input admission.
+pub(crate) fn input_projection(request: &LlmRequest<'_>) -> Value {
+    request_body(request.clone())
 }
 static CACHE_PROBE: LazyLock<Option<Mutex<CacheProbe>>> = LazyLock::new(|| {
     std::env::var("TAUQE_DEV_OPENAI_CACHE")
@@ -385,16 +390,11 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        mut cancel: watch::Receiver<bool>,
+        cancel: HardCancellation,
     ) -> ProviderResult {
-        let cancelled = async {
-            if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        };
         tokio::select! {
             biased;
-            _ = cancelled => {let _ = tx.send(StreamEvent::Cancelled).await; Ok(())}
+            _ = cancel.cancelled() => {let _ = tx.try_send(StreamEvent::Cancelled); Ok(())}
             _ = tx.closed() => Ok(()),
             result = self.execute(ENDPOINT, request, &tx) => result,
         }

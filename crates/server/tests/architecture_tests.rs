@@ -107,6 +107,63 @@ fn core_facade_does_not_reexport_the_rpc_contract() {
     assert!(!facade.contains("pub use tauqe_protocol"));
 }
 
+#[test]
+fn operation_stop_has_no_legacy_bool_contract_or_second_token_implementation() {
+    let crates = server_dir().join("..");
+    let operation = read_source(&crates.join("flow/src/application/operation.rs"));
+    for old in ["cancel_receiver", "soft_stop_receiver"] {
+        assert!(
+            !operation.contains(old),
+            "obsolete operation accessor: {old}"
+        );
+    }
+    fn inspect(path: &Path) {
+        if path.is_dir() {
+            for child in source_dir_entries(path) {
+                inspect(&child);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && !path.ends_with("server/tests/architecture_tests.rs")
+        {
+            let source = read_source(path);
+            for old in [
+                "LegacyBool",
+                "from_legacy_receiver",
+                "cancel_receiver",
+                "soft_stop_receiver",
+            ] {
+                assert!(
+                    !source.contains(old),
+                    "obsolete stop contract in {}",
+                    path.display()
+                );
+            }
+            if !path.ends_with("tools/src/process.rs") {
+                assert!(
+                    !source.contains("watch::Receiver<bool>"),
+                    "bool operation cancellation in {}",
+                    path.display()
+                );
+            }
+            for definition in [
+                "struct CancellationToken",
+                "enum CancellationToken",
+                "impl CancellationToken",
+            ] {
+                assert!(
+                    !source.contains(definition),
+                    "second cancellation implementation in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    inspect(&crates.join("tools/src"));
+    inspect(&crates.join("core/src"));
+    inspect(&crates.join("flow/src"));
+    inspect(&crates.join("server/src"));
+}
+
 fn assert_protocol_free(paths: &[&str]) {
     fn inspect(path: &Path) {
         if path.is_dir() {
@@ -166,6 +223,59 @@ fn context_models_do_not_depend_on_protocol() {
         "flow/src/application/context.rs",
         "flow/src/application/context_operation.rs",
     ]);
+}
+
+#[test]
+fn scenario_context_cannot_choose_manual_cleanup() {
+    let manager = syn::parse_file(include_str!("../../core/src/context.rs")).unwrap();
+    let clear = manager
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Impl(item) => item.items.iter().find_map(|member| match member {
+                syn::ImplItem::Fn(method) if method.sig.ident == "clear" => Some(method),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(clear.vis, syn::Visibility::Inherited));
+
+    let session = syn::parse_file(include_str!("../../flow/src/application/context.rs")).unwrap();
+    for item in &session.items {
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        if !matches!(item.self_ty.as_ref(), syn::Type::Path(ty) if ty.path.is_ident("ContextSession"))
+        {
+            continue;
+        }
+        for member in &item.items {
+            let syn::ImplItem::Fn(method) = member else {
+                continue;
+            };
+            if method.sig.ident == "mutate_manual" || method.sig.ident == "clear_context" {
+                assert!(
+                    matches!(method.vis, syn::Visibility::Inherited),
+                    "{} escapes application",
+                    method.sig.ident
+                );
+            }
+        }
+    }
+    for path in ["architect.rs", "plan.rs", "review.rs"] {
+        let source = production_code(&read_source(
+            &server_dir().join("../flow/src/workflows").join(path),
+        ));
+        assert!(
+            !source.contains(".clear_context("),
+            "{path} selects a manual cleanup scope"
+        );
+        assert!(
+            source.contains(".clear_transient_context()"),
+            "{path} must clear transient context"
+        );
+    }
 }
 
 #[test]
@@ -240,6 +350,54 @@ fn core_and_flow_sources_are_independent_of_protocol() {
 }
 
 #[test]
+fn core_sources_do_not_depend_on_flow() {
+    fn inspect(path: &Path) {
+        if path.is_dir() {
+            for child in source_dir_entries(path) {
+                inspect(&child);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            assert!(
+                !production_code(&read_source(path)).contains("tauqe_flow"),
+                "core depends on flow: {}",
+                path.display()
+            );
+        }
+    }
+    inspect(&server_dir().join("../core/src"));
+}
+
+#[test]
+fn shared_workflows_do_not_execute_through_application_hosts() {
+    let flow = server_dir().join("../flow/src/workflows");
+    for path in ["structured.rs", "step/attempts.rs", "step/queue.rs"] {
+        let source = read_source(&flow.join(path));
+        let code = production_code(&source);
+        for forbidden in [
+            "Application::",
+            "&Application",
+            "Arc<Application>",
+            "Host:",
+            "Host>",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "shared workflow {path} invokes an application host: {forbidden}"
+            );
+        }
+    }
+    let structured = production_code(&read_source(&flow.join("structured.rs")));
+    assert!(structured.contains("scope.run("));
+    let scope = production_code(&read_source(
+        &server_dir().join("../flow/src/application/execution_scope.rs"),
+    ));
+    assert!(scope.contains("task::join(task).await"));
+    let attempts = production_code(&read_source(&flow.join("step/attempts.rs")));
+    assert!(attempts.contains("self.operations.attempt(request)"));
+    assert!(!attempts.contains("ApplicationEvent::"));
+}
+
+#[test]
 fn review_scenarios_do_not_construct_or_stream_provider_requests() {
     let application = server_dir().join("../flow/src/application");
     for path in source_dir_entries(&application) {
@@ -302,13 +460,7 @@ fn scenarios_do_not_wire_provider_requests() {
         "workflows/repl/publication.rs",
     ] {
         let code = production_code(&read_source(&flow.join(name)));
-        for forbidden in [
-            ".stream(",
-            "LlmRequest",
-            "PromptProtocol",
-            "ApplyPolicy",
-            "LlmProvider",
-        ] {
+        for forbidden in [".stream(", "LlmRequest", "ApplyPolicy", "LlmProvider"] {
             assert!(
                 !code.contains(forbidden),
                 "scenario {name} bypasses execution infrastructure: {forbidden}"
@@ -377,7 +529,7 @@ fn production_repl_uses_the_shared_workflow() {
     assert!(!factory.contains("ReplExecution"));
     assert!(!factory.contains("for_repl("));
     let ask = production_code(include_str!("../../flow/src/application/ask.rs"));
-    assert!(ask.contains("repl::run("));
+    assert!(ask.contains("lifecycle::run("));
     let repl = production_code(include_str!("../../flow/src/workflows/repl.rs"));
     for retired in [
         "ReplWorkflow",
@@ -398,6 +550,297 @@ fn production_repl_uses_the_shared_workflow() {
         assert!(!code.contains("LlmProvider"));
         assert!(!code.contains("PromptEnvironment"));
     }
+    let repl_source = include_str!("../../flow/src/workflows/repl.rs");
+    let computation = repl_source
+        .split("#[cfg(test)]\nmod tests;")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "ReplResources",
+        "bind_interactive_history(",
+        "HistorySession",
+        "ExecutionSession",
+        "UsageSession",
+        "ApplicationEvent",
+        "InteractiveTask",
+        "settle_turn_context(",
+        "start_prepared(",
+    ] {
+        assert!(
+            !computation.contains(forbidden),
+            "computational REPL owns {forbidden}"
+        );
+    }
+    let lifecycle = production_code(include_str!("../../flow/src/workflows/repl/lifecycle.rs"));
+    for forbidden in [
+        "recover_interrupted_workflow(",
+        "start_turn(",
+        "complete_open_turn(",
+        "interrupt_open_turn(",
+        "finish_with_root(",
+        "worker.finish(",
+    ] {
+        assert!(
+            !lifecycle.contains(forbidden),
+            "coordinator implements {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn interactive_history_is_a_session_service_without_a_bound_turn_container() {
+    let flow = server_dir().join("../flow/src");
+    for path in [
+        "application/history.rs",
+        "application/history_compaction.rs",
+        "application/interactive_history.rs",
+        "application/interactive_task.rs",
+        "application/infrastructure/execution.rs",
+        "workflows/repl/lifecycle.rs",
+    ] {
+        let code = production_code(&read_source(&flow.join(path)));
+        for retired in [
+            "BoundInteractiveJournal",
+            "ScribeBinding",
+            "bind_interactive_history",
+        ] {
+            assert!(
+                !code.contains(retired),
+                "retired turn binding in {path}: {retired}"
+            );
+        }
+    }
+    // lifecycle.rs has inline test gates before its production launch path.
+    let lifecycle = read_source(&flow.join("workflows/repl/lifecycle.rs"));
+    let compaction = production_code(&read_source(
+        &flow.join("application/history_compaction.rs"),
+    ));
+    assert!(lifecycle.contains("pub(crate) history: HistorySession"));
+    assert!(lifecycle.contains("services.interactive.start_prepared("));
+    assert!(compaction.contains(".scribe(config, operation, usage)"));
+    for code in [&lifecycle, &compaction] {
+        assert!(!code.contains("Application::"));
+        assert!(!code.contains("&Application"));
+    }
+    let history = syn::parse_file(&read_source(&flow.join("application/history.rs"))).unwrap();
+    let session = history
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "HistorySession" => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    struct ForbiddenHistoryField;
+    impl<'ast> Visit<'ast> for ForbiddenHistoryField {
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            for forbidden in [
+                "ContextSession",
+                "OperationGuard",
+                "UsageBinding",
+                "ExecutionSession",
+                "AppConfig",
+            ] {
+                assert_ne!(ident, forbidden, "history retains {forbidden}");
+            }
+        }
+    }
+    for field in &session.fields {
+        ForbiddenHistoryField.visit_type(&field.ty);
+    }
+}
+
+#[test]
+fn interactive_documents_remain_outside_the_technical_turn_and_have_no_worker() {
+    let turn = include_str!("../../flow/src/workflows/turn.rs")
+        .split("#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "PlanStorage",
+        "ReviewStorage",
+        "apply_plan_commands",
+        "apply_review_commands",
+        "TurnDisk",
+        "DiskWorker",
+        "DiskCommand",
+        "DiskPass",
+        "DiskSettlement",
+        "DiskOutcome",
+        "TurnSettlement",
+        "FileExecution",
+        "run_disk(",
+    ] {
+        assert!(
+            !turn.contains(forbidden),
+            "technical turn owns document persistence: {forbidden}"
+        );
+    }
+    assert!(turn.contains(".run_inner(state, &input, policy)"));
+    assert!(!turn.contains("pub async fn run("));
+
+    // repl.rs has inline cfg(test) parameters before its production handlers.
+    let repl = include_str!("../../flow/src/workflows/repl.rs")
+        .split("#[cfg(test)]\nmod tests;")
+        .next()
+        .unwrap();
+    let lifecycle = include_str!("../../flow/src/workflows/repl/lifecycle.rs");
+    assert!(lifecycle.contains("run_technical_turn("));
+    assert!(!lifecycle.contains("TurnWorkflow::run_direct("));
+    assert!(lifecycle.contains("super::continue_after_turn("));
+    let continuation = repl
+        .split("async fn continue_after_turn(")
+        .nth(1)
+        .unwrap()
+        .split("fn response_text(")
+        .next()
+        .unwrap();
+    assert!(!continuation.contains("TurnDisk"));
+    assert!(!continuation.contains("rollback"));
+    assert!(continuation.contains("apply_plan_commands("));
+    assert!(continuation.contains("apply_review_commands("));
+    assert!(repl.contains("apply_plan_commands("));
+    assert!(repl.contains("apply_review_commands("));
+    for forbidden in ["DocumentExecutor", "DocumentWorker", "DocumentCommand"] {
+        assert!(
+            !repl.contains(forbidden),
+            "REPL reinstates a document executor: {forbidden}"
+        );
+    }
+
+    // documents.rs also has an inline cfg(test) write gate before its commit calls.
+    let documents = include_str!("../../flow/src/workflows/repl/documents.rs")
+        .split("#[cfg(test)]\nmod tests;")
+        .next()
+        .unwrap();
+    for required in [
+        "prepare_plan_batch(",
+        "prepare_plan_updates(",
+        "commit_prepared_batch(",
+        "prepare_decisions(",
+        "commit_prepared_decisions(",
+        "run_blocking_async(",
+    ] {
+        assert!(
+            documents.contains(required),
+            "document function loses {required}"
+        );
+    }
+    for forbidden in [
+        "DocumentExecutor",
+        "DocumentWorker",
+        "tokio::spawn(",
+        "mpsc::",
+        "DocumentCommand",
+    ] {
+        assert!(
+            !documents.contains(forbidden),
+            "document function starts independent work: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn interactive_owners_keep_their_production_boundaries() {
+    struct Forbidden<'a> {
+        path: &'a str,
+        names: &'a [&'a str],
+    }
+
+    impl<'ast> Visit<'ast> for Forbidden<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            assert!(
+                !self.names.iter().any(|name| ident == *name),
+                "{} owns forbidden operation {ident}",
+                self.path
+            );
+        }
+    }
+
+    for (path, names) in [
+        (
+            "workflows/repl.rs",
+            &[
+                "Application",
+                "HistorySession",
+                "UsageSession",
+                "clear_transient",
+                "finish_applied_edit",
+            ][..],
+        ),
+        (
+            "workflows/repl/lifecycle.rs",
+            &[
+                "write_open_rounds",
+                "set_turn_rounds",
+                "finish_with_root",
+                "recover_interrupted_workflow",
+            ][..],
+        ),
+        (
+            "application/interactive_task.rs",
+            &["with_history", "with_disk", "with_documents", "with_rounds"][..],
+        ),
+    ] {
+        let source = read_source(&server_dir().join("../flow/src").join(path));
+        Forbidden { path, names }.visit_file(&syn::parse_file(&source).unwrap());
+    }
+
+    let parsed = syn::parse_file(include_str!(
+        "../../flow/src/application/interactive_task.rs"
+    ))
+    .unwrap();
+    let task = parsed
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "InteractiveTask" => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    let fields: BTreeSet<_> = task
+        .fields
+        .iter()
+        .filter_map(|field| field.ident.as_ref())
+        .map(ToString::to_string)
+        .collect();
+    for required in ["operation", "task", "preparation", "read_rounds", "_serial"] {
+        assert!(
+            fields.contains(required),
+            "interactive task loses {required}"
+        );
+    }
+    for field in &task.fields {
+        if let syn::Type::Path(ty) = &field.ty {
+            assert_ne!(
+                ty.path.segments.first().unwrap().ident,
+                "Option",
+                "interactive task has an optional owner"
+            );
+        }
+    }
+    assert!(
+        !fields.contains("disk"),
+        "interactive task owns a file worker"
+    );
 }
 
 #[test]
@@ -416,21 +859,21 @@ fn plan_and_review_steps_share_the_isolated_turn_without_legacy_execution() {
             "self.operations.attempt(request)",
         ),
         ("workflows/plan/attempt.rs", ".step.run_published_attempt("),
-        (
-            "workflows/step/run.rs",
-            "self.execute_prepared_single_step(",
-        ),
+        ("workflows/step/run.rs", "self.execute_observed_step("),
         ("application/review_batch.rs", ".launch_batch("),
         ("workflows/review.rs", "ReviewSequence {"),
         ("workflows/review/sequence.rs", "run_queue("),
-        ("workflows/review/sequence.rs", ".step.prepare_single_step("),
         (
             "workflows/review/sequence.rs",
-            ".step.execute_prepared_single_step(",
+            ".step.prepare_single_step_with_usage(",
         ),
-        ("workflows/step/run.rs", "attempt.run(disk)"),
-        ("workflows/step.rs", "TurnWorkflow {"),
-        ("workflows/turn.rs", "RoundWorkflow"),
+        (
+            "workflows/review/sequence.rs",
+            ".step.execute_observed_step(",
+        ),
+        ("workflows/step/run.rs", "self.supervise_step_attempt("),
+        ("workflows/step.rs", "run_technical_turn("),
+        ("workflows/turn.rs", "run_round("),
         ("workflows/round.rs", "PromptExecutor"),
     ] {
         let code = production_code(&read_source(&flow.join(path)));
@@ -569,16 +1012,10 @@ fn migrated_workflows_do_not_depend_on_the_application_facade() {
                 inspect(&child);
             }
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            // The interactive supervisor is not part of the plan/review migration.
-            // Shared turn and edit-cycle mechanics are checked independently.
-            if [
-                "repl.rs",
-                "repl/publication.rs",
-                "repl/tests.rs",
-                "step/run/tests.rs",
-            ]
-            .iter()
-            .any(|name| path.ends_with(name))
+            // Shared step test fixtures retain their application-level setup.
+            if ["repl/tests.rs", "step/run/tests.rs"]
+                .iter()
+                .any(|name| path.ends_with(name))
             {
                 return;
             }
@@ -597,6 +1034,126 @@ fn migrated_workflows_do_not_depend_on_the_application_facade() {
     let flow = server_dir().join("../flow/src");
     inspect(&flow.join("workflows.rs"));
     inspect(&flow.join("workflows"));
+}
+
+#[test]
+fn prepared_steps_publish_the_bound_executor_identity_without_a_second_config() {
+    let source = include_str!("../../flow/src/workflows/step/run.rs");
+    let file = syn::parse_file(source).unwrap();
+    let prepared = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "PreparedSingleStep" => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    let fields: BTreeSet<_> = prepared
+        .fields
+        .iter()
+        .filter_map(|field| field.ident.as_ref())
+        .map(ToString::to_string)
+        .collect();
+    for required in ["executor", "policy", "root", "operation_id"] {
+        assert!(fields.contains(required), "prepared step loses {required}");
+    }
+    for duplicate in [
+        "model",
+        "config",
+        "selection",
+        "reasoning_effort",
+        "session_id",
+    ] {
+        assert!(
+            !fields.contains(duplicate),
+            "prepared step carries unbound {duplicate}"
+        );
+    }
+    let code = production_code(source);
+    assert!(code.contains("self.executor.identity()"));
+    assert!(code.contains("identity: prepared.identity().clone()"));
+    assert!(code.contains("executor: ReadyPromptExecutor"));
+    let publication = production_code(include_str!(
+        "../../flow/src/workflows/step/run/publication.rs"
+    ));
+    assert!(publication.contains("pub identity: PromptIdentity"));
+    assert!(publication.contains("let model = identity.model().clone()"));
+    assert!(publication.contains("let effort = identity.effort()"));
+    assert!(publication.contains("let role = identity.role()"));
+    assert!(publication.contains("let alias = identity.alias().map(str::to_owned)"));
+}
+
+#[test]
+fn scenarios_delegate_materials_and_keep_distinct_route_policies() {
+    let flow = server_dir().join("../flow/src/workflows");
+    for path in [
+        "repl.rs",
+        "plan.rs",
+        "plan/run.rs",
+        "plan/synthesis.rs",
+        "plan/synthesis/replan.rs",
+        "review.rs",
+        "review/sequence.rs",
+        "review/audit.rs",
+        "review/audit/groups.rs",
+        "review/analysis.rs",
+        "step/run.rs",
+        "round.rs",
+        "architect.rs",
+    ] {
+        let code = production_code(&read_source(&flow.join(path)));
+        for forbidden in [
+            "generate_repo_map(",
+            "generate_repo_dirs(",
+            "render_context_element(",
+            "<current_versions>",
+            "PromptEnvironment::new(",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "scenario {path} assembles {forbidden}"
+            );
+        }
+    }
+    // repl.rs has an inline #[cfg(test)] argument before its production handlers.
+    // Exclude only the trailing test module, not the rest of the workflow.
+    let repl_source = read_source(&flow.join("repl.rs"));
+    let repl = repl_source
+        .split("#[cfg(test)]\nmod tests;")
+        .next()
+        .unwrap();
+    assert!(repl.contains("format_discussion_task("));
+    let documents = read_source(&flow.join("repl/documents.rs"));
+    assert!(repl.contains("apply_plan_commands("));
+    assert!(repl.contains("apply_review_commands("));
+    assert!(documents.contains("PlanStorage::prepare_plan_updates("));
+    assert!(documents.contains("ReviewStorage::prepare_decisions("));
+    let synthesis = production_code(&read_source(&flow.join("plan/synthesis.rs")));
+    for route in [
+        "PlanSynthesisInput::Create",
+        "PlanSynthesisInput::Refine",
+        "PlanSynthesisInput::Replan",
+        "synthesize_horizon(",
+    ] {
+        assert!(synthesis.contains(route), "plan synthesis loses {route}");
+    }
+    let shared = production_code(&read_source(&flow.join("architect/refinement.rs")));
+    assert!(shared.contains("run_planner_wave("));
+    assert!(shared.contains("run_critique_wave("));
+    assert!(!shared.contains("PlanStorage"));
+    assert!(!shared.contains("ReviewStorage"));
+    assert!(!shared.contains("crate::workflows::plan::"));
+    let review = production_code(&read_source(&flow.join("review/audit.rs")));
+    for route in ["execute_preset_review(", "execute_review_synthesis("] {
+        assert!(review.contains(route), "review audit loses {route}");
+    }
+    let analysis = production_code(&read_source(&flow.join("review/analysis.rs")));
+    assert!(analysis.contains("execute_review_post_analysis("));
+    let groups = production_code(&read_source(&flow.join("review/audit/groups.rs")));
+    assert!(groups.contains("expand_window("));
+    assert!(groups.contains("BatchStepStatus::Failed"));
+    let step = production_code(&read_source(&flow.join("step/run.rs")));
+    assert!(step.contains("execute_observed_step("));
 }
 
 #[test]
@@ -853,6 +1410,56 @@ fn shared_technical_execution_does_not_own_plan_or_review_status() {
 }
 
 #[test]
+fn round_execution_is_a_concrete_free_async_function() {
+    let file = syn::parse_file(include_str!("../../flow/src/workflows/round.rs")).unwrap();
+    let mut found = false;
+    for item in &file.items {
+        match item {
+            syn::Item::Fn(function) if function.sig.ident == "run_round" => {
+                assert!(function.sig.asyncness.is_some());
+                assert!(function.sig.generics.params.is_empty());
+                assert_eq!(function.sig.inputs.len(), 5);
+                assert!(function
+                    .sig
+                    .inputs
+                    .iter()
+                    .all(|arg| matches!(arg, syn::FnArg::Typed(_))));
+                found = true;
+            }
+            syn::Item::Struct(item) => assert_ne!(item.ident, "RoundWorkflow"),
+            syn::Item::Impl(item) => assert!(
+                !matches!(item.self_ty.as_ref(), syn::Type::Path(ty) if ty.path.is_ident("RoundWorkflow"))
+            ),
+            _ => {}
+        }
+    }
+    assert!(found, "round.rs must define run_round as a free function");
+}
+
+#[test]
+fn technical_supervision_uses_concrete_functions_without_computation_callbacks() {
+    let source = include_str!("../../flow/src/workflows/turn/execution.rs");
+    let file = syn::parse_file(source).unwrap();
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            assert!(function.sig.generics.params.is_empty());
+        }
+        if let syn::Item::Struct(item) = item {
+            assert_ne!(item.ident, "TechnicalTurn");
+        }
+    }
+    assert!(source.contains("TurnWorkflow::run_direct("));
+    assert!(source.contains("task::join(computation).await"));
+    assert!(source.contains("policy.finish_interrupted(&mut context).await"));
+    for forbidden in ["FnOnce", "dyn Fn", "std::future::Future"] {
+        assert!(!source.contains(forbidden));
+    }
+    let step = include_str!("../../flow/src/workflows/step/run/supervision.rs");
+    assert!(!step.contains("mpsc::"));
+    assert!(step.contains("attempt.run(operation, policy).await"));
+}
+
+#[test]
 fn workspace_does_not_define_or_depend_on_retired_control() {
     fn inspect(path: &Path) {
         if path.is_dir() {
@@ -957,10 +1564,14 @@ fn architect_research_uses_shared_execution_without_an_edit_turn_or_legacy_contr
         assert!(!references_legacy_control(code));
         assert!(!code.contains("StructuredResearchUnit"));
     }
-    assert!(synthesis.contains(".execute_round("));
-    assert!(factory
-        .contains(".execute_decoded(events, cancel, PlanRefinePromptProtocol::decode_round)"));
-    assert!(synthesis.contains("execute_research_commands("));
+    assert!(synthesis.contains("run_round("));
+    assert!(synthesis.contains("RoundServices {"));
+    assert!(!synthesis.contains(".prepare_architect("));
+    assert!(!synthesis.contains(".prepare_evidence_continuation("));
+    assert!(!synthesis.contains(".execute_decoded("));
+    assert!(!synthesis.contains("TurnTranscript"));
+    assert!(!factory.contains("pub(crate) async fn execute_round("));
+    assert!(!synthesis.contains(".research_commands("));
     for retired in ["ApplyPolicy", "TurnWorkflow", "TurnDisk"] {
         assert!(!synthesis.contains(retired));
     }
@@ -974,18 +1585,154 @@ fn executor_has_no_turn_policy() {
         "WorkflowKind",
         "LoopContext",
         "TurnState",
-        "TurnTranscript",
         "TurnRoundStarted",
         "accept_round",
         "max_turn_rounds",
         "MAX_EMPTY",
         "run_turn_loop",
-        "execute_research_step",
         "execute_edit_step",
+        "run_queue(",
+        "run_accounted(",
+        "PlanSynthesisInput",
+        "ReviewSequence",
     ] {
         assert!(
             !executor.contains(forbidden),
             "executor owns turn policy: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn flow_does_not_manage_the_private_turn_transcript() {
+    let transcript = include_str!("../../core/src/execution/transcript.rs");
+    assert!(transcript.contains("pub(crate) struct TurnTranscript"));
+    let executor = include_str!("../../core/src/execution/executor.rs");
+    assert!(executor.contains("transcript: Arc<Mutex<TurnTranscript>>"));
+    assert!(executor.contains("accepted: crate::execution::accepted_rounds::AcceptedRounds"));
+    assert!(!include_str!("../../core/src/execution.rs").contains("mod prompt_turn"));
+    let state = include_str!("../../flow/src/workflows/state.rs");
+    assert!(!state.contains("PromptTurn"));
+    assert!(!production_code(state).contains("PromptTurn"));
+
+    fn inspect(path: &Path) {
+        if path.is_dir() {
+            for child in source_dir_entries(path) {
+                inspect(&child);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let code = production_code(&read_source(path));
+            for forbidden in [
+                "TurnTranscript",
+                "PromptTurn",
+                "PreparedTurnRequest",
+                "PreparedArchitectRequest",
+                "prompt_turn",
+                ".transcript",
+                ".record_answer(",
+                ".record_feedback(",
+                ".reseed_prefix(",
+                ".append_discoveries(",
+                ".project_files(",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "Flow manages private prompt state in {}: {forbidden}",
+                    path.display()
+                );
+            }
+        }
+    }
+    inspect(&server_dir().join("../flow/src"));
+}
+
+#[test]
+fn scenario_prompt_inputs_do_not_carry_technical_catalogs() {
+    let executor = include_str!("../../core/src/execution/executor.rs");
+    let input = executor
+        .split("pub struct ExecuteInput<'a> {")
+        .nth(1)
+        .expect("semantic prompt input")
+        .split('}')
+        .next()
+        .unwrap();
+    for forbidden in [
+        "repo_map",
+        "repo_dirs",
+        "outer_docs",
+        "ContextConfig",
+        "project:",
+    ] {
+        assert!(
+            !input.contains(forbidden),
+            "technical material in scenario input: {forbidden}"
+        );
+    }
+    let architect = production_code(include_str!(
+        "../../flow/src/workflows/architect/synthesis.rs"
+    ));
+    for forbidden in [
+        ".materials(",
+        "repo_map:",
+        "repo_dirs:",
+        "outer_docs:",
+        "ContextConfig",
+    ] {
+        assert!(
+            !architect.contains(forbidden),
+            "architect assembles technical materials: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn request_materials_and_continuation_have_separate_owners() {
+    let flow = server_dir().join("../flow/src");
+    for path in ["workflows/round.rs", "workflows/turn.rs"] {
+        let code = production_code(&read_source(&flow.join(path)));
+        for forbidden in ["ContextConfig", "repo_map:", "repo_dirs:"] {
+            assert!(
+                !code.contains(forbidden),
+                "technical catalog passed through {path}: {forbidden}"
+            );
+        }
+        if path == "workflows/round.rs" {
+            // Research consumes the frozen declaration here; it is not a
+            // scenario input or a second prompt-material catalog.
+            assert!(code.contains("outer_docs: environment.outer_docs()"));
+        } else {
+            assert!(!code.contains("outer_docs:"));
+        }
+    }
+    let executor = production_code(include_str!("../../core/src/execution/executor.rs"));
+    for forbidden in [
+        "PlanItemStatus",
+        "IssueStatus",
+        "max_turn_rounds",
+        "TurnState",
+        "run_queue(",
+    ] {
+        assert!(
+            !executor.contains(forbidden),
+            "executor owns scenario policy: {forbidden}"
+        );
+    }
+    assert!(executor.contains("super::budget::admit("));
+    let transport = production_code(include_str!("../../core/src/execution/request.rs"));
+    assert!(transport.contains("provider.stream("));
+    for path in [
+        "workflows/repl.rs",
+        "workflows/architect/synthesis.rs",
+        "workflows/review/audit/synthesis_execution.rs",
+    ] {
+        let code = production_code(&read_source(&flow.join(path)));
+        assert!(
+            !code.contains(".stream("),
+            "scenario bypasses shared transport: {path}"
+        );
+        assert!(
+            !code.contains("LlmRequest"),
+            "scenario constructs provider request: {path}"
         );
     }
 }
@@ -1145,6 +1892,50 @@ fn application_publication_has_no_workflow_access() {
             "publication has workflow access: {forbidden}"
         );
     }
+}
+
+#[test]
+fn context_changed_has_one_rpc_route_from_the_session_projection() {
+    let publication = production_code(include_str!("../src/publication.rs"));
+    assert!(publication.contains(
+        "ApplicationEvent::Context(context) => crate::handlers::context::publish_context("
+    ));
+    assert!(!publication.contains("StreamEvent::ContextChanged"));
+    let projection = production_code(include_str!("../src/handlers/context/projection.rs"));
+    assert!(projection.contains("events::CONTEXT_CHANGED"));
+    for path in [
+        "core/src/workflow/research/step.rs",
+        "core/src/edits/execution.rs",
+        "core/src/providers/types.rs",
+        "flow/src/workflows/turn.rs",
+        "server/src/transport.rs",
+    ] {
+        let source = production_code(&read_source(&server_dir().join("..").join(path)));
+        assert!(
+            !source.contains("ContextChanged"),
+            "legacy context event in {path}"
+        );
+    }
+    // Only the application event adapter may call the projection, and only
+    // that projection may serialize context/changed.
+    fn inspect(path: &Path) {
+        if path.is_dir() {
+            for child in source_dir_entries(path) {
+                inspect(&child);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && !path.ends_with("handlers/context/projection.rs")
+            && !path.ends_with("publication.rs")
+        {
+            let source = production_code(&read_source(path));
+            assert!(
+                !source.contains("events::CONTEXT_CHANGED") && !source.contains("publish_context("),
+                "direct context RPC publication outside projection: {}",
+                path.display()
+            );
+        }
+    }
+    inspect(&server_dir().join("src"));
 }
 
 #[test]

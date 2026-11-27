@@ -57,27 +57,16 @@ fn begin_repl_turn(st: &mut AppState) {
     // Executing code hands control to the Coder role: detach the discussion
     // focus locally so no anchor survives into the new turn.
     st.discussion_focus = DiscussionFocus::None;
-    st.model.reasoning.clear();
-    st.model.text.clear();
-    st.model.markdown_lines.clear();
-    st.model.error = None;
-    st.model.result = None;
+    // Preflight can fail or be cancelled before MODEL_STARTED arrives. Reset
+    // the answer together with its round offsets now, so that rendering that
+    // refusal cannot slice an empty answer using the previous turn's offsets.
+    st.model.reset_turn_buffers();
     // A freshly launched turn drops the in-flight usage window a cancelled or
     // failed turn may have left open; the daemon owns the durable totals (c-1).
     st.model.end_in_flight_usage();
     st.model.scroll = 0;
     st.model.status = TurnStatus::Awaiting;
     st.model.auto_scroll = true;
-    st.model.edits_active = false;
-    st.model.files.clear();
-    st.model.selected_file_index = 0;
-    st.model.edit_final_applied = None;
-    st.model.edit_final_error = None;
-    st.model.last_commit_hash = None;
-    st.model.last_commit_summary = None;
-    st.model.toolchain = None;
-    st.model.copy_flash = None;
-    st.model.code_blocks.clear();
     st.turn_started_at = Some(std::time::Instant::now());
 }
 
@@ -209,7 +198,11 @@ async fn start_turn(
     // no discussion anchor may survive into the turn. Applying it here covers
     // plan, review, pipeline, and refine launches at once, and the rollback
     // below still restores the launch state if the request cannot be written.
-    st.discussion_focus = DiscussionFocus::None;
+    // Group refinement is Architect synthesis, not code execution: retain its
+    // existing group/step attention anchor through this launch.
+    if method != methods::REVIEW_REFINE_GROUP {
+        st.discussion_focus = DiscussionFocus::None;
+    }
     drop(st);
 
     if let Err(err) = send_request(server_writer, method, params).await {
@@ -314,9 +307,8 @@ pub(crate) async fn confirm_execute_review(
     server_writer: &mut RpcConnection,
     target: crate::app::ConfirmExecuteReviewState,
 ) -> anyhow::Result<()> {
-    // Point execution carries the developer's explicit Coder choice and
-    // directives; a batch runs autonomously on the configured role defaults
-    // (concept #c-3).
+    // Every target carries the selected Coder rung; only a point target carries
+    // developer directives.
     let single = target.is_single_target();
     let instructions = {
         let text = target.instructions_editor.get_text().trim().to_string();
@@ -329,16 +321,12 @@ pub(crate) async fn confirm_execute_review(
     // The selected Coder rung travels whole: the model together with the
     // reasoning depth it was configured with, so the coder the developer picked
     // is the coder that runs.
-    let model = if single {
-        target
-            .selected_entry()
-            .map(|entry| tauqe_protocol::ModelSelection::Tier {
-                model: entry.model.clone(),
-                effort: entry.effort,
-            })
-    } else {
-        None
-    };
+    let model = target
+        .selected_entry()
+        .map(|entry| tauqe_protocol::ModelSelection::Tier {
+            model: entry.model.clone(),
+            effort: entry.effort,
+        });
     let params = ReviewExecuteParams {
         target: review_execute_target(&target),
         model,
@@ -461,8 +449,8 @@ pub(crate) async fn launch_review(
 /// disagree about what a launch means (c-2, c-4).
 ///
 /// A launchable dialog does not start the audit by itself: the typed parameters
-/// are projected through `review/preview` first, so the answer decides whether
-/// the run needs an explicit consent step for a truncated window (c-3).
+/// are projected through `review/preview` first, so a legacy server cannot
+/// silently launch a truncated subset (c-3).
 pub(crate) async fn start_review_from_dialog(
     state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
@@ -493,8 +481,8 @@ pub(crate) async fn start_review_from_dialog(
     drop(st);
 
     // The projection is a read RPC answered before the audit opens: a window the
-    // budgets leave intact launches immediately, while a truncated one asks for
-    // consent first (c-2, c-3).
+    // window is complete launches immediately; a truncated one is refused
+    // (c-2, c-3).
     if let Err(error) = send_request(server_writer, methods::REVIEW_PREVIEW, payload).await {
         let mut st = state.lock().await;
         if let Some(pending) = st.modals.pending_review_launch.take() {
@@ -1165,27 +1153,6 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
-        Some(ActiveModal::ReviewTruncation) => {
-            if let Some(target) = st.modals.confirm_review_truncation.take() {
-                match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
-                        st.modals.confirm_review_truncation = Some(target)
-                    }
-                    ConfirmOutcome::Dismissed => {
-                        // Declining the truncated window sends nothing and
-                        // returns the launch dialog with its typed fields, so
-                        // the developer can narrow the patterns (c-3).
-                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        st.modals.review_dialog = Some(target.pending.dialog);
-                    }
-                    ConfirmOutcome::Accepted => {
-                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        launch_review(state, st, server_writer, target.pending.params).await?;
-                    }
-                }
-            }
-            return Ok(Some(InputResult::Continue));
-        }
         Some(ActiveModal::ConfirmCancel) => {
             match resolve_confirm(&mut st, key) {
                 ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
@@ -1438,29 +1405,8 @@ pub(crate) async fn handle_dialog_event(
             return handle_review_analyze_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::ExecuteReview) => {
-            // Point execution is a form dialog (Coder selector, directives,
-            // action buttons); only the batch queue is a binary confirmation.
-            let single_target = st
-                .modals
-                .confirm_execute_review
-                .as_ref()
-                .is_some_and(|target| target.is_single_target());
-            if single_target {
-                return execute_review::handle_execute_review_dialog(key, state, st, server_writer)
-                    .await;
-            }
-            if let Some(target) = st.modals.confirm_execute_review.take() {
-                match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
-                        st.modals.confirm_execute_review = Some(target)
-                    }
-                    ConfirmOutcome::Dismissed => {}
-                    ConfirmOutcome::Accepted => {
-                        confirm_execute_review(state, st, server_writer, target).await?;
-                    }
-                }
-            }
-            return Ok(Some(InputResult::Continue));
+            return execute_review::handle_execute_review_dialog(key, state, st, server_writer)
+                .await;
         }
         Some(ActiveModal::ExecutePipeline) => {
             if let Some(target) = st.modals.confirm_execute_pipeline.take() {
@@ -1736,6 +1682,107 @@ mod tests {
     use super::*;
     use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
 
+    #[tokio::test]
+    async fn batch_preflight_refusal_after_a_multi_round_answer_keeps_the_ui_usable() {
+        type BeginTurn = fn(&mut AppState);
+        let launches: [(&str, BeginTurn); 3] = [
+            (methods::PLAN_EXECUTE, begin_scope_execution_turn),
+            (
+                methods::PLAN_EXECUTE_PIPELINE,
+                begin_pipeline_execution_turn,
+            ),
+            (methods::REVIEW_EXECUTE, begin_review_execution_turn),
+        ];
+        for (method, begin) in launches {
+            for code in [
+                tauqe_protocol::errors::CANCELLED,
+                tauqe_protocol::errors::PREFLIGHT_VERIFICATION_FAILED,
+            ] {
+                let mut st = crate::app::test_state();
+                st.model.start_answer_round(1);
+                st.model.text.push_str("Previous answer: проверка\n");
+                st.model.start_answer_round(2);
+                st.model.text.push_str("Second round");
+                st.model.update_markdown();
+                st.model.status = TurnStatus::Done;
+                assert!(st.model.answer_rounds[1].1 > 0);
+
+                let state = Arc::new(Mutex::new(st));
+                let mut conn = RpcConnection::new(Vec::<u8>::new());
+                let guard = state.lock().await;
+                start_turn(
+                    &state,
+                    guard,
+                    &mut conn,
+                    method,
+                    serde_json::json!({}),
+                    begin,
+                )
+                .await;
+                {
+                    let guard = state.lock().await;
+                    assert!(guard.model.text.is_empty());
+                    assert!(guard.model.answer_rounds.is_empty());
+                    assert!(guard.model.is_busy());
+                }
+
+                let mut is_reasoning = false;
+                for (method, params) in [
+                    (
+                        tauqe_protocol::events::TOOLCHAIN_STARTED,
+                        serde_json::json!({"operation_id": "preflight-op", "command": "pre-flight"}),
+                    ),
+                    (
+                        tauqe_protocol::events::TOOLCHAIN_FINISHED,
+                        serde_json::json!({"operation_id": "preflight-op", "command": "pre-flight", "success": false, "message": "Preflight interrupted"}),
+                    ),
+                ] {
+                    crate::rpc::events::handle_event(
+                        tauqe_protocol::Event {
+                            method: method.into(),
+                            params: Some(params),
+                        },
+                        &state,
+                        &mut is_reasoning,
+                    )
+                    .await;
+                }
+                assert_eq!(state.lock().await.model.status, TurnStatus::Verifying);
+                // No MODEL_STARTED is delivered: preflight answers the launch
+                // directly, and the response handler clears its telemetry.
+                let request: tauqe_protocol::Request =
+                    serde_json::from_slice(conn.written()).unwrap();
+                crate::rpc::responses::handle_response(
+                    tauqe_protocol::Response::err(request.id, code, "Preflight interrupted"),
+                    &state,
+                    &mut conn,
+                )
+                .await;
+                {
+                    let mut guard = state.lock().await;
+                    guard.model.render_markdown_now();
+                    assert!(!guard.model.is_busy());
+                    assert!(!guard.model.is_batch);
+                    assert!(guard.modals.server_disconnected.is_none());
+                    assert_eq!(guard.model.error.as_deref(), Some("Preflight interrupted"));
+                    assert!(guard.model.toolchain.is_none());
+                }
+                let result = crate::input::handle_terminal_event(
+                    crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::Char('a'),
+                        KeyModifiers::NONE,
+                    )),
+                    &state,
+                    &mut conn,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result, InputResult::Continue);
+                assert_eq!(state.lock().await.input_editor.get_text(), "a");
+            }
+        }
+    }
+
     /// Builds a review launch dialog over two configured reviewer entries — the
     /// production shape in which `ModelSelector::handle_key` is live — with
     /// `preset_count` review presets and the keyboard on `focus` (c-3, c-4).
@@ -1940,8 +1987,7 @@ mod tests {
     }
 
     fn execute_review_target() -> ConfirmExecuteReviewState {
-        // Two findings: the batch confirmation shape, which keeps the binary
-        // confirm/cancel vocabulary under test here.
+        // Two findings: the queue form shares the Coder picker with the point form.
         ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
@@ -1958,8 +2004,10 @@ mod tests {
     async fn launch_execute_review(key: KeyEvent) -> (ViewMode, Option<String>, bool) {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.modals.confirm_execute_review = Some(execute_review_target());
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
+        let mut target = execute_review_target();
+        target.focus = crate::views::plans::RefineDialogFocus::Actions;
+        target.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(target);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1979,11 +2027,12 @@ mod tests {
     /// focused `Confirm` button and returns everything the launch wrote to the
     /// transport, so both launch shapes of a session are compared under one
     /// setup (concept #c-1, #c-2).
-    async fn launch_execute_review_payload(target: ConfirmExecuteReviewState) -> String {
+    async fn launch_execute_review_payload(mut target: ConfirmExecuteReviewState) -> String {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
+        target.focus = crate::views::plans::RefineDialogFocus::Actions;
+        target.confirm_button = ConfirmDialogButton::Confirm;
         st.modals.confirm_execute_review = Some(target);
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2060,8 +2109,10 @@ mod tests {
 
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
+        let mut target = target;
+        target.focus = crate::views::plans::RefineDialogFocus::Actions;
+        target.confirm_button = ConfirmDialogButton::Confirm;
         st.modals.confirm_execute_review = Some(target);
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2450,18 +2501,18 @@ mod tests {
     async fn group_plan_execution_dispatches_the_group_target() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.modals.confirm_execute_review = Some(
-            ConfirmExecuteReviewState::new(
-                Some("rev-1".to_string()),
-                "Session rev-1".to_string(),
-                "Unified auth guard".to_string(),
-                None,
-                vec![review_issue(1), review_issue(2)],
-                Vec::new(),
-            )
-            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
-        );
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
+        let mut target = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Unified auth guard".to_string(),
+            None,
+            vec![review_issue(1), review_issue(2)],
+            Vec::new(),
+        )
+        .with_group("arch-auth".to_string(), "Unified auth guard".to_string());
+        target.focus = crate::views::plans::RefineDialogFocus::Actions;
+        target.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(target);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2930,8 +2981,10 @@ mod tests {
         st.model.scroll = 7;
         st.model.auto_scroll = false;
         st.discussion_focus = DiscussionFocus::review("rev-1", vec!["2".to_string()]);
-        st.modals.confirm_execute_review = Some(execute_review_target());
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
+        let mut target = execute_review_target();
+        target.focus = crate::views::plans::RefineDialogFocus::Actions;
+        target.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(target);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(FailingWriter);
@@ -3946,170 +3999,6 @@ mod tests {
                 .confirm_remove_context_file
                 .is_none());
         }
-    }
-
-    /// Builds the pending launch a confirmed dialog leaves behind, over the
-    /// typed parameters the projection describes (c-3).
-    fn pending_launch(path: &str) -> PendingReviewLaunch {
-        let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
-        dialog.path_inputs[0].insert_str(path);
-        PendingReviewLaunch {
-            dialog,
-            params: tauqe_protocol::ReviewStartParams {
-                path_patterns: vec![path.to_string()],
-                ..Default::default()
-            },
-        }
-    }
-
-    /// Builds the projection of a window the configured budgets truncate.
-    fn truncated_window() -> tauqe_protocol::review::ReviewPreviewWindow {
-        tauqe_protocol::review::ReviewPreviewWindow {
-            matched_files: 9,
-            selected_files: 4,
-            selected_tokens: 40_000,
-            // Truncation is defined by the shared file token budget alone, so
-            // the fixture sets the counter `is_truncated()` reads (c-3). The
-            // aggregate mirrors it in production.
-            omitted_files: 5,
-            omitted_by_budget: 5,
-            files_token_budget: 60_000,
-            ..Default::default()
-        }
-    }
-
-    /// Confirming the truncation card dispatches the audited launch and consumes
-    /// the consent decision, so the approved window is exactly the projected one
-    /// (c-3).
-    #[tokio::test]
-    async fn truncation_confirm_dispatches_the_projected_launch() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
-            pending: pending_launch("src/"),
-            window: truncated_window(),
-        });
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        handle_dialog_event(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &state,
-            &mut conn,
-        )
-        .await
-        .expect("in-memory dispatch never fails");
-
-        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
-        assert!(payload.contains("review/start"), "{payload}");
-        assert!(payload.contains("src/"), "{payload}");
-
-        let guard = state.lock().await;
-        assert!(guard.modals.confirm_review_truncation.is_none());
-        assert!(guard.review.running);
-    }
-
-    /// Declining the truncated window sends nothing and returns the launch dialog
-    /// with the fields the developer typed (c-3).
-    #[tokio::test]
-    async fn truncation_cancel_returns_the_launch_dialog_without_a_request() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
-            pending: pending_launch("src/**/*.rs"),
-            window: truncated_window(),
-        });
-        st.modals.confirm_button = ConfirmDialogButton::Confirm;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        handle_dialog_event(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &state,
-            &mut conn,
-        )
-        .await
-        .expect("in-memory dispatch never fails");
-
-        assert!(
-            conn.written().is_empty(),
-            "a declined consent launches nothing"
-        );
-        let guard = state.lock().await;
-        assert!(guard.modals.confirm_review_truncation.is_none());
-        let dialog = guard
-            .modals
-            .review_dialog
-            .as_ref()
-            .expect("the launch dialog returns with its fields");
-        assert_eq!(dialog.path_inputs[0].get_text(), "src/**/*.rs");
-        assert_eq!(guard.active_modal(), Some(ActiveModal::Review));
-    }
-    /// The consent card is presentation over the runtime locale, so every label
-    /// it shows resolves through the catalog and a hot-swapped locale reaches it
-    /// without touching the dialog (c-3, Conventions §9).
-    #[tokio::test]
-    async fn truncation_consent_resolves_its_labels_from_the_catalog() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
-            pending: pending_launch("src/"),
-            window: truncated_window(),
-        });
-        st.modals.confirm_button = ConfirmDialogButton::Cancel;
-
-        let params = crate::dialogs::render::review_truncation_params(&st)
-            .expect("the pending consent describes its card");
-
-        assert_eq!(
-            params.title,
-            crate::i18n::active_t("review.truncation.title")
-        );
-        assert_eq!(
-            params.confirm_label,
-            crate::i18n::active_t("review.truncation.confirm")
-        );
-        assert_eq!(params.cancel_label, crate::i18n::active_t("modal.cancel"));
-        assert_eq!(params.confirm_button, ConfirmDialogButton::Cancel);
-        assert!(
-            !params.body_lines.is_empty(),
-            "the card states the truncated window"
-        );
-    }
-
-    /// The consent card keeps the shared fast-select vocabulary: `y` confirms
-    /// the narrowed window even while the safe `Cancel` default holds focus.
-    #[tokio::test]
-    async fn truncation_consent_confirms_through_the_yes_accelerator() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
-            pending: pending_launch("src/**/*.rs"),
-            window: truncated_window(),
-        });
-        st.modals.confirm_button = ConfirmDialogButton::Cancel;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        handle_dialog_event(
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
-            &state,
-            &mut conn,
-        )
-        .await
-        .expect("in-memory dispatch never fails");
-
-        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
-        assert!(payload.contains("review/start"), "{payload}");
-        assert!(payload.contains("src/**/*.rs"), "{payload}");
-
-        let guard = state.lock().await;
-        assert!(guard.modals.confirm_review_truncation.is_none());
-        assert!(
-            guard.review.running,
-            "the confirmed window starts the audit"
-        );
     }
 
     /// Presses one physical key through the interface gateway, so a regression

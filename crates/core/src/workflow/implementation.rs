@@ -29,8 +29,8 @@ pub use scope::{classify_scope_stall, ExecutionScope, ImplementationFrame};
 use crate::edits::EditOutcome;
 use crate::models::{ArchitectTier, ModelSelection, ReasoningEffort};
 use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+use crate::stop::HardCancellation;
 use crate::workflow::turn::TurnWorkQueue;
-use tokio::sync::watch;
 
 /// Category of an implementation step failure, controlling pipeline behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +164,7 @@ pub struct StepTurnRequest {
     /// Provider session identifier shared by every step of the horizon.
     pub session_id: Option<String>,
     /// Cancellation signal of the running batch.
-    pub cancel_rx: watch::Receiver<bool>,
+    pub cancel_rx: HardCancellation,
 }
 
 /// Terminal outcome of one bounded step turn.

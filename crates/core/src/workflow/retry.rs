@@ -36,6 +36,7 @@ pub fn build_patch_retry_prompt(
     patch_strategy: PatchStrategy,
 ) -> String {
     let profile = StrategyProfile::of(patch_strategy);
+    let source = "Authoritative file versions are supplied in this request: the original <file> content in <context>, with content, anchors, access, and availability overridden by <current_versions> where present. Paths without an override retain their original context version. This file view includes accepted virtual changes. The rejected edit text is diagnostic material, not a file version. A context request registers a path or increases its access; an already satisfied request does not supply another file version.";
     if patch_strategy == PatchStrategy::ApplyPatch {
         let errors = failed_files
             .values()
@@ -44,21 +45,23 @@ pub fn build_patch_retry_prompt(
             .collect::<Vec<_>>()
             .join("\n");
         return format!(
-            "Patch staging failed: {errors}\n{}",
+            "Patch staging failed: {errors}\n\n{source}\n\n{}",
             profile.retry_instruction
         );
     }
     let mut prompt = String::new();
-    prompt.push_str("Some of the proposed edits failed to apply.\n\n");
+    prompt.push_str("Some of the proposed edits failed virtual staging.\n\n");
+    prompt.push_str(source);
+    prompt.push_str("\n\n");
 
     if !succeeded_files.is_empty() {
         let mut succ_sorted: Vec<&String> = succeeded_files.iter().collect();
         succ_sorted.sort();
-        prompt.push_str("Successfully applied edits for:\n");
+        prompt.push_str("Accepted virtual edits for:\n");
         for path in succ_sorted {
             prompt.push_str(&format!("- {}\n", path));
         }
-        prompt.push_str("Use the current versions for any further edits to these files.\n\n");
+        prompt.push_str("These edits are retained in the virtual state; acceptance here does not mean they have been written to disk.\n\n");
     }
 
     if !protocol_errors.is_empty() {
@@ -83,11 +86,9 @@ pub fn build_patch_retry_prompt(
     }
 
     if failed_files.is_empty() {
-        prompt.push_str("\nPlease provide corrected edit blocks strictly following the required protocol format.");
+        prompt.push_str("\nRequired result: corrected edit blocks conforming to the active protocol and authoritative file versions.");
     } else {
-        prompt.push_str(
-            "\nPlease provide corrected edit blocks for the failed files listed above.\n",
-        );
+        prompt.push('\n');
         prompt.push_str(profile.retry_instruction);
     }
     prompt
@@ -179,9 +180,9 @@ mod tests {
         assert!(prompt.contains("Protocol parsing errors encountered in your edit blocks:"));
         assert!(prompt.contains("Malformed XML edit block: Unclosed tag"));
 
-        assert!(prompt.contains("Successfully applied edits for:"));
+        assert!(prompt.contains("Accepted virtual edits for:"));
         assert!(prompt.contains("- crates/core/src/lib.rs"));
-        assert!(prompt.contains("Use the current versions for any further edits to these files."));
+        assert!(prompt.contains("does not mean they have been written to disk"));
 
         assert!(prompt.contains("Failed files and errors:"));
         assert!(prompt.contains("crates/core/src/main.rs"));
@@ -190,8 +191,39 @@ mod tests {
         assert!(prompt.contains("crates/core/src/utils.rs"));
         assert!(prompt.contains("Search block matches 3 times"));
 
-        assert!(prompt
-            .contains("Please provide corrected edit blocks for the failed files listed above."));
+        assert!(prompt.contains("Required result: corrected edit blocks for the failed files."));
+    }
+
+    #[test]
+    fn repair_prompts_state_the_available_versions_and_required_result() {
+        let failed = HashMap::from([(
+            "a.rs".to_string(),
+            EditError::NoMatch {
+                path: "a.rs".to_string(),
+            },
+        )]);
+        for strategy in [
+            PatchStrategy::SearchReplace,
+            PatchStrategy::LineAnchor,
+            PatchStrategy::ApplyPatch,
+        ] {
+            let prompt = build_patch_retry_prompt(&HashSet::new(), &failed, &[], strategy);
+            assert!(
+                prompt.contains("supplied in this request"),
+                "{strategy}: {prompt}"
+            );
+            assert!(prompt.contains("<file>"));
+            assert!(prompt.contains("<current_versions>"));
+            assert!(prompt.contains("retain their original context version"));
+            assert!(prompt.contains("accepted virtual changes"));
+            assert!(prompt.contains("diagnostic material, not a file version"));
+            assert!(prompt.contains("Required result:"));
+            assert!(!prompt.to_lowercase().contains("re-read"));
+            if strategy == PatchStrategy::ApplyPatch {
+                assert!(prompt.contains("The refused patch was not applied."));
+                assert!(prompt.contains("a complete corrected patch"));
+            }
+        }
     }
 
     #[test]

@@ -12,6 +12,81 @@ fn anchored(id: &str) -> DiscussionFocus {
 }
 
 #[tokio::test]
+async fn plan_focus_renders_the_current_persisted_blocker_on_each_request() {
+    use tauqe_core::plan::{PlanItem, PlanItemStatus};
+
+    let root = tempfile::tempdir().unwrap();
+    let app = Application::default();
+    let mut plan = Plan {
+        id: "blocked-plan".into(),
+        title: "Blocked plan".into(),
+        ..Default::default()
+    };
+    plan.implementation.items = vec![PlanItem {
+        id: "1".into(),
+        title: "Implement contract".into(),
+        status: PlanItemStatus::Blocked,
+        blocked_reason: Some("Missing <contract>".into()),
+        files: vec!["src/lib.rs".into()],
+        ..Default::default()
+    }];
+    PlanStorage::save_plan(root.path(), &plan).unwrap();
+    let explicit = app
+        .prepare_model_ask(
+            root.path(),
+            ModelAskInput::Discussion {
+                target: DiscussionTarget::Plan {
+                    id: plan.id.clone(),
+                },
+                focused_items: vec!["1".into()],
+                comment: "Why is this blocked?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let DiscussionDocument::Plan {
+        plan: loaded_plan,
+        focused_items,
+    } = explicit.discussion.unwrap().document
+    else {
+        panic!("expected a resolved plan");
+    };
+    let prompt = tauqe_core::plan::prompt::format_plan_discussion_prompt(
+        &loaded_plan,
+        &focused_items,
+        &explicit.utterance,
+    );
+    assert!(prompt.contains("<blocked_reason>Missing &lt;contract&gt;</blocked_reason>"));
+
+    plan.implementation.items[0].blocked_reason = Some("Dependency is unavailable".into());
+    PlanStorage::save_plan(root.path(), &plan).unwrap();
+    let implicit = app
+        .prepare_model_ask(
+            root.path(),
+            ModelAskInput::Prompt {
+                text: "Explain the current blocker".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let DiscussionDocument::Plan {
+        plan: loaded_plan,
+        focused_items,
+    } = implicit.discussion.unwrap().document
+    else {
+        panic!("expected a resolved plan");
+    };
+    let prompt = tauqe_core::plan::prompt::format_plan_discussion_prompt(
+        &loaded_plan,
+        &focused_items,
+        &implicit.utterance,
+    );
+    assert!(prompt.contains("<blocked_reason>Dependency is unavailable</blocked_reason>"));
+    assert!(!prompt.contains("Missing &lt;contract&gt;"));
+    assert_eq!(app.discussion_focus().await, anchored("blocked-plan"));
+}
+
+#[tokio::test]
 async fn explicit_discussion_loads_before_replacing_focus_and_preserves_repeat_notifications() {
     let root = tempfile::tempdir().unwrap();
     let app = Application::default();

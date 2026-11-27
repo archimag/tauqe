@@ -58,6 +58,9 @@ use std::sync::Mutex;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::oneshot;
 
+mod operations;
+pub use operations::{OperationHandle, OperationSummary, StartedOperations};
+
 thread_local! {
     /// Whether the current thread is already running inside [`run_blocking`].
     static IN_BLOCKING: Cell<bool> = const { Cell::new(false) };
@@ -148,6 +151,64 @@ where
             }
         }
         Err(_) => Ok(run_blocking(f)),
+    }
+}
+
+/// Owns the completion report of one blocking operation independently of any
+/// future waiting for it. Dropping a wait future does not cancel the operation
+/// or discard its result; the owner retains this handle until settlement.
+pub struct BlockingOperation<T> {
+    receiver: Option<oneshot::Receiver<OffloadOutcome<T>>>,
+}
+
+impl<T> BlockingOperation<T> {
+    /// Waits for the closure itself to report that it has stopped running.
+    /// A cancelled wait leaves the receiver in the handle for a later wait.
+    /// Completion can be taken only once.
+    pub async fn wait(&mut self) -> Result<T, OffloadError> {
+        let receiver = self
+            .receiver
+            .as_mut()
+            .expect("blocking operation completion already taken");
+        let report = receiver.await;
+        self.receiver = None;
+        match report {
+            Ok(OffloadOutcome::Completed(value)) => Ok(value),
+            Ok(OffloadOutcome::Panicked(payload)) => Err(OffloadError::panicked(payload)),
+            // The sender belongs to the closure. If it vanished without a
+            // report, the runtime dropped that closure before it could run.
+            Err(_) => Err(OffloadError::never_ran()),
+        }
+    }
+}
+
+/// Starts exactly one blocking closure and returns its owned completion slot.
+/// Unlike [`run_blocking_async`], the slot belongs to the caller rather than
+/// to a single await. No second execution starts when an await is lost.
+pub fn start_blocking_operation<T, F>(f: F) -> BlockingOperation<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    let work = move || {
+        IN_BLOCKING.with(|flag| flag.set(true));
+        let _reset = ResetBlockingFlag;
+        let report = match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(value) => OffloadOutcome::Completed(value),
+            Err(payload) => OffloadOutcome::Panicked(PanicPayload::new(payload)),
+        };
+        // The closure publishes completion only after its work has stopped.
+        // A dropped wait future cannot consume or erase the report.
+        let _ = sender.send(report);
+    };
+    if let Ok(handle) = Handle::try_current() {
+        let _task = handle.spawn_blocking(work);
+    } else {
+        work();
+    }
+    BlockingOperation {
+        receiver: Some(receiver),
     }
 }
 
@@ -295,7 +356,65 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{resolve_offload_failure, run_blocking, run_blocking_async, OffloadError};
+    use super::{
+        resolve_offload_failure, run_blocking, run_blocking_async, start_blocking_operation,
+        OffloadError,
+    };
+
+    #[tokio::test]
+    async fn owned_operation_survives_a_lost_wait_without_restarting() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let counter = Arc::clone(&runs);
+        let mut operation = start_blocking_operation(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            41
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        {
+            let wait = operation.wait();
+            tokio::pin!(wait);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err());
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        assert_eq!(operation.wait().await.unwrap(), 41);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_operation_retains_panic_after_a_lost_wait() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut operation = start_blocking_operation(move || -> () {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            panic!("owned operation panic");
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        {
+            let wait = operation.wait();
+            tokio::pin!(wait);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err());
+        }
+        release_tx.send(()).unwrap();
+        let error = operation.wait().await.unwrap_err();
+        let payload =
+            std::panic::catch_unwind(|| resolve_offload_failure(error, "owned operation", || ()))
+                .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"owned operation panic")
+        );
+    }
 
     #[test]
     fn runs_outside_a_runtime() {

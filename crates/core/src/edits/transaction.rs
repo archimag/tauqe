@@ -1,20 +1,55 @@
 //! Settlement of an edit transaction. The caller owns the obligation to settle it.
 
+use crate::config::project::ProjectConfig;
 use crate::context::ContextManager;
-use crate::workflow::policy::ApplyPolicy;
+use crate::edits::{EditOperation, EditOutcome, VerificationVerdict};
+use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnapshot};
+use crate::stop::HardCancellation;
+use crate::workflow::policy::{ApplyPolicy, FinalizationStatus, PolicyRollback};
 use anyhow::{bail, Context, Result};
 use ring::digest::{digest, Digest, SHA256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Preserves originals for files the apply policy cannot restore.
-pub(super) struct DiskBackup {
-    root: PathBuf,
-    files: BTreeMap<String, Original>,
+struct DiskBackup {
+    shared: Arc<SharedTransaction>,
 }
 
+#[derive(Default)]
+struct TransactionState {
+    files: BTreeMap<String, Original>,
+    changed_files: Vec<String>,
+    lifecycle: Lifecycle,
+}
+
+struct SharedTransaction {
+    root: PathBuf,
+    state: Mutex<TransactionState>,
+    operations: crate::blocking::StartedOperations,
+    commands: crate::blocking::StartedOperations,
+    pending_command: tokio::sync::Mutex<Option<CommandEvidence>>,
+}
+
+struct CommandEvidence {
+    baseline: Arc<ArtifactBaseline>,
+    worktree: WorktreeSnapshot,
+}
+
+#[derive(Default)]
+enum Lifecycle {
+    #[default]
+    Open,
+    Finalizing,
+    RollingBack,
+    Finalized(CommitOutcome),
+    RolledBack(RollbackOutcome),
+}
+
+#[derive(Clone)]
 enum Original {
     File(Vec<u8>),
     Absent,
@@ -23,7 +58,7 @@ enum Original {
 
 /// Pre-command evidence. A Git status code does not establish the original
 /// bytes (checkout filters may change them), or even prove a path was absent.
-pub(super) struct ArtifactBaseline {
+struct ArtifactBaseline {
     revision: Option<String>,
     entries: BTreeMap<PathBuf, BaselineEntry>,
 }
@@ -35,7 +70,7 @@ enum BaselineEntry {
 }
 
 impl ArtifactBaseline {
-    pub(super) fn capture(root: &Path) -> Self {
+    pub fn capture(root: &Path) -> Self {
         let revision = crate::git::run_git(Some(root), &["rev-parse", "--verify", "HEAD"])
             .ok()
             .map(|revision| revision.trim().to_owned());
@@ -79,6 +114,20 @@ impl ArtifactBaseline {
             }
         }
         Self { revision, entries }
+    }
+
+    fn changed_dirty_files(&self, root: &Path, before: &WorktreeSnapshot) -> Vec<String> {
+        before
+            .keys()
+            .filter(|path| {
+                let Some(BaselineEntry::File(expected)) = self.entries.get(Path::new(path)) else {
+                    return false;
+                };
+                fs::read(root.join(path))
+                    .is_ok_and(|bytes| expected.as_ref() != digest(&SHA256, &bytes).as_ref())
+            })
+            .cloned()
+            .collect()
     }
 
     fn original(&self, root: &Path, path: &str) -> Result<Original> {
@@ -129,41 +178,62 @@ fn backup_path(root: &Path, path: &str) -> Result<PathBuf> {
 }
 
 impl DiskBackup {
-    pub(super) fn record_paths(&mut self, paths: &[String]) -> Result<()> {
-        let mut captured = BTreeMap::new();
-        for path in paths {
-            match self.files.get(path) {
-                Some(Original::Unavailable(reason)) => {
-                    bail!("Cannot back up `{path}`: {reason}");
-                }
-                Some(_) => continue,
-                None => {}
-            }
-            let original = backup_path(&self.root, path)
-                .and_then(|full| match fs::read(full) {
-                    Ok(bytes) => Ok(Original::File(bytes)),
-                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(Original::Absent),
-                    Err(error) => Err(error.into()),
-                })
-                .with_context(|| format!("Cannot back up `{path}`"))?;
-            captured.insert(path.clone(), original);
-        }
-        self.files.extend(captured);
-        Ok(())
+    fn state(&self) -> std::sync::MutexGuard<'_, TransactionState> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(super) fn record_artifacts(&mut self, baseline: &ArtifactBaseline, paths: &[String]) {
-        for path in paths {
-            self.files.entry(path.clone()).or_insert_with(|| {
-                baseline
-                    .original(&self.root, path)
-                    .unwrap_or_else(|error| Original::Unavailable(format!("{error:#}")))
-            });
-        }
+    pub(super) async fn record_paths(&self, paths: &[String]) -> Result<()> {
+        self.shared.operations.wait().await;
+        let missing = {
+            let state = self.state();
+            paths
+                .iter()
+                .filter(|path| !state.files.contains_key(*path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let shared = Arc::clone(&self.shared);
+        let root = shared.root.clone();
+        let handle = self
+            .shared
+            .operations
+            .start(
+                move || {
+                    let mut captured = BTreeMap::new();
+                    for path in &missing {
+                        let original = backup_path(&root, path)
+                            .and_then(|full| match fs::read(full) {
+                                Ok(bytes) => Ok(Original::File(bytes)),
+                                Err(error) if error.kind() == ErrorKind::NotFound => {
+                                    Ok(Original::Absent)
+                                }
+                                Err(error) => Err(error.into()),
+                            })
+                            .with_context(|| format!("Cannot back up `{path}`"))?;
+                        captured.insert(path.clone(), original);
+                    }
+                    let mut data = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    data.files.extend(captured);
+                    Ok::<_, anyhow::Error>(())
+                },
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        handle
+            .take_result()
+            .await
+            .context("backup capture did not return a result")??
     }
 
     pub(super) fn known_files(&self) -> std::collections::HashMap<String, Option<Vec<u8>>> {
-        self.files
+        self.state()
+            .files
             .iter()
             .filter_map(|(path, original)| match original {
                 Original::File(bytes) => Some((path.clone(), Some(bytes.clone()))),
@@ -174,8 +244,8 @@ impl DiskBackup {
     }
 
     fn rollback(&self, needs_restore: impl Fn(&str) -> bool) -> Result<()> {
-        let failures: Vec<_> = self
-            .files
+        let files = self.state().files.clone();
+        let failures: Vec<_> = files
             .iter()
             .filter(|(path, _)| needs_restore(path))
             .filter_map(|(path, original)| {
@@ -191,7 +261,7 @@ impl DiskBackup {
     }
 
     fn restore(&self, path: &str, original: &Original) -> Result<()> {
-        let full = backup_path(&self.root, path)?;
+        let full = backup_path(&self.shared.root, path)?;
         match original {
             Original::File(bytes) => {
                 if let Some(parent) = full.parent() {
@@ -210,18 +280,386 @@ impl DiskBackup {
     }
 }
 
-pub struct TurnTransaction {
+struct TurnTransaction {
     pub(super) backup: DiskBackup,
-    settled: bool,
+}
+
+/// Internal owner of a turn's policy, first-touch bytes and cumulative paths.
+pub(crate) struct PolicyTransaction {
+    policy: Box<dyn ApplyPolicy>,
+    shared: Arc<SharedTransaction>,
+}
+
+/// Terminal file facts. Failed finalization remains an explicit EditOutcome.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PolicySettlement {
+    NoChanges,
+    Finalized(EditOutcome),
+    RolledBack(RollbackOutcome),
+}
+
+impl PolicyTransaction {
+    pub(crate) fn new(root: &Path, policy: Box<dyn ApplyPolicy>) -> Self {
+        Self {
+            policy,
+            shared: TurnTransaction::new(root).backup.shared,
+        }
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &state.lifecycle {
+            Lifecycle::Open => Ok(()),
+            Lifecycle::Finalizing | Lifecycle::RollingBack => {
+                bail!("file transaction settlement is already in progress")
+            }
+            Lifecycle::Finalized(commit) => bail!(
+                "file transaction has already been finalized (commit: {:?}, error: {:?})",
+                commit.commit_hash,
+                commit.commit_error
+            ),
+            Lifecycle::RolledBack(outcome) => {
+                bail!("file transaction has already been rolled back: {outcome:?}")
+            }
+        }
+    }
+
+    fn backup(&self) -> DiskBackup {
+        DiskBackup {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// An owned snapshot of paths published by completed operations.
+    pub fn changed_files(&self) -> Vec<String> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .changed_files
+            .clone()
+    }
+
+    /// Copies original bytes from completed operations without exposing the backup.
+    pub fn original_bytes(&self) -> std::collections::HashMap<String, Option<Vec<u8>>> {
+        self.backup().known_files()
+    }
+
+    /// Register pre-command evidence before handing out the retained process owner.
+    /// Artifact capture remains the transaction's responsibility if the waiter is lost.
+    pub async fn begin_command(&self) -> Result<crate::blocking::StartedOperations> {
+        self.ensure_open()?;
+        let mut pending = self.shared.pending_command.lock().await;
+        if pending.is_some() {
+            bail!("a project command is already in progress");
+        }
+        self.shared.commands.wait().await;
+        let root = self.shared.root.clone();
+        let evidence = crate::blocking::run_blocking_async(move || CommandEvidence {
+            baseline: Arc::new(ArtifactBaseline::capture(&root)),
+            worktree: snapshot_worktree(&root),
+        })
+        .await?;
+        *pending = Some(evidence);
+        Ok(self.shared.commands.clone())
+    }
+
+    /// Account for a command only after its process group has stopped.
+    pub async fn complete_command(&self) -> Result<Vec<String>> {
+        let mut pending = self.shared.pending_command.lock().await;
+        let evidence = pending
+            .as_ref()
+            .context("no project command is in progress")?;
+        let summary = self.shared.commands.wait().await;
+        if summary.unconfirmed != 0 {
+            bail!("project command shutdown could not be confirmed");
+        }
+        let root = self.shared.root.clone();
+        let before = evidence.worktree.clone();
+        let baseline = Arc::clone(&evidence.baseline);
+        let paths = crate::blocking::run_blocking_async(move || {
+            let mut paths = changed_worktree_paths(&before, &snapshot_worktree(&root));
+            paths.extend(baseline.changed_dirty_files(&root, &before));
+            paths.sort();
+            paths.dedup();
+            paths
+        })
+        .await?;
+        self.capture_artifacts_inner(Arc::clone(&evidence.baseline), &paths)
+            .await?;
+        pending.take();
+        Ok(paths)
+    }
+
+    /// `touched` includes deletions and both ends of moves.
+    pub async fn apply(
+        &mut self,
+        project: &ProjectConfig,
+        context: &mut ContextManager,
+        touched: &[String],
+        batches: &[&[EditOperation]],
+        cancel: Option<&HardCancellation>,
+    ) -> Result<Vec<String>> {
+        self.ensure_open()?;
+        let root = self.shared.root.clone();
+        self.backup().record_paths(touched).await?;
+        // Publication can complete after its waiter disappears. Retain paths
+        // before entering it, including writes that subsequently report failure.
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            for path in touched {
+                if !state.changed_files.contains(path) {
+                    state.changed_files.push(path.clone());
+                }
+            }
+        }
+        let changed = self
+            .policy
+            .apply_temporary_batches_owned(&root, project, context, batches, cancel)
+            .await?;
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        for path in &changed {
+            if !state.changed_files.contains(path) {
+                state.changed_files.push(path.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Capture artifacts only where the baseline proves original bytes or absence.
+    async fn capture_artifacts_inner(
+        &self,
+        baseline: Arc<ArtifactBaseline>,
+        paths: &[String],
+    ) -> Result<()> {
+        let root = self.shared.root.clone();
+        self.shared.operations.wait().await;
+        // Retain path ownership before starting the capture, even if its waiter vanishes.
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            for path in paths {
+                if !state.changed_files.contains(path) {
+                    state.changed_files.push(path.clone());
+                }
+            }
+        }
+        let missing: Vec<_> = {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            paths
+                .iter()
+                .filter(|path| !state.files.contains_key(*path))
+                .cloned()
+                .collect()
+        };
+        let shared = Arc::clone(&self.shared);
+        let handle = self
+            .shared
+            .operations
+            .start(
+                move || {
+                    let originals = missing
+                        .into_iter()
+                        .map(|path| {
+                            let original =
+                                baseline.original(&root, &path).unwrap_or_else(|error| {
+                                    Original::Unavailable(format!("{error:#}"))
+                                });
+                            (path, original)
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .files
+                        .extend(originals);
+                },
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        handle
+            .take_result()
+            .await
+            .context("artifact capture did not return a result")??;
+        Ok(())
+    }
+
+    /// A lost waiter can rejoin finalization without starting a second commit.
+    pub async fn finalize_resumable(
+        &mut self,
+        summary: &str,
+        verification: VerificationVerdict,
+        cancel: Option<&HardCancellation>,
+    ) -> Result<Option<(PolicySettlement, bool)>> {
+        self.settle_finalization(summary, verification, cancel, true)
+            .await
+    }
+
+    /// Rejoin only a finalization already admitted by the underlying policy.
+    pub async fn finalization_result(
+        &mut self,
+        summary: &str,
+        verification: VerificationVerdict,
+        cancel: Option<&HardCancellation>,
+    ) -> Result<Option<(PolicySettlement, bool)>> {
+        self.settle_finalization(summary, verification, cancel, false)
+            .await
+    }
+
+    async fn settle_finalization(
+        &mut self,
+        summary: &str,
+        verification: VerificationVerdict,
+        cancel: Option<&HardCancellation>,
+        admit: bool,
+    ) -> Result<Option<(PolicySettlement, bool)>> {
+        if !admit {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(state.lifecycle, Lifecycle::Open) {
+                return Ok(None);
+            }
+        }
+        if self.shared.pending_command.lock().await.is_some() {
+            bail!("project command consequences have not been recorded");
+        }
+        let commands = self.shared.commands.wait().await;
+        if commands.unconfirmed != 0 {
+            bail!("project command shutdown could not be confirmed");
+        }
+        {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.lifecycle {
+                Lifecycle::Open | Lifecycle::Finalizing => {}
+                _ => bail!("file transaction has already been settled"),
+            }
+        }
+        self.shared.operations.wait().await;
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lifecycle = Lifecycle::Finalizing;
+        let changed_files = self.changed_files();
+        let status = if admit {
+            self.policy
+                .finalize_resumable(&self.shared.root, &changed_files, summary, cancel)
+                .await?
+        } else {
+            self.policy
+                .finalization_result(&self.shared.root, &changed_files, summary, cancel)
+                .await?
+        };
+        let FinalizationStatus::Completed { result, cancelled } = status else {
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lifecycle = Lifecycle::Open;
+            return Ok(None);
+        };
+        let commit = match result {
+            Ok(commit_hash) => CommitOutcome {
+                commit_hash,
+                commit_error: None,
+            },
+            Err(error) => CommitOutcome {
+                commit_hash: None,
+                commit_error: Some(format!(
+                    "Changes were applied but the Git transaction could not be finalized: {error}"
+                )),
+            },
+        };
+        let no_changes = changed_files.is_empty()
+            && commit.commit_error.is_none()
+            && commit.commit_hash.is_none();
+        let applied = commit.commit_error.is_none();
+        let error = commit.commit_error.clone();
+        let hash = commit.commit_hash.clone();
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lifecycle = Lifecycle::Finalized(commit);
+        if no_changes {
+            return Ok(Some((PolicySettlement::NoChanges, cancelled)));
+        }
+        Ok(Some((
+            PolicySettlement::Finalized(EditOutcome {
+                applied,
+                error,
+                changed_files,
+                commit_hash: hash,
+                verification: Some(verification),
+            }),
+            cancelled,
+        )))
+    }
+
+    pub async fn rollback(&mut self, context: &mut ContextManager) -> Result<PolicySettlement> {
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.lifecycle {
+                Lifecycle::Open | Lifecycle::RollingBack => {
+                    state.lifecycle = Lifecycle::RollingBack
+                }
+                _ => bail!("file transaction has already been settled"),
+            }
+        }
+        self.shared.commands.close();
+        if let Err(error) = self.complete_pending_command().await {
+            let outcome = RollbackOutcome::Incomplete {
+                policy_error: None,
+                backup_error: format!(
+                    "Project command completion or artifact capture failed: {error:#}"
+                ),
+            };
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lifecycle = Lifecycle::RolledBack(outcome.clone());
+            return Ok(PolicySettlement::RolledBack(outcome));
+        }
+        if self.shared.commands.wait().await.unconfirmed != 0 {
+            let outcome = RollbackOutcome::Incomplete {
+                policy_error: None,
+                backup_error: "Project command shutdown could not be confirmed".into(),
+            };
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lifecycle = Lifecycle::RolledBack(outcome.clone());
+            return Ok(PolicySettlement::RolledBack(outcome));
+        }
+        let outcome = TurnTransaction {
+            backup: self.backup(),
+        }
+        .rollback(self.policy.as_mut(), context)
+        .await;
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lifecycle = Lifecycle::RolledBack(outcome.clone());
+        Ok(PolicySettlement::RolledBack(outcome))
+    }
+
+    async fn complete_pending_command(&mut self) -> Result<()> {
+        if self.shared.pending_command.lock().await.is_some() {
+            self.complete_command().await?;
+        }
+        Ok(())
+    }
 }
 
 /// Finalization failure is explicit: verified bytes must not imply a commit.
-pub struct CommitOutcome {
+struct CommitOutcome {
     pub commit_hash: Option<String>,
     pub commit_error: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RollbackOutcome {
     NothingToDo,
     FinalizationAttempted,
@@ -257,54 +695,53 @@ impl RollbackOutcome {
 }
 
 impl TurnTransaction {
-    pub fn new(root: &Path) -> Self {
+    fn new(root: &Path) -> Self {
         Self {
             backup: DiskBackup {
-                root: root.to_path_buf(),
-                files: BTreeMap::new(),
+                shared: Arc::new(SharedTransaction {
+                    root: root.to_path_buf(),
+                    state: Mutex::new(TransactionState::default()),
+                    operations: crate::blocking::StartedOperations::default(),
+                    commands: crate::blocking::StartedOperations::default(),
+                    pending_command: tokio::sync::Mutex::new(None),
+                }),
             },
-            settled: false,
         }
     }
 
-    pub async fn finalize(
-        &mut self,
-        policy: &mut dyn ApplyPolicy,
-        paths: &[String],
-        summary: &str,
-    ) -> CommitOutcome {
-        let result = policy.apply_final(&self.backup.root, paths, summary).await;
-        // Finalization consumes the policy's checkpoint even on failure. Do not
-        // claim a rollback after that point; preserve the explicit commit error.
-        self.settled = true;
-        match result {
-            Ok(commit_hash) => CommitOutcome {
-                commit_hash,
-                commit_error: None,
-            },
-            Err(error) => {
-                let message = format!(
-                    "Changes were applied but the Git transaction could not be finalized: {error}"
-                );
-                tracing::error!(%error, "{message}");
-                CommitOutcome {
-                    commit_hash: None,
-                    commit_error: Some(message),
-                }
-            }
-        }
-    }
-
-    pub async fn rollback(
+    async fn rollback(
         self,
         policy: &mut dyn ApplyPolicy,
         context: &mut ContextManager,
     ) -> RollbackOutcome {
-        if self.settled {
+        if matches!(
+            self.backup.state().lifecycle,
+            Lifecycle::Finalizing | Lifecycle::Finalized(_)
+        ) {
             return RollbackOutcome::FinalizationAttempted;
         }
-        let (restored, policy_error) = match policy.rollback(&self.backup.root).await {
-            Ok(restored) => (restored, None),
+        self.backup.shared.operations.close();
+        let operations = self.backup.shared.operations.wait().await;
+        if operations.unconfirmed != 0 {
+            return RollbackOutcome::Incomplete {
+                policy_error: None,
+                backup_error: format!(
+                    "{} technical operation(s) could not be confirmed",
+                    operations.unconfirmed
+                ),
+            };
+        }
+        if let Err(error) = policy.stop_and_wait().await {
+            return RollbackOutcome::Incomplete {
+                policy_error: Some(format!("{error:#}")),
+                backup_error:
+                    "Active publication could not be confirmed; restoration was not attempted"
+                        .into(),
+            };
+        }
+        let (restored, policy_error) = match policy.rollback(&self.backup.shared.root).await {
+            Ok(PolicyRollback::RestoredCheckpoint) => (true, None),
+            Ok(PolicyRollback::NoCheckpoint) => (false, None),
             Err(error) => (false, Some(format!("{error:#}"))),
         };
         let outcome = crate::blocking::run_blocking(|| {
@@ -316,10 +753,10 @@ impl TurnTransaction {
                         policy_error,
                         backup_error: format!("{error:#}"),
                     },
-                    Ok(()) if self.backup.files.is_empty() && policy_error.is_none() => {
+                    Ok(()) if self.backup.state().files.is_empty() && policy_error.is_none() => {
                         RollbackOutcome::NothingToDo
                     }
-                    Ok(()) if self.backup.files.is_empty() => RollbackOutcome::Incomplete {
+                    Ok(()) if self.backup.state().files.is_empty() => RollbackOutcome::Incomplete {
                         policy_error,
                         backup_error: "No file backups were available".into(),
                     },
@@ -330,6 +767,15 @@ impl TurnTransaction {
             context.prune_missing_files();
             outcome
         });
+        if operations.unconfirmed != 0 {
+            return RollbackOutcome::Incomplete {
+                policy_error: None,
+                backup_error: format!(
+                    "{} technical operation(s) could not be confirmed",
+                    operations.unconfirmed
+                ),
+            };
+        }
         if let Some(diagnostic) = outcome.diagnostic() {
             tracing::error!(%diagnostic, "turn recovery could not be confirmed");
         }
@@ -339,11 +785,11 @@ impl TurnTransaction {
     fn restore_outside_checkpoint(&self) -> RollbackOutcome {
         // Checkpoint rollback leaves ignored paths alone. Restore the known
         // sandbox paths even if the general coverage probe fails.
-        let paths: Vec<_> = self.backup.files.keys().cloned().collect();
+        let paths: Vec<_> = self.backup.state().files.keys().cloned().collect();
         if paths.is_empty() {
             return RollbackOutcome::RestoredByPolicy;
         }
-        let ignored = tauqe_tools::git::state::gitignored_paths(&self.backup.root, &paths);
+        let ignored = tauqe_tools::git::state::gitignored_paths(&self.backup.shared.root, &paths);
         let needs_restore = |path: &str| {
             crate::mockups::is_mockups_path(path)
                 || ignored
@@ -376,20 +822,20 @@ impl TurnTransaction {
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_touch_preserves_bytes_and_absence_and_reports_all_restore_conflicts() {
+    #[tokio::test]
+    async fn first_touch_preserves_bytes_and_absence_and_reports_all_restore_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut transaction = TurnTransaction::new(root);
-        let backup = &mut transaction.backup;
+        let transaction = TurnTransaction::new(root);
+        let backup = &transaction.backup;
         let paths = ["binary", "new", "conflict-a", "conflict-b"].map(str::to_owned);
         fs::write(root.join("binary"), [0, 255, 128]).unwrap();
-        backup.record_paths(&paths).unwrap();
+        backup.record_paths(&paths).await.unwrap();
         fs::write(root.join("binary"), b"edited").unwrap();
         fs::write(root.join("new"), b"created").unwrap();
         fs::create_dir(root.join("conflict-a")).unwrap();
         fs::create_dir(root.join("conflict-b")).unwrap();
-        backup.record_paths(&paths).unwrap();
+        backup.record_paths(&paths).await.unwrap();
 
         let error = backup.rollback(|_| true).unwrap_err().to_string();
         assert!(
@@ -402,28 +848,28 @@ mod tests {
         assert!(!root.join("new").exists());
     }
 
-    #[test]
-    fn artifact_backup_uses_only_git_bytes_proven_to_match_the_original() {
+    #[tokio::test]
+    async fn artifact_backup_uses_only_git_bytes_proven_to_match_the_original() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("binary"), [0, 255, 128]).unwrap();
         fs::write(root.join("dirty"), b"committed").unwrap();
         crate::git::init_repository(Some(root), true).unwrap();
         fs::write(root.join("dirty"), b"uncommitted").unwrap();
-        let baseline = ArtifactBaseline::capture(root);
+        let policy = PolicyTransaction::new(
+            root,
+            Box::new(crate::workflow::policy::DirectApplyPolicy::new()),
+        );
+        let baseline = Arc::new(ArtifactBaseline::capture(root));
         for path in ["binary", "dirty", "new"] {
             fs::write(root.join(path), b"artifact").unwrap();
         }
-        let mut transaction = TurnTransaction::new(root);
-        transaction
-            .backup
-            .record_artifacts(&baseline, &["binary", "dirty", "new"].map(str::to_owned));
+        policy
+            .capture_artifacts_inner(baseline, &["binary", "dirty", "new"].map(str::to_owned))
+            .await
+            .unwrap();
 
-        let error = transaction
-            .backup
-            .rollback(|_| true)
-            .unwrap_err()
-            .to_string();
+        let error = policy.backup().rollback(|_| true).unwrap_err().to_string();
         assert!(error.contains("`dirty`: original unavailable"), "{error}");
         assert_eq!(fs::read(root.join("binary")).unwrap(), [0, 255, 128]);
         assert_eq!(fs::read(root.join("dirty")).unwrap(), b"artifact");
@@ -439,8 +885,12 @@ mod tests {
         fs::create_dir_all(root.join(".tauqe/mockups")).unwrap();
         fs::write(root.join(path), b"developer draft").unwrap();
         let mut context = ContextManager::new(root.to_path_buf());
-        let mut transaction = TurnTransaction::new(root);
-        transaction.backup.record_paths(&[path.into()]).unwrap();
+        let transaction = TurnTransaction::new(root);
+        transaction
+            .backup
+            .record_paths(&[path.into()])
+            .await
+            .unwrap();
         let mut policy = crate::workflow::GitTransactionPolicy::new();
         policy
             .apply_temporary_batches(root, &Default::default(), &mut context, &[])

@@ -5,8 +5,8 @@
 //! leaves every persisted finding untouched.
 
 use super::{
-    init_repo_with_file, save_grouped_session, subplan_item, test_config, test_item, test_session,
-    test_state, TestDir,
+    horizon_config, horizon_leaf, horizon_response, init_repo_with_file, save_grouped_session,
+    subplan_item, test_config, test_item, test_session, test_state, TestDir,
 };
 
 use super::super::handle_review_execute;
@@ -37,6 +37,41 @@ fn save_session(dir: &TestDir, review_id: &str, statuses: &[IssueStatus]) {
         .map(|(index, status)| test_item(index as u32 + 1, *status, "src/target.rs"))
         .collect::<Vec<_>>();
     ReviewStorage::save_session(dir.path(), &test_session(review_id, items)).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_initial_horizons_block_only_the_group_and_leave_findings_open() {
+    for (name, response, diagnosis) in [
+        ("refused", serde_json::json!({"status":"blocked","explanation":"Cannot design","reason":"Contradictory contract","items":[]}).to_string(), "Contradictory contract"),
+        ("empty", horizon_response(serde_json::json!([])), "empty"),
+        ("duplicate", horizon_response(serde_json::json!([horizon_leaf("s-1"), horizon_leaf("s-1")])), "s-1"),
+        ("cycle", horizon_response(serde_json::json!([{
+            "id":"s-1", "title":"First", "status":"todo", "files":["src/target.rs"], "depends_on":["s-2"]
+        }, {
+            "id":"s-2", "title":"Second", "status":"todo", "files":["src/target.rs"], "depends_on":["s-1"]}])), "cycle"),
+    ] {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+        save_grouped_session(&dir, name, "arch-1", vec![]);
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response).with_usage(ModelUsageInfo {total_tokens: 7, ..Default::default()})]));
+        let (out, mut rx) = OutChannel::new();
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(horizon_config(), dir.path().into(), history, out);
+        state.application.test_set_provider(provider.clone()).await;
+        let published = super::execute::execute_and_collect(&state, &mut rx, super::execute::execute_request(serde_json::json!({
+            "kind":"group", "review_id":name, "group_id":"arch-1"
+        }))).await;
+        assert_eq!(provider.requests().len(), 1, "{name}");
+        assert_eq!(provider.requests()[0].model, "review/architect");
+        let stored = ReviewStorage::load_review(dir.path(), name).unwrap().unwrap();
+        assert!(stored.groups[0].implementation.items.is_empty(), "{name}");
+        assert!(stored.groups[0].blocked_reason.as_deref().unwrap().to_lowercase().contains(&diagnosis.to_lowercase()), "{name}");
+        assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Todo);
+        assert_eq!(published.last().unwrap().params.as_ref().unwrap()["summary"]["failed_count"], 1);
+        let usage = state.application.usage_snapshot().await;
+        assert_eq!(usage.session.total_tokens, 7, "{name}");
+        assert_eq!(usage.lifetime.total_tokens, 7, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -301,22 +336,35 @@ async fn review_group_preserves_its_first_commit_when_the_second_step_blocks() {
     assert!(reason.contains(BLOCKER), "{reason}");
     assert_eq!(group.blocked_reason.as_deref(), Some(reason));
 
-    // The final snapshot retains the receipt without announcing another commit
-    // or a successful aggregate edit for the interrupted sequence.
+    // The interrupted sequence retains the earlier commit receipt and blocker
+    // without announcing another commit or a successful aggregate edit.
     let commits: Vec<_> = published
         .iter()
         .filter(|event| event.method == events::GIT_COMMIT_CREATED)
         .collect();
     assert_eq!(commits.len(), 1);
     assert_eq!(commits[0].params.as_ref().unwrap()["commit_hash"], commit);
-    for event in published
+    let edit_finishes: Vec<_> = published
         .iter()
         .filter(|event| event.method == events::EDIT_FINISHED)
-    {
+        .collect();
+    let (terminal, withdrawn) = edit_finishes
+        .split_last()
+        .expect("the interrupted sequence must close its edit cycle");
+    for event in withdrawn {
         let params = event.params.as_ref().unwrap();
         assert_eq!(params["applied"], false);
         assert!(params["commit_hash"].is_null());
     }
+    let params = terminal.params.as_ref().unwrap();
+    assert_eq!(params["applied"], false);
+    assert_eq!(params["commit_hash"], commit);
+    assert_eq!(params["changed_files"], serde_json::json!([PATH]));
+    let diagnostic = params["error"]
+        .as_str()
+        .expect("the interrupted sequence must publish its blocker");
+    assert!(diagnostic.contains(BLOCKER), "{diagnostic}");
+    assert!(!diagnostic.contains("without proposing any file change"));
     let summary = &published.last().unwrap().params.as_ref().unwrap()["summary"];
     assert_eq!(summary["status"], "completed");
     assert_eq!(summary["fixed_count"], 0);

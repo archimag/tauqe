@@ -1,34 +1,53 @@
 //! Session accounting, window ownership, timing, and typed usage publication.
 
 use super::context::ContextSession;
+use super::usage_totals::UsageReceipt;
 use crate::api::{next_operation_id, Application};
 use crate::api::{UsageTotals, UsageTotalsSnapshot};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
+use tauqe_core::execution::usage::UsageSink;
 use tauqe_core::providers::ModelUsageInfo;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
 type UsagePublisher = Arc<dyn Fn(&str, &UsageTotalsSnapshot) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub(crate) struct UsageSession {
-    ledger: Arc<Mutex<UsageLedger>>,
+    ledger: Arc<StdMutex<UsageLedger>>,
+    window_gate: Arc<Mutex<()>>,
+    publication_gate: Arc<Mutex<()>>,
 }
 
 impl UsageSession {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
-            ledger: Arc::new(Mutex::new(UsageLedger::new(
+            ledger: Arc::new(StdMutex::new(UsageLedger::new(
                 crate::application::infrastructure::usage::load_initial_snapshot(root),
             ))),
+            window_gate: Arc::new(Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, UsageLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[allow(dead_code)] // Used by request-bound accounting once its routes are migrated.
+    pub(crate) fn record_window(&self, window: u64, report: &ModelUsageInfo) {
+        if !self.lock().observe(window, report) {
+            tracing::warn!(window_id = window, "Discarding late usage report");
         }
     }
 
     pub(crate) async fn snapshot(&self) -> UsageTotalsSnapshot {
-        self.ledger.lock().await.snapshot().clone()
+        self.lock().snapshot().clone()
     }
 
     pub(crate) async fn begin<F>(
@@ -51,7 +70,10 @@ impl UsageSession {
         tick: Duration,
         publisher: UsagePublisher,
     ) -> UsageGuard {
-        let window = self.ledger.lock().await.begin();
+        let ownership = Arc::clone(&self.window_gate).lock_owned().await;
+        let root = context.repository_root().await;
+        let publication = self.publication_gate.lock().await;
+        let window = self.lock().begin();
         let started = Instant::now();
         let ticker = spawn_live_duration_ticker(
             self,
@@ -63,25 +85,22 @@ impl UsageSession {
         );
         let guard = UsageGuard {
             usage: self.clone(),
-            context: context.clone(),
             operation_id: operation_id.to_owned(),
             window,
             started,
             ticker,
             publisher,
+            root,
+            ownership: Some(ownership),
         };
-        guard.publish().await;
+        guard.publish();
+        drop(publication);
         guard
     }
 }
 
-async fn persist_lifetime(context: &ContextSession, lifetime: &UsageTotals, operations: u64) {
-    crate::application::infrastructure::usage::persist_lifetime(
-        context.repository_root().await,
-        lifetime,
-        operations,
-    )
-    .await;
+async fn persist_lifetime(root: PathBuf, lifetime: &UsageTotals, operations: u64) {
+    crate::application::infrastructure::usage::persist_lifetime(root, lifetime, operations).await;
 }
 
 /// Identity of one usage accounting window.
@@ -99,16 +118,14 @@ fn next_window_id() -> WindowId {
 ///
 /// The snapshot and the identity of the window that owns its in-flight scope
 /// live under one mutex, so identity and window can never disagree. Ownership
-/// is the guarantee the accounting layer itself provides: the heartbeat, an
-/// observation, and a flush act on the in-flight scope only while the recorded
-/// identity is their own, so a window a successor already replaced can neither
-/// publish nor fold anything that belongs to that successor, whatever order the
-/// two tasks reach the lock in. The guarantee therefore never depends on the
-/// operation slot or on a task abort having taken effect.
+/// is the guarantee the accounting layer itself provides: observations and
+/// closure act only on the window whose identity they carry. The window lease
+/// keeps a successor from opening until persistence and final publication end.
 #[derive(Default)]
 struct UsageLedger {
     snapshot: UsageTotalsSnapshot,
     window: Option<WindowId>,
+    cost_complete: bool,
 }
 
 impl UsageLedger {
@@ -120,6 +137,7 @@ impl UsageLedger {
         Self {
             snapshot,
             window: None,
+            cost_complete: true,
         }
     }
 
@@ -138,15 +156,12 @@ impl UsageLedger {
         self.window == Some(window)
     }
 
-    /// Opens a fresh window, discarding an abandoned in-flight scope.
-    ///
-    /// A window left behind by an operation that failed before flushing is
-    /// discarded here, and the identity minted for its successor is what makes
-    /// the abandoned heartbeat find itself dispossessed instead of publishing
-    /// the successor's state under its own identifier and clock.
+    /// Opens only after the prior owner has finished its terminal publication.
     fn begin(&mut self) -> WindowId {
+        assert!(self.window.is_none(), "accounting window still open");
         let window = next_window_id();
         self.window = Some(window);
+        self.cost_complete = true;
         self.snapshot.cur = Some(UsageTotals::default());
         window
     }
@@ -156,30 +171,51 @@ impl UsageLedger {
     /// A window that no longer owns the scope reports nothing: its successor
     /// installed its own in-flight totals, and folding a stale report into them
     /// would attribute one operation's spend to another.
-    fn observe(&mut self, window: WindowId, usage: &UsageTotals) -> bool {
+    fn observe(&mut self, window: WindowId, usage: &ModelUsageInfo) -> bool {
         if !self.owns(window) {
             return false;
         }
+        self.cost_complete &= usage.cost.is_some();
         self.snapshot
             .cur
             .get_or_insert_with(UsageTotals::default)
-            .accumulate(usage);
+            .accumulate(&UsageTotals::from_usage(usage));
         true
     }
 
-    /// Closes `window`, returning the totals it observed.
-    ///
-    /// Only a window that still owns the scope is closed. Every other window is
-    /// absent for its guard, so the successor's in-flight totals are never
-    /// taken by a flush that finished after its own window was discarded.
-    fn close(&mut self, window: WindowId, elapsed_ms: u64) -> Option<UsageTotals> {
+    /// Closes `window` exactly once, folding its totals and returning a receipt.
+    fn close(&mut self, window: WindowId, elapsed_ms: u64) -> Option<UsageReceipt> {
         if !self.owns(window) {
             return None;
         }
         self.window = None;
         let mut completed = self.snapshot.cur.take().unwrap_or_default();
         completed.duration_ms = completed.duration_ms.saturating_add(elapsed_ms);
-        Some(completed)
+        self.snapshot.session.accumulate(&completed);
+        self.snapshot.operations = self.snapshot.operations.saturating_add(1);
+        self.snapshot.lifetime.accumulate(&completed);
+        self.snapshot.lifetime_operations = self.snapshot.lifetime_operations.saturating_add(1);
+        self.snapshot.prev = completed.clone();
+        Some(UsageReceipt {
+            window_id: window,
+            totals: completed,
+            cost_complete: self.cost_complete,
+            snapshot: self.snapshot.clone(),
+        })
+    }
+}
+
+/// Synchronous receiver for an admitted request; late reports stay isolated.
+struct WindowUsageSink {
+    usage: UsageSession,
+    window: WindowId,
+}
+
+impl UsageSink for WindowUsageSink {
+    fn record(&self, usage: &ModelUsageInfo) {
+        if !self.usage.lock().observe(self.window, usage) {
+            tracing::warn!(window_id = self.window, "Discarding late usage report");
+        }
     }
 }
 
@@ -200,9 +236,8 @@ const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 /// Open accounting window for one operation.
 ///
 /// The window starts when the operation begins and closes on
-/// [`UsageGuard::flush`]. Dropping it without flushing abandons the window; the
-/// next `Application::begin_usage` discards the abandoned totals, so a failed
-/// operation can never leave a permanently in-flight window behind. While the
+/// [`UsageGuard::flush`]. Dropping an unflushed legacy guard folds its accepted
+/// totals in memory; it does not start asynchronous persistence. While the
 /// window is open, its heartbeat republishes the snapshot with the live
 /// in-flight duration, so a client renders a running clock for the current
 /// operation instead of a dash.
@@ -211,11 +246,12 @@ const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 /// caller already announces through its own lifecycle events, so every snapshot
 /// this window publishes names the operation a client is rendering. The window
 /// identifier stays internal: every operation the guard performs is checked
-/// against it under the accounting lock, so the guard can never publish or fold
-/// a scope a successor already replaced.
+/// against it under the accounting lock, so a late request cannot charge a
+/// successor's scope.
 pub struct UsageGuard {
     usage: UsageSession,
-    context: ContextSession,
+    root: PathBuf,
+    ownership: Option<OwnedMutexGuard<()>>,
     /// Identifier the window publishes under: the one the caller announces
     /// through its own lifecycle events.
     operation_id: String,
@@ -233,6 +269,13 @@ impl Drop for UsageGuard {
         // own heartbeat, so a dropped window never keeps publishing a running
         // clock for an operation that is no longer executing.
         self.ticker.abort();
+        if self.ownership.is_some() {
+            // Abandoned legacy windows retain their accepted spend in memory.
+            // Drop never starts asynchronous persistence.
+            self.usage
+                .lock()
+                .close(self.window, self.started.elapsed().as_millis() as u64);
+        }
     }
 }
 
@@ -241,11 +284,9 @@ impl Drop for UsageGuard {
 /// The published duration is derived, never stored: the authoritative
 /// `cur.duration_ms` stays zero until [`UsageGuard::flush`] folds in the final
 /// measurement, so a heartbeat can never leak into the session totals. The
-/// heartbeat holds the accounting lock across its synchronous send and checks
-/// the window identity under that very lock, which keeps it strictly ordered
-/// against both the flush and the successor's `begin`: the moment the identity
-/// it was spawned with stops owning the in-flight scope it exits without
-/// publishing, so neither a closed window nor a replaced one can produce a
+/// heartbeat holds the publication gate across its synchronous send and checks
+/// the window identity under the ledger lock, which keeps it ordered against
+/// the final publish: once its window closes it exits without producing a
 /// stale "still running" snapshot. The cadence arrives as `tick`, so a test can
 /// compress it without touching the production default.
 fn spawn_live_duration_ticker(
@@ -261,14 +302,10 @@ fn spawn_live_duration_ticker(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tick).await;
-            // The lock is held across the send because the send is
-            // synchronous: the heartbeat stays strictly ordered against
-            // flush without ever awaiting on a locked window. Ownership is
-            // read under the same lock, so a heartbeat whose window a
-            // successor already replaced observes that it no longer owns the
-            // in-flight scope and exits without publishing anything — least of
-            // all the successor's state under its own identifier and clock.
-            let ledger = usage.ledger.lock().await;
+            let _publication = usage.publication_gate.lock().await;
+            // The publication gate orders the heartbeat against completion;
+            // the ledger lock is released before calling the publisher.
+            let ledger = usage.lock();
             if !ledger.owns(window) {
                 break;
             }
@@ -276,38 +313,21 @@ fn spawn_live_duration_ticker(
             if let Some(cur) = live.cur.as_mut() {
                 cur.duration_ms = started.elapsed().as_millis() as u64;
             }
+            drop(ledger);
             publisher(&operation_id, &live);
         }
     })
 }
 
 impl Application {
-    /// Opens a usage accounting window for the operation named by `operation_id`.
-    ///
-    /// The identifier is the one the caller already announces through its own
-    /// lifecycle events, so the in-flight totals, the running-clock heartbeat,
-    /// and the final flush of this window name the operation a client is
-    /// rendering instead of a second identity it would have to correlate.
-    ///
-    /// Ownership stays a separate, internal identity minted under the lock that
-    /// installs the window, so a window left behind by an operation that failed
-    /// before flushing is discarded here and its abandoned heartbeat can never
-    /// mistake the successor's totals for its own.
-    pub(crate) async fn begin_usage<F>(&self, operation_id: &str, publish: F) -> UsageGuard
+    #[cfg(feature = "test-support")]
+    pub async fn test_begin_usage<F>(&self, operation_id: &str, publish: F) -> UsageGuard
     where
         F: Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static,
     {
         self.usage_session()
             .begin(self.context_session(), operation_id, publish)
             .await
-    }
-
-    #[cfg(feature = "test-support")]
-    pub async fn test_begin_usage<F>(&self, operation_id: &str, publish: F) -> UsageGuard
-    where
-        F: Fn(&str, &UsageTotalsSnapshot) + Send + Sync + 'static,
-    {
-        self.begin_usage(operation_id, publish).await
     }
 
     #[cfg(feature = "test-support")]
@@ -355,7 +375,7 @@ impl Application {
     {
         let publisher: UsagePublisher = Arc::new(publish);
         let snapshot = {
-            let mut ledger = self.usage_session().ledger.lock().await;
+            let mut ledger = self.usage_session().lock();
             {
                 let snapshot = ledger.snapshot_mut();
                 snapshot.lifetime = UsageTotals::default();
@@ -364,7 +384,7 @@ impl Application {
             ledger.snapshot().clone()
         };
         persist_lifetime(
-            self.context_session(),
+            self.repository_root().await,
             &snapshot.lifetime,
             snapshot.lifetime_operations,
         )
@@ -391,7 +411,7 @@ impl Application {
             crate::application::infrastructure::usage::load_lifetime(self.repository_root().await)
                 .await;
         {
-            let mut ledger = self.usage_session().ledger.lock().await;
+            let mut ledger = self.usage_session().lock();
             let snapshot = ledger.snapshot_mut();
             snapshot.lifetime = loaded.0;
             snapshot.lifetime_operations = loaded.1;
@@ -402,24 +422,37 @@ impl Application {
 }
 
 impl UsageGuard {
+    #[allow(dead_code)] // Used by the shared accounting supervisor after route migration.
+    pub(crate) fn window_id(&self) -> u64 {
+        self.window
+    }
+
+    pub fn sink(&self) -> Arc<dyn UsageSink> {
+        Arc::new(WindowUsageSink {
+            usage: self.usage.clone(),
+            window: self.window,
+        })
+    }
+
     /// Adds the usage reported by one provider call to the in-flight totals.
     ///
     /// A provider may answer with token counts only, a cost only, or nothing at
     /// all; the totals accumulate whatever was reported and stay additive
-    /// across the several calls a multi-round operation makes. A window that no
-    /// longer owns the in-flight scope records and publishes nothing, because
-    /// the totals installed under the lock belong to its successor.
+    /// across the several calls a multi-round operation makes. A late report
+    /// for a closed window records and publishes nothing.
     pub async fn observe(&self, usage: &ModelUsageInfo) {
+        let publication_gate = Arc::clone(&self.usage.publication_gate);
+        let _publication = publication_gate.lock().await;
         let applied = {
-            let mut ledger = self.usage.ledger.lock().await;
-            ledger.observe(self.window, &UsageTotals::from_usage(usage))
+            let mut ledger = self.usage.lock();
+            ledger.observe(self.window, usage)
         };
         if applied {
-            self.publish().await;
+            self.publish();
         } else {
             tracing::warn!(
                 operation_id = self.operation_id.as_str(),
-                "Usage window was already replaced; the observation is discarded",
+                "Usage window was already closed; the observation is discarded",
             );
         }
     }
@@ -442,40 +475,49 @@ impl UsageGuard {
     /// it can neither take the successor's in-flight totals nor publish them
     /// under an identifier they do not belong to.
     pub async fn flush(self) {
+        if let Err(error) = self.finish().await {
+            tracing::error!(%error, "Usage window completion failed");
+        }
+    }
+
+    /// Close once, retaining the lease through persistence and publication.
+    pub async fn finish(mut self) -> Result<UsageReceipt, String> {
         self.ticker.abort();
-        let elapsed_ms = self.started.elapsed().as_millis() as u64;
-        let folded = {
-            let mut ledger = self.usage.ledger.lock().await;
-            match ledger.close(self.window, elapsed_ms) {
-                Some(completed) => {
-                    let snapshot = ledger.snapshot_mut();
-                    snapshot.session.accumulate(&completed);
-                    snapshot.operations = snapshot.operations.saturating_add(1);
-                    snapshot.lifetime.accumulate(&completed);
-                    let operations = snapshot.lifetime_operations.saturating_add(1);
-                    snapshot.lifetime_operations = operations;
-                    snapshot.prev = completed;
-                    Some((snapshot.lifetime.clone(), operations))
-                }
-                None => None,
-            }
-        };
-        let Some((lifetime, lifetime_operations)) = folded else {
-            tracing::warn!(
-                operation_id = self.operation_id.as_str(),
-                "Usage window was already replaced; the flush folds nothing",
-            );
-            return;
-        };
-        // Attempt persistence before publication. A failed write remains best
-        // effort and does not suppress the terminal in-memory snapshot.
-        persist_lifetime(&self.context, &lifetime, lifetime_operations).await;
-        self.publish().await;
+        let ownership = self
+            .ownership
+            .take()
+            .ok_or_else(|| "usage window already finished".to_string())?;
+        let usage = self.usage.clone();
+        let root = self.root.clone();
+        let window = self.window;
+        let started = self.started;
+        let publisher = Arc::clone(&self.publisher);
+        let operation_id = self.operation_id.clone();
+        tokio::spawn(async move {
+            let publication_gate = Arc::clone(&usage.publication_gate);
+            let _publication = publication_gate.lock().await;
+            let receipt = usage
+                .lock()
+                .close(window, started.elapsed().as_millis() as u64)
+                .ok_or_else(|| "usage window ownership was lost".to_string())?;
+            // Persistence is best effort, but precedes the final publication.
+            persist_lifetime(
+                root,
+                &receipt.snapshot.lifetime,
+                receipt.snapshot.lifetime_operations,
+            )
+            .await;
+            publisher(&operation_id, &receipt.snapshot);
+            drop(ownership);
+            Ok(receipt)
+        })
+        .await
+        .map_err(|error| format!("usage completion task failed: {error}"))?
     }
 
     /// Publishes the current snapshot to the client.
-    async fn publish(&self) {
-        let snapshot = self.usage.snapshot().await;
+    fn publish(&self) {
+        let snapshot = self.usage.lock().snapshot().clone();
         (self.publisher)(&self.operation_id, &snapshot);
     }
 }
@@ -526,7 +568,7 @@ mod tests {
         let publications = Arc::new(StdMutex::new(Vec::new()));
         let observed = Arc::clone(&publications);
         let guard = app
-            .begin_usage("headless-operation", move |id, snapshot| {
+            .test_begin_usage("headless-operation", move |id, snapshot| {
                 observed
                     .lock()
                     .unwrap()
@@ -556,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloned_applications_share_window_ownership_and_discard_stale_observations() {
+    async fn cloned_applications_wait_for_completion_and_discard_late_reports() {
         let root = tempfile::tempdir().unwrap();
         let app = application(root.path());
         let peer = app.clone();
@@ -571,21 +613,29 @@ mod tests {
             })
             .await;
         stale.observe(&report(100)).await;
-        let successor = peer
-            .test_begin_usage_with_tick("current", Duration::from_secs(60), |_, _| {})
-            .await;
-        successor.observe(&report(5)).await;
-        publications.lock().unwrap().clear();
-        stale.observe(&report(200)).await;
-        stale.flush().await;
-        assert!(publications.lock().unwrap().is_empty());
-        assert_eq!(
-            app.usage_snapshot().await.operation_totals().total_tokens,
-            5
+        let late = stale.sink();
+        let waiting = tokio::spawn(async move {
+            peer.test_begin_usage_with_tick("current", Duration::from_secs(60), |_, _| {})
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a successor waits for the final publication"
         );
-        successor.flush().await;
-        assert_eq!(app.usage_snapshot().await.session.total_tokens, 5);
-        assert_eq!(app.usage_snapshot().await.operations, 1);
+        let receipt = stale.finish().await.unwrap();
+        assert_eq!(receipt.totals.total_tokens, 100);
+        assert!(receipt.cost_complete);
+        assert_eq!(receipt.snapshot.operations, 1);
+        let successor = waiting.await.unwrap();
+        let before = publications.lock().unwrap().len();
+        late.record(&report(200));
+        successor.observe(&report(5)).await;
+        let second = successor.finish().await.unwrap();
+        assert_ne!(receipt.window_id, second.window_id);
+        assert_eq!(second.snapshot.session.total_tokens, 105);
+        assert_eq!(second.snapshot.operations, 2);
+        assert_eq!(publications.lock().unwrap().len(), before);
     }
 
     #[tokio::test]
@@ -597,7 +647,7 @@ mod tests {
         let publications = Arc::new(StdMutex::new(Vec::new()));
         let observed = Arc::clone(&publications);
         let guard = app
-            .begin_usage("storage-failure", move |_, snapshot| {
+            .test_begin_usage("storage-failure", move |_, snapshot| {
                 observed.lock().unwrap().push(snapshot.clone());
             })
             .await;

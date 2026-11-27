@@ -24,10 +24,8 @@ mod repl;
 mod review;
 
 pub use context::ContextConfig;
-pub(crate) use context::DEFAULT_MAX_SCRATCHPAD_CHARS;
 #[cfg(test)]
 pub(crate) use context::{
-    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
     DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
 };
 pub use credentials::default_credentials_path;
@@ -58,6 +56,8 @@ pub use review::{ReviewConfig, ReviewGroupConfig, ReviewPreset};
 pub struct AppConfig {
     pub providers: ProvidersConfig,
     pub models: ModelsConfig,
+    /// Ceiling for the estimated complete model input, including its response schema.
+    pub request: RequestConfig,
     /// The `[repl]` section: the profile every bounded turn of this project runs
     /// under.
     ///
@@ -138,6 +138,8 @@ struct AppConfigRaw {
     providers: ProvidersConfig,
     #[serde(default)]
     models: ModelsConfigRaw,
+    #[serde(default)]
+    request: RequestConfig,
     #[serde(default, alias = "develop", alias = "edit")]
     repl: ReplConfig,
     #[serde(default)]
@@ -161,6 +163,7 @@ impl TryFrom<AppConfigRaw> for AppConfig {
         let AppConfigRaw {
             providers,
             models,
+            request,
             repl,
             project,
             context,
@@ -176,6 +179,7 @@ impl TryFrom<AppConfigRaw> for AppConfig {
                 &providers.catalog().cloned().collect::<Vec<_>>(),
             )?,
             providers,
+            request,
             repl,
             project,
             context,
@@ -187,6 +191,25 @@ impl TryFrom<AppConfigRaw> for AppConfig {
             explicit_credentials_path: None,
             config_error: None,
         })
+    }
+}
+
+/// One user-configurable ceiling for the complete input to a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestConfig {
+    #[serde(default = "default_max_input_tokens")]
+    pub max_input_tokens: usize,
+}
+
+fn default_max_input_tokens() -> usize {
+    1_000_000
+}
+
+impl Default for RequestConfig {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: default_max_input_tokens(),
+        }
     }
 }
 
@@ -330,6 +353,9 @@ impl AppConfig {
     /// configuration is rejected as a whole instead of degrading silently.
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.models.validate()?;
+        if self.history.budget_tokens == 0 {
+            return Err("[history] budget_tokens must be greater than zero".into());
+        }
         self.project
             .validate()
             .map_err(|err| format!("[project] {}", err))?;
@@ -502,7 +528,6 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::context::DEFAULT_TOKEN_BUDGET;
     use crate::review::PostAnalysisMode;
     use crate::workflow::WorkflowKind;
     #[test]
@@ -741,8 +766,8 @@ files = ["docs/TUI.md"]
     #[test]
     fn test_history_config_defaults_and_override() {
         let default_cfg = HistoryConfig::default();
-        assert_eq!(default_cfg.budget_tokens, 20_000);
         assert_eq!(default_cfg.tail_turns, 10);
+        assert_eq!(default_cfg.budget_tokens, 20_000);
 
         let toml_str = r#"
 [history]
@@ -750,21 +775,23 @@ budget_tokens = 45000
 tail_turns = 7
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.history.budget_tokens, 45_000);
         assert_eq!(config.history.tail_turns, 7);
-    }
+        assert_eq!(config.history.budget_tokens, 45_000);
+        assert!(toml::to_string(&config.history)
+            .unwrap()
+            .contains("budget_tokens = 45000"));
 
-    #[test]
-    fn test_repomap_budget_config() {
-        let default_cfg = ContextConfig::default();
-        assert_eq!(default_cfg.repomap_token_budget, 4000);
-
-        let toml_str = r#"
-[context]
-repomap_token_budget = 6000
-"#;
-        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.context.repomap_token_budget, 6000);
+        let absent: AppConfig = toml::from_str("[history]\ntail_turns = 2\n").unwrap();
+        assert_eq!(absent.history.budget_tokens, 20_000);
+        let minimum: AppConfig =
+            toml::from_str("[models]\nrepl = ['openrouter:a/b']\n[history]\nbudget_tokens = 1\n")
+                .unwrap();
+        assert!(minimum.validate().is_ok());
+        let zero: AppConfig =
+            toml::from_str("[models]\nrepl = ['openrouter:a/b']\n[history]\nbudget_tokens = 0\n")
+                .unwrap();
+        assert!(zero.validate().unwrap_err().contains("[history]"));
+        assert!(toml::from_str::<AppConfig>("[history]\nbudget_tokens = -1\n").is_err());
     }
 
     #[test]
@@ -799,43 +826,30 @@ repomap_token_budget = 6000
 token_budget = 150000
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.context.token_budget, 150000);
-
-        let default_cfg = ContextConfig::default();
-        assert_eq!(default_cfg.token_budget, 300_000);
+        assert_eq!(
+            config.request.max_input_tokens,
+            RequestConfig::default().max_input_tokens
+        );
+        assert!(!toml::to_string(&config.context)
+            .unwrap()
+            .contains("token_budget"));
     }
 
     #[test]
     fn test_research_and_feedback_limits_defaults_and_overrides() {
-        // Every operational cap that shapes model context carries a documented
-        // default, so an omitted key never silently disables the bound.
+        // Only operation counts remain configurable; retired size keys are ignored.
         let defaults = ContextConfig::default();
         assert_eq!(
             defaults.max_search_requests_per_round,
             DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
         );
         assert_eq!(
-            defaults.max_matched_files_per_search,
-            DEFAULT_MAX_MATCHED_FILES_PER_SEARCH
-        );
-        assert_eq!(defaults.max_dir_list_entries, DEFAULT_MAX_DIR_LIST_ENTRIES);
-        assert_eq!(
             defaults.max_repo_map_requests_per_round,
             DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND
         );
-        assert_eq!(defaults.max_feedback_chars, DEFAULT_MAX_FEEDBACK_CHARS);
-        assert_eq!(defaults.max_scratchpad_chars, DEFAULT_MAX_SCRATCHPAD_CHARS);
-        assert_eq!(defaults.token_budget, DEFAULT_TOKEN_BUDGET);
         assert_eq!(defaults.max_search_requests_per_round, 5);
-        assert_eq!(defaults.max_matched_files_per_search, 50);
-        assert_eq!(defaults.max_dir_list_entries, 100);
         assert_eq!(defaults.max_repo_map_requests_per_round, 3);
-        assert_eq!(defaults.max_feedback_chars, 4_000);
-        assert_eq!(defaults.max_scratchpad_chars, 4_000);
-        assert_eq!(defaults.token_budget, 300_000);
 
-        // A project that routinely needs wider searches, larger listings, or
-        // roomier tool-output reporting raises the ceilings in `tauqe.toml`.
         let overridden: AppConfig = toml::from_str(
             r#"
 [context]
@@ -849,21 +863,22 @@ max_scratchpad_chars = 1500
         )
         .expect("parse config");
         assert_eq!(overridden.context.max_search_requests_per_round, 9);
-        assert_eq!(overridden.context.max_matched_files_per_search, 12);
-        assert_eq!(overridden.context.max_dir_list_entries, 40);
         assert_eq!(overridden.context.max_repo_map_requests_per_round, 1);
-        assert_eq!(overridden.context.max_feedback_chars, 800);
-        assert_eq!(overridden.context.max_scratchpad_chars, 1500);
+        assert_eq!(
+            overridden.request.max_input_tokens,
+            RequestConfig::default().max_input_tokens
+        );
 
-        // A partially declared section keeps the defaults of omitted keys.
         let partial: AppConfig =
             toml::from_str("[context]\nmax_dir_list_entries = 7\n").expect("parse config");
-        assert_eq!(partial.context.max_dir_list_entries, 7);
         assert_eq!(
             partial.context.max_search_requests_per_round,
             DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
         );
-        assert_eq!(partial.context.token_budget, DEFAULT_TOKEN_BUDGET);
+        assert_eq!(
+            partial.request.max_input_tokens,
+            RequestConfig::default().max_input_tokens
+        );
     }
 
     #[test]
@@ -953,12 +968,24 @@ repl = ["anthropc:claude"]
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
+        assert_eq!(config.request.max_input_tokens, 1_000_000);
         assert_eq!(
             config.active_model(),
             ModelRef::openrouter(BUILTIN_DEFAULT_REPL_MODEL)
         );
         assert_eq!(config.repl.workflow, WorkflowKind::Git);
         assert_eq!(config.repl.max_turn_rounds, DEFAULT_MAX_TURN_ROUNDS);
+    }
+
+    #[test]
+    fn test_request_limit_is_independent_of_legacy_context_limits() {
+        let config: AppConfig =
+            toml::from_str("[request]\nmax_input_tokens = 42\n[context]\ntoken_budget = 7\n")
+                .unwrap();
+        assert_eq!(config.request.max_input_tokens, 42);
+        assert!(!toml::to_string(&config.context)
+            .unwrap()
+            .contains("token_budget"));
     }
 
     #[test]
@@ -1569,10 +1596,13 @@ paths = ["crates/core/src"]
             "got: {:?}",
             config.config_error
         );
-        // The base document keeps its own key ...
-        assert_eq!(config.context.repomap_token_budget, 6000);
-        // ... and the module contributes the key it owns.
-        assert_eq!(config.context.token_budget, 99999);
+        assert_eq!(
+            config.request.max_input_tokens,
+            RequestConfig::default().max_input_tokens
+        );
+        assert!(!toml::to_string(&config.context)
+            .unwrap()
+            .contains("token_budget"));
     }
 
     #[test]
@@ -1665,8 +1695,7 @@ paths = ["crates/core/src"]
 
         let cfg = load_context_config(dir.path());
 
-        assert_eq!(cfg.repomap_token_budget, 6000);
-        assert_eq!(cfg.token_budget, 99999);
+        assert!(!toml::to_string(&cfg).unwrap().contains("token_budget"));
     }
 
     #[test]
@@ -1692,7 +1721,10 @@ paths = ["crates/core/src"]
         // The explicit document anchors the configuration ...
         assert_eq!(config.active_model(), ModelRef::openrouter("c/d"));
         // ... while the module directory stays the one of the repository.
-        assert_eq!(config.context.token_budget, 111111);
+        assert_eq!(
+            config.request.max_input_tokens,
+            RequestConfig::default().max_input_tokens
+        );
     }
 
     #[test]

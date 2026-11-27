@@ -28,4 +28,4 @@ pub use change_set::{
     StagedEditsState,
 };
 pub use error::EditError;
-pub use format::prepare_edit_batches;
+pub use format::{prepare_edit_batches, prepare_edit_batches_with_operations};

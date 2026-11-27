@@ -20,6 +20,9 @@ fn document_error(
         DocumentError::InvalidPlanId => errors::INVALID_PLAN_ID,
         DocumentError::InvalidPlanTree(_) => errors::INVALID_PLAN_TREE,
         DocumentError::MissingReviewId => errors::INVALID_PARAMS,
+        DocumentError::InvalidReviewGroupStepAddress => errors::INVALID_PARAMS,
+        DocumentError::ReviewGroupStepNotFound(_) => errors::NOT_FOUND,
+        DocumentError::ReviewGroupStepRejected(_) => fallback,
         DocumentError::Busy => errors::OPERATION_IN_PROGRESS,
         DocumentError::Storage(_) => fallback,
     };

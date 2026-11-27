@@ -1,23 +1,31 @@
 //! Headless Architect task lifecycle, context merge, and usage accounting.
+pub(crate) mod refinement;
 mod synthesis;
 
 use self::synthesis::run_architect_synthesis;
-use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard, UsageGuard};
+use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
 use crate::application::context::ContextSession;
-use crate::application::usage::UsageSession;
+use crate::application::usage_totals::UsageReceipt;
 use crate::application::{ExecutionSession, PlanExecutionEnvironment};
 use std::sync::Arc;
 use tauqe_core::context::ContextManager;
+use tauqe_core::execution::task::{self, TaskOutcome};
 use tauqe_core::models::ArchitectTier;
-use tauqe_core::plan::prompt::StructuredRefineOutcome;
+use tauqe_core::plan::find_duplicate_item_ids;
+use tauqe_core::plan::prompt::{
+    AbortReport, PlanRefinementOutput, StructuredRefineOutcome, StructuredRefineStatus,
+};
 use tauqe_core::providers::StreamEvent;
-use tokio::sync::{mpsc, watch};
+use tauqe_core::stop::HardCancellation;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Default)]
 pub struct ContourRelaySummary {
     pub assistant_text: String,
     pub cancelled: bool,
     pub error: Option<String>,
+    pub terminal_stream_published: bool,
+    pub(crate) receipt: Option<UsageReceipt>,
 }
 
 pub struct PlanHorizonContour {
@@ -27,7 +35,92 @@ pub struct PlanHorizonContour {
     pub scope: ArchitectScope,
     pub tier: ArchitectTier,
     pub intro_header: String,
-    pub budget_hint: String,
+}
+
+/// Research retained only for the lifetime of the owning operation.
+pub(crate) struct ArchitectResearchState {
+    pub(crate) context: ContextManager,
+    pub(crate) execution: crate::application::ArchitectResearchExecution,
+}
+
+impl std::fmt::Debug for ArchitectResearchState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArchitectResearchState { research: <private> }")
+    }
+}
+
+pub(crate) enum HorizonVerdict {
+    Synthesized {
+        output: PlanRefinementOutput,
+        tier: ArchitectTier,
+    },
+    Blocked {
+        reason: String,
+        tier: ArchitectTier,
+    },
+    Aborted {
+        report: AbortReport,
+        tier: ArchitectTier,
+    },
+    EmptyHorizon {
+        tier: ArchitectTier,
+    },
+    InvalidTree {
+        duplicate: String,
+        tier: ArchitectTier,
+    },
+    Cancelled,
+    Failed(String),
+}
+
+/// Admit a contour's horizon once, independently of the caller's persistence policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_horizon_wave(
+    resources: &ExecutionSession,
+    shared_context: &ContextSession,
+    operation: &OperationGuard,
+    environment: &PlanExecutionEnvironment,
+    work: PlanHorizonContour,
+    observer: Arc<dyn ApplicationObserver>,
+) -> (HorizonVerdict, ContourRelaySummary) {
+    let (result, summary) = run_contour(
+        resources,
+        shared_context,
+        operation,
+        environment,
+        work,
+        observer.clone(),
+    )
+    .await;
+    let _ = shared_context.clear_transient_context().await;
+    let verdict = match result {
+        _ if summary.cancelled || operation.hard_cancellation().is_cancelled() => {
+            HorizonVerdict::Cancelled
+        }
+        Err(error) => {
+            HorizonVerdict::Failed(summary.error.clone().unwrap_or_else(|| error.to_string()))
+        }
+        Ok(StructuredRefineOutcome {
+            output,
+            tier,
+            status,
+        }) => match status {
+            StructuredRefineStatus::Cancelled => HorizonVerdict::Cancelled,
+            StructuredRefineStatus::Blocked { reason } => HorizonVerdict::Blocked { reason, tier },
+            StructuredRefineStatus::Aborted(report) => HorizonVerdict::Aborted { report, tier },
+            StructuredRefineStatus::Synthesized => match output {
+                Some(output) if !output.items.is_empty() => {
+                    if let Some(duplicate) = find_duplicate_item_ids(&output.items) {
+                        HorizonVerdict::InvalidTree { duplicate, tier }
+                    } else {
+                        HorizonVerdict::Synthesized { output, tier }
+                    }
+                }
+                _ => HorizonVerdict::EmptyHorizon { tier },
+            },
+        },
+    };
+    (verdict, summary)
 }
 
 /// Identity of the plan or review audit whose Architect prefix is warmed.
@@ -38,41 +131,103 @@ pub enum ArchitectScope {
 }
 
 const CONTOUR_EVENT_CAPACITY: usize = 256;
-/// Consumes the engine stream and accounts one synthesis across all its rounds.
+/// Relays the engine stream without owning the accounting window.
 async fn relay_architect_events(
     observer: Arc<dyn ApplicationObserver>,
     op_id: String,
-    usage: UsageGuard,
     mut events_rx: mpsc::Receiver<StreamEvent>,
-    mut cancel: watch::Receiver<bool>,
+    cancel: HardCancellation,
 ) -> ContourRelaySummary {
     let mut summary = ContourRelaySummary::default();
     while let Some(event) = events_rx.recv().await {
-        observer.ready(&event, &mut cancel).await;
+        observer.ready(&event, &cancel).await;
         match &event {
             StreamEvent::TextDelta(delta) => summary.assistant_text.push_str(delta),
             StreamEvent::ResetStream => summary.assistant_text.clear(),
-            StreamEvent::Usage(reported) => usage.observe(reported).await,
-            StreamEvent::Cancelled => summary.cancelled = true,
-            StreamEvent::Error(message) => summary.error = Some(message.clone()),
+            StreamEvent::Cancelled => {
+                summary.cancelled = true;
+                summary.terminal_stream_published = true;
+            }
+            StreamEvent::Error(message) => {
+                summary.error = Some(message.clone());
+                summary.terminal_stream_published = true;
+            }
             StreamEvent::Done => break,
             _ => {}
         }
         observer.publish(&op_id, ApplicationEvent::Stream(event));
     }
-    usage.flush().await;
     summary
 }
 /// Run a read-only synthesis under the caller's admitted operation and frozen configuration.
 pub(crate) async fn run_contour(
     resources: &ExecutionSession,
     shared_context: &ContextSession,
-    usage_session: &UsageSession,
     operation: &OperationGuard,
     environment: &PlanExecutionEnvironment,
     work: PlanHorizonContour,
     observer: Arc<dyn ApplicationObserver>,
 ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
+    let (result, summary, mut state) = run_contour_with_state_inner(
+        resources,
+        shared_context,
+        operation,
+        environment,
+        work,
+        observer.clone(),
+        None,
+        true,
+    )
+    .await;
+    if let Some(state) = state.as_mut() {
+        tauqe_core::blocking::run_blocking(|| state.context.clear_transient());
+    }
+    (result, summary)
+}
+
+/// Return the detached state only after the worker and accounting have drained.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_contour_with_state(
+    resources: &ExecutionSession,
+    shared_context: &ContextSession,
+    operation: &OperationGuard,
+    environment: &PlanExecutionEnvironment,
+    work: PlanHorizonContour,
+    observer: Arc<dyn ApplicationObserver>,
+    previous: Option<ArchitectResearchState>,
+) -> (
+    anyhow::Result<StructuredRefineOutcome>,
+    ContourRelaySummary,
+    Option<ArchitectResearchState>,
+) {
+    run_contour_with_state_inner(
+        resources,
+        shared_context,
+        operation,
+        environment,
+        work,
+        observer,
+        previous,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_contour_with_state_inner(
+    resources: &ExecutionSession,
+    shared_context: &ContextSession,
+    operation: &OperationGuard,
+    environment: &PlanExecutionEnvironment,
+    work: PlanHorizonContour,
+    observer: Arc<dyn ApplicationObserver>,
+    previous: Option<ArchitectResearchState>,
+    cleanup_shared: bool,
+) -> (
+    anyhow::Result<StructuredRefineOutcome>,
+    ContourRelaySummary,
+    Option<ArchitectResearchState>,
+) {
     if !resources.owns(operation) {
         let message =
             "Architect synthesis requires an active operation for this session".to_string();
@@ -82,6 +237,7 @@ pub(crate) async fn run_contour(
                 error: Some(message),
                 ..Default::default()
             },
+            previous,
         );
     }
     let PlanHorizonContour {
@@ -91,90 +247,184 @@ pub(crate) async fn run_contour(
         scope,
         tier,
         intro_header,
-        budget_hint,
     } = work;
     let op_id = operation_id.as_str();
     let repo_root = context.repo_root().to_path_buf();
-    let execution = match environment
-        .for_architect_research(resources, operation, &tier, &scope)
-        .await
-    {
-        Ok(execution) => execution,
-        Err(err) => {
-            observer.publish(
-                op_id,
-                ApplicationEvent::Stream(StreamEvent::Error(err.to_string())),
-            );
-            return (
-                Err(anyhow::anyhow!(err.to_string())),
-                ContourRelaySummary {
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
-            );
-        }
+    let continuing = previous.is_some();
+    let mut state = if let Some(state) = previous {
+        state
+    } else {
+        let execution = match environment
+            .for_architect_research(resources, operation, &tier, &scope, &repo_root)
+            .await
+        {
+            Ok(execution) => execution,
+            Err(err) => {
+                observer.publish(
+                    op_id,
+                    ApplicationEvent::Stream(StreamEvent::Error(err.to_string())),
+                );
+                return (
+                    Err(anyhow::anyhow!(err.to_string())),
+                    ContourRelaySummary {
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    },
+                    None,
+                );
+            }
+        };
+        ArchitectResearchState { context, execution }
     };
+    if state.context.repo_root() != repo_root {
+        return (
+            Err(anyhow::anyhow!(
+                "Architect research belongs to another repository"
+            )),
+            ContourRelaySummary::default(),
+            Some(state),
+        );
+    }
+    let Some(listener) = shared_context.activate_research_publication(
+        operation,
+        operation_id.clone(),
+        observer.clone(),
+        &state.context,
+    ) else {
+        let message = "Could not bind architect context publication".to_string();
+        return (
+            Err(anyhow::anyhow!(message.clone())),
+            ContourRelaySummary {
+                error: Some(message),
+                ..Default::default()
+            },
+            Some(state),
+        );
+    };
+    state.context.set_listener(Some(listener));
     let (events_tx, events_rx) = mpsc::channel::<StreamEvent>(CONTOUR_EVENT_CAPACITY);
-    let cancel_rx = operation.cancel_receiver();
     // The relay waits out a client that stopped reading, so it shares the very
     // signal that interrupts the synthesis it relays.
-    let relay_cancel = cancel_rx.clone();
+    let relay_cancel = operation.hard_cancellation();
+    let synthesis_cancel = operation.hard_cancellation();
 
-    // The usage window wraps the whole synthesis, so every round and every tier
-    // it climbs report into the same accounting window under the identifier the
-    // surrounding operation already announced. The relay closes it.
-    let publisher = observer.clone();
-    let usage = usage_session
-        .begin(shared_context, op_id, move |id, snapshot| {
-            publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
-        })
-        .await;
+    // All research rounds and tier changes retain the same request-bound scope.
+    let scope = resources.prepare_scope();
+    let binding = if continuing {
+        state.execution.rebind_usage(scope.binding())
+    } else {
+        state.execution.bind_usage(scope.binding())
+    };
+    if let Err(error) = binding {
+        let message = error.to_string();
+        state.context.set_listener(None);
+        shared_context.close_research_publication(operation.id());
+        return (
+            Err(anyhow::anyhow!(message.clone())),
+            ContourRelaySummary {
+                error: Some(message),
+                ..Default::default()
+            },
+            Some(state),
+        );
+    }
     let relay = tokio::spawn(relay_architect_events(
         observer.clone(),
         op_id.to_string(),
-        usage,
         events_rx,
         relay_cancel,
     ));
 
-    let contour = tokio::spawn(async move {
-        let mut contour_context = context;
-        let result = run_architect_synthesis(
-            execution,
-            &mut contour_context,
-            &task,
-            &repo_root,
-            tier,
-            &intro_header,
-            &budget_hint,
-            events_tx,
-            cancel_rx,
-        )
-        .await;
-        (contour_context, result)
-    });
-    // A hard cancel reaches the task that really runs, not just the future that
-    // waits for it, so the abort handle is installed for the whole synthesis and
-    // dropped the moment the contour settles.
-    operation.set_abort_handle(contour.abort_handle());
-    let joined = contour.await;
+    let context_session = shared_context.clone();
+    let publication_operation = operation.id();
+    let context_op_id = op_id.to_string();
+    let publisher = observer.clone();
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
+    let supervised = scope.run(
+        shared_context,
+        op_id.to_string(),
+        move |id, snapshot| publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone())),
+        async move {
+            let result = run_architect_synthesis(
+                &mut state,
+                &task,
+                &repo_root,
+                tier,
+                &intro_header,
+                events_tx,
+                synthesis_cancel,
+            )
+            .await;
+            (state, result)
+        },
+        move |handle| {
+            let _ = handle_tx.send(handle);
+        },
+        move |joined| async move {
+            if let TaskOutcome::Completed((state, _)) = &joined {
+                match context_session
+                    .merge_turn_context(state.context.clone())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        operation_id = context_op_id,
+                        error = %error,
+                        "Failed to merge the architect context back into the shared state"
+                    ),
+                }
+            }
+            if cleanup_shared {
+                if let Err(error) = context_session.clear_transient_context().await {
+                    tracing::warn!(error = %error, "Failed to clear architect transient context");
+                }
+            }
+            context_session.close_research_publication(publication_operation);
+            joined
+        },
+    );
+    tokio::pin!(supervised);
+    let joined = tokio::select! {
+        result = &mut supervised => result,
+        handle = handle_rx => {
+            if let Ok(handle) = handle {
+                operation.set_abort_handle(handle);
+            }
+            supervised.await
+        }
+    };
     operation.clear_abort_handle();
 
-    let summary = match relay.await {
-        Ok(summary) => summary,
-        Err(join_error) => {
+    let mut summary = match task::join(relay).await {
+        TaskOutcome::Completed(summary) => summary,
+        other => {
             tracing::warn!(
                 operation_id = op_id,
-                error = %join_error,
+                error = ?other,
                 "Architect telemetry relay terminated unexpectedly"
             );
-            ContourRelaySummary::default()
+            ContourRelaySummary {
+                error: Some(format!(
+                    "Architect telemetry relay terminated unexpectedly: {other:?}"
+                )),
+                ..Default::default()
+            }
         }
     };
 
-    let (contour_context, outcome) = match joined {
-        Ok(joined) => joined,
-        Err(join_error) => {
+    let joined = match joined {
+        Ok((joined, receipt)) => {
+            summary.receipt = Some(receipt);
+            joined
+        }
+        Err(error) => return (Err(anyhow::anyhow!(error)), summary, None),
+    };
+    let (state, outcome) = match joined {
+        TaskOutcome::Completed((mut state, outcome)) => {
+            state.context.set_listener(None);
+            (Some(state), outcome)
+        }
+        other => {
             // A contour that ignored the cooperative signal is force-aborted through
             // the operation slot, so its relayed `Cancelled` event never arrives and
             // the summary alone would classify the dead task as a provider failure.
@@ -182,41 +432,28 @@ pub(crate) async fn run_contour(
             // cancel surfaces as a cancellation, while a task that died without it
             // keeps its failure classification.
             let mut summary = summary;
-            if *operation.cancel_receiver().borrow() {
+            if operation.hard_cancellation().is_cancelled() {
                 tracing::warn!(
                     operation_id = op_id,
-                    error = %join_error,
+                    error = ?other,
                     "Architect contour terminated while the operation was cancelled"
                 );
                 summary.cancelled = true;
             }
             return (
                 Err(anyhow::anyhow!(
-                    "The architect synthesis task terminated unexpectedly: {join_error}"
+                    "The architect synthesis task terminated unexpectedly: {other:?}"
                 )),
                 summary,
+                None,
             );
         }
     };
 
-    // The synthesis owns the auto context layer it widened: the material is the
-    // Architect's investigation rather than the developer's dialogue, so it is
-    // never kept. Everything the contour observed — the files research added
-    // and the restored layers — is merged back so a partial run keeps the work
-    // that was already paid for.
-    let merged = shared_context.merge_turn_context(contour_context).await;
-    match merged {
-        Ok(ctx_state) => observer.publish(op_id, ApplicationEvent::Context(ctx_state)),
-        Err(err) => {
-            tracing::warn!(
-                operation_id = op_id,
-                error = %err,
-                "Failed to merge the architect context back into the shared state"
-            );
-        }
+    if let Some(error) = &summary.error {
+        return (Err(anyhow::anyhow!(error.clone())), summary, state);
     }
-
-    (outcome, summary)
+    (outcome, summary, state)
 }
 
 pub(crate) fn publish_architect_started(
@@ -239,13 +476,43 @@ pub(crate) fn publish_architect_started(
     );
 }
 
+/// Finish a horizon publication without repeating a terminal stream event.
+pub(crate) fn publish_horizon_terminal(
+    observer: &dyn ApplicationObserver,
+    id: &str,
+    verdict: &HorizonVerdict,
+    summary: &ContourRelaySummary,
+) {
+    match verdict {
+        HorizonVerdict::Cancelled if !summary.terminal_stream_published => {
+            observer.publish(id, ApplicationEvent::Stream(StreamEvent::Cancelled));
+        }
+        HorizonVerdict::Failed(reason) if !summary.terminal_stream_published => {
+            observer.publish(
+                id,
+                ApplicationEvent::Stream(StreamEvent::Error(reason.clone())),
+            );
+        }
+        HorizonVerdict::Cancelled | HorizonVerdict::Failed(_) => {}
+        _ => observer.publish(
+            id,
+            ApplicationEvent::Finished(summary.assistant_text.clone()),
+        ),
+    }
+    if let Some(receipt) = &summary.receipt {
+        observer.publish(id, ApplicationEvent::Usage(receipt.snapshot.clone()));
+    }
+}
+
 #[cfg(feature = "test-support")]
 pub async fn test_relay_architect_events(
     observer: Arc<dyn ApplicationObserver>,
     op_id: String,
-    usage: UsageGuard,
     events: mpsc::Receiver<StreamEvent>,
-    cancel: watch::Receiver<bool>,
+    cancel: HardCancellation,
 ) -> ContourRelaySummary {
-    relay_architect_events(observer, op_id, usage, events, cancel).await
+    relay_architect_events(observer, op_id, events, cancel).await
 }
+
+#[cfg(test)]
+mod context_tests;

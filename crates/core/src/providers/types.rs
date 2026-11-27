@@ -107,9 +107,6 @@ pub enum StreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
 
-    // Context streaming events
-    ContextChanged(crate::context::ContextState),
-
     // Semantic edit streaming events
     EditStarted,
     EditFileStarted {
@@ -196,6 +193,7 @@ pub enum StreamEvent {
     /// The stream broke after partial output, so accumulated deltas are void.
     ResetStream,
 
+    /// Incremental usage for this provider attempt, not a cumulative snapshot.
     Usage(ModelUsageInfo),
     Done,
     Cancelled,

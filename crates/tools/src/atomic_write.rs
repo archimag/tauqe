@@ -60,6 +60,7 @@
 //! durability barrier a plan, review, or history write does.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -590,7 +591,19 @@ impl SiblingCommit {
     pub fn stage(target: &Path, content: &[u8]) -> std::io::Result<Self> {
         reject_directory_target(target)?;
         let staged = unique_sibling_path(target, STAGING_TEMP_MARKER);
-        stage_bytes(&staged, content)?;
+        if let Err(error) = stage_bytes(&staged, content) {
+            match std::fs::remove_file(&staged) {
+                Ok(()) => return Err(error),
+                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(error);
+                }
+                Err(cleanup) => {
+                    return Err(std::io::Error::other(format!(
+                        "staging failed: {error}; staging cleanup failed: {cleanup}"
+                    )));
+                }
+            }
+        }
         // Carry the original's permissions over to the staged content so a
         // write never silently widens or narrows access.
         preserve_permissions_of(&staged, target);
@@ -654,20 +667,50 @@ impl SiblingCommit {
     /// sync it after their own renames. A barrier that cannot run leaves the
     /// restored working tree in place, because a rollback reports no state.
     pub fn rollback(&self) {
+        let _ = self.rollback_checked();
+    }
+
+    /// Restore this change, reporting failures of both cleanup and durability.
+    pub fn rollback_checked(&self) -> std::io::Result<()> {
         let mut mutated = false;
+        let mut target_removed = !self.published;
+        let mut failures = Vec::new();
         if let Some(staged) = &self.staged {
-            if self.published && std::fs::remove_file(&self.target).is_ok() {
-                mutated = true;
+            if self.published {
+                match std::fs::remove_file(&self.target) {
+                    Ok(()) => {
+                        mutated = true;
+                        target_removed = true;
+                    }
+                    Err(error) => failures.push(format!("remove target: {error}")),
+                }
             }
-            if std::fs::remove_file(staged).is_ok() {
-                mutated = true;
+            match std::fs::remove_file(staged) {
+                Ok(()) => mutated = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.published => {}
+                Err(error) => failures.push(format!("remove staging: {error}")),
             }
         }
-        if self.original_moved && std::fs::rename(&self.backup, &self.target).is_ok() {
-            mutated = true;
+        if self.original_moved {
+            // Never overwrite a published target whose removal failed.
+            if !target_removed {
+                failures.push("cannot restore backup over published target".into());
+            } else {
+                match std::fs::rename(&self.backup, &self.target) {
+                    Ok(()) => mutated = true,
+                    Err(error) => failures.push(format!("restore backup: {error}")),
+                }
+            }
         }
         if mutated {
-            let _ = sync_parent_directory(&self.target);
+            if let Err(error) = sync_parent_directory(&self.target) {
+                failures.push(format!("sync directory: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(failures.join("; ")))
         }
     }
 
@@ -683,6 +726,16 @@ impl SiblingCommit {
         }
     }
 
+    /// Checked cleanup for a staged change that was never committed.
+    pub fn discard_staged_content_checked(&self) -> std::io::Result<()> {
+        if let Some(staged) = &self.staged {
+            std::fs::remove_file(staged)?;
+            sync_parent_directory(staged)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Drops the backup once the whole change set is committed.
     pub fn finish(self) {
         if self.original_moved {
@@ -692,13 +745,104 @@ impl SiblingCommit {
     }
 }
 
+/// A reversible set of sibling replacements. This protects ordinary failures
+/// and cancellation, not crashes between independent file renames.
+#[derive(Default)]
+pub struct SiblingBatch {
+    replacements: BTreeMap<PathBuf, Option<Vec<u8>>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BatchError {
+    #[error("file batch cancelled before acceptance")]
+    Cancelled,
+    #[error("file batch failed: {0}")]
+    Failed(String),
+    #[error("file batch failed: {cause}; recovery failed: {recovery}")]
+    Recovery { cause: String, recovery: String },
+}
+
+impl SiblingBatch {
+    /// Repeated changes of a path collapse to its final bytes.
+    pub fn replace(&mut self, path: PathBuf, bytes: Option<Vec<u8>>) {
+        self.replacements.insert(path, bytes);
+    }
+
+    /// `stop` checks between disk operations; `accept` is the final ordered
+    /// cancellation decision, after which a late stop cannot undo the result.
+    pub fn apply(
+        self,
+        mut stop: impl FnMut() -> bool,
+        mut accept: impl FnMut() -> bool,
+    ) -> Result<(), BatchError> {
+        let mut changes = Vec::new();
+        if stop() {
+            return Err(BatchError::Cancelled);
+        }
+        for (path, bytes) in self.replacements {
+            if stop() {
+                return Err(recover_batch(&changes, true, "cancelled"));
+            }
+            let change = match bytes {
+                Some(bytes) => SiblingCommit::stage(&path, &bytes),
+                None => SiblingCommit::removal(&path),
+            };
+            match change {
+                Ok(change) => changes.push(change),
+                Err(error) => return Err(recover_batch(&changes, false, &error.to_string())),
+            }
+        }
+        if stop() {
+            return Err(recover_batch(&changes, true, "cancelled"));
+        }
+        for index in 0..changes.len() {
+            if stop() {
+                return Err(recover_batch(&changes, true, "cancelled"));
+            }
+            if let Err(error) = changes[index].commit() {
+                return Err(recover_batch(&changes, false, &error.to_string()));
+            }
+        }
+        if !accept() {
+            return Err(recover_batch(&changes, true, "cancelled"));
+        }
+        for change in changes {
+            change.finish();
+        }
+        Ok(())
+    }
+}
+
+fn recover_batch(changes: &[SiblingCommit], cancelled: bool, cause: &str) -> BatchError {
+    let failures: Vec<_> = changes
+        .iter()
+        .rev()
+        .filter_map(|change| {
+            change
+                .rollback_checked()
+                .err()
+                .map(|error| format!("{}: {error}", change.target.display()))
+        })
+        .collect();
+    if !failures.is_empty() {
+        BatchError::Recovery {
+            cause: cause.into(),
+            recovery: failures.join("; "),
+        }
+    } else if cancelled {
+        BatchError::Cancelled
+    } else {
+        BatchError::Failed(cause.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         create_dir_all_durable, is_process_alive, move_without_replace, remove_atomic,
         staging_backup_original_name, staging_backup_sibling, staging_path,
-        staging_temp_original_name, staging_temp_sibling, write_atomic, NoReplaceMove,
-        SiblingCommit,
+        staging_temp_original_name, staging_temp_sibling, write_atomic, BatchError, NoReplaceMove,
+        SiblingBatch, SiblingCommit,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -714,6 +858,91 @@ mod tests {
                     || staging_backup_original_name(name).is_some()
             })
             .collect()
+    }
+
+    #[test]
+    fn cancelling_after_first_replacement_restores_every_target() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("a.json");
+        let second = dir.path().join("b.json");
+        std::fs::write(&first, b"original").unwrap();
+        let mut batch = SiblingBatch::default();
+        batch.replace(first.clone(), Some(b"updated".to_vec()));
+        batch.replace(second.clone(), Some(b"new".to_vec()));
+
+        let result = batch.apply(
+            || std::fs::read(&first).is_ok_and(|bytes| bytes == b"updated"),
+            || true,
+        );
+        assert!(matches!(result, Err(BatchError::Cancelled)), "{result:?}");
+        assert_eq!(std::fs::read(&first).unwrap(), b"original");
+        assert!(!second.exists());
+        assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_second_stage_discards_first_stage_without_publishing() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("a.json");
+        let second = dir.path().join("b.json");
+        std::fs::write(&first, b"original").unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let mut batch = SiblingBatch::default();
+        batch.replace(first.clone(), Some(b"updated".to_vec()));
+        batch.replace(second.clone(), Some(b"new".to_vec()));
+
+        assert!(matches!(
+            batch.apply(|| false, || true),
+            Err(BatchError::Failed(_))
+        ));
+        assert_eq!(std::fs::read(&first).unwrap(), b"original");
+        assert!(second.is_dir());
+        assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn cancellation_at_final_acceptance_restores_documents_and_marker() {
+        let dir = tempdir().unwrap();
+        let document = dir.path().join("a.json");
+        let marker = dir.path().join("active");
+        std::fs::write(&document, b"original").unwrap();
+        std::fs::write(&marker, b"old").unwrap();
+        let mut batch = SiblingBatch::default();
+        batch.replace(document.clone(), Some(b"updated".to_vec()));
+        batch.replace(marker.clone(), Some(b"new".to_vec()));
+        let result = batch.apply(|| false, || false);
+        assert!(matches!(result, Err(BatchError::Cancelled)), "{result:?}");
+        assert_eq!(std::fs::read(document).unwrap(), b"original");
+        assert_eq!(std::fs::read(marker).unwrap(), b"old");
+        assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_recovery_is_reported_instead_of_claiming_cancellation() {
+        let dir = tempdir().unwrap();
+        let document = dir.path().join("a.json");
+        let marker = dir.path().join("active");
+        std::fs::write(&document, b"original").unwrap();
+        let mut batch = SiblingBatch::default();
+        batch.replace(document.clone(), Some(b"updated".to_vec()));
+        batch.replace(marker, Some(b"new".to_vec()));
+        let result = batch.apply(
+            || {
+                if std::fs::read(&document).is_ok_and(|bytes| bytes == b"updated") {
+                    std::fs::remove_file(&document).unwrap();
+                    std::fs::create_dir(&document).unwrap();
+                    true
+                } else {
+                    false
+                }
+            },
+            || true,
+        );
+        assert!(
+            matches!(result, Err(BatchError::Recovery { .. })),
+            "{result:?}"
+        );
+        assert!(document.is_dir());
     }
 
     #[test]

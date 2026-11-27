@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tauqe_tools::git::checkpoint::{index_availability, IndexAvailability};
-use tokio::sync::watch;
+use tauqe_tools::stop::HardCancellation;
 
 /// The harness-specific inputs every committing Git step of `dir` runs under.
 ///
@@ -56,7 +56,7 @@ impl GitPolicy {
     /// The declaration is read from the project configuration of that directory,
     /// so a turn never inherits the settings of whatever process it happens to run
     /// in. An absent or unreadable configuration keeps the harness defaults.
-    fn resolve(dir: &Path, cancel: Option<watch::Receiver<bool>>) -> Self {
+    fn resolve(dir: &Path, cancel: Option<HardCancellation>) -> Self {
         let config = crate::config::load_git_config(dir);
         let timeout_secs = config.timeout_secs;
         let hooks = if config.bypass_hooks {
@@ -85,8 +85,8 @@ impl GitPolicy {
 /// the substrate fails the child it interrupts, the command reports the
 /// cancellation, and the marker the capture already wrote is resolved by crash
 /// recovery, which distinguishes a capture that committed from one that did not.
-fn refuse_cancelled(cancel: Option<&watch::Receiver<bool>>, step: &str) -> anyhow::Result<()> {
-    if cancel.is_some_and(|cancel| *cancel.borrow()) {
+fn refuse_cancelled(cancel: Option<&HardCancellation>, step: &str) -> anyhow::Result<()> {
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
         anyhow::bail!("the {step} was not started: the turn was cancelled");
     }
     Ok(())
@@ -143,7 +143,7 @@ pub enum IndexGateError {
 /// command that follows it.
 pub fn ensure_index_available(
     dir: &Path,
-    cancel: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Result<(), IndexGateError> {
     let policy = GitPolicy::resolve(dir, cancel.cloned());
     await_index_available(dir, &policy.deadline, cancel)
@@ -158,7 +158,7 @@ pub fn ensure_index_available(
 fn await_index_available(
     dir: &Path,
     deadline: &GitDeadline,
-    cancel: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Result<(), IndexGateError> {
     let started = Instant::now();
     let mut pause = INDEX_GATE_INITIAL_PAUSE;
@@ -166,7 +166,7 @@ fn await_index_available(
     for observation in 1..=INDEX_GATE_OBSERVATIONS {
         // A cancelled turn stops waiting at once instead of holding the caller
         // for the rest of the backoff.
-        if cancel.is_some_and(|cancel| *cancel.borrow()) {
+        if cancel.is_some_and(HardCancellation::is_cancelled) {
             return Err(IndexGateError::Cancelled);
         }
         match index_availability(dir, deadline) {
@@ -200,7 +200,7 @@ pub mod checkpoint {
     //! every Git child they run.
     use std::path::Path;
 
-    use tokio::sync::watch;
+    use tauqe_tools::stop::HardCancellation;
 
     pub use tauqe_tools::git::checkpoint::{
         cleanup_orphaned_staging_files, ensure_tauqe_ignored, is_tauqe_commit,
@@ -218,7 +218,7 @@ pub mod checkpoint {
     /// waited out by the index gate before the capture starts.
     pub(crate) fn create_checkpoint(
         dir: &Path,
-        cancel: Option<&watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
     ) -> anyhow::Result<CheckpointInfo> {
         super::refuse_cancelled(cancel, "checkpoint capture")?;
         // The capture commits, and Git refuses a commit while another process
@@ -242,7 +242,7 @@ pub mod checkpoint {
         dir: &Path,
         changed_files: &[String],
         step_name: &str,
-        cancel: Option<&watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
     ) -> anyhow::Result<String> {
         super::refuse_cancelled(cancel, "step commit")?;
         // The commit writes the index, so a lock another process holds would
@@ -409,6 +409,7 @@ mod tests {
         create_checkpoint, create_step_commit, ensure_index_available, run_git, GitHooks,
         IndexGateError,
     };
+    use tauqe_tools::stop::StopSource;
 
     /// Resolves the hook policy the commit of `dir` follows.
     ///
@@ -556,12 +557,49 @@ mod tests {
         let root = dir.path();
         crate::git::init_repository(Some(root), true).unwrap();
         std::fs::write(index_lock_path(root), "").unwrap();
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let stop = StopSource::new();
+        stop.request_hard();
+        let cancel = stop.token().hard_cancellation();
 
-        let error = ensure_index_available(root, Some(&cancel_rx))
+        let error = ensure_index_available(root, Some(&cancel))
             .expect_err("a cancelled turn never waits for the lock");
 
         assert_eq!(error, IndexGateError::Cancelled);
+    }
+
+    #[test]
+    fn soft_stop_does_not_cancel_git_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::git::init_repository(Some(root), true).unwrap();
+        let stop = StopSource::new();
+        stop.request_soft();
+        let cancel = stop.token().hard_cancellation();
+        assert!(ensure_index_available(root, Some(&cancel)).is_ok());
+        std::fs::write(root.join("notes.txt"), "uncommitted work").unwrap();
+        assert!(create_checkpoint(root, Some(&cancel)).is_ok());
+        std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+        assert!(create_step_commit(root, &["a.rs".into()], "apply step", Some(&cancel)).is_ok());
+    }
+
+    #[test]
+    fn hard_stop_before_git_capture_and_step_refuses_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::git::init_repository(Some(root), true).unwrap();
+        let stop = StopSource::new();
+        stop.request_hard();
+        let cancel = stop.token().hard_cancellation();
+        assert!(
+            format!("{:#}", create_checkpoint(root, Some(&cancel)).unwrap_err())
+                .contains("was cancelled")
+        );
+        assert!(format!(
+            "{:#}",
+            create_step_commit(root, &[], "apply step", Some(&cancel)).unwrap_err()
+        )
+        .contains("was cancelled"));
+        assert!(!root.join(".tauqe/active-transaction.json").exists());
     }
 
     /// The capture refuses to open a transaction while another process holds the

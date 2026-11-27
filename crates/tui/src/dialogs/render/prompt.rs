@@ -133,6 +133,7 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
             session_id,
             group_id,
             group_title,
+            focused_steps,
             blocked_reason,
             purpose,
         } => {
@@ -168,6 +169,12 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
                     engine.fg(palette.text_muted),
                 ),
             ]));
+            if !focused_steps.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(&format!("Step: #{}", focused_steps.join(", #")), max_w),
+                    engine.fg(palette.status_success).bold(),
+                )));
+            }
             if let Some(reason) = blocked_reason
                 .as_deref()
                 .map(str::trim)

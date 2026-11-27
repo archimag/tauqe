@@ -23,6 +23,9 @@ pub struct ReplConfig {
     /// verification healing, and empty response retries all spend from this pool.
     #[serde(default = "default_max_turn_rounds")]
     pub(crate) max_turn_rounds: usize,
+    /// Repair waves per Architect rung without a newly completed implementation
+    /// leaf. Progress resets the budget; exhaustion promotes if available.
+    /// Zero disables automated replanning, not initial horizon synthesis.
     #[serde(default = "default_max_replans")]
     pub max_replans: usize,
 }

@@ -56,7 +56,7 @@ pub(crate) fn withdraw_streamed_attempt(
         .ok(),
     );
 }
-/// Publishes each context snapshot at the boundary selected by core preparation.
+/// Observe the shared context source through the production RPC projection.
 #[cfg(test)]
 pub(crate) async fn prepare_implementation_step(
     state: &Arc<AppState>,
@@ -67,9 +67,15 @@ pub(crate) async fn prepare_implementation_step(
 ) -> Result<String, tauqe_flow::api::StepPreparationError> {
     state
         .application
-        .test_prepare_implementation_step(operation, root, config, request, |snapshot| {
-            crate::handlers::context::publish_context(&state.out, &snapshot);
-        })
+        .test_prepare_implementation_step(
+            operation,
+            root,
+            config,
+            request,
+            Arc::new(crate::publication::Publisher {
+                out: state.out.clone(),
+            }),
+        )
         .await
 }
 
@@ -137,7 +143,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::watch;
 
     #[tokio::test]
     async fn step_preparation_publishes_clear_and_document_admission_in_order() {
@@ -190,7 +195,7 @@ mod tests {
             history,
             out,
         );
-        let (_, cancel) = watch::channel(false);
+        let source = tauqe_core::stop::StopSource::new();
         let operation = state.application.test_begin_operation().unwrap();
         let request = tauqe_core::workflow::implementation::StepTurnRequest {
             scope,
@@ -207,17 +212,19 @@ mod tests {
             instructions: None,
             marker: None,
             session_id: None,
-            cancel_rx: cancel,
+            cancel_rx: source.token().hard_cancellation(),
         };
-        for _ in 0..2 {
+        for round in 0..2 {
             let prompt = prepare_implementation_step(&state, &operation, &root, &config, &request)
                 .await
                 .unwrap();
             assert_eq!(prompt, "Execute step");
-            let cleared: serde_json::Value =
-                serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-            assert_eq!(cleared["method"], events::CONTEXT_CHANGED);
-            assert_eq!(cleared["params"]["state"]["items"], serde_json::json!([]));
+            if round == 1 {
+                let cleared: serde_json::Value =
+                    serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+                assert_eq!(cleared["method"], events::CONTEXT_CHANGED);
+                assert_eq!(cleared["params"]["state"]["items"], serde_json::json!([]));
+            }
             let admitted: serde_json::Value =
                 serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
             assert_eq!(admitted["method"], events::CONTEXT_CHANGED);

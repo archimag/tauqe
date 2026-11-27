@@ -41,7 +41,6 @@ pub struct RepoSearchResult {
     pub(crate) matches: Vec<FileSearchMatch>,
     pub(crate) total_matched_files: usize,
     pub(crate) total_matches: usize,
-    pub(crate) omitted_files: usize,
     /// In-scope files the round left unsearched because the aggregate corpus
     /// ceiling was reached.
     pub(crate) unsearched_files: usize,
@@ -300,12 +299,11 @@ impl RoundQuery<'_> {
     /// Evaluates the query against the corpus resolved for the round.
     ///
     /// Only the file texts are shared: the scope predicate, the count-descending
-    /// ordering, the truncation against `max_matched_files_per_search`, and the
-    /// diagnostic of a rejected query stay the property of the query itself. The
-    /// aggregate ceiling is the one corpus-level omission, and it is counted
+    /// ordering and the diagnostic of a rejected query stay the property of the
+    /// query itself. The aggregate ceiling is the one corpus-level omission, and it is counted
     /// against the query's own scope, so a file the query never searched is
     /// never presented to it as a search gap.
-    fn evaluate(self, corpus: &SearchCorpus<'_>, limits: ResearchLimits) -> RepoSearchResult {
+    fn evaluate(self, corpus: &SearchCorpus<'_>) -> RepoSearchResult {
         match self {
             Self::Prepared {
                 request,
@@ -330,7 +328,7 @@ impl RoundQuery<'_> {
                     .iter()
                     .filter(|path| scope.admits(path))
                     .count();
-                accounted_search_result(request.clone(), matches, unsearched_files, limits)
+                accounted_search_result(request.clone(), matches, unsearched_files)
             }
             Self::Rejected { request, error } => failed_search_result(request.clone(), error),
         }
@@ -358,27 +356,22 @@ fn prepare_query<'a>(repo_root: &Path, query: &'a RepoSearchRequest) -> RoundQue
     }
 }
 
-/// Sorts, truncates, and accounts the matches of one query.
+/// Sorts and accounts for all matches of one query.
 fn accounted_search_result(
     query: RepoSearchRequest,
     mut matches: Vec<FileSearchMatch>,
     unsearched_files: usize,
-    limits: ResearchLimits,
 ) -> RepoSearchResult {
     // Deterministic order: highest occurrence count first, then alphabetical.
     matches.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
 
     let total_matched_files = matches.len();
     let total_matches: usize = matches.iter().map(|matched| matched.count).sum();
-    let omitted_files = total_matched_files.saturating_sub(limits.max_matched_files_per_search);
-    matches.truncate(limits.max_matched_files_per_search);
-
     RepoSearchResult {
         query,
         matches,
         total_matched_files,
         total_matches,
-        omitted_files,
         unsearched_files,
         error: None,
     }
@@ -391,7 +384,6 @@ fn failed_search_result(query: RepoSearchRequest, error: String) -> RepoSearchRe
         matches: Vec::new(),
         total_matched_files: 0,
         total_matches: 0,
-        omitted_files: 0,
         unsearched_files: 0,
         error: Some(error),
     }
@@ -407,7 +399,7 @@ fn execute_repo_search_sync(
     repo_root: &Path,
     query: &RepoSearchRequest,
     available_files: &[String],
-    limits: ResearchLimits,
+    _limits: ResearchLimits,
 ) -> RepoSearchResult {
     let prepared = prepare_query(repo_root, query);
     let in_scope = |candidate: &str| prepared.admits(candidate);
@@ -417,14 +409,12 @@ fn execute_repo_search_sync(
         MAX_SEARCHABLE_CORPUS_BYTES,
         in_scope,
     );
-    prepared.evaluate(&corpus, limits)
+    prepared.evaluate(&corpus)
 }
 
 /// Executes a single repository search, offloading blocking file I/O via [`run_blocking`].
 ///
-/// The number of reported matching files is bounded by the project's
-/// `[context].max_matched_files_per_search`, so a project tunes how much of a
-/// broad match set reaches the model instead of recompiling the engine.
+/// Every matching file is reported; full-request admission bounds the feedback.
 #[cfg(test)]
 fn execute_repo_search(
     repo_root: &Path,
@@ -474,7 +464,7 @@ fn execute_repo_searches_sync(
 
     prepared
         .into_iter()
-        .map(|query| query.evaluate(&corpus, limits))
+        .map(|query| query.evaluate(&corpus))
         .collect()
 }
 
@@ -506,17 +496,15 @@ fn format_single_search_feedback(result: &RepoSearchResult) -> String {
     if let Some(err) = &result.error {
         out.push_str(&format!("Error: {}\n", err));
     } else if result.matches.is_empty() {
-        out.push_str("No matches found.\n");
+        out.push_str(if result.unsearched_files > 0 {
+            "No matches found in searched files.\n"
+        } else {
+            "No matches found.\n"
+        });
     } else {
         for m in &result.matches {
             let label = if m.count == 1 { "match" } else { "matches" };
             out.push_str(&format!("{}: {} {}\n", m.path, m.count, label));
-        }
-        if result.omitted_files > 0 {
-            out.push_str(&format!(
-                "[{} more matching files omitted]\n",
-                result.omitted_files
-            ));
         }
     }
 
@@ -689,41 +677,25 @@ mod tests {
     }
 
     #[test]
-    fn test_search_truncation_and_omitted_count() {
+    fn test_search_reports_all_matched_files() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
         let mut available = Vec::new();
-        for i in 0..60 {
-            let name = format!("file_{:02}.txt", i);
+        for i in 0..150 {
+            let name = format!("file_{:03}.txt", i);
             std::fs::write(root.join(&name), "needle in haystack").unwrap();
             available.push(name);
         }
 
         let query = RepoSearchRequest::new("", "needle");
-        let limits = ResearchLimits {
-            max_matched_files_per_search: 50,
-            ..ResearchLimits::default()
-        };
-        let res = execute_repo_search(root, &query, &available, limits);
-        assert_eq!(res.total_matched_files, 60);
-        assert_eq!(res.matches.len(), 50);
-        assert_eq!(res.omitted_files, 10);
+        let res = execute_repo_search(root, &query, &available, ResearchLimits::default());
+        assert_eq!(res.total_matched_files, 150);
+        assert_eq!(res.matches.len(), 150);
 
         let feedback = format_single_search_feedback(&res);
-        assert!(feedback.contains("[10 more matching files omitted]"));
-        assert!(feedback.contains("file_00.txt: 1 match"));
-
-        // The cap is configuration-driven, so a project narrows how much of a
-        // broad match set reaches the model without recompiling.
-        let narrow = ResearchLimits {
-            max_matched_files_per_search: 3,
-            ..ResearchLimits::default()
-        };
-        let res_narrow = execute_repo_search(root, &query, &available, narrow);
-        assert_eq!(res_narrow.total_matched_files, 60);
-        assert_eq!(res_narrow.matches.len(), 3);
-        assert_eq!(res_narrow.omitted_files, 57);
+        assert!(feedback.contains("file_000.txt: 1 match"));
+        assert!(feedback.contains("file_149.txt: 1 match"));
     }
 
     #[test]
@@ -835,7 +807,6 @@ mod tests {
             matches: Vec::new(),
             total_matched_files: 0,
             total_matches: 0,
-            omitted_files: 0,
             unsearched_files: 0,
             error: None,
         };
@@ -848,7 +819,6 @@ mod tests {
             matches: Vec::new(),
             total_matched_files: 0,
             total_matches: 0,
-            omitted_files: 0,
             unsearched_files: 0,
             error: Some("Directory traversal ('..') is not allowed".to_string()),
         };
@@ -911,7 +881,7 @@ mod tests {
 
         let results: Vec<RepoSearchResult> = prepared
             .into_iter()
-            .map(|query| query.evaluate(&corpus, ResearchLimits::default()))
+            .map(|query| query.evaluate(&corpus))
             .collect();
 
         // The subdirectory query never covered the omitted file.
@@ -922,7 +892,7 @@ mod tests {
         // though the pattern matched nothing.
         assert_eq!(results[1].unsearched_files, 1);
         let feedback = format_single_search_feedback(&results[1]);
-        assert!(feedback.contains("No matches found."));
+        assert!(feedback.contains("No matches found in searched files."));
         assert!(feedback.contains("1 in-scope file(s) were not searched"));
         assert!(feedback.contains("MiB of text"));
     }

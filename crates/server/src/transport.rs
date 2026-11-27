@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tauqe_flow::api::types::StreamEvent;
+use tauqe_flow::api::types::{HardCancellation, StreamEvent};
 use tauqe_protocol::{Event, Response};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
@@ -168,7 +168,6 @@ fn is_pacing_exempt(event: &StreamEvent) -> bool {
         StreamEvent::Done | StreamEvent::Cancelled | StreamEvent::Error(_) => true,
         StreamEvent::ReasoningDelta(_)
         | StreamEvent::TextDelta(_)
-        | StreamEvent::ContextChanged(_)
         | StreamEvent::EditStarted
         | StreamEvent::EditFileStarted { .. }
         | StreamEvent::EditHunk { .. }
@@ -268,7 +267,7 @@ impl OutChannel {
     /// identically across every contour: a terminal notice publishes
     /// immediately, and every other variant waits for the writer to catch up
     /// through [`OutChannel::wait_for_headroom`].
-    pub async fn pace_event(&self, event: &StreamEvent, cancel: &mut watch::Receiver<bool>) {
+    pub async fn pace_event(&self, event: &StreamEvent, cancel: &HardCancellation) {
         if is_pacing_exempt(event) {
             return;
         }
@@ -294,13 +293,13 @@ impl OutChannel {
     ///
     /// Only a high-rate streaming contour calls this, so responses and control
     /// events keep flowing and the request loop stays responsive while a stream
-    /// is throttled. The wait ends with the operation: a raised `cancel` signal
+    /// is throttled. The wait ends with the operation: a Hard stop request
     /// releases it even while the client is still stalled, because a paused
     /// stream must never outlive the turn that produces it. What is left to
     /// enqueue afterwards is bounded by the relay channel, since the producer
     /// stops producing once it observes the cancellation.
-    pub async fn wait_for_headroom(&self, cancel: &mut watch::Receiver<bool>) {
-        if *cancel.borrow() {
+    pub async fn wait_for_headroom(&self, cancel: &HardCancellation) {
+        if cancel.is_cancelled() {
             return;
         }
         // Subscribing before the first depth check stamps this receiver with the
@@ -320,13 +319,7 @@ impl OutChannel {
                         return;
                     }
                 }
-                changed = cancel.changed() => {
-                    // A raised signal ends the wait even while the client is
-                    // stalled, and so does an operation whose signal is gone.
-                    if changed.is_err() || *cancel.borrow() {
-                        return;
-                    }
-                }
+                _ = cancel.cancelled() => return,
             }
         }
     }
@@ -459,6 +452,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use tauqe_flow::api::types::{StopSource, StopState};
 
     /// Sink that fails exactly like a client pipe whose read end was closed, so
     /// the writer's failure path is exercised without the real stdout.
@@ -671,30 +665,25 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_client_pauses_the_producer_until_the_writer_catches_up() {
         let (out, rx) = OutChannel::new();
-        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
 
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            out.wait_for_headroom(&mut cancel),
-        )
-        .await
-        .expect("an empty queue must never delay a producer");
+        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+            .await
+            .expect("an empty queue must never delay a producer");
 
         for _ in 0..BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                out.wait_for_headroom(&mut cancel)
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+                .await
+                .is_err(),
             "a producer must wait while the backlog sits at the high-water mark"
         );
 
         let writing = tokio::spawn(out.writer(rx).run_with(tokio::io::sink()));
-        tokio::time::timeout(Duration::from_secs(1), out.wait_for_headroom(&mut cancel))
+        tokio::time::timeout(Duration::from_secs(1), out.wait_for_headroom(&cancel))
             .await
             .expect("the writer must drain the queue below the low-water mark");
         assert!(
@@ -715,25 +704,20 @@ mod tests {
         for _ in 0..BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
-        let (cancel_tx, mut cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
 
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                out.wait_for_headroom(&mut cancel)
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+                .await
+                .is_err(),
             "the stalled client must hold the producer"
         );
 
-        let _ = cancel_tx.send(true);
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            out.wait_for_headroom(&mut cancel),
-        )
-        .await
-        .expect("a cancelled operation must not wait for the stalled client");
+        cancel_source.request_hard();
+        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+            .await
+            .expect("a cancelled operation must not wait for the stalled client");
     }
 
     /// A shutdown request ends the writer and still publishes every line queued
@@ -790,18 +774,18 @@ mod tests {
         for _ in 0..BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let cancel_source = StopSource::new();
 
-        let spawn_paused = |channel: &OutChannel, cancel: &watch::Sender<bool>| {
+        let spawn_paused = |channel: &OutChannel, cancel: &StopSource| {
             let producer = channel.clone();
-            let mut cancel = cancel.subscribe();
+            let cancel = cancel.token().hard_cancellation();
             tokio::spawn(async move {
-                producer.wait_for_headroom(&mut cancel).await;
+                producer.wait_for_headroom(&cancel).await;
                 producer.state.pending.load(Ordering::Relaxed)
             })
         };
-        let first = spawn_paused(&out, &cancel_tx);
-        let second = spawn_paused(&out, &cancel_tx);
+        let first = spawn_paused(&out, &cancel_source);
+        let second = spawn_paused(&out, &cancel_source);
 
         // Both producers reach the gate before a single line leaves the queue,
         // so the drain below is the only wakeup either of them can observe.
@@ -830,8 +814,8 @@ mod tests {
 
         // A producer whose first depth check happens after that drain reads the
         // drained depth and never parks at all.
-        let mut late = cancel_tx.subscribe();
-        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&mut late))
+        let late = cancel_source.token().hard_cancellation();
+        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&late))
             .await
             .expect("a producer that starts after the drain must not park");
 
@@ -848,19 +832,17 @@ mod tests {
         for _ in 0..=BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
-        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
 
         for notice in [
             StreamEvent::Done,
             StreamEvent::Cancelled,
             StreamEvent::Error("provider rejected the request".to_string()),
         ] {
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                out.pace_event(&notice, &mut cancel),
-            )
-            .await
-            .expect("a terminal notice must never wait for a stalled client");
+            tokio::time::timeout(Duration::from_millis(20), out.pace_event(&notice, &cancel))
+                .await
+                .expect("a terminal notice must never wait for a stalled client");
         }
     }
 
@@ -873,13 +855,14 @@ mod tests {
         for _ in 0..=BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
-        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
         let gated_event = StreamEvent::TextDelta("delta".to_string());
 
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                out.pace_event(&gated_event, &mut cancel)
+                out.pace_event(&gated_event, &cancel)
             )
             .await
             .is_err(),
@@ -889,7 +872,7 @@ mod tests {
         let writing = tokio::spawn(out.writer(rx).run_with(tokio::io::sink()));
         tokio::time::timeout(
             Duration::from_secs(1),
-            out.pace_event(&gated_event, &mut cancel),
+            out.pace_event(&gated_event, &cancel),
         )
         .await
         .expect("the writer must drain the queue below the low-water mark");
@@ -907,25 +890,69 @@ mod tests {
         for _ in 0..=BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
-        let (cancel_tx, mut cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
         let gated_event = StreamEvent::TextDelta("delta".to_string());
 
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                out.pace_event(&gated_event, &mut cancel)
+                out.pace_event(&gated_event, &cancel)
             )
             .await
             .is_err(),
             "the stalled client must hold the gated event"
         );
 
-        let _ = cancel_tx.send(true);
+        cancel_source.request_hard();
         tokio::time::timeout(
             Duration::from_millis(20),
-            out.pace_event(&gated_event, &mut cancel),
+            out.pace_event(&gated_event, &cancel),
         )
         .await
         .expect("a cancelled operation must not wait for the stalled client");
+    }
+
+    /// Closing an operation without Hard does not release a stalled producer;
+    /// Soft stops scheduling, not delivery of the current event.
+    #[tokio::test]
+    async fn closed_running_and_soft_sources_do_not_release_headroom_waiters() {
+        for state in [StopState::Running, StopState::Soft] {
+            let (out, _rx) = OutChannel::new();
+            for _ in 0..BACKLOG_HIGH_WATER {
+                out.send_event(&event("test/delta"));
+            }
+            let source = StopSource::new();
+            let cancel = source.token().hard_cancellation();
+            if state == StopState::Soft {
+                source.request_soft();
+            }
+            drop(source);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+                    .await
+                    .is_err(),
+                "a closed {state:?} source must not release a stalled producer"
+            );
+        }
+    }
+
+    /// Hard requested before the first poll remains observable after its owner
+    /// is dropped, even while no writer can drain the queue.
+    #[tokio::test]
+    async fn hard_before_first_poll_releases_a_stalled_producer() {
+        let (out, _rx) = OutChannel::new();
+        for _ in 0..BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
+        source.request_hard();
+        drop(source);
+
+        tokio::time::timeout(Duration::from_millis(20), out.wait_for_headroom(&cancel))
+            .await
+            .expect("Hard before the first poll must release the producer");
     }
 }

@@ -1,8 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::io::Read;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 
 use crate::git::exec::{self, GitDeadline};
 use crate::git::GitHooks;
@@ -195,13 +193,10 @@ fn check_ignore_batches(paths: &[String]) -> Vec<&[String]> {
 
 /// Runs one bounded `check-ignore` invocation over the supplied candidates.
 ///
-/// The child runs under the same bounded executor as every other Git call: its
-/// candidate list is written on a dedicated thread while its verdicts are
-/// drained on another, so a command that stops reading its standard input is
-/// torn down at the invocation budget instead of blocking the caller's write
-/// forever. `check-ignore` echoes one verdict per candidate, so writing the
-/// whole list before reading would deadlock as soon as the echoed verdicts
-/// filled the child's stdout pipe.
+/// The child runs under the same bounded executor as every other Git call:
+/// nonblocking input and output pipes are serviced together, so echoed verdicts
+/// cannot deadlock a large candidate list and a child that stops reading is
+/// torn down at the invocation budget.
 ///
 /// The child is spawned through the shared `git_command` helper, so it inherits
 /// the same sanitized environment as every other Git call.
@@ -243,81 +238,6 @@ fn candidate_payload(paths: &[String]) -> Vec<u8> {
         payload.push(0);
     }
     payload
-}
-
-/// Bytes the drain thread reads from a child pipe before it publishes them.
-const PIPE_CHUNK_BYTES: usize = 16 * 1024;
-
-/// A child pipe drained on its own thread.
-///
-/// The bytes are published into a shared buffer as the reader consumes them, so
-/// a reader that is abandoned — because a descendant inherited the pipe and kept
-/// it open past the invocation window — still reports everything the child wrote
-/// before the window closed.
-pub(super) struct PipeDrain {
-    reader: std::thread::JoinHandle<std::io::Result<()>>,
-    delivered: Arc<Mutex<Vec<u8>>>,
-}
-
-impl PipeDrain {
-    /// Reports whether the reader reached its end on its own.
-    pub(super) fn is_finished(&self) -> bool {
-        self.reader.is_finished()
-    }
-
-    /// Collects the bytes the reader delivered.
-    ///
-    /// A reader that reached its end is joined, so a failed or panicked drain
-    /// stays a diagnostic. A reader that a descendant still holds open is never
-    /// joined: the bytes it already published come back instead, and the reader
-    /// is abandoned with the buffer it keeps filling.
-    pub(super) fn collect(self) -> Vec<u8> {
-        if self.reader.is_finished() {
-            match self.reader.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(reason = %err, "failed to drain a git child pipe");
-                }
-                Err(_) => {
-                    tracing::warn!("a git child pipe drain thread panicked");
-                }
-            }
-        }
-        match self.delivered.lock() {
-            Ok(mut delivered) => std::mem::take(&mut *delivered),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        }
-    }
-}
-
-/// Drains a child pipe to EOF on its own thread.
-///
-/// Reading a pipe independently of the child's exit keeps a command that emits
-/// more than a pipe buffer holds from blocking on its own output, and it lets
-/// the bounded executor observe the child it started while the pipes drain.
-pub(super) fn spawn_pipe_drain<R>(pipe: Option<R>) -> PipeDrain
-where
-    R: Read + Send + 'static,
-{
-    let delivered = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&delivered);
-    let reader = std::thread::spawn(move || -> std::io::Result<()> {
-        let Some(mut pipe) = pipe else {
-            return Ok(());
-        };
-        let mut chunk = [0u8; PIPE_CHUNK_BYTES];
-        loop {
-            let read = pipe.read(&mut chunk)?;
-            if read == 0 {
-                return Ok(());
-            }
-            match sink.lock() {
-                Ok(mut buffer) => buffer.extend_from_slice(&chunk[..read]),
-                Err(poisoned) => poisoned.into_inner().extend_from_slice(&chunk[..read]),
-            }
-        }
-    });
-    PipeDrain { reader, delivered }
 }
 
 /// Stages the specified list of files into the Git index.
@@ -699,8 +619,8 @@ mod tests {
         init_repo(root);
         install_hook(root, SLEEPING_HOOK);
 
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let deadline = GitDeadline::from_cancel(cancel_rx);
+        let source = crate::stop::StopSource::new();
+        let deadline = GitDeadline::default().with_cancel(Some(source.token().hard_cancellation()));
         let path = root.to_path_buf();
         let started = Instant::now();
         let turn = std::thread::spawn(move || {
@@ -723,7 +643,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(hook_started, "the hook never started");
-        let _ = cancel_tx.send(true);
+        source.request_hard();
 
         let error = turn
             .join()
@@ -751,13 +671,12 @@ mod tests {
     const PIPE_HOLDING_HOOK: &str = "#!/bin/sh\necho hook-output\nsleep 5 &\nexit 0\n";
 
     /// A command that exited on its own keeps its exit code and its output when
-    /// a descendant holds the inherited pipes open.
+    /// a descendant holds the inherited pipes open, after stopping that descendant.
     ///
     /// The hook exits successfully and leaves a background descendant behind, so
     /// the direct child exits with status 0 well inside its budget while the
-    /// pipes stay open. The wait owns the verdict: the invocation must stay
-    /// `Exited` with its code intact, and every byte the child wrote before the
-    /// drain window closed must survive the abandoned drain.
+    /// pipes stay open. Cleanup must stop the descendant before reaping Git,
+    /// preserving the exit code and the bytes Git already produced.
     #[cfg(unix)]
     #[test]
     fn a_clean_exit_keeps_its_output_when_a_descendant_holds_the_pipes() {
@@ -792,7 +711,7 @@ mod tests {
         );
         assert!(
             started.elapsed() < Duration::from_secs(4),
-            "the abandoned drain did not release the caller: {:?}",
+            "process-group cleanup did not release the caller: {:?}",
             started.elapsed()
         );
     }

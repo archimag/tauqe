@@ -41,7 +41,7 @@ impl AnalysisResources<'_> {
         let documents = Documents::new(root);
         // Preserve the final cancellation gate directly before scheduling storage.
         // Once storage starts, the existing mutation remains cancel-blind.
-        if *operation.cancel_receiver().borrow() {
+        if operation.hard_cancellation().is_cancelled() {
             return Err(ReviewAnalysisPersistenceError::Cancelled(
                 session.id.clone(),
             ));
@@ -203,6 +203,24 @@ mod tests {
             prepared.session
         );
         assert!(!root.path().join(".tauqe/history.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn soft_stop_does_not_prevent_persisting_regrouping() {
+        let root = tempfile::tempdir().unwrap();
+        let app = application(root.path());
+        let operation = app.try_begin_operation().unwrap();
+        let prepared = prepare(&app, &operation, root.path()).await;
+        app.soft_stop_active_operation();
+        let stored = app
+            .audit_resources()
+            .analysis()
+            .persist_review_post_analysis(&operation, root.path(), &prepared, regrouping(&prepared))
+            .await
+            .unwrap();
+        assert_eq!(stored.description.as_deref(), Some("One shared boundary"));
+        assert_eq!(stored.items[0].body, prepared.session.items[0].body);
+        assert_eq!(app.history_page(None, None).await.unwrap().total_count, 2);
     }
 
     #[tokio::test]

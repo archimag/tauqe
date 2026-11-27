@@ -1,13 +1,15 @@
 //! Exclusive manual context editing, independent of RPC transport.
 
+use crate::api::ApplicationObserver;
 use crate::api::{
     Application, ContextClearScope, ContextError, OperationGuard, OperationInProgress,
 };
+use std::{future::Future, sync::Arc};
 use tauqe_core::context::{ContextAccess, ContextLayer, ContextState};
 
 pub struct ContextOperation {
     application: Application,
-    _guard: OperationGuard,
+    _guard: Arc<OperationGuard>,
 }
 
 pub struct ContextPatternAddition {
@@ -22,8 +24,39 @@ impl Application {
         let guard = self.try_begin_operation()?;
         Ok(ContextOperation {
             application: self.clone(),
-            _guard: guard,
+            _guard: Arc::new(guard),
         })
+    }
+
+    /// The worker retains admission through mutation and publication even if
+    /// the request future is dropped while waiting.
+    async fn run_context_change<T, E, F, Fut>(
+        &self,
+        observer: Arc<dyn ApplicationObserver>,
+        busy: E,
+        failed: fn(String) -> E,
+        run: F,
+    ) -> Result<(T, ContextState), E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(ContextOperation) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let operation = self.begin_context_change().map_err(|_| busy)?;
+        let context = self.context_session().clone();
+        let guard = operation._guard.clone();
+        tokio::spawn(async move {
+            if !context.activate_manual_publication(&guard, observer) {
+                return Err(failed("Could not bind context publication".into()));
+            }
+            let result = run(operation).await;
+            context.close_manual_publication(&guard);
+            let state = context.context_state().await;
+            result.map(|value| (value, state))
+        })
+        .await
+        .map_err(|error| failed(format!("Context worker failed: {error}")))?
     }
 }
 
@@ -48,11 +81,11 @@ impl ContextOperation {
             _ => {}
         }
         self.application
-            .mutate_context(move |context| {
+            .mutate_manual_context(move |context| {
                 context
-                    .add_file_to_layer(&path, access, layer)
+                    .add_file(&path, access, layer)
                     .map_err(|error| ContextError::Mutation(error.to_string()))?;
-                Ok(context.get_state())
+                Ok(context.state())
             })
             .await?
     }
@@ -62,26 +95,19 @@ impl ContextOperation {
         pattern: String,
         access: ContextAccess,
     ) -> Result<ContextPatternAddition, ContextError> {
-        // Resolve configuration and subprocess inputs before taking the context lock.
-        let budget = self
-            .application
-            .configuration()
-            .await
-            .config
-            .context
-            .token_budget;
+        // Resolve the tracked file list before taking the context lock.
         let root = self.application.repository_root().await;
         let files = super::context::repository_files(root).await;
         self.application
-            .mutate_context(move |context| {
+            .mutate_manual_context(move |context| {
                 let outcome = context
-                    .add_files_by_pattern(&pattern, access, &files, budget)
+                    .add_pattern(&pattern, access, &files)
                     .map_err(|error| ContextError::Mutation(error.to_string()))?;
                 Ok(ContextPatternAddition {
                     added_count: outcome.added_items.len(),
                     added_tokens: outcome.added_tokens,
                     truncated: outcome.truncated,
-                    state: context.get_state(),
+                    state: context.state(),
                 })
             })
             .await?
@@ -89,11 +115,11 @@ impl ContextOperation {
 
     async fn remove_file(&self, path: String) -> Result<ContextState, ContextError> {
         self.application
-            .mutate_context(move |context| {
+            .mutate_manual_context(move |context| {
                 context
                     .remove_file(&path)
                     .map_err(|error| ContextError::Mutation(error.to_string()))?;
-                Ok(context.get_state())
+                Ok(context.state())
             })
             .await?
     }
@@ -104,11 +130,11 @@ impl ContextOperation {
         access: ContextAccess,
     ) -> Result<ContextState, ContextError> {
         self.application
-            .mutate_context(move |context| {
+            .mutate_manual_context(move |context| {
                 context
                     .set_access(&path, access)
                     .map_err(|error| ContextError::Mutation(error.to_string()))?;
-                Ok(context.get_state())
+                Ok(context.state())
             })
             .await?
     }
@@ -131,13 +157,16 @@ impl Application {
         path: String,
         access: ContextAccess,
         layer: Option<ContextLayer>,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<ContextState, ContextError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| ContextError::Busy)?;
-        let state = operation.add_file(path, access, layer).await?;
-        publish_context(observer, &state);
+        let (_, state) = self
+            .run_context_change(
+                observer,
+                ContextError::Busy,
+                ContextError::Mutation,
+                move |operation| async move { operation.add_file(path, access, layer).await },
+            )
+            .await?;
         Ok(state)
     }
 
@@ -145,26 +174,33 @@ impl Application {
         &self,
         pattern: String,
         access: ContextAccess,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<ContextPatternAddition, ContextError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| ContextError::Busy)?;
-        let result = operation.add_pattern(pattern, access).await?;
-        publish_context(observer, &result.state);
+        let (mut result, state) = self
+            .run_context_change(
+                observer,
+                ContextError::Busy,
+                ContextError::Mutation,
+                move |operation| async move { operation.add_pattern(pattern, access).await },
+            )
+            .await?;
+        result.state = state;
         Ok(result)
     }
 
     pub async fn remove_context_file(
         &self,
         path: String,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<ContextState, ContextError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| ContextError::Busy)?;
-        let state = operation.remove_file(path).await?;
-        publish_context(observer, &state);
+        let (_, state) = self
+            .run_context_change(
+                observer,
+                ContextError::Busy,
+                ContextError::Mutation,
+                move |operation| async move { operation.remove_file(path).await },
+            )
+            .await?;
         Ok(state)
     }
 
@@ -172,47 +208,50 @@ impl Application {
         &self,
         path: String,
         access: ContextAccess,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<ContextState, ContextError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| ContextError::Busy)?;
-        let state = operation.set_access(path, access).await?;
-        publish_context(observer, &state);
+        let (_, state) = self
+            .run_context_change(
+                observer,
+                ContextError::Busy,
+                ContextError::Mutation,
+                move |operation| async move { operation.set_access(path, access).await },
+            )
+            .await?;
         Ok(state)
     }
 
     pub async fn clear_manual_context(
         &self,
         layer: Option<ContextLayer>,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<ContextState, ContextError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| ContextError::Busy)?;
-        let state = operation.clear(layer).await?;
-        publish_context(observer, &state);
+        let (_, state) = self
+            .run_context_change(
+                observer,
+                ContextError::Busy,
+                ContextError::Mutation,
+                move |operation| async move { operation.clear(layer).await },
+            )
+            .await?;
         Ok(state)
     }
 
     pub async fn remove_cached_documents(
         &self,
         path: String,
-        observer: &dyn crate::api::ApplicationObserver,
+        observer: Arc<dyn ApplicationObserver>,
     ) -> Result<tauqe_core::outer_docs::CacheRemoval, crate::api::CacheError> {
-        let operation = self
-            .begin_context_change()
-            .map_err(|_| crate::api::CacheError::Busy)?;
-        let outcome = operation.remove_outer_docs_cache(path).await?;
-        if let Some(state) = outcome.context_update {
-            observer.publish("", crate::api::ApplicationEvent::Context(state));
-        }
+        let (outcome, _) = self
+            .run_context_change(
+                observer,
+                crate::api::CacheError::Busy,
+                crate::api::CacheError::Failed,
+                move |operation| async move { operation.remove_outer_docs_cache(path).await },
+            )
+            .await?;
         Ok(outcome.removed)
     }
-}
-
-fn publish_context(observer: &dyn crate::api::ApplicationObserver, state: &ContextState) {
-    observer.publish("", crate::api::ApplicationEvent::Context(state.clone()));
 }
 
 #[cfg(test)]
@@ -301,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pattern_uses_configured_budget_but_declared_preload_is_unbounded() {
+    async fn pattern_and_declared_preload_admit_complete_selection() {
         let root = tempfile::tempdir().unwrap();
         tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
         for file in ["target.rs", "reference.rs"] {
@@ -312,18 +351,17 @@ mod tests {
             &["target.rs".into(), "reference.rs".into()],
         )
         .unwrap();
-        let mut config = AppConfig::default();
-        config.context.token_budget = 0;
-        let app = application(root.path(), config);
+        let app = application(root.path(), AppConfig::default());
         let operation = app.begin_context_change().unwrap();
         let pattern = operation
             .add_pattern("*.rs".into(), ContextAccess::ReadOnly)
             .await
             .unwrap();
-        assert_eq!(pattern.added_count, 0);
-        assert!(pattern.truncated);
-        assert!(pattern.state.items.is_empty());
-        // A workflow preload uses declared files despite the discovery budget.
+        assert_eq!(pattern.added_count, 2);
+        assert_eq!(pattern.added_tokens, 0);
+        assert!(!pattern.truncated);
+        assert_eq!(pattern.state.items.len(), 2);
+        // A declared preload upgrades the selected files in place.
         let admission = app
             .context_session()
             .preload_declared_context(
@@ -333,13 +371,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(admission.outcome.added.len(), 2);
-        assert!(admission.outcome.limit_exceeded.is_none());
+        assert_eq!(admission.outcome.added, vec!["target.rs"]);
         assert!(admission
             .state
             .items
             .iter()
-            .all(|item| item.layer == ContextLayer::Auto));
+            .all(|item| item.layer == ContextLayer::User));
         let target = admission
             .state
             .items

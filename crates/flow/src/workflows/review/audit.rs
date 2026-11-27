@@ -21,7 +21,6 @@ use crate::application::configuration::Configuration;
 use crate::application::context::ContextSession;
 use crate::application::history::HistorySession;
 use crate::application::review_observer::ReviewObserver;
-use crate::application::usage::UsageSession;
 use crate::application::{ExecutionSession, PlanExecutionEnvironment};
 use crate::workflows::architect::ArchitectScope;
 use groups::{run_group_audits, GroupAuditObserver};
@@ -35,6 +34,7 @@ use tauqe_core::config::{AppConfig, ReviewPreset};
 use tauqe_core::models::{ModelRef, ModelRole, ModelSelection};
 use tauqe_core::providers::{ModelUsageInfo, StreamEvent};
 use tauqe_core::review::{stream::ReviewStreamUpdate, ReviewGroup, ReviewSession};
+use tauqe_core::stop::HardCancellation;
 
 pub struct ReviewStartInput {
     pub preset: Option<String>,
@@ -102,7 +102,7 @@ impl ReviewPublication {
 }
 #[async_trait::async_trait]
 impl ReviewObserver for ReviewPublication {
-    async fn pace(&self, event: &StreamEvent, cancel: &mut tokio::sync::watch::Receiver<bool>) {
+    async fn pace(&self, event: &StreamEvent, cancel: &HardCancellation) {
         self.observer.ready(event, cancel).await;
     }
     fn publish(&self, event: ReviewStreamUpdate) {
@@ -169,7 +169,6 @@ pub(crate) struct AuditResources {
     pub(crate) context: ContextSession,
     pub(crate) execution: ExecutionSession,
     pub(crate) history: HistorySession,
-    pub(crate) usage: UsageSession,
 }
 
 fn preset_name(name: Option<&str>) -> Option<&str> {
@@ -305,7 +304,6 @@ impl AuditResources {
             context: &self.context,
             execution: &self.execution,
             history: &self.history,
-            usage: &self.usage,
         }
     }
 }
@@ -337,5 +335,6 @@ impl AuditResources {
             deadline,
         )
         .await
+        .map(|(report, _)| report)
     }
 }

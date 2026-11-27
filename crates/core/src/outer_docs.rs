@@ -32,7 +32,7 @@ pub(crate) mod trust;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tokio::sync::watch;
+use tauqe_tools::stop::HardCancellation;
 
 use crate::config::{OuterDocEntry, OuterDocSource};
 use crate::outer_docs::trust::RefsTrust;
@@ -558,7 +558,7 @@ impl OuterDocsRegistry {
         repo_root: &Path,
         path: &str,
         max_bytes: u64,
-        cancel_rx: Option<&watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
     ) -> Result<Option<String>, MaterializeError> {
         let Some(name) = registry_name(path) else {
             return Ok(None);
@@ -566,7 +566,7 @@ impl OuterDocsRegistry {
         let Some(target) = self.resolve(&name) else {
             return Ok(None);
         };
-        let cache_path = materialize_target(repo_root, target, max_bytes, cancel_rx, None).await?;
+        let cache_path = materialize_target(repo_root, target, max_bytes, cancel, None).await?;
         Ok(Some(cache_path))
     }
 
@@ -582,9 +582,9 @@ impl OuterDocsRegistry {
         repo_root: &Path,
         id: &str,
         max_bytes: u64,
-        cancel_rx: Option<&watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
     ) -> Result<String, MaterializeError> {
-        self.materialize_declared_with(repo_root, id, max_bytes, cancel_rx, None)
+        self.materialize_declared_with(repo_root, id, max_bytes, cancel, None)
             .await
     }
 
@@ -594,7 +594,7 @@ impl OuterDocsRegistry {
         repo_root: &Path,
         id: &str,
         max_bytes: u64,
-        cancel_rx: Option<&watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
         trust: Option<RefsTrust>,
     ) -> Result<String, MaterializeError> {
         let name = id.trim();
@@ -608,7 +608,7 @@ impl OuterDocsRegistry {
                 "the outer document `{name}` is not declared, so it cannot be requested"
             )));
         };
-        materialize_target(repo_root, target, max_bytes, cancel_rx, trust).await
+        materialize_target(repo_root, target, max_bytes, cancel, trust).await
     }
 
     /// Resolves the identifier a request names to the document it addresses.
@@ -662,18 +662,17 @@ async fn materialize_target(
     repo_root: &Path,
     target: DeclaredTarget<'_>,
     max_bytes: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
     trust: Option<RefsTrust>,
 ) -> Result<String, MaterializeError> {
     match target {
         DeclaredTarget::Root(doc) => {
-            materialize::materialize_document_with(repo_root, doc, max_bytes, cancel_rx, trust)
-                .await
+            materialize::materialize_document_with(repo_root, doc, max_bytes, cancel, trust).await
         }
         DeclaredTarget::Relative(doc, relative) => {
             ensure_inside_root(doc, &relative)?;
             materialize::materialize_relative_with(
-                repo_root, doc, &relative, max_bytes, cancel_rx, trust,
+                repo_root, doc, &relative, max_bytes, cancel, trust,
             )
             .await
         }

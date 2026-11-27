@@ -277,6 +277,11 @@ pub fn render_status_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Sta
             item_title,
             current_status,
             ..
+        }
+        | crate::app::StatusDialogTarget::ReviewPlanStep {
+            item_title,
+            current_status,
+            ..
         } => (
             active_t("dialog.status.plan.title"),
             item_title.as_str(),

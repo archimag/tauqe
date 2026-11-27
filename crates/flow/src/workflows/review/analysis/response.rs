@@ -1,7 +1,7 @@
 //! Stream decoding and completion classification for review post-analysis.
 
-use crate::application::structured_task::StructuredTaskError;
-use tauqe_core::execution::structured::StructuredError;
+use crate::workflows::structured::{StructuredFailure, StructuredTaskError};
+use tauqe_core::execution::budget::InputLimitExceeded;
 use tauqe_core::review::analysis::{
     PostAnalysisOutput, PostAnalysisRegrouping, PostAnalysisRegroupingError,
 };
@@ -13,6 +13,8 @@ pub enum ReviewAnalysisCompletionError {
     Cancelled(String),
     #[error("{0}")]
     Provider(String),
+    #[error(transparent)]
+    InputLimit(#[from] InputLimitExceeded),
     #[error("Model returned an empty post-analysis for review session '{0}'")]
     EmptyResponse(String),
     #[error("Failed to parse the review post-analysis payload: {0}")]
@@ -36,38 +38,23 @@ impl ReviewAnalysisResponse {
         }
         let output = match result {
             Ok(output) => output,
-            Err(
-                StructuredTaskError::Cancelled
-                | StructuredTaskError::Request(StructuredError::Cancelled),
-            ) => return Err(ReviewAnalysisCompletionError::Cancelled(session.id.clone())),
-            Err(StructuredTaskError::Request(StructuredError::Empty)) => {
-                return Err(ReviewAnalysisCompletionError::EmptyResponse(
-                    session.id.clone(),
-                ))
-            }
-            Err(StructuredTaskError::Request(StructuredError::Decode(message))) => {
-                return Err(ReviewAnalysisCompletionError::Parse(message))
-            }
-            Err(
-                StructuredTaskError::Stream(message)
-                | StructuredTaskError::Task(message)
-                | StructuredTaskError::Request(StructuredError::Failed(message)),
-            ) => return Err(ReviewAnalysisCompletionError::Provider(message)),
-            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
-                return Err(ReviewAnalysisCompletionError::Provider(
-                    "Structured request closed without Done".into(),
-                ))
-            }
-            Err(StructuredTaskError::ForeignOperation) => {
-                return Err(ReviewAnalysisCompletionError::Provider(
-                    "review post-analysis requires an active operation for this session".into(),
-                ))
-            }
-            Err(StructuredTaskError::Orphaned) => {
-                return Err(ReviewAnalysisCompletionError::Provider(
-                    "review post-analysis task did not stop within its exit deadline".into(),
-                ))
-            }
+            Err(error) => match error.classify("review post-analysis") {
+                StructuredFailure::Cancelled => {
+                    return Err(ReviewAnalysisCompletionError::Cancelled(session.id.clone()))
+                }
+                StructuredFailure::Empty => {
+                    return Err(ReviewAnalysisCompletionError::EmptyResponse(
+                        session.id.clone(),
+                    ))
+                }
+                StructuredFailure::Decode(message) => {
+                    return Err(ReviewAnalysisCompletionError::Parse(message))
+                }
+                StructuredFailure::InputLimit(error) => return Err(error.into()),
+                StructuredFailure::Failed(message) => {
+                    return Err(ReviewAnalysisCompletionError::Provider(message))
+                }
+            },
         };
         PostAnalysisRegrouping::prepare(session, &output).map_err(Into::into)
     }
@@ -76,6 +63,7 @@ impl ReviewAnalysisResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_core::execution::structured::StructuredError;
 
     fn decode(raw: &str) -> PostAnalysisOutput {
         tauqe_core::review::analysis::parse_post_analysis(raw).unwrap()
@@ -113,6 +101,27 @@ mod tests {
             ReviewAnalysisResponse::finish(Err(StructuredTaskError::Cancelled), &session(), false),
             Err(ReviewAnalysisCompletionError::Cancelled(_))
         ));
+    }
+
+    #[test]
+    fn input_limit_remains_typed_after_completion() {
+        let limit = InputLimitExceeded {
+            size: 12,
+            limit: 1,
+            messages: 5,
+            response_format: 4,
+            adapter_and_framing: 3,
+        };
+        let result = ReviewAnalysisResponse::finish(
+            Err(StructuredTaskError::Request(StructuredError::InputLimit(
+                limit,
+            ))),
+            &session(),
+            false,
+        );
+        assert!(
+            matches!(result, Err(ReviewAnalysisCompletionError::InputLimit(error)) if error.size == 12 && error.limit == 1)
+        );
     }
 
     #[test]

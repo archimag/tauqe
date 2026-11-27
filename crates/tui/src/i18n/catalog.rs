@@ -1068,6 +1068,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.execute", "Execute the selected finding, group root-cause plan, or all Todo findings in the session", "Review command description", None),
         item("cmd.review.run", "Run a code review on the current context", "Review command description", None),
         item("cmd.review.analyze", "Run the Architect post-analysis over the selected review session", "Review command description", None),
+        item("cmd.review.refine_group", "Refine the selected architectural group's unfinished plan with the Architect", "Review command description for explicit group horizon recovery", None),
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
         item("cmd.review.refresh", "Refresh the review sessions from the server", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
@@ -1326,6 +1327,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_all_fixed_session", "All findings in this review session are already FIXED.", "Review notification for a completed session", None),
         item("notify.review_no_todo_session", "No TODO findings to execute in this review session.", "Review notification when a session has no TODO findings", None),
         item("notify.review_no_todo_section", "No actionable findings to execute in this section.", "Review notification when a rendered review section carries no actionable findings", None),
+        item("notify.review_refine_group_only", "Select a declared architectural group or one of its plan steps to refine its horizon.", "Review notification when the refinement shortcut targets another row", None),
+        item("notify.review_plan_step_container", "Container steps have no editable status; select a leaf step.", "Review notification when status editing targets a group plan container", None),
+        item("notify.review_plan_step_done", "A completed plan step cannot change status.", "Review notification when status editing targets a completed group plan leaf", None),
         item("notify.review_no_sessions", "No review sessions available.", "Review notification when no sessions exist", None),
         item("notify.review_no_findings", "No findings in review sessions.", "Review notification when sessions have no findings", None),
         item("notify.review_discussion_only", "All remaining findings are in DISCUSSION status; approve or change status to TODO (t) before executing.", "Review notification when only discussion findings remain", None),
@@ -1344,25 +1348,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured file token budget; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the file token budget", None),
         item("notify.review_pattern_no_matches", "The target pattern '{}' matches no repository files; correct it or clear the field", "Review notification rejecting a launch whose target pattern selects no repository file", None),
         // ------------------------------------------------------------------
-        // Truncated audit window (c-3). The confirmation card states the whole
-        // picture of the window the launch would audit — the context, the
-        // pattern matches, the selection, the omissions split by the limit that
-        // dropped them, and the shared token budget — so consent to a narrowed
-        // audit is explicit and never assumed.
-        // ------------------------------------------------------------------
-        item("review.truncation.title", "Truncated Review Window", "Title for the confirmation card shown before launching a review whose audited window the configured budgets truncate", None),
-        item("review.truncation.heading", "The configured budgets truncate the audited window.", "Heading in the review truncation confirmation card", None),
-        item("review.truncation.context_label", " Context: ", "Truncation card label for the files and tokens the active context contributes", None),
-        item("review.truncation.matched_label", " Matched: ", "Truncation card label for the files the target patterns matched", None),
-        item("review.truncation.selected_label", " Selected: ", "Truncation card label for the files the audited window accepted", None),
-        item("review.truncation.omitted_label", " Omitted: ", "Truncation card label for the files the budgets dropped", None),
-        item("review.truncation.budget_label", " Budget: ", "Truncation card label for the shared file token budget", None),
-        item("review.truncation.files_tokens", "{} file(s) (~{} tokens)", "Truncation card value naming a file count and its estimated tokens", None),
-        item("review.truncation.files_only", "{} file(s)", "Truncation card value naming a file count without a token estimate", None),
-        item("review.truncation.omitted_value", "{} file(s) dropped by the token budget", "Truncation card value naming how many matched files the shared file token budget dropped", None),
-        item("review.truncation.budget_value", "~{} of {} tokens", "Truncation card value naming the estimated tokens the selection spends against the shared file budget", None),
-        item("review.truncation.note", "TAUQE audits exactly the selected files. Raise the file budget or narrow the target patterns to audit the omitted ones.", "Warning note in the truncation card explaining how to widen the audited window", None),
-        item("review.truncation.confirm", "Audit Selected", "Button confirming a launch whose audited window the budgets truncate", Some(16)),
+        // Refuse a legacy projection that reports a budget-truncated window.
+        item("notify.review_preview_truncated", "The server projected a budget-truncated review window; the audit was not started. Update the server and retry with the full window.", "Notification refusing a legacy budget-truncated review projection", None),
         item("notify.review_preview_failed", "Failed to project the review window: {}", "Notification when the review audit-window projection cannot be requested or read", None),
         item("notify.review_context_empty", "Context is empty: add files in the Context tab (Ctrl+2) first", "Review notification requiring context files", None),
         item("notify.review_copied", "Review findings copied to clipboard", "Review notification after copying findings", None),
@@ -1473,6 +1460,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "Suffix appended to the completion notification of a review batch: the first placeholder receives the findings the queue fixed, the second the findings the open-questions gate deferred, and the third the members that failed locally",
             None,
         ),
+        // Batch kind labels and status words: the typed supervisor outcome
+        item("repl.deferred_groups_heading", "\n\nDeferred review groups:\n", "REPL report heading for groups omitted from a review execution queue", None),
+        item("repl.deferral_questions", "Unresolved questions", "Review group deferral reason for unanswered findings or discussion steps", None),
+        item("repl.deferral_refinement", "Horizon needs refinement", "Review group deferral reason for an impassable saved horizon", None),
         // Batch kind labels and status words: the typed supervisor outcome
         // resolves its localized fragments here instead of the RPC layer
         // forwarding English literals into the templates above.
@@ -1594,6 +1585,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Plan refinement (architect) dialog and its blocked popup.
         // ------------------------------------------------------------------
         item("dialog.refine.plan_label", " Plan: ", "Refine dialog plan field label", None),
+        item("dialog.refine_group.title", "Refine Review Group (AI Architect)", "Title for refinement of one architectural review group", None),
+        item("dialog.refine_group.group_label", " Group: ", "Refinement target group label", None),
+        item("dialog.refine_group.address", "review {} / group {}", "Address of the review group being refined", None),
+        item("dialog.refine_group.header_note", " Only the unfinished horizon is replaced; Coder does not run and findings are not regrouped.", "Group refinement scope and safety note", None),
         item("dialog.refine.header_note", " Decomposes high-level tasks into verified atomic engineering steps without altering agreed architecture.", "Refine dialog header note describing the architect mandate", None),
         item("dialog.refine.model_list_counter", " Architect Model  [{} of {}] ", "Refine dialog architect list title with a position counter", None),
         item("dialog.refine.model_list_title", " Architect Model ", "Refine dialog architect list title with a single entry", None),
@@ -1789,7 +1784,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_deleted", "Review session deleted", "Notification after a review session is deleted", None),
         item("notify.squashed_commit_fallback", "Squashed commit", "Fallback commit summary when a squash message is empty", None),
         item("notify.context_added", "Added {} files (~{} tokens)", "Notification when files are added to context by pattern", None),
-        item("notify.context_added_truncated", "Added {} files (~{} tokens); the file token budget was exhausted and the remaining matched files were skipped", "Notification when a context pattern add exhausts the file token budget", None),
+        item("notify.context_added_truncated", "Added {} files (~{} tokens); some matching files were not added", "Notification when a context pattern add reports incomplete results", None),
         item("notify.context_removed", "Removed {} file(s) from context", "Notification when files are removed from context", None),
         item("notify.context_cleared", "Cleared {} file(s) from context", "Notification when a context layer is cleared", None),
         item("notify.locale_busy", "Cannot change locale while model is generating", "Notification rejecting a locale change while the model is busy", None),
@@ -1799,6 +1794,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.finding_decomposed_default", "Finding decomposed into steps by the Architect", "Notification after the Architect decomposes a finding without a note", None),
         item("notify.finding_decompose_blocked", "Decomposition blocked: {}", "Notification when the Architect refuses to decompose a finding", None),
         item("notify.plan_horizon_updated", "Plan '{}' horizon updated ({}/{} done): {}", "Notification after the Architect updates a plan horizon", None),
+        item("notify.review_group_refined", "Review group '{}' in '{}' refined: {}", "Notification after the addressed review group horizon is saved", None),
+        item("notify.review_group_refined_default", "Review group '{}' in '{}' refined", "Notification after the addressed review group is saved without an explanation", None),
+        item("notify.review_group_aborted", "Group refinement aborted: {}. {}", "Notification naming an aborted group refinement and recovery instruction", None),
+        item("notify.review_group_response_mismatch", "Group refinement response addressed a different group", "Notification rejecting a mismatched group refinement reply", None),
         item("notify.plan_horizon_updated_default", "Plan '{}' horizon updated successfully by architect ({}/{} done)", "Notification after the Architect updates a plan horizon without a note", None),
         item("notify.plan_horizon_blocked", "Plan horizon synthesis blocked by architect: manual intervention or replanning required", "Notification when the Architect refuses a plan horizon synthesis", None),
         item("notify.plan_created", "Plan '{}' created ({}/{} done): {}", "Notification after the two-phase pipeline issues a new plan with its reconciliation note", None),

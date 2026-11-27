@@ -1,14 +1,23 @@
+use super::lifecycle::{self, LifecycleServices};
+use super::settlement::{classify_task, interrupt, InterruptionCause, TaskSettlement};
 use super::*;
-use crate::api::Application;
-use crate::application::discussion_prompt::ResolvedDiscussion;
+use crate::api::{Application, ApplicationEvent, ApplicationObserver, InteractiveTaskOutcome};
+use crate::application::discussion_prompt::{PreparedModelAsk, ResolvedDiscussion};
 use crate::application::ExecutionFactory;
 use std::path::Path;
 use std::sync::Arc;
 use tauqe_core::config::AppConfig;
 use tauqe_core::models::{ModelRole, ProviderKind};
 use tauqe_core::plan::storage::PlanStorage;
+use tauqe_core::plan::PlanRejectionKind;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::review::storage::ReviewStorage;
+
+struct NoopObserver;
+
+impl ApplicationObserver for NoopObserver {
+    fn publish(&self, _: &str, _: ApplicationEvent) {}
+}
 
 async fn execute(
     root: &Path,
@@ -30,26 +39,81 @@ async fn execute(
     let operation = Arc::new(app.try_begin_operation().unwrap());
     let factory = ExecutionFactory::bind(&app, &operation).await.unwrap();
     let model = factory.resolve_model(factory.selection().clone(), ModelRole::REPL);
-    let executor = factory
+    let max_turn_rounds =
+        tauqe_core::workflow::WorkflowOptions::from_app_config(&model.config).max_turn_rounds();
+    let mut executor = factory
         .bind_prompt(
             &model.model,
             model.effort,
+            model.role,
             None,
             model.config.repl.patch_strategy(),
         )
         .await
         .unwrap();
+    let scope = app.execution_session().prepare_scope();
+    let binding = scope.binding();
+    executor.bind_usage(binding.clone()).unwrap();
+    let config = Arc::new(model.config.clone());
     let policy = factory.apply_policy(model.config.repl.workflow);
     let prepared = PreparedModelAsk {
         utterance: "Discuss the change".into(),
         discussion,
         focus_update: None,
     };
-    let mut started = start_task(&app, operation, prepared, model, executor, policy)
+    let services = LifecycleServices {
+        context: app.context_session().clone(),
+        interactive: app.interactive_execution().clone(),
+        execution: app.execution_session(),
+        history: app.history_session().clone(),
+    };
+    let context = services.context.clone();
+    // The helper runs the task directly, so activate the same accounting
+    // binding before history preparation or model execution.
+    let (result, _) = scope
+        .run(
+            &context,
+            operation.publication_id(),
+            |_, _| {},
+            async move {
+                let started = lifecycle::start_task(
+                    &services,
+                    operation.clone(),
+                    prepared,
+                    max_turn_rounds,
+                    config,
+                    binding,
+                    executor,
+                    policy,
+                    EventSink::noop(),
+                    Arc::new(NoopObserver),
+                )
+                .await
+                .unwrap();
+                let report = started.join().await;
+                report
+                    .preparation
+                    .complete(
+                        &operation,
+                        crate::application::interactive_history::CompleteTurn {
+                            rounds: report.rounds,
+                            source: report.source,
+                            response: String::new(),
+                            edit: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                report.task.unwrap().result
+            },
+            |_| {},
+            |outcome| async move { outcome },
+        )
         .await
         .unwrap();
-    while started.events.recv().await.is_some() {}
-    let result = started.task.join().await.task.unwrap().result;
+    let tauqe_core::execution::task::TaskOutcome::Completed(result) = result else {
+        panic!("interactive test task failed");
+    };
     (result, provider.requests())
 }
 
@@ -122,130 +186,33 @@ fn document(result: Result<ReplResult, ExecutionError>) -> DocumentResult {
 }
 
 #[tokio::test]
-async fn forced_abort_drains_an_admitted_document_write_and_keeps_its_receipt() {
-    use std::time::Duration;
-    use tokio::sync::Notify;
-
+async fn budget_before_first_round_is_an_environment_answer() {
     let root = tempfile::tempdir().unwrap();
-    tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
-    let plans = PlanStorage::plans_dir(root.path());
-    std::fs::create_dir_all(plans.join("active")).unwrap();
-    let (history, _) = tokio::sync::mpsc::unbounded_channel();
-    let app = Application::for_repository(Default::default(), root.path().to_path_buf(), history);
-    let operation = Arc::new(app.try_begin_operation().unwrap());
-    let admitted = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let (documents, worker) = DocumentExecutor::spawn(
-        root.path().to_path_buf(),
-        CancellationToken::from_receiver(operation.cancel_receiver()),
-        {
-            let admitted = admitted.clone();
-            let release = release.clone();
-            move || {
-                let admitted = admitted.clone();
-                let release = release.clone();
-                async move {
-                    admitted.notify_one();
-                    release.notified().await;
-                }
-            }
-        },
-    );
-    let payload: serde_json::Value = serde_json::from_str(&plan_payload(true)).unwrap();
-    let update = serde_json::from_value(payload["action"]["plan_create"].clone()).unwrap();
-    let task = app
-        .start_interactive_task(operation.clone(), move |context| async move {
-            let result = documents
-                .write(DocumentWrite::Plans {
-                    updates: vec![update],
-                    mode: PlanMutationMode::Repl,
-                })
-                .await;
-            InteractiveTaskOutcome {
-                result: result
-                    .map(|_| ReplResult::Answer(ReplText::Environment("Write completed".into()))),
-                context,
-            }
-        })
-        .unwrap()
-        .with_document_worker(worker);
-    tokio::time::timeout(Duration::from_secs(10), admitted.notified())
-        .await
-        .unwrap();
-    assert_eq!(app.cancel_active_operation(), Some(operation.id()));
-    assert!(app.abort_operation(operation.id()));
-    let mut joining = Box::pin(task.join());
+    let (result, requests) = execute(root.path(), vec![], None, 0).await;
+    assert!(requests.is_empty());
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut joining)
-            .await
-            .is_err()
+        matches!(result, Ok(ReplResult::Answer(ReplText::Environment(text)))
+        if text.contains("Round Budget Reached") && text.contains("0 provider call(s)"))
     );
-    assert!(!plans.join("corrected.json").exists());
-    assert!(app.try_begin_operation().is_err());
-
-    release.notify_one();
-    let joined = tokio::time::timeout(Duration::from_secs(10), joining)
-        .await
-        .unwrap();
-    assert!(
-        matches!(joined.task, Err(InteractiveTaskError::Interrupted(cause)) if cause.is_cancelled())
-    );
-    assert!(joined.documents.join_error.is_none());
-    let report = joined.documents.receipts;
-    assert_eq!(report.len(), 1);
-    let DocumentOutcome::Plans(outcomes) = report[0].as_ref() else {
-        panic!("expected a plan write receipt");
-    };
-    assert_eq!(outcomes.len(), 1);
-    assert_eq!(outcomes[0].applied.len(), 1);
-    assert_eq!(outcomes[0].applied[0].id, "corrected");
-    assert!(outcomes[0]
-        .storage_error
-        .as_deref()
-        .unwrap()
-        .contains("active plan marker"));
-    assert!(PlanStorage::load_plan(root.path(), "corrected")
-        .unwrap()
-        .is_some());
-    assert!(app.try_begin_operation().is_err());
-    drop(operation);
-    assert!(app.try_begin_operation().is_ok());
 }
 
 #[tokio::test]
-async fn document_worker_join_failure_preserves_previous_receipts() {
+async fn budget_after_research_is_an_error_not_an_environment_answer() {
     let root = tempfile::tempdir().unwrap();
     tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
-    let mut first = true;
-    let (documents, worker) = DocumentExecutor::spawn(
-        root.path().to_path_buf(),
-        CancellationToken::new(),
-        move || {
-            assert!(std::mem::take(&mut first), "simulated worker failure");
-            std::future::ready(())
-        },
-    );
-    let write = || {
-        let payload: serde_json::Value = serde_json::from_str(&plan_payload(true)).unwrap();
-        DocumentWrite::Plans {
-            updates: vec![
-                serde_json::from_value(payload["action"]["plan_create"].clone()).unwrap(),
-            ],
-            mode: PlanMutationMode::Repl,
-        }
-    };
-    let first = documents.write(write()).await.unwrap();
-    assert!(documents.write(write()).await.is_err());
-    drop(documents);
-
-    let settlement = worker.finish().await;
-    assert!(settlement.join_error.unwrap().is_panic());
-    assert_eq!(settlement.receipts.len(), 1);
-    assert!(Arc::ptr_eq(&settlement.receipts[0], &first));
-    let DocumentOutcome::Plans(outcomes) = first.as_ref() else {
-        panic!("expected a plan write receipt");
-    };
-    assert_eq!(outcomes[0].applied[0].id, "corrected");
+    std::fs::write(root.path().join("source.txt"), "source\n").unwrap();
+    let (result, requests) = execute(
+        root.path(),
+        vec![MockResponse::text(
+            r#"{"message":"Research accepted.","action":{"kind":"research","context_requests":[{"path":"source.txt","access":"read_only"}]}}"#,
+        )],
+        None,
+        1,
+    )
+    .await;
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(result, Err(ExecutionError::Other(error))
+        if error.contains("budget was exhausted after 1 call(s)")));
 }
 
 #[tokio::test]
@@ -387,11 +354,11 @@ async fn a_free_dialogue_cannot_update_an_existing_plan() {
 }
 
 #[tokio::test]
-async fn a_storage_failure_is_terminal_and_reports_any_document_already_saved() {
-    for (conflict, diagnostic, saved) in [
-        ("", "Failed to read plans directory", false),
-        ("corrected.json", "Failed to write plan document", false),
-        ("active", "Failed to write active plan marker", true),
+async fn a_storage_failure_is_terminal_and_leaves_no_document_saved() {
+    for (conflict, diagnostic) in [
+        ("", "Failed to read plans directory"),
+        ("corrected.json", "Is a directory"),
+        ("active", "Is a directory"),
     ] {
         let root = tempfile::tempdir().unwrap();
         tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
@@ -429,19 +396,9 @@ async fn a_storage_failure_is_terminal_and_reports_any_document_already_saved() 
             panic!("a storage failure must not be treated as a correctable refusal");
         };
         assert!(error.contains(diagnostic), "{error}");
-        assert_eq!(
-            error.contains("Plan documents already saved: corrected"),
-            saved
-        );
+        assert!(!error.contains("already saved"));
         let document = plans.join("corrected.json");
-        assert_eq!(document.is_file(), saved);
-        if saved {
-            let stored = PlanStorage::load_plan(root.path(), "corrected")
-                .unwrap()
-                .unwrap();
-            assert_eq!(stored.title, "Corrected");
-            assert!(plans.join("active").is_dir());
-        }
+        assert!(!document.is_file());
     }
 }
 
@@ -478,4 +435,45 @@ fn a_finalized_edit_cannot_be_settled_as_a_text_answer() {
             diagnostic,
         } if diagnostic.contains("stream failed") && diagnostic.contains("worker failed")
     ));
+}
+
+#[test]
+fn interruption_matrix_preserves_receipts_and_uncertain_recovery() {
+    for (cause, worker_error, confirmed, unknown, expect_diagnostic) in [
+        (InterruptionCause::Cancelled, false, false, false, false),
+        (InterruptionCause::Cancelled, true, false, false, true),
+        (InterruptionCause::Cancelled, false, true, false, true),
+        (InterruptionCause::Cancelled, false, false, true, true),
+        (InterruptionCause::TaskFailed, true, true, true, true),
+    ] {
+        let documents = documents::DocumentChanges {
+            reviews: if confirmed {
+                vec![tauqe_core::review::ReviewSession {
+                    id: "focused".into(),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let diagnostic = if worker_error {
+            "document worker failed".into()
+        } else {
+            String::new()
+        };
+        let result = interrupt(cause, diagnostic, vec![], None, &documents, None, unknown);
+        assert_eq!(result.cause, cause);
+        assert_eq!(!result.diagnostic.is_empty(), expect_diagnostic);
+        let history = result.history;
+        assert_eq!(history.cancelled, cause == InterruptionCause::Cancelled);
+        assert_eq!(history.confirmed_documents, confirmed);
+        assert_eq!(!history.diagnostic.is_empty(), expect_diagnostic);
+        if unknown {
+            assert!(history.diagnostic.contains("recovery is unconfirmed"));
+        }
+        if confirmed {
+            assert!(history.reason.contains("focused"));
+        }
+    }
 }

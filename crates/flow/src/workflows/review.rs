@@ -2,16 +2,16 @@
 
 pub(crate) mod analysis;
 pub(crate) mod audit;
+mod horizon;
 mod member;
+pub(crate) mod refinement;
 pub(super) mod sequence;
 
-use crate::api::{ApplicationEvent, ApplicationObserver, ContextClearScope, OperationGuard};
+use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
 use crate::application::configuration::{Configuration, ConfigurationSnapshot};
-use crate::application::dialogue::DialogueSession;
 use crate::application::documents::Documents;
 use crate::application::focus::FocusSession;
-use crate::application::preflight::{run_preflight_verification, PreflightVerdict};
-use crate::application::turn_setup::ResolvedTurnModel;
+use crate::application::preflight::{run_batch_preflight, PreflightVerdict};
 use crate::application::PlanExecutionEnvironment;
 use crate::workflows::step::run::StepResources;
 use async_trait::async_trait;
@@ -21,11 +21,13 @@ use tauqe_core::models::ModelSelection;
 use tauqe_core::plan::PlanScopeEvaluation;
 use tauqe_core::providers::StreamEvent;
 use tauqe_core::review::prompt::refine::has_recorded_decision;
+use tauqe_core::review::prompt::render_group_implementation;
 use tauqe_core::review::storage::GroupCompletion;
 use tauqe_core::review::{IssueStatus, IssueType, ReviewExecuteTarget, ReviewItem, ReviewSession};
+use tauqe_core::stop::HardCancellation;
 use tauqe_core::workflow::batch::{
     BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepStatus,
-    BatchStop,
+    BatchStop, SoftStopPolicy,
 };
 use tauqe_core::workflow::implementation::{
     classify_scope_stall, ExecutionScope, ImplementationFrame, StepFailure,
@@ -33,7 +35,7 @@ use tauqe_core::workflow::implementation::{
 use tauqe_core::workflow::turn::TurnWorkContext;
 use tauqe_core::workflow::turn::TurnWorkItem;
 use tauqe_core::workflow::turn::TurnWorkQueue;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 pub(crate) async fn resolve_group_frame(
     documents: &Documents,
@@ -67,6 +69,7 @@ async fn load_session(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewQueueFailure {
     ArchitecturalGroupExecutionRequired,
+    GroupNeedsRefinement,
     GroupUnresolvedQuestions,
     InvalidParams,
     ItemInDiscussion,
@@ -94,8 +97,80 @@ pub enum ReviewLaunchError {
 }
 
 struct PreparedReviewBatch {
-    owner_id: String,
+    owner: ReviewOwner,
     queue: ResolvedQueue,
+}
+
+enum ReviewOwner {
+    All,
+    Session(String),
+}
+
+impl ReviewOwner {
+    fn id(&self) -> &str {
+        match self {
+            Self::All => "all",
+            Self::Session(id) => id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReviewMember {
+    Group { review_id: String, group_id: String },
+    Finding { review_id: String, item_id: u32 },
+}
+
+impl ReviewMember {
+    fn id(&self) -> String {
+        match self {
+            Self::Group {
+                review_id,
+                group_id,
+            } => group_member_id(review_id, group_id),
+            Self::Finding { review_id, item_id } => format!("{review_id}:{item_id}"),
+        }
+    }
+
+    pub(crate) fn review_id(&self) -> &str {
+        match self {
+            Self::Group { review_id, .. } | Self::Finding { review_id, .. } => review_id,
+        }
+    }
+
+    fn scope(&self) -> ExecutionScope {
+        match self {
+            Self::Group {
+                review_id,
+                group_id,
+            } => ExecutionScope::ReviewGroup {
+                review_id: review_id.clone(),
+                group_id: group_id.clone(),
+            },
+            Self::Finding { review_id, item_id } => ExecutionScope::ReviewFinding {
+                review_id: review_id.clone(),
+                item_id: *item_id,
+            },
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_batch_id(id: &str) -> Option<Self> {
+        if let Some((review_id, group_id)) = parse_group_member(id) {
+            return Some(Self::Group {
+                review_id: review_id.into(),
+                group_id: group_id.into(),
+            });
+        }
+        let (review_id, item_id) = id.split_once(':')?;
+        if review_id.is_empty() {
+            return None;
+        }
+        Some(Self::Finding {
+            review_id: review_id.into(),
+            item_id: item_id.parse().ok()?,
+        })
+    }
 }
 
 pub struct ReviewBatchStarted {
@@ -114,17 +189,54 @@ pub struct ExecutedReviewBatch {
     pub fixed_count: usize,
     pub deferred: usize,
     pub failed_count: usize,
+    pub deferred_groups: Vec<DeferredReviewGroup>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferralReason {
+    UnresolvedQuestions,
+    NeedsRefinement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredReviewGroup {
+    pub review_id: String,
+    pub group_id: String,
+    pub reason: DeferralReason,
+    pub diagnostic: String,
+    pub recovery: String,
+    pub open_findings: usize,
 }
 
 pub(crate) struct ReviewResources {
     pub(crate) step: StepResources,
-    pub(crate) dialogue: Arc<DialogueSession>,
 }
 
 pub(crate) struct ReviewBatch<'a> {
-    pub(crate) owner_id: &'a str,
-    pub(crate) members: &'a [String],
+    owner: ReviewOwner,
+    members: &'a [ReviewMember],
     pub(crate) deferred: usize,
+    deferred_groups: Vec<DeferredReviewGroup>,
+}
+
+impl<'a> ReviewBatch<'a> {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_batch_ids(
+        owner_id: &str,
+        members: &'a [ReviewMember],
+        deferred: usize,
+    ) -> Self {
+        Self {
+            owner: if owner_id == "all" {
+                ReviewOwner::All
+            } else {
+                ReviewOwner::Session(owner_id.into())
+            },
+            members,
+            deferred,
+            deferred_groups: Vec::new(),
+        }
+    }
 }
 
 impl ReviewResources {
@@ -144,8 +256,8 @@ impl ReviewResources {
             .map_err(|_| ReviewLaunchError::Busy)?;
         let root = self.step.context.repository_root().await;
         let documents = Documents::new(&root);
-        let PreparedReviewBatch { owner_id, queue } = prepare_queue(&documents, &target).await?;
-        match run_preflight_verification(&root, operation.cancel_receiver()).await {
+        let PreparedReviewBatch { owner, queue } = prepare_queue(&documents, &target).await?;
+        match run_batch_preflight(&root, &operation, observer.as_ref()).await {
             PreflightVerdict::Passed => {}
             PreflightVerdict::Cancelled => return Err(ReviewLaunchError::Cancelled),
             PreflightVerdict::Failed(report) => {
@@ -166,9 +278,10 @@ impl ReviewResources {
         tokio::spawn(async move {
             self.run_batch(
                 ReviewBatch {
-                    owner_id: &owner_id,
+                    owner,
                     members: &queue.members,
                     deferred: queue.deferred,
+                    deferred_groups: queue.deferred_groups,
                 },
                 configuration,
                 model,
@@ -183,9 +296,10 @@ impl ReviewResources {
     pub(crate) async fn run_batch(
         &self,
         ReviewBatch {
-            owner_id,
+            owner,
             members,
             deferred,
+            deferred_groups,
         }: ReviewBatch<'_>,
         configuration: ConfigurationSnapshot,
         model: Option<ModelSelection>,
@@ -196,37 +310,50 @@ impl ReviewResources {
             self.step.execution.owns(operation),
             "operation belongs to another application"
         );
+        assert!(
+            self.step
+                .context
+                .activate_manual_publication(operation, observer.clone()),
+            "could not bind review batch context publication"
+        );
         let root = self.step.context.repository_root().await;
         let documents = Documents::new(&root);
-        if owner_id != "all" {
+        if let ReviewOwner::Session(owner_id) = &owner {
             let _ = documents.write_active_review(owner_id).await;
         }
         let id = operation.publication_id();
         self.clear_batch_context(&id, observer.as_ref()).await;
         let started = std::time::Instant::now();
 
+        let selection = model.unwrap_or(ModelSelection::Role(tauqe_core::models::ModelRole::Coder));
         let execution = PlanExecutionEnvironment::new(configuration, operation);
-        let model = execution.resolve_step_model(model);
+        let initial_deferrals = deferred_groups.len();
         let mut executor = ReviewBatchExecutor {
             step: &self.step,
             root: &root,
             documents: &documents,
             operation,
             execution: &execution,
-            model: &model,
+            selection: &selection,
             observer: &observer,
             fixed_items: 0,
+            deferred_groups,
+            initial_deferrals,
+            members: members
+                .iter()
+                .map(|member| (member.id(), member.clone()))
+                .collect(),
         };
         let steps: Vec<_> = members
             .iter()
-            .map(|member_id| BatchStep::new(member_id.clone(), member_label(member_id)))
+            .map(|member| BatchStep::new(member.id(), member_label(member)))
             .collect();
-        let cancel = operation.cancel_receiver();
-        let soft_stop = operation.soft_stop_receiver();
+        let cancel = operation.hard_cancellation();
+        let stop = operation.stop_token();
         let (tx, mut rx) = mpsc::channel(1);
         let run = async {
             let report = BatchExecution::new()
-                .run(&steps, &mut executor, &tx, &cancel, &soft_stop)
+                .run(&steps, &mut executor, &tx, &stop, SoftStopPolicy::Observe)
                 .await;
             drop(tx);
             report
@@ -240,30 +367,33 @@ impl ReviewResources {
         };
         let (mut report, ()) = tokio::join!(run, relay);
         self.clear_batch_context(&id, observer.as_ref()).await;
-        if matches!(report.stop, BatchStop::Completed | BatchStop::Stopped) && *cancel.borrow() {
+        if matches!(report.stop, BatchStop::Completed | BatchStop::Stopped) && cancel.is_cancelled()
+        {
             report.stop = BatchStop::Cancelled;
         }
+        let deferred = deferred
+            + executor
+                .deferred_groups
+                .iter()
+                .skip(executor.initial_deferrals)
+                .map(|group| group.open_findings)
+                .sum::<usize>();
         let (outcome, publication) = batch_result(
             report,
             executor.fixed_items,
             deferred,
-            owner_id,
+            owner.id(),
             started.elapsed(),
+            executor.deferred_groups,
         );
-        tracing::info!(owner_id, executed_count = publication.executed_count, fixed_count = publication.fixed_count, deferred, failed_count = publication.failed_count, stop = ?publication.stop, "Review batch finished");
+        tracing::info!(owner_id = owner.id(), executed_count = publication.executed_count, fixed_count = publication.fixed_count, deferred, failed_count = publication.failed_count, stop = ?publication.stop, "Review batch finished");
         observer.publish(&id, ApplicationEvent::ReviewBatchFinished(publication));
+        self.step.context.close_manual_publication(operation);
         outcome
     }
 
-    async fn clear_batch_context(&self, id: &str, observer: &dyn ApplicationObserver) {
-        if let Ok(state) = self
-            .step
-            .context
-            .clear_context(&self.dialogue, ContextClearScope::Transient)
-            .await
-        {
-            observer.publish(id, ApplicationEvent::Context(state));
-        }
+    async fn clear_batch_context(&self, _id: &str, _observer: &dyn ApplicationObserver) {
+        let _ = self.step.context.clear_transient_context().await;
     }
 }
 /// Separator binding the session identifier to the group identifier of a
@@ -286,22 +416,6 @@ fn parse_group_member(member_id: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((session_id, group_id))
-}
-
-/// Decodes the execution scope a batch member addresses.
-fn member_scope(member_id: &str) -> Option<ExecutionScope> {
-    if let Some((review_id, group_id)) = parse_group_member(member_id) {
-        return Some(ExecutionScope::ReviewGroup {
-            review_id: review_id.to_string(),
-            group_id: group_id.to_string(),
-        });
-    }
-    let (review_id, item_part) = member_id.split_once(':')?;
-    let item_id = item_part.parse::<u32>().ok()?;
-    Some(ExecutionScope::ReviewFinding {
-        review_id: review_id.to_string(),
-        item_id,
-    })
 }
 
 /// Statistics of one review batch run, reported with its terminal outcome.
@@ -468,11 +582,6 @@ fn group_open_questions<'a>(session: &'a ReviewSession, group_id: &str) -> Vec<&
         .collect()
 }
 
-/// Whether an architectural group can be executed without the engineer.
-fn group_ready_for_autonomous_run(session: &ReviewSession, group_id: &str) -> bool {
-    group_open_questions(session, group_id).is_empty()
-}
-
 /// Builds the typed refusal of a group that still poses open questions.
 fn group_unresolved_questions_error(group_id: &str, open: &[&ReviewItem]) -> ReviewQueueError {
     let ids = open
@@ -487,6 +596,104 @@ fn group_unresolved_questions_error(group_id: &str, open: &[&ReviewItem]) -> Rev
             group_id, ids
         ),
     )
+}
+
+/// Refuse an explicit run of a saved horizon that cannot advance. The Core
+/// projection supplies the complete stored diagnostics, not an inferred cause.
+fn group_horizon_refusal(
+    review_id: &str,
+    group: &tauqe_core::review::ReviewGroup,
+) -> Option<ReviewQueueError> {
+    (!group.implementation.items.is_empty()).then_some(())?;
+    let evaluation = group.implementation.evaluate_scope(None);
+    let kind = match &evaluation {
+        PlanScopeEvaluation::BlockedByBlockers(_)
+        | PlanScopeEvaluation::BlockedByDependencies(_)
+        | PlanScopeEvaluation::StepBlocked => ReviewQueueFailure::GroupNeedsRefinement,
+        PlanScopeEvaluation::BlockedByDiscussion(_) => ReviewQueueFailure::GroupUnresolvedQuestions,
+        PlanScopeEvaluation::Ready(_)
+        | PlanScopeEvaluation::AllCompleted
+        | PlanScopeEvaluation::Cancelled
+        | PlanScopeEvaluation::NotFound => return None,
+    };
+    let recovery = if matches!(
+        evaluation,
+        PlanScopeEvaluation::BlockedByBlockers(_) | PlanScopeEvaluation::StepBlocked
+    ) {
+        "After resolving an external blocker, manually change the affected leaf step from Blocked to Todo; if the plan itself must change, run review/refineGroup"
+    } else {
+        "Resolve DISCUSSION steps with an engineering decision; for an impassable horizon run review/refineGroup"
+    };
+    Some(response_error(
+        kind,
+        format!(
+            "Review group {} in session {} cannot execute its saved horizon ({evaluation:?}).\n\n{}\n{recovery} with review_id={} and group_id={} before executing again.",
+            serde_json::json!(group.id),
+            serde_json::json!(review_id),
+            render_group_implementation(group),
+            serde_json::json!(review_id),
+            serde_json::json!(group.id),
+        ),
+    ))
+}
+
+/// Read-only readiness decision shared by explicit, implicit and late admission.
+fn group_deferral(
+    session: &ReviewSession,
+    group: &tauqe_core::review::ReviewGroup,
+) -> Option<DeferredReviewGroup> {
+    let questions = group_open_questions(session, &group.id);
+    let (reason, diagnostic, recovery) = if !questions.is_empty() {
+        (
+            DeferralReason::UnresolvedQuestions,
+            group_unresolved_questions_error(&group.id, &questions).message,
+            "Record decisions on the open findings or move them to TODO".to_string(),
+        )
+    } else {
+        let refusal = group_horizon_refusal(&session.id, group)?;
+        let reason = if refusal.kind == ReviewQueueFailure::GroupUnresolvedQuestions {
+            DeferralReason::UnresolvedQuestions
+        } else {
+            DeferralReason::NeedsRefinement
+        };
+        let recovery = if reason == DeferralReason::UnresolvedQuestions {
+            "Resolve the DISCUSSION steps before executing the group".to_string()
+        } else if matches!(
+            group.implementation.evaluate_scope(None),
+            PlanScopeEvaluation::BlockedByBlockers(_) | PlanScopeEvaluation::StepBlocked
+        ) {
+            format!(
+                "After resolving an external blocker, manually change the affected leaf step from Blocked to Todo; if the plan must change, run review/refineGroup with review_id={} and group_id={}",
+                serde_json::json!(session.id),
+                serde_json::json!(group.id)
+            )
+        } else {
+            format!(
+                "Run review/refineGroup with review_id={} and group_id={}",
+                serde_json::json!(session.id),
+                serde_json::json!(group.id)
+            )
+        };
+        (reason, refusal.message, recovery)
+    };
+    Some(DeferredReviewGroup {
+        review_id: session.id.clone(),
+        group_id: group.id.clone(),
+        reason,
+        diagnostic,
+        recovery,
+        open_findings: session
+            .items
+            .iter()
+            .filter(|item| {
+                item.group.as_deref() == Some(&group.id)
+                    && matches!(
+                        item.status,
+                        IssueStatus::Discussion | IssueStatus::Todo | IssueStatus::InProgress
+                    )
+            })
+            .count(),
+    })
 }
 
 /// Whether an actionable architecture finding has no architectural group to be
@@ -559,11 +766,12 @@ fn resolve_session_queue(session: &ReviewSession, item_ids: &[u32]) -> Vec<u32> 
 /// One session's contribution to an implicit review batch queue.
 struct SessionContribution {
     /// Batch members the session contributes, in client order.
-    members: Vec<String>,
+    members: Vec<ReviewMember>,
     /// Findings the scheduled members address.
     addressed: Vec<u32>,
     /// Findings postponed until the questions of their group are decided.
     deferred_findings: usize,
+    deferred_groups: Vec<DeferredReviewGroup>,
     /// Architecture findings no architectural group can plan yet.
     pending_architecture: usize,
 }
@@ -574,28 +782,47 @@ fn session_contribution(session: &ReviewSession) -> SessionContribution {
         members: Vec::new(),
         addressed: Vec::new(),
         deferred_findings: 0,
+        deferred_groups: Vec::new(),
         pending_architecture: 0,
     };
     let mut scheduled_groups: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut deferred_groups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for group in session
+        .groups
+        .iter()
+        .filter(|group| group.kind == tauqe_core::review::ReviewGroupKind::Architectural)
+    {
+        let open = session.items.iter().any(|item| {
+            item.group.as_deref() == Some(&group.id)
+                && matches!(
+                    item.status,
+                    IssueStatus::Discussion | IssueStatus::Todo | IssueStatus::InProgress
+                )
+        });
+        let remaining = !group.implementation.items.is_empty()
+            && !matches!(
+                group.implementation.evaluate_scope(None),
+                PlanScopeEvaluation::AllCompleted
+            );
+        if !open && !remaining {
+            continue;
+        }
+        if let Some(deferred) = group_deferral(session, group) {
+            contribution.deferred_findings += deferred.open_findings;
+            contribution.deferred_groups.push(deferred);
+        } else {
+            scheduled_groups.insert(group.id.clone());
+        }
+    }
     for item in session.items.iter().filter(|item| is_actionable(item)) {
         if let Some(group_id) = architectural_group_of(session, item) {
-            if deferred_groups.contains(group_id) {
+            if !scheduled_groups.contains(group_id) {
                 continue;
             }
-            if !group_ready_for_autonomous_run(session, group_id) {
-                if deferred_groups.insert(group_id.to_string()) {
-                    contribution.deferred_findings += session
-                        .items
-                        .iter()
-                        .filter(|member| member.group.as_deref() == Some(group_id))
-                        .count();
-                }
-                continue;
-            }
-            let member = group_member_id(&session.id, group_id);
-            if scheduled_groups.insert(member.clone()) {
-                contribution.members.push(member);
+            if !contribution.members.iter().any(|member| matches!(member, ReviewMember::Group { group_id: id, .. } if id == group_id)) {
+                contribution.members.push(ReviewMember::Group {
+                    review_id: session.id.clone(),
+                    group_id: group_id.into(),
+                });
             }
             contribution.addressed.push(item.id);
             continue;
@@ -604,10 +831,19 @@ fn session_contribution(session: &ReviewSession) -> SessionContribution {
             contribution.pending_architecture += 1;
             continue;
         }
-        contribution
-            .members
-            .push(format!("{}:{}", session.id, item.id));
+        contribution.members.push(ReviewMember::Finding {
+            review_id: session.id.clone(),
+            item_id: item.id,
+        });
         contribution.addressed.push(item.id);
+    }
+    for group in &session.groups {
+        if scheduled_groups.contains(&group.id)
+            && !contribution.members.iter().any(|member| matches!(member, ReviewMember::Group { group_id, .. } if group_id == &group.id)) {
+            contribution.members.push(ReviewMember::Group {
+                review_id: session.id.clone(), group_id: group.id.clone(),
+            });
+        }
     }
     contribution
 }
@@ -615,11 +851,12 @@ fn session_contribution(session: &ReviewSession) -> SessionContribution {
 /// The implicit queue every stored session contributes.
 struct ImplicitQueues {
     /// Batch members to run, in stored order.
-    members: Vec<String>,
+    members: Vec<ReviewMember>,
     /// Findings the scheduled members address.
     addressed: Vec<u32>,
     /// Findings postponed until the questions of their group are decided.
     deferred: usize,
+    deferred_groups: Vec<DeferredReviewGroup>,
     /// Architecture findings no architectural group can plan yet.
     pending_architecture: usize,
 }
@@ -630,6 +867,7 @@ fn accumulate_implicit_queues(sessions: &[ReviewSession]) -> ImplicitQueues {
         members: Vec::new(),
         addressed: Vec::new(),
         deferred: 0,
+        deferred_groups: Vec::new(),
         pending_architecture: 0,
     };
     for session in sessions {
@@ -637,37 +875,38 @@ fn accumulate_implicit_queues(sessions: &[ReviewSession]) -> ImplicitQueues {
         queues.members.extend(contribution.members);
         queues.addressed.extend(contribution.addressed);
         queues.deferred += contribution.deferred_findings;
+        queues.deferred_groups.extend(contribution.deferred_groups);
         queues.pending_architecture += contribution.pending_architecture;
     }
     queues
 }
 
 /// Renders the supervisor diagnostic label of one batch member.
-fn member_label(member_id: &str) -> String {
-    if let Some((session_id, group_id)) = parse_group_member(member_id) {
-        return format!(
+fn member_label(member: &ReviewMember) -> String {
+    match member {
+        ReviewMember::Group {
+            review_id,
+            group_id,
+        } => format!(
             "Fix the root cause of review group '{}' in session '{}'",
-            group_id, session_id
-        );
+            group_id, review_id
+        ),
+        ReviewMember::Finding { review_id, item_id } => {
+            format!("Fix review finding #{} in session '{}'", item_id, review_id)
+        }
     }
-    let Some((session_id, item_id)) = member_id.split_once(':') else {
-        return format!("Execute review member '{}'", member_id);
-    };
-    format!(
-        "Fix review finding #{} in session '{}'",
-        item_id, session_id
-    )
 }
 
 /// A resolved `review/execute` selection.
 #[derive(Debug)]
 struct ResolvedQueue {
     /// Batch members to run, in the order the client addressed them.
-    members: Vec<String>,
+    members: Vec<ReviewMember>,
     /// Findings the members address.
     addressed: Vec<u32>,
     /// Findings postponed until the questions of their group are decided.
     deferred: usize,
+    deferred_groups: Vec<DeferredReviewGroup>,
 }
 
 type ResolvedSelection = Result<ResolvedQueue, ReviewQueueError>;
@@ -682,20 +921,29 @@ fn resolve_group_selection(
     review_id: &str,
     group_id: &str,
 ) -> ResolvedSelection {
-    if !session.groups.iter().any(|group| group.id == group_id) {
-        return Err(response_error(
-            ReviewQueueFailure::NotFound,
-            format!(
-                "Review group '{}' not found in session '{}'",
-                group_id, review_id
-            ),
-        ));
-    }
+    let group = session
+        .groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .ok_or_else(|| {
+            response_error(
+                ReviewQueueFailure::NotFound,
+                format!(
+                    "Review group '{}' not found in session '{}'",
+                    group_id, review_id
+                ),
+            )
+        })?;
     // The readiness gate runs before anything is scheduled: a group that still
     // poses an open question is not executed at all.
-    let open_questions = group_open_questions(session, group_id);
-    if !open_questions.is_empty() {
-        return Err(group_unresolved_questions_error(group_id, &open_questions));
+    if let Some(deferred) = group_deferral(session, group) {
+        return Err(response_error(
+            match deferred.reason {
+                DeferralReason::UnresolvedQuestions => ReviewQueueFailure::GroupUnresolvedQuestions,
+                DeferralReason::NeedsRefinement => ReviewQueueFailure::GroupNeedsRefinement,
+            },
+            deferred.diagnostic,
+        ));
     }
     let item_ids: Vec<u32> = session
         .items
@@ -704,9 +952,13 @@ fn resolve_group_selection(
         .map(|item| item.id)
         .collect();
     Ok(ResolvedQueue {
-        members: vec![group_member_id(review_id, group_id)],
+        members: vec![ReviewMember::Group {
+            review_id: review_id.into(),
+            group_id: group_id.into(),
+        }],
         addressed: item_ids,
         deferred: 0,
+        deferred_groups: Vec::new(),
     })
 }
 
@@ -723,7 +975,10 @@ fn resolve_finding_selection(
     review_id: &str,
     target: &ReviewExecuteTarget,
 ) -> ResolvedSelection {
-    let member_of = |item_id: u32| format!("{}:{}", review_id, item_id);
+    let member_of = |item_id: u32| ReviewMember::Finding {
+        review_id: review_id.into(),
+        item_id,
+    };
     match target {
         ReviewExecuteTarget::AllSessions => Err(response_error(
             ReviewQueueFailure::InvalidParams,
@@ -782,6 +1037,7 @@ fn resolve_finding_selection(
                     members: vec![member_of(item_id)],
                     addressed: vec![item_id],
                     deferred: 0,
+                    deferred_groups: Vec::new(),
                 }),
             }
         }
@@ -814,11 +1070,12 @@ fn resolve_finding_selection(
                 members,
                 addressed: ids,
                 deferred: 0,
+                deferred_groups: Vec::new(),
             })
         }
         ReviewExecuteTarget::Session(_) => {
             let queues = accumulate_implicit_queues(std::slice::from_ref(session));
-            if queues.members.is_empty() {
+            if queues.members.is_empty() && queues.deferred_groups.is_empty() {
                 return Err(response_error(
                     ReviewQueueFailure::NothingToExecute,
                     empty_queue_message(
@@ -832,6 +1089,7 @@ fn resolve_finding_selection(
                 members: queues.members,
                 addressed: queues.addressed,
                 deferred: queues.deferred,
+                deferred_groups: queues.deferred_groups,
             })
         }
     }
@@ -844,10 +1102,13 @@ struct ReviewBatchExecutor<'a> {
     documents: &'a Documents,
     operation: &'a OperationGuard,
     execution: &'a PlanExecutionEnvironment,
-    model: &'a ResolvedTurnModel,
+    selection: &'a ModelSelection,
     observer: &'a Arc<dyn ApplicationObserver>,
     /// Findings the completed members repaired.
     fixed_items: usize,
+    deferred_groups: Vec<DeferredReviewGroup>,
+    initial_deferrals: usize,
+    members: std::collections::HashMap<String, ReviewMember>,
 }
 
 impl ReviewBatchExecutor<'_> {
@@ -911,12 +1172,9 @@ impl ReviewBatchExecutor<'_> {
     /// drives exactly the steps the entity declares. A scope that cannot be
     /// resolved, or whose horizon is not synthesized yet, yields the diagnostic
     /// the member reports instead of a model turn.
-    async fn member_run(&self, scope: &ExecutionScope) -> Result<MemberRun, StepFailure> {
-        match scope {
-            ExecutionScope::Plan { .. } => Err(StepFailure::infrastructure(
-                "A review batch member addresses no plan horizon",
-            )),
-            ExecutionScope::ReviewFinding { review_id, item_id } => {
+    async fn member_run(&self, member: &ReviewMember) -> Result<MemberRun, StepFailure> {
+        match member {
+            ReviewMember::Finding { review_id, item_id } => {
                 let frame = resolve_finding_frame(self.documents, review_id, *item_id).await?;
                 Ok(MemberRun {
                     work: TurnWorkContext::ReviewStep {
@@ -933,14 +1191,14 @@ impl ReviewBatchExecutor<'_> {
                     steps: vec![item_id.to_string()],
                 })
             }
-            ExecutionScope::ReviewGroup {
+            ReviewMember::Group {
                 review_id,
                 group_id,
             } => {
                 let frame = resolve_group_frame(self.documents, review_id, group_id).await?;
                 if frame.plan.implementation.items.is_empty() {
-                    return Err(StepFailure::domain(format!(
-                        "Review group '{}' of session '{}' owns no implementation horizon yet; synthesize its horizon before the group is executed",
+                    return Err(StepFailure::infrastructure(format!(
+                        "Review group '{}' of session '{}' has no saved horizon after preparation",
                         group_id, review_id
                     )));
                 }
@@ -988,83 +1246,178 @@ pub(crate) struct MemberRun {
 /// Note recorded on a finding the run addressed through its own step.
 const FINDING_COMPLETION_NOTE: &str = "Addressed by the implementation run";
 
-/// Resolves the review session a batch member addresses.
-fn scope_review_id(scope: &ExecutionScope) -> Option<String> {
-    match scope {
-        ExecutionScope::ReviewGroup { review_id, .. }
-        | ExecutionScope::ReviewFinding { review_id, .. } => Some(review_id.clone()),
-        ExecutionScope::Plan { .. } => None,
-    }
-}
-
 #[async_trait]
 impl BatchStepExecutor for ReviewBatchExecutor<'_> {
     async fn execute_step(
         &mut self,
         step: &BatchStep,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> anyhow::Result<BatchStepOutcome> {
-        let Some(scope) = member_scope(&step.id) else {
+        let Some(member) = self.members.get(&step.id).cloned() else {
             return Ok(BatchStepOutcome::failed(format!(
                 "Invalid review step id: {}",
                 step.id
             )));
         };
-        let Some(review_id) = scope_review_id(&scope) else {
-            return Ok(BatchStepOutcome::failed(format!(
-                "Review step '{}' addresses no review session",
-                step.id
-            )));
-        };
+        let review_id = member.review_id().to_string();
+        let scope = member.scope();
         // A cancel observed before the member is launched ends it before any model
         // turn is requested and before the addressed entity is touched.
-        if *cancel_rx.borrow() {
+        if cancel_rx.is_cancelled() {
             return Ok(BatchStepOutcome::cancelled());
+        }
+
+        // A saved horizon may have changed since admission. Do not rewrite its blocker.
+        if let ReviewMember::Group {
+            review_id,
+            group_id,
+        } = &member
+        {
+            let session = load_session(self.documents, review_id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.into_reason()))?;
+            let group = session
+                .groups
+                .iter()
+                .find(|group| group.id == *group_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Review group '{group_id}' not found in session '{review_id}'")
+                })?;
+            if let Some(deferred) = group_deferral(&session, group) {
+                self.deferred_groups.push(deferred);
+                return Ok(BatchStepOutcome::skipped());
+            }
         }
 
         // The horizon is resolved before the run starts, because the sequence loop
         // drives exactly the steps the entity declares: a scope that cannot be
         // resolved, or whose horizon is not synthesized yet, reports its diagnostic
         // instead of spending a model turn.
-        let run = self.member_run(&scope).await;
-        if *cancel_rx.borrow() {
-            return Ok(BatchStepOutcome::cancelled());
+        let (architect_receipt, preparation) = match &member {
+            ReviewMember::Group {
+                review_id,
+                group_id,
+            } => horizon::prepare_group(self, review_id, group_id).await,
+            ReviewMember::Finding { .. } => (None, Ok(())),
+        };
+        // The Architect replaces the batch's shared source while preparing a
+        // horizon. Resume it before resolving or starting the next member.
+        let _ = self
+            .step
+            .context
+            .activate_manual_publication(self.operation, self.observer.clone());
+        let run = match preparation {
+            Ok(()) if !cancel_rx.is_cancelled() => self.member_run(&member).await,
+            Ok(()) | Err(horizon::PreparationFailure::Cancelled) => {
+                return Ok(horizon::with_receipts(
+                    BatchStepOutcome::cancelled(),
+                    architect_receipt.as_ref(),
+                    None,
+                ));
+            }
+            Err(horizon::PreparationFailure::Local(reason)) => {
+                if cancel_rx.is_cancelled() {
+                    return Ok(horizon::with_receipts(
+                        BatchStepOutcome::cancelled(),
+                        architect_receipt.as_ref(),
+                        None,
+                    ));
+                }
+                let outcome = self
+                    .skip_member(&scope, &reason, false)
+                    .await
+                    .unwrap_or_else(BatchStepOutcome::failed);
+                self.documents
+                    .publish_review_snapshot(&review_id, self.observer.as_ref())
+                    .await;
+                return Ok(horizon::with_receipts(
+                    outcome,
+                    architect_receipt.as_ref(),
+                    None,
+                ));
+            }
+            Err(horizon::PreparationFailure::Fatal(reason)) => {
+                let outcome = if cancel_rx.is_cancelled() {
+                    BatchStepOutcome::cancelled()
+                } else {
+                    BatchStepOutcome::failed(reason)
+                };
+                return Ok(horizon::with_receipts(
+                    outcome,
+                    architect_receipt.as_ref(),
+                    None,
+                ));
+            }
+        };
+        if cancel_rx.is_cancelled() {
+            return Ok(horizon::with_receipts(
+                BatchStepOutcome::cancelled(),
+                architect_receipt.as_ref(),
+                None,
+            ));
         }
         let outcome = match run {
-            Err(failure) if failure.is_domain() => {
-                self.skip_member(&scope, failure.reason(), false).await
+            Err(failure) if failure.is_domain() => self
+                .skip_member(&scope, failure.reason(), false)
+                .await
+                .map(|outcome| (outcome, None)),
+            Err(failure) => {
+                return Ok(horizon::with_receipts(
+                    BatchStepOutcome::failed(failure.into_reason()),
+                    architect_receipt.as_ref(),
+                    None,
+                ))
             }
-            Err(failure) => return Ok(BatchStepOutcome::failed(failure.into_reason())),
-            Ok(run) if run.steps.is_empty() => self.fix_member(&scope).await,
+            Ok(run) if run.steps.is_empty() => {
+                self.fix_member(&scope).await.map(|outcome| (outcome, None))
+            }
             Ok(run) => {
-                let report = ReviewSequence {
+                let mut report = ReviewSequence {
                     step: self.step,
                     root: self.root,
                     operation: self.operation,
                     execution: self.execution,
-                    model: self.model,
+                    selection: self.selection,
                     observer: self.observer,
                     documents: self.documents,
-                    scope: &scope,
-                    review_id: &review_id,
+                    member: &member,
                     stream_tx: &stream_tx,
                 }
                 .run(run)
                 .await;
-                self.settle_run(&scope, report).await
+                let _ = self
+                    .step
+                    .context
+                    .activate_manual_publication(self.operation, self.observer.clone());
+                let usage = report.usage.take();
+                let outcome = self
+                    .settle_run(&scope, report)
+                    .await
+                    .unwrap_or_else(BatchStepOutcome::failed);
+                Ok((outcome, usage))
             }
         };
 
-        let outcome = match outcome {
+        let (outcome, usage) = match outcome {
             Ok(outcome) => outcome,
-            Err(error) => return Ok(BatchStepOutcome::failed(error)),
+            Err(error) => {
+                return Ok(horizon::with_receipts(
+                    BatchStepOutcome::failed(error),
+                    architect_receipt.as_ref(),
+                    None,
+                ))
+            }
         };
         // Publish only after the member's verdict has settled.
         self.documents
             .publish_review_snapshot(&review_id, self.observer.as_ref())
             .await;
-        Ok(outcome)
+        Ok(horizon::with_receipts(
+            outcome,
+            architect_receipt.as_ref(),
+            usage.as_ref(),
+        ))
     }
 }
 
@@ -1072,14 +1425,14 @@ async fn prepare_queue(
     documents: &Documents,
     target: &ReviewExecuteTarget,
 ) -> Result<PreparedReviewBatch, ReviewQueueError> {
-    let (owner_id, queue) = match target {
+    let (owner, queue) = match target {
         ReviewExecuteTarget::AllSessions => {
             let sessions = match documents.reviews().await {
                 Ok(s) => s,
                 Err(err) => return Err(response_error(ReviewQueueFailure::ReviewLoadFailed, err)),
             };
             let queues = accumulate_implicit_queues(&sessions);
-            if queues.members.is_empty() {
+            if queues.members.is_empty() && queues.deferred_groups.is_empty() {
                 return Err(response_error(
                     ReviewQueueFailure::NothingToExecute,
                     empty_queue_message(
@@ -1090,11 +1443,12 @@ async fn prepare_queue(
                 ));
             }
             (
-                "all".to_string(),
+                ReviewOwner::All,
                 ResolvedQueue {
                     members: queues.members,
                     addressed: queues.addressed,
                     deferred: queues.deferred,
+                    deferred_groups: queues.deferred_groups,
                 },
             )
         }
@@ -1119,10 +1473,10 @@ async fn prepare_queue(
                 Ok(queue) => queue,
                 Err(err) => return Err(err),
             };
-            (review_id.to_string(), queue)
+            (ReviewOwner::Session(review_id.to_string()), queue)
         }
     };
-    Ok(PreparedReviewBatch { owner_id, queue })
+    Ok(PreparedReviewBatch { owner, queue })
 }
 
 fn batch_result(
@@ -1131,6 +1485,7 @@ fn batch_result(
     deferred: usize,
     owner_id: &str,
     elapsed: std::time::Duration,
+    deferred_groups: Vec<DeferredReviewGroup>,
 ) -> (BatchOutcome, ExecutedReviewBatch) {
     let executed_count = report.executed.len();
     let total_count = report.scheduled;
@@ -1193,13 +1548,12 @@ fn batch_result(
         fixed_count,
         deferred,
         failed_count,
+        deferred_groups,
     };
     (outcome, publication)
 }
 #[cfg(test)]
-pub(crate) use member::{
-    ReviewLeafReceipt, ReviewSequenceResult, ReviewSequenceStop, ReviewStepStop,
-};
+pub(crate) use member::{ReviewSequenceResult, ReviewSequenceStop, ReviewStepStop};
 
 #[cfg(test)]
 mod tests {
@@ -1313,13 +1667,12 @@ mod tests {
         };
 
         assert_eq!(
-            session_contribution(&session).members,
-            vec![
-                "rev-x:g:arch-1".to_string(),
-                "rev-x:3".to_string(),
-                "rev-x:4".to_string(),
-                "rev-x:6".to_string(),
-            ]
+            session_contribution(&session)
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-x:g:arch-1", "rev-x:3", "rev-x:4", "rev-x:6"]
         );
     }
 
@@ -1371,8 +1724,12 @@ mod tests {
         };
 
         assert_eq!(
-            session_contribution(&session).members,
-            vec!["rev-arch:g:arch-1".to_string(), "rev-arch:7".to_string()]
+            session_contribution(&session)
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-arch:g:arch-1", "rev-arch:7"]
         );
     }
 
@@ -1405,7 +1762,11 @@ mod tests {
         let queues = accumulate_implicit_queues(&[clustered, plain]);
 
         assert_eq!(
-            queues.members,
+            queues
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
             vec![
                 "rev-a:g:arch-1".to_string(),
                 "rev-a:2".to_string(),
@@ -1516,7 +1877,14 @@ mod tests {
 
         let contribution = session_contribution(&session);
 
-        assert_eq!(contribution.members, vec!["rev-gate:3".to_string()]);
+        assert_eq!(
+            contribution
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-gate:3"]
+        );
         assert_eq!(contribution.addressed, vec![3]);
         assert_eq!(contribution.deferred_findings, 2);
         assert_eq!(contribution.pending_architecture, 0);
@@ -1539,12 +1907,155 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(group_ready_for_autonomous_run(&session, "arch-1"));
+        assert!(group_open_questions(&session, "arch-1").is_empty());
 
         let contribution = session_contribution(&session);
 
-        assert_eq!(contribution.members, vec!["rev-gate:g:arch-1".to_string()]);
+        assert_eq!(
+            contribution
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-gate:g:arch-1"]
+        );
         assert_eq!(contribution.deferred_findings, 0);
+    }
+
+    #[test]
+    fn mixed_queue_keeps_addressed_deferrals_and_independent_work() {
+        use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+        use tauqe_core::review::ReviewGroupKind;
+
+        let mut blocked = group_of("blocked", ReviewGroupKind::Architectural);
+        blocked.implementation = PlanImplementation {
+            items: vec![
+                PlanItem {
+                    id: "done".into(),
+                    status: PlanItemStatus::Done,
+                    commit: Some("saved-commit".into()),
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "stuck".into(),
+                    status: PlanItemStatus::Blocked,
+                    blocked_reason: Some("saved obstacle".into()),
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "next".into(),
+                    status: PlanItemStatus::Todo,
+                    depends_on: vec!["stuck".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let session = ReviewSession {
+            id: "rev-mixed".into(),
+            groups: vec![
+                blocked,
+                group_of("questions", ReviewGroupKind::Architectural),
+            ],
+            items: vec![
+                grouped_finding(1, IssueStatus::Todo, Some("blocked")),
+                grouped_finding(2, IssueStatus::Fixed, Some("blocked")),
+                grouped_finding(3, IssueStatus::Discussion, Some("questions")),
+                finding(4, IssueStatus::Todo),
+            ],
+            ..Default::default()
+        };
+        let before = session.clone();
+        let queue = accumulate_implicit_queues(std::slice::from_ref(&session));
+        assert_eq!(
+            queue
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-mixed:4"]
+        );
+        assert_eq!(queue.deferred, 2);
+        assert_eq!(queue.deferred_groups.len(), 2);
+        assert_eq!(queue.deferred_groups[0].review_id, "rev-mixed");
+        assert_eq!(queue.deferred_groups[0].group_id, "blocked");
+        assert_eq!(
+            queue.deferred_groups[0].reason,
+            DeferralReason::NeedsRefinement
+        );
+        assert_eq!(queue.deferred_groups[0].open_findings, 1);
+        assert!(queue.deferred_groups[0]
+            .diagnostic
+            .contains("saved obstacle"));
+        assert!(queue.deferred_groups[0]
+            .recovery
+            .contains("review/refineGroup"));
+        assert_eq!(
+            queue.deferred_groups[1].reason,
+            DeferralReason::UnresolvedQuestions
+        );
+        assert!(queue.deferred_groups[1].diagnostic.contains("#3"));
+        assert_eq!(session, before);
+    }
+
+    #[tokio::test]
+    async fn discussion_only_queue_is_admitted_without_mutating_the_session() {
+        use tauqe_core::review::{ReviewGroupKind, ReviewSessionTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let documents = Documents::new(dir.path());
+        let session = ReviewSession {
+            id: "rev-discussion".into(),
+            groups: vec![group_of("arch", ReviewGroupKind::Architectural)],
+            items: vec![grouped_finding(1, IssueStatus::Discussion, Some("arch"))],
+            ..Default::default()
+        };
+        documents.save_review(&session).await.unwrap();
+        let target = ReviewExecuteTarget::Session(ReviewSessionTarget {
+            review_id: session.id.clone(),
+        });
+        let prepared = prepare_queue(&documents, &target).await.unwrap();
+        assert!(prepared.queue.members.is_empty());
+        assert_eq!(prepared.queue.deferred_groups[0].group_id, "arch");
+        assert_eq!(documents.review(&session.id).await.unwrap(), Some(session));
+    }
+
+    #[test]
+    fn decided_discussion_and_remaining_horizon_without_open_findings_are_scheduled() {
+        use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+        use tauqe_core::review::ReviewGroupKind;
+        let mut decided = grouped_finding(1, IssueStatus::Discussion, Some("decided"));
+        decided.resolution_notes = Some("Approved".into());
+        let mut remaining = group_of("remaining", ReviewGroupKind::Architectural);
+        remaining.implementation = PlanImplementation {
+            items: vec![PlanItem {
+                id: "leaf".into(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let session = ReviewSession {
+            id: "rev-ready".into(),
+            groups: vec![
+                group_of("decided", ReviewGroupKind::Architectural),
+                remaining,
+            ],
+            items: vec![
+                decided,
+                grouped_finding(2, IssueStatus::Fixed, Some("remaining")),
+            ],
+            ..Default::default()
+        };
+        let contribution = session_contribution(&session);
+        assert_eq!(
+            contribution
+                .members
+                .iter()
+                .map(ReviewMember::id)
+                .collect::<Vec<_>>(),
+            ["rev-ready:g:decided", "rev-ready:g:remaining"]
+        );
+        assert!(contribution.deferred_groups.is_empty());
     }
 
     /// The empty-queue diagnostic names the postponed findings before the
@@ -1592,4 +2103,163 @@ mod tests {
         assert_eq!(telemetry.failed, 1);
         assert!(report.is_success());
     }
+
+    /// Admission reads saved facts without changing the stored group.
+    #[tokio::test]
+    async fn explicit_group_refuses_saved_impassable_horizons_without_mutation() {
+        use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+        use tauqe_core::review::{ReviewGroup, ReviewGroupKind, ReviewGroupTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let documents = Documents::new(dir.path());
+        let target = ReviewExecuteTarget::Group(ReviewGroupTarget {
+            review_id: "rev-gate".into(),
+            group_id: "arch-1".into(),
+        });
+        for (status, depends_on, expected) in [
+            (
+                PlanItemStatus::Blocked,
+                vec![],
+                ReviewQueueFailure::GroupNeedsRefinement,
+            ),
+            (
+                PlanItemStatus::Todo,
+                vec!["missing".into()],
+                ReviewQueueFailure::GroupNeedsRefinement,
+            ),
+            (
+                PlanItemStatus::Discussion,
+                vec![],
+                ReviewQueueFailure::GroupUnresolvedQuestions,
+            ),
+        ] {
+            let mut session =
+                session_with(vec![grouped_finding(1, IssueStatus::Todo, Some("arch-1"))]);
+            session.id = "rev-gate".into();
+            session.groups = vec![ReviewGroup {
+                id: "arch-1".into(),
+                kind: ReviewGroupKind::Architectural,
+                implementation: PlanImplementation {
+                    items: vec![PlanItem {
+                        id: "step-1".into(),
+                        title: "Saved step".into(),
+                        status,
+                        blocked_reason: (status == PlanItemStatus::Blocked)
+                            .then(|| "saved blocker".into()),
+                        depends_on,
+                        files: vec!["src/target.rs".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }];
+            documents.save_review(&session).await.unwrap();
+            let before = documents.review("rev-gate").await.unwrap().unwrap();
+            let refusal = prepare_queue(&documents, &target)
+                .await
+                .err()
+                .expect("the saved horizon must be refused");
+            assert_eq!(refusal.kind, expected);
+            assert!(refusal.message.contains("review/refineGroup"));
+            assert!(refusal.message.contains("rev-gate"));
+            assert!(refusal.message.contains("arch-1"));
+            assert!(refusal.message.contains("Step `#step-1`"));
+            if status == PlanItemStatus::Blocked {
+                assert!(refusal.message.contains("saved blocker"));
+                assert!(refusal.message.contains("none recorded for the group"));
+            }
+            assert_eq!(documents.review("rev-gate").await.unwrap().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn ready_and_complete_group_horizons_ignore_stale_group_blocker() {
+        use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+        use tauqe_core::review::{ReviewGroup, ReviewGroupKind, ReviewGroupTarget};
+
+        let target = ReviewExecuteTarget::Group(ReviewGroupTarget {
+            review_id: "rev-queue".into(),
+            group_id: "arch-1".into(),
+        });
+        let mut session = session_with(vec![grouped_finding(1, IssueStatus::Todo, Some("arch-1"))]);
+        session.groups = vec![ReviewGroup {
+            id: "arch-1".into(),
+            kind: ReviewGroupKind::Architectural,
+            blocked_reason: Some("stale".into()),
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    id: "s-1".into(),
+                    status: PlanItemStatus::Todo,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        for status in [PlanItemStatus::Todo, PlanItemStatus::Done] {
+            session.groups[0].implementation.items[0].status = status;
+            assert!(resolve_finding_selection(&session, "rev-queue", &target).is_ok());
+        }
+        session.groups[0].implementation.items.clear();
+        assert!(resolve_finding_selection(&session, "rev-queue", &target).is_ok());
+    }
+
+    #[test]
+    fn changing_one_leaf_does_not_bypass_other_group_gates() {
+        use tauqe_core::plan::{PlanImplementation, PlanItem, PlanItemStatus};
+        use tauqe_core::review::{ReviewGroupKind, ReviewGroupTarget};
+
+        let target = ReviewExecuteTarget::Group(ReviewGroupTarget {
+            review_id: "rev-queue".into(),
+            group_id: "arch-1".into(),
+        });
+        let mut session = session_with(vec![grouped_finding(1, IssueStatus::Todo, Some("arch-1"))]);
+        let mut group = group_of("arch-1", ReviewGroupKind::Architectural);
+        group.implementation = PlanImplementation {
+            items: vec![
+                PlanItem {
+                    id: "unblocked".into(),
+                    status: PlanItemStatus::Todo,
+                    depends_on: vec!["still-blocked".into()],
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "still-blocked".into(),
+                    status: PlanItemStatus::Blocked,
+                    blocked_reason: Some("another external cause".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        session.groups.push(group);
+        let refusal = resolve_finding_selection(&session, "rev-queue", &target).unwrap_err();
+        assert_eq!(refusal.kind, ReviewQueueFailure::GroupNeedsRefinement);
+        assert!(refusal.message.contains("still-blocked"));
+        assert!(session_contribution(&session).members.is_empty());
+
+        session.groups[0].implementation.items[1].status = PlanItemStatus::Discussion;
+        session.groups[0].implementation.items[1].blocked_reason = None;
+        assert_eq!(
+            resolve_finding_selection(&session, "rev-queue", &target)
+                .unwrap_err()
+                .kind,
+            ReviewQueueFailure::GroupUnresolvedQuestions
+        );
+        assert!(session_contribution(&session).members.is_empty());
+
+        session.groups[0].implementation.items[1].status = PlanItemStatus::Todo;
+        session.groups[0].implementation.items[1].depends_on = vec!["missing".into()];
+        assert_eq!(
+            resolve_finding_selection(&session, "rev-queue", &target)
+                .unwrap_err()
+                .kind,
+            ReviewQueueFailure::GroupNeedsRefinement
+        );
+        assert!(session_contribution(&session).members.is_empty());
+    }
 }
+
+#[cfg(test)]
+mod context_tests;

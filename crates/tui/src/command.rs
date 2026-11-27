@@ -1143,17 +1143,16 @@ mod tests {
             "uppercase R must replan every blocked step"
         );
 
-        // Manual decomposition of a review finding no longer exists: the
-        // Architect projects a missing group plan just in time, so `r` / `R`
-        // must stay unbound in the Review view (c-2, c-5).
+        // A review group can explicitly refine its saved horizon; uppercase R
+        // remains unbound so the command never widens to a batch.
         assert_eq!(
             resolve_action(
                 &REVIEW_COMMAND_MAP,
                 key(KeyCode::Char('r'), KeyModifiers::NONE),
                 &input
             ),
-            None,
-            "the Review view must not bind a manual refine verb"
+            Some(ReviewAction::RefineGroup),
+            "lowercase r refines only the selected architectural group"
         );
         assert_eq!(
             resolve_action(

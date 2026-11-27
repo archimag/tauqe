@@ -1,9 +1,7 @@
 //! State whose lifetime belongs to one user task, not to a provider request.
 
-use std::sync::{Arc, Mutex};
 use tauqe_core::context::ContextManager;
-use tauqe_core::execution::transcript::TurnTranscript;
-use tauqe_core::history::{HistorySnapshot, TurnRoundRecord};
+use tauqe_core::history::HistorySnapshot;
 use tauqe_core::llm::CapabilityTree;
 use tauqe_core::workflow::research::journal::TurnResearchJournal;
 
@@ -12,9 +10,8 @@ pub(crate) struct TurnState {
     pub capabilities: CapabilityTree,
     pub history: Option<HistorySnapshot>,
     pub journal: TurnResearchJournal,
-    pub(super) transcript: Arc<Mutex<TurnTranscript>>,
+    pub(super) created_paths: Vec<String>,
     pub(super) budget: TurnBudget,
-    pub(super) max_scratchpad_chars: usize,
 }
 
 impl TurnState {
@@ -23,26 +20,18 @@ impl TurnState {
         capabilities: CapabilityTree,
         history: Option<HistorySnapshot>,
         max_rounds: Option<usize>,
-        max_scratchpad_chars: usize,
     ) -> Self {
         Self {
             context,
             capabilities,
             history,
             journal: TurnResearchJournal::default(),
-            transcript: Arc::new(Mutex::new(TurnTranscript::default())),
+            created_paths: Vec::new(),
             budget: TurnBudget {
                 spent: 0,
                 max_rounds,
             },
-            max_scratchpad_chars,
         }
-    }
-
-    /// A supervisor may retain this reader across task destruction. It exposes
-    /// only accepted, sanitized rounds, not context, scratchpad or mutable state.
-    pub fn history_reader(&self) -> impl FnOnce() -> Vec<TurnRoundRecord> + Send + 'static {
-        TurnTranscript::history_reader(&self.transcript)
     }
 }
 
@@ -58,5 +47,13 @@ impl TurnBudget {
 
     pub fn is_last(&self) -> bool {
         self.max_rounds == self.spent.checked_add(1)
+    }
+
+    pub fn charge(&mut self, before: usize, after: usize) {
+        self.spent += after.saturating_sub(before);
+    }
+
+    pub fn final_directive(&self) -> Option<&'static str> {
+        self.is_last().then_some("<response_directive>\nThis is your final allowed round for this turn: the turn round budget is reaching its limit. Conclude the task using a terminal branch of the active response schema. Do not issue further discovery requests.\n</response_directive>")
     }
 }

@@ -433,129 +433,36 @@ mod tests {
         drop(restarted);
     }
 
-    /// A window a successor replaced must never publish again: the abandoned
-    /// heartbeat may still reach the accounting lock after its own abort was
-    /// requested, and the identity it carries is what makes it observe that the
-    /// in-flight totals now belong to another operation.
-    ///
-    /// Without that identity the heartbeat would publish the successor's window
-    /// under its own operation id and its own clock, so a client would render a
-    /// running operation that already ended.
+    /// A successor waits for the final snapshot of its predecessor before it
+    /// opens, and a late source cannot charge the successor's window.
     #[tokio::test]
-    async fn an_abandoned_window_never_publishes_under_its_successor() {
-        // The windows run on a compressed tick, so the abandoned heartbeat
-        // really reaches the lock while the successor owns it.
-        const TEST_TICK: Duration = Duration::from_millis(20);
-        let (state, mut rx, root) = test_state();
-
-        let abandoned = state.begin_usage_with_tick("op-abandoned", TEST_TICK).await;
-        let abandoned_id = "op-abandoned";
-        abandoned.observe(&usage(100, 40)).await;
-
-        // The successor installs its own window while the abandoned guard is
-        // still alive: the abandoned totals are discarded with that window.
-        let successor = state.begin_usage_with_tick("op-successor", TEST_TICK).await;
-        let successor_id = "op-successor";
-        successor.observe(&usage(3, 2)).await;
-        while rx.try_recv().is_ok() {}
-
-        // The successor heartbeat proves itself while the abandoned heartbeat
-        // runs out its remaining ticks: every publication of that stretch must
-        // name the successor, and none may carry the abandoned identifier.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        let mut successor_live = false;
-        let mut leaked = 0usize;
-        while !successor_live && std::time::Instant::now() < deadline {
-            while let Ok(raw) = rx.try_recv() {
-                let Some(event) = decode_usage_event(&raw) else {
-                    continue;
-                };
-                if event.operation_id == abandoned_id {
-                    leaked += 1;
-                    continue;
-                }
-                if event.operation_id == successor_id
-                    && event
-                        .snapshot
-                        .cur
-                        .as_ref()
-                        .is_some_and(|cur| cur.duration_ms > 0)
-                {
-                    successor_live = true;
-                }
-            }
-            if !successor_live {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-        assert!(
-            successor_live,
-            "the successor heartbeat must still publish its live duration"
-        );
-        assert_eq!(
-            leaked, 0,
-            "an abandoned window must never publish the successor's state"
-        );
-
-        // The successor's flush folds exactly the totals its own window
-        // observed; the abandoned observation was discarded with its window.
-        successor.flush().await;
-        let snapshot = state.usage_snapshot().await;
-        assert_eq!(snapshot.operations, 1, "only the successor flushed");
-        assert_eq!(snapshot.session.prompt_tokens, 3);
-        assert_eq!(snapshot.session.completion_tokens, 2);
-        assert_eq!(snapshot.session.total_tokens, 5);
-        assert_eq!(snapshot.prev.total_tokens, 5);
-        assert!(
-            snapshot.cur.is_none(),
-            "the successor's flush closes its own window"
-        );
-
-        drop(abandoned);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A flush closes only the window it still owns: a superseded guard can
-    /// neither take the successor's in-flight totals nor publish them under an
-    /// identifier they do not belong to.
-    #[tokio::test]
-    async fn a_superseded_flush_folds_only_its_own_window() {
-        // The production cadence is irrelevant here, so the heartbeat is parked
-        // far beyond the test to keep the published events deterministic.
+    async fn a_successor_waits_for_final_publication_and_rejects_late_reports() {
         const PARKED_TICK: Duration = Duration::from_secs(3600);
         let (state, mut rx, root) = test_state();
-
-        let abandoned = state
-            .begin_usage_with_tick("op-superseded", PARKED_TICK)
-            .await;
-        abandoned.observe(&usage(100, 40)).await;
-        let successor = state.begin_usage_with_tick("op-current", PARKED_TICK).await;
-        successor.observe(&usage(3, 2)).await;
+        let first = state.begin_usage_with_tick("op-first", PARKED_TICK).await;
+        first.observe(&usage(100, 40)).await;
+        let late = first.sink();
         while rx.try_recv().is_ok() {}
-
-        abandoned.flush().await;
-        let in_flight = state.usage_snapshot().await;
-        assert!(
-            in_flight.cur.is_some(),
-            "a superseded flush must leave the successor's window installed"
-        );
-        assert_eq!(
-            in_flight.operation_totals().total_tokens,
-            5,
-            "the successor's in-flight totals stay its own"
-        );
-        assert_eq!(in_flight.operations, 0, "a superseded flush counts nothing");
-        assert!(
-            rx.try_recv().is_err(),
-            "a superseded flush publishes nothing"
-        );
-
-        successor.flush().await;
-        let flushed = state.usage_snapshot().await;
-        assert!(flushed.cur.is_none());
-        assert_eq!(flushed.operations, 1);
-        assert_eq!(flushed.session.total_tokens, 5);
-        assert_eq!(flushed.prev.total_tokens, 5);
+        let peer = state.clone();
+        let next =
+            tokio::spawn(async move { peer.begin_usage_with_tick("op-second", PARKED_TICK).await });
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        let first_receipt = first.finish().await.unwrap();
+        let second = next.await.unwrap();
+        let final_event = decode_usage_event(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(final_event.operation_id, "op-first");
+        assert_eq!(final_event.snapshot, wire_snapshot(&first_receipt.snapshot));
+        let started = decode_usage_event(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(started.operation_id, "op-second");
+        assert_eq!(started.snapshot.session.total_tokens, 140);
+        late.record(&usage(200, 0));
+        assert!(rx.try_recv().is_err(), "late sources do not publish");
+        second.observe(&usage(3, 2)).await;
+        let second_receipt = second.finish().await.unwrap();
+        assert_ne!(first_receipt.window_id, second_receipt.window_id);
+        assert_eq!(second_receipt.snapshot.session.total_tokens, 145);
+        assert_eq!(second_receipt.snapshot.operations, 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }

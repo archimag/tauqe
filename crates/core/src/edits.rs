@@ -37,7 +37,9 @@ pub mod transaction;
 
 #[cfg(test)]
 pub(crate) use apply::apply_edit_proposal;
+#[cfg(test)]
 pub(crate) use apply::apply_edit_proposal_with_config;
+pub(crate) use apply::apply_edit_proposal_with_config_and_operations;
 pub use protocol::{ContextRequest, EditProtocolFactory};
 #[cfg(test)]
 pub(crate) use stage::prepare_staged_edits;

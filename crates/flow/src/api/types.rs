@@ -34,6 +34,7 @@ pub use tauqe_core::review::{
     ReviewIssue, ReviewItem, ReviewLaunchConfig, ReviewPostAnalysis, ReviewSession,
     ReviewSessionTarget, ReviewSeverity,
 };
+pub use tauqe_core::stop::{HardCancellation, StopSource, StopState, StopToken};
 pub use tauqe_core::workflow::batch::BatchStop;
 pub use tauqe_core::workflow::turn::{
     ModelTurnPlanContext, ReviewWorkPhase, TurnPhase, TurnWorkContext, TurnWorkItem, TurnWorkQueue,

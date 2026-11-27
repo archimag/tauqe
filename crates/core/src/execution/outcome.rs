@@ -4,26 +4,22 @@ use crate::llm::{LlmCapability, LlmCommand};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
+    #[error(transparent)]
+    InputLimit(#[from] super::budget::InputLimitExceeded),
     #[error("operation cancelled")]
     Cancelled,
+    #[error("usage execution is not accepting provider requests")]
+    UsageNotActive,
     #[error("provider error: {0}")]
     Provider(String),
     #[error("the provider stream closed without completing")]
     Incomplete,
+    #[error("the provider returned an empty response")]
+    EmptyResponse,
+    #[error("invalid model response: {0}")]
+    Protocol(String),
     #[error("infrastructure error: {0}")]
     Other(String),
-}
-
-/// A provisional preview is not evidence that the final payload was accepted.
-pub enum PromptOutcome {
-    Completed(ResponseEnvelope),
-    Empty,
-    ProtocolError(ResponseEnvelope),
-}
-
-pub struct PromptResult {
-    pub outcome: PromptOutcome,
-    pub previewed_message: bool,
 }
 
 /// Decoded semantic commands, without the raw provider payload.

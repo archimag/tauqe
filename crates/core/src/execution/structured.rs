@@ -7,8 +7,11 @@ use crate::models::ReasoningEffort;
 use crate::providers::ResponseFormat;
 use crate::providers::{ChatMessage, LlmProvider, LlmRequest, StreamEvent};
 
+use crate::execution::budget::InputLimitExceeded;
+use crate::execution::outcome::ExecutionError;
 use crate::execution::request;
 use crate::execution::support::{CancellationToken, EventSink};
+use crate::execution::usage::UsageBinding;
 
 pub use crate::execution::support::{StructuredContract, StructuredVisibility};
 
@@ -50,6 +53,8 @@ impl EditStreamFilter for StructuredFilter {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StructuredError {
+    #[error(transparent)]
+    InputLimit(#[from] InputLimitExceeded),
     #[error("Structured request was cancelled")]
     Cancelled,
     #[error("{0}")]
@@ -73,13 +78,15 @@ pub async fn execute<T>(
     messages: Vec<ChatMessage>,
     events: &EventSink,
     cancel: &CancellationToken,
+    max_input_tokens: usize,
+    usage: &UsageBinding,
 ) -> Result<T, StructuredError> {
     if cancel.is_cancelled() {
         return Err(StructuredError::Cancelled);
     }
     let mut request_messages = vec![ChatMessage::system(&contract.instructions)];
     request_messages.extend(messages);
-    let stream = request::execute(
+    let stream = request::execute_with_limit(
         provider,
         LlmRequest {
             model,
@@ -90,13 +97,18 @@ pub async fn execute<T>(
         },
         Box::new(StructuredFilter::new(contract.visibility)),
         events,
-        cancel.receiver(),
+        cancel.clone(),
+        max_input_tokens,
+        usage,
     )
     .await;
     if cancel.is_cancelled() {
         return Err(StructuredError::Cancelled);
     }
-    let stream = stream.map_err(|error| StructuredError::Failed(error.to_string()))?;
+    let stream = stream.map_err(|error| match error {
+        ExecutionError::InputLimit(limit) => StructuredError::InputLimit(limit),
+        other => StructuredError::Failed(other.to_string()),
+    })?;
     if stream.cancelled {
         return Err(StructuredError::Cancelled);
     }
@@ -118,6 +130,22 @@ mod tests {
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::providers::JsonSchemaDefinition;
     use std::borrow::Cow;
+
+    struct RecordingUsage(std::sync::Mutex<Vec<crate::providers::ModelUsageInfo>>);
+
+    impl crate::execution::usage::UsageSink for RecordingUsage {
+        fn record(&self, report: &crate::providers::ModelUsageInfo) {
+            self.0.lock().unwrap().push(report.clone());
+        }
+    }
+
+    fn binding() -> UsageBinding {
+        let scope = crate::execution::usage::UsageScope::new(std::sync::Arc::new(RecordingUsage(
+            std::sync::Mutex::new(Vec::new()),
+        )));
+        scope.activate();
+        UsageBinding::Bound(scope)
+    }
 
     #[tokio::test]
     async fn silent_request_decodes_without_publishing_payload() {
@@ -147,7 +175,9 @@ mod tests {
             &contract,
             vec![ChatMessage::user("Task")],
             &sink,
-            &CancellationToken::new(),
+            &CancellationToken::never(),
+            crate::config::RequestConfig::default().max_input_tokens,
+            &binding(),
         )
         .await
         .unwrap();
@@ -172,7 +202,7 @@ mod tests {
             &self,
             _: LlmRequest<'_>,
             tx: tokio::sync::mpsc::Sender<StreamEvent>,
-            _: tokio::sync::watch::Receiver<bool>,
+            _: crate::stop::HardCancellation,
         ) -> crate::providers::ProviderResult {
             for event in &self.0 {
                 tx.send(event.clone()).await.unwrap();
@@ -207,10 +237,34 @@ mod tests {
             contract,
             vec![],
             &sink,
-            &CancellationToken::new(),
+            &CancellationToken::never(),
+            crate::config::RequestConfig::default().max_input_tokens,
+            &binding(),
         )
         .await;
         (result, std::iter::from_fn(|| rx.try_recv().ok()).collect())
+    }
+
+    #[tokio::test]
+    async fn admission_counts_instructions_and_schema_before_provider_io() {
+        let provider = MockLlmProvider::scripted([MockResponse::text("{}")]);
+        let result = execute(
+            &provider,
+            "test",
+            None,
+            None,
+            &contract(StructuredVisibility::Silent, true),
+            vec![ChatMessage::user("task")],
+            &EventSink::noop(),
+            &CancellationToken::never(),
+            1,
+            &binding(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(StructuredError::InputLimit(limit)) if limit.limit == 1 && limit.response_format > 0 && limit.messages > 0)
+        );
+        assert!(provider.requests().is_empty());
     }
 
     #[tokio::test]

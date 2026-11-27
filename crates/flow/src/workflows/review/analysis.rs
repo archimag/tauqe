@@ -14,9 +14,10 @@ pub use response::ReviewAnalysisCompletionError;
 
 use super::audit::{ReviewEvent, ReviewPublication};
 use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
+use crate::application::usage_totals::UsageReceipt;
 use crate::application::{
     configuration::Configuration, context::ContextSession, documents::Documents,
-    history::HistorySession, usage::UsageSession, ExecutionSession, PlanExecutionEnvironment,
+    history::HistorySession, ExecutionSession, PlanExecutionEnvironment,
 };
 use crate::workflows::architect::ArchitectScope;
 use std::{path::Path, sync::Arc, time::Duration};
@@ -40,7 +41,6 @@ pub(crate) struct AnalysisResources<'a> {
     pub(crate) context: &'a ContextSession,
     pub(crate) execution: &'a ExecutionSession,
     pub(crate) history: &'a HistorySession,
-    pub(crate) usage: &'a UsageSession,
 }
 
 impl AnalysisResources<'_> {
@@ -91,6 +91,32 @@ impl AnalysisResources<'_> {
         is_batch: bool,
         deadline: Duration,
     ) -> Result<ReviewSession, AnalyzeReviewError> {
+        self.run_review_analysis_with_receipt(
+            operation,
+            environment,
+            root,
+            session,
+            selection,
+            publication,
+            is_batch,
+            deadline,
+        )
+        .await
+        .map(|(session, _)| session)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_review_analysis_with_receipt(
+        &self,
+        operation: &OperationGuard,
+        environment: &PlanExecutionEnvironment,
+        root: &Path,
+        session: &ReviewSession,
+        selection: Option<&ModelSelection>,
+        publication: Arc<ReviewPublication>,
+        is_batch: bool,
+        deadline: Duration,
+    ) -> Result<(ReviewSession, UsageReceipt), AnalyzeReviewError> {
         let prepared = self
             .prepare_review_post_analysis(operation, environment, root, session, selection)
             .await
@@ -126,7 +152,7 @@ impl AnalysisResources<'_> {
             model,
             findings_count: session.items.len(),
         });
-        let stored = self
+        let (stored, receipt) = self
             .execute_review_post_analysis(
                 operation,
                 root,
@@ -140,7 +166,7 @@ impl AnalysisResources<'_> {
             .publish_review_snapshot(&session.id, publication.observer.as_ref())
             .await;
         publication.review(ReviewEvent::AnalyzeFinished(stored.clone()));
-        Ok(stored)
+        Ok((stored, receipt))
     }
 
     #[cfg(feature = "test-support")]

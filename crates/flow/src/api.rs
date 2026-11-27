@@ -82,11 +82,14 @@ pub use crate::workflows::plan::synthesis::{
     PlanHorizonError, PlanHorizonFailure, PlanSynthesisError, PlanSynthesisInput,
 };
 
+pub use crate::workflows::review::refinement::{
+    GroupRefineError, GroupRefineInput, GroupRefineResult,
+};
 pub use crate::workflows::review::{
     group_member_id as review_group_member_id, BatchOutcome as ReviewBatchOutcome,
-    BatchTelemetry as ReviewBatchTelemetry, ExecutedReviewBatch,
-    FailedMember as FailedReviewMember, ReviewBatchStarted, ReviewLaunchError, ReviewQueueError,
-    ReviewQueueFailure,
+    BatchTelemetry as ReviewBatchTelemetry, DeferralReason as ReviewGroupDeferralReason,
+    ExecutedReviewBatch, FailedMember as FailedReviewMember, ReviewBatchStarted, ReviewLaunchError,
+    ReviewQueueError, ReviewQueueFailure,
 };
 
 pub use crate::application::discussion_prompt::{DiscussionPromptError, ModelAskInput};

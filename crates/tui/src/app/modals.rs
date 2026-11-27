@@ -15,9 +15,9 @@ use crate::views::plans::{PlanCreateDialogState, PlanRefineBlockedState, PlanRef
 use super::{BatchCancelButton, CommitAudit, ConfirmDialogButton, DiffInspectorState};
 use super::{
     ConfirmExecutePipelineState, ConfirmExecuteReviewState, ConfirmExecuteScopeState,
-    ConfirmReviewAnalyzeState, ConfirmReviewTruncationState, HelpTab, LocaleDialogState,
-    OuterDocsCacheDialogState, PendingReviewLaunch, PromptModalState, ReviewDialogState,
-    SelectionDialogState, SquashDialogState, StatusDialogState, UsageSummaryState,
+    ConfirmReviewAnalyzeState, HelpTab, LocaleDialogState, OuterDocsCacheDialogState,
+    PendingReviewLaunch, PromptModalState, ReviewDialogState, SelectionDialogState,
+    SquashDialogState, StatusDialogState, UsageSummaryState,
 };
 
 #[derive(Debug, Clone)]
@@ -160,11 +160,6 @@ pub struct ModalState {
     /// projection or a declined truncation returns these exact fields, and an
     /// approved window starts exactly these parameters (c-3).
     pub pending_review_launch: Option<PendingReviewLaunch>,
-    /// Projection awaiting the developer's consent to a truncated audit window.
-    ///
-    /// It outranks the launch dialog it returns to, so a pending decision is
-    /// never hidden behind a reopened dialog (c-3).
-    pub confirm_review_truncation: Option<ConfirmReviewTruncationState>,
     /// Review launch dialog, when open.
     ///
     /// The dialog owns the keyboard while it is open and exposes the reviewer,
@@ -214,10 +209,6 @@ pub enum ActiveModal {
     ConfirmQuit,
     ChatGptSignIn,
     Squash,
-    /// Consent to launch a review whose audited window the configured budgets
-    /// truncate. It outranks the launch dialog it returns to, so a pending
-    /// decision is never hidden behind a reopened dialog (c-3).
-    ReviewTruncation,
     Review,
     ConfirmCancel,
     BatchCancel,
@@ -316,7 +307,6 @@ mod tests {
         assert!(state.confirm_execute_review.is_none());
         assert!(state.confirm_review_analyze.is_none());
         assert!(state.pending_review_launch.is_none());
-        assert!(state.confirm_review_truncation.is_none());
         assert!(state.review_dialog.is_none());
         assert!(!state.confirm_cancel);
         assert!(!state.confirm_quit);
@@ -362,7 +352,6 @@ mod tests {
             ActiveModal::ConfirmQuit,
             ActiveModal::ChatGptSignIn,
             ActiveModal::Squash,
-            ActiveModal::ReviewTruncation,
             ActiveModal::Review,
             ActiveModal::ConfirmCancel,
             ActiveModal::BatchCancel,

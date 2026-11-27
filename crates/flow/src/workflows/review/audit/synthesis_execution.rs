@@ -7,7 +7,8 @@ use super::AuditResources;
 use crate::api::{OperationGuard, UsageTotalsSnapshot};
 use crate::application::documents::Documents;
 use crate::application::review_observer::ReviewObserver;
-use crate::application::{structured_task, StructuredExecution};
+use crate::application::StructuredExecution;
+use crate::workflows::structured::{self, StructuredFailure};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -71,30 +72,25 @@ impl AuditResources {
             return Err(ReviewSynthesisRequestError.into());
         }
         let publisher = Arc::clone(&observer);
-        let usage = self
-            .usage
-            .begin(&self.context, &config.operation_id, move |id, snapshot| {
-                publisher.publish_usage_totals(id, snapshot);
-            })
-            .await;
-        let cancel = operation.cancel_receiver();
+        let cancel = operation.hard_cancellation();
+        let pacing_cancel = operation.hard_cancellation();
         let (metadata, messages) = prepared.into_parts();
-        let result = structured_task::run_with_session(
+        let completed = structured::run_bound(
             &self.execution,
+            &self.context,
             operation,
             execution,
             single_review_contract(),
             messages,
             &config.operation_id,
             config.exit_deadline,
+            move |id, snapshot| publisher.publish_usage_totals(id, snapshot),
             |event| {
-                let usage = &usage;
                 let observer = &observer;
-                let mut pacing_cancel = cancel.clone();
+                let pacing_cancel = pacing_cancel.clone();
                 async move {
-                    observer.pace(&event, &mut pacing_cancel).await;
+                    observer.pace(&event, &pacing_cancel).await;
                     match event {
-                        StreamEvent::Usage(report) => usage.observe(&report).await,
                         StreamEvent::TextDelta(delta) => {
                             observer.publish(ReviewStreamUpdate::Content(delta))
                         }
@@ -108,10 +104,26 @@ impl AuditResources {
             },
         )
         .await;
-        usage.flush().await;
-        let snapshot = self.usage.snapshot().await;
+        let (result, receipt) = completed.map_err(|error| {
+            let failure = if cancel.is_cancelled() {
+                StructuredFailure::Cancelled
+            } else {
+                error.classify("review synthesis")
+            };
+            ReviewSynthesisExecutionError::Completion(match failure {
+                StructuredFailure::Cancelled => ReviewSynthesisCompletionError::Cancelled,
+                StructuredFailure::Empty => ReviewSynthesisCompletionError::EmptyResponse(
+                    tauqe_core::review::synthesis::EmptyReviewResponse,
+                ),
+                StructuredFailure::InputLimit(error) => error.into(),
+                StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                    ReviewSynthesisCompletionError::Provider(message)
+                }
+            })
+        })?;
+        let snapshot = receipt.snapshot;
         observer.publish_usage(&snapshot);
-        let cancelled = *cancel.borrow();
+        let cancelled = cancel.is_cancelled();
         let session = ReviewSynthesisStream::finish(result, metadata, cancelled)?;
         self.persist_review_synthesis(operation, root, &session, || async {
             let list = Documents::new(root).review_list().await.ok();
@@ -139,8 +151,6 @@ mod tests {
     use tauqe_core::providers::{mock::MockResponse, MockLlmProvider, ModelUsageInfo, StreamEvent};
     use tauqe_core::review::ReviewStorage;
 
-    use tokio::sync::watch;
-
     struct Observer {
         app: Application,
         root: std::path::PathBuf,
@@ -151,7 +161,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ReviewObserver for Observer {
-        async fn pace(&self, event: &StreamEvent, _: &mut watch::Receiver<bool>) {
+        async fn pace(&self, event: &StreamEvent, _: &tauqe_core::stop::HardCancellation) {
             if matches!(event, StreamEvent::Usage(_)) && self.cancel_on_usage {
                 self.app.cancel_active_operation();
             }
@@ -307,6 +317,8 @@ mod tests {
         assert_eq!(result.usage.prev.total_tokens, 17);
         assert_eq!(result.usage.session.cost, 0.25);
         assert!(result.usage.cur.is_none());
+        assert_eq!(app.usage_snapshot().await.session.total_tokens, 17);
+        assert_eq!(app.usage_snapshot().await.lifetime.total_tokens, 17);
         assert_eq!(app.history_page(None, None).await.unwrap().total_count, 1);
         let updates = observer.updates.lock().unwrap();
         assert!(updates.contains(&"reasoning"));
@@ -362,6 +374,8 @@ mod tests {
         assert!(ReviewStorage::load_all(root.path()).unwrap().is_empty());
         assert!(!root.path().join(".tauqe/history.jsonl").exists());
         assert!(!observer.updates.lock().unwrap().contains(&"saved"));
+        assert_eq!(app.usage_snapshot().await.session.total_tokens, 17);
+        assert_eq!(app.usage_snapshot().await.operations, 1);
     }
 
     #[tokio::test]
@@ -411,6 +425,8 @@ mod tests {
             );
             assert!(ReviewStorage::load_all(root.path()).unwrap().is_empty());
             assert!(!root.path().join(".tauqe/history.jsonl").exists());
+            assert_eq!(app.usage_snapshot().await.operations, 1);
+            assert!(app.usage_snapshot().await.cur.is_none());
         }
     }
 
@@ -445,5 +461,55 @@ mod tests {
         assert!(provider.requests().is_empty());
         assert!(observer.totals.lock().unwrap().is_empty());
         assert!(app.usage_snapshot().await.cur.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_audit_refuses_the_full_window_before_transport_or_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut configuration = AppConfig::default();
+        configuration.request.max_input_tokens = 1;
+        configuration.models.reviewer = Some(vec![ModelEntry::new(
+            ModelRef::openrouter("test/reviewer"),
+            None,
+        )]);
+        let (history, _) = tokio::sync::mpsc::unbounded_channel();
+        let app = Application::for_repository(configuration, root.path().into(), history);
+        let operation = app.try_begin_operation().unwrap();
+        let prepared = prepare(&app, &operation).await;
+        let observer = observer(&app, root.path(), false);
+        let provider = Arc::new(MockLlmProvider::new());
+        app.test_set_provider_for(ProviderKind::OpenRouter, provider.clone())
+            .await;
+        let execution = execution(&app, &operation).await;
+        let result = app
+            .audit_resources()
+            .execute_review_synthesis(
+                &operation,
+                root.path(),
+                prepared,
+                &execution,
+                observer.clone(),
+                config(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ReviewSynthesisExecutionError::Completion(
+                ReviewSynthesisCompletionError::InputLimit(_)
+            ))
+        ));
+        assert!(provider.requests().is_empty());
+        assert!(ReviewStorage::load_all(root.path()).unwrap().is_empty());
+        assert!(!root.path().join(".tauqe/history.jsonl").exists());
+        assert!(!observer.updates.lock().unwrap().contains(&"saved"));
+        assert!(observer
+            .final_usage
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cur
+            .is_none());
+        assert_eq!(app.active_operation_id(), Some(operation.id()));
     }
 }

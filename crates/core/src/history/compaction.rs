@@ -1,8 +1,25 @@
-use super::entry::HistoryEntry;
+use super::entry::{record_bytes, HistoryEntry};
 use crate::history::TurnRoundRecord;
+use tauqe_tools::tokens::estimate_tokens_from_bytes;
 
-/// Default budget of tokens for interaction history before compaction is triggered.
-pub(crate) const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 20_000;
+/// The proposed rewrite is not persisted until the owner checks the journal
+/// against `original` again after the Scribe returns.
+#[derive(Debug, Clone)]
+pub struct PreparedCompaction {
+    pub original: crate::history::HistorySnapshot,
+    pub entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompactionOutcome {
+    NotNeeded,
+    Compacted(PreparedCompaction),
+    BudgetUnreachable,
+}
+
+pub(crate) fn entries_tokens(entries: &[HistoryEntry]) -> u64 {
+    estimate_tokens_from_bytes(entries.iter().map(record_bytes).sum())
+}
 
 /// Default count of user turns to preserve in detailed form in the tail.
 pub(crate) const DEFAULT_TAIL_TURNS_COUNT: usize = 10;
@@ -31,7 +48,11 @@ pub(crate) fn partition_head_tail(
     }
 
     let cutoff_turn_idx = turn_indices.len() - keep_tail_turns;
-    let split_pos = turn_indices[cutoff_turn_idx];
+    let split_pos = if keep_tail_turns == 0 {
+        entries.len()
+    } else {
+        turn_indices[cutoff_turn_idx]
+    };
 
     if split_pos == 0 {
         return None;
@@ -209,6 +230,9 @@ mod tests {
         // When turns <= keep_tail_turns, nothing to partition
         assert!(partition_head_tail(&entries, 4).is_none());
         assert!(partition_head_tail(&entries, 5).is_none());
+        let (head, tail) = partition_head_tail(&entries, 0).unwrap();
+        assert_eq!(head, entries);
+        assert!(tail.is_empty());
     }
 
     #[test]
@@ -340,5 +364,34 @@ mod tests {
             }
             other => panic!("expected the retained turn, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn retained_exchange_keeps_ids_rounds_and_context_metadata() {
+        let retained = HistoryEntry::Turn {
+            id: Some(7),
+            prompt: "Recent completed task".into(),
+            context: vec!["src/lib.rs".into()],
+            context_watermark: Some(42),
+            rounds: vec![TurnRoundRecord {
+                index: 1,
+                message: "Checked.".into(),
+                feedback: "passed".into(),
+            }],
+        };
+        let entries = vec![
+            turn_with_rounds(1, "Old task", vec![(1, "Failed.", "retry")]),
+            response(2, "Old result"),
+            retained,
+            response(8, "Recent result"),
+        ];
+        let (head, tail) = partition_head_tail(&entries, 1).unwrap();
+        assert_eq!(tail, entries[2..]);
+        let compacted = build_compacted_history(Some(6), "Old work".into(), tail);
+        assert_eq!(compacted[1..], entries[2..]);
+        assert_eq!(compacted[1].id(), Some(7));
+        assert_eq!(compacted[2].id(), Some(8));
+        assert!(build_compaction_request(&head).contains("Old task"));
+        assert!(!build_compaction_request(&head).contains("Recent completed task"));
     }
 }

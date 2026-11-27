@@ -17,19 +17,38 @@ pub struct Application {
     pub(crate) chatgpt_login: Option<Arc<tauqe_core::providers::ChatGptSignIn>>,
 }
 
-#[derive(Default)]
 struct Session {
     usage: super::usage::UsageSession,
     interactive_execution: super::interactive_task::InteractiveExecution,
     context: super::context::ContextSession,
     history: super::history::HistorySession,
     configuration: super::configuration::Configuration,
-    dialogue: Arc<super::dialogue::DialogueSession>,
     transaction: Arc<std::sync::atomic::AtomicBool>,
     operations: Arc<super::operation::OperationRegistry>,
     focus: FocusSession,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: super::infrastructure::execution::ProviderOverrides,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        let operations = Arc::new(super::operation::OperationRegistry::default());
+        Self {
+            usage: Default::default(),
+            interactive_execution: Default::default(),
+            context: super::context::ContextSession::with_operations(
+                std::path::PathBuf::new(),
+                operations.clone(),
+            ),
+            history: Default::default(),
+            configuration: Default::default(),
+            transaction: Default::default(),
+            operations,
+            focus: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            provider_override: Default::default(),
+        }
+    }
 }
 
 impl Application {
@@ -69,6 +88,7 @@ impl Application {
             operations: self.session.operations.clone(),
             transaction: self.session.transaction.clone(),
             login: self.chatgpt_login.clone(),
+            usage: self.session.usage.clone(),
             #[cfg(any(test, feature = "test-support"))]
             provider_override: self.session.provider_override.clone(),
         }
@@ -77,7 +97,6 @@ impl Application {
     pub(crate) fn step_resources(&self) -> crate::workflows::step::run::StepResources {
         crate::workflows::step::run::StepResources {
             context: self.context_session().clone(),
-            usage: self.usage_session().clone(),
             execution: self.execution_session(),
         }
     }
@@ -88,10 +107,6 @@ impl Application {
 
     pub(crate) fn configuration_session(&self) -> &super::configuration::Configuration {
         &self.session.configuration
-    }
-
-    pub(crate) fn dialogue_session(&self) -> &Arc<super::dialogue::DialogueSession> {
-        &self.session.dialogue
     }
 
     pub async fn discussion_focus(&self) -> DiscussionFocus {
@@ -256,17 +271,22 @@ mod operation_tests {
     fn cancellation_keeps_registration_and_soft_stop_is_advisory() {
         let app = Application::default();
         let guard = app.try_begin_operation().unwrap();
-        let cancel = guard.cancel_receiver();
-        let stop = guard.soft_stop_receiver();
+        let stop = guard.stop_token();
         app.soft_stop_active_operation();
-        assert!(*stop.borrow());
-        assert!(!*cancel.borrow());
+        assert_eq!(stop.state(), tauqe_core::stop::StopState::Soft);
         assert_eq!(app.cancel_active_operation(), Some(guard.id()));
-        assert!(*cancel.borrow());
+        assert_eq!(stop.state(), tauqe_core::stop::StopState::Hard);
         assert_eq!(app.cancel_active_operation(), Some(guard.id()));
+        app.soft_stop_active_operation();
+        assert_eq!(stop.state(), tauqe_core::stop::StopState::Hard);
         assert!(app.try_begin_operation().is_err());
         drop(guard);
         assert_eq!(app.cancel_active_operation(), None);
+        let fresh = app.try_begin_operation().unwrap();
+        assert_eq!(
+            fresh.stop_token().state(),
+            tauqe_core::stop::StopState::Running
+        );
     }
 
     #[tokio::test]
@@ -321,11 +341,11 @@ impl Application {
 
 impl Application {
     pub async fn session_uuid(&self) -> String {
-        self.session.dialogue.id().await
+        self.context_session().session_uuid()
     }
 
     pub(crate) async fn reset_session_uuid(&self) -> String {
-        self.session.dialogue.reset().await
+        self.context_session().reset_session_uuid()
     }
 
     pub async fn maybe_rotate_session_on_model_change(
@@ -333,7 +353,7 @@ impl Application {
         old: &tauqe_core::models::ModelRef,
         new: &tauqe_core::models::ModelRef,
     ) -> bool {
-        self.session.dialogue.rotate_on_model_change(old, new).await
+        self.context_session().rotate_on_model_change(old, new)
     }
 }
 
@@ -394,7 +414,14 @@ impl Application {
         config: tauqe_core::config::AppConfig,
         selection: ReloadSelection,
     ) -> ConfigurationChange {
-        self.session.configuration.replace(config, selection).await
+        let change = self.session.configuration.replace(config, selection).await;
+        // Configuration changes are operation-owned; manager copies already in
+        // flight retain their original budget.
+        let _ = self
+            .history_session()
+            .set_budget_tokens(change.snapshot.config.history.budget_tokens)
+            .await;
+        change
     }
     pub(crate) async fn update_configuration(
         &self,
@@ -527,13 +554,19 @@ impl Application {
         mutations: tokio::sync::mpsc::UnboundedSender<tauqe_core::history::HistoryMutation>,
     ) -> Self {
         super::repository_startup::prepare(&root);
+        let budget_tokens = config.history.budget_tokens;
+        let operations = Arc::new(super::operation::OperationRegistry::default());
         Self {
             chatgpt_login: None,
             session: Arc::new(Session {
                 configuration: super::configuration::Configuration::new(config),
                 usage: super::usage::UsageSession::new(&root),
-                context: super::context::ContextSession::new(root.clone()),
-                history: super::history::HistorySession::new(root, mutations),
+                context: super::context::ContextSession::with_operations(
+                    root.clone(),
+                    operations.clone(),
+                ),
+                operations,
+                history: super::history::HistorySession::new(root, budget_tokens, mutations),
                 ..Session::default()
             }),
         }

@@ -5,7 +5,7 @@ use std::path::Path;
 use tauqe_core::context::ContextState;
 use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
 
-use tokio::sync::watch;
+use tauqe_core::stop::HardCancellation;
 
 #[derive(Debug)]
 pub struct OuterDocsPreload {
@@ -51,14 +51,13 @@ impl OuterDocsRefusal {
 
 impl ContextSession {
     /// Trust refusals stop the step; delivery and admission failures remain
-    /// diagnostics. Frozen registry and budget inputs belong to the running turn.
+    /// diagnostics. The frozen registry belongs to the running turn.
     pub(crate) async fn preload_declared_outer_docs(
         &self,
         repo_root: &Path,
         registry: &OuterDocsRegistry,
         declared: &[String],
-        token_budget: usize,
-        cancel_rx: &watch::Receiver<bool>,
+        cancel: &HardCancellation,
     ) -> Result<OuterDocsPreload, OuterDocsRefusal> {
         let mut unavailable: Vec<String> = Vec::new();
         let mut mounted: Vec<String> = Vec::new();
@@ -71,7 +70,7 @@ impl ContextSession {
             }
             requested.push(id);
             match registry
-                .materialize_declared(repo_root, id, MAX_DOCUMENT_BYTES, Some(cancel_rx))
+                .materialize_declared(repo_root, id, MAX_DOCUMENT_BYTES, Some(cancel))
                 .await
             {
                 Ok(cache_path) => {
@@ -97,7 +96,7 @@ impl ContextSession {
             });
         }
 
-        let applied = self.admit_outer_documents(mounted, token_budget).await;
+        let applied = self.admit_outer_documents(mounted).await;
 
         let mut context_update = None;
         match applied {
@@ -105,15 +104,6 @@ impl ContextSession {
                 let outcome = admission.outcome;
                 if !outcome.added.is_empty() {
                     context_update = Some(admission.state);
-                }
-                if let Some(limit) = outcome.limit_exceeded {
-                    unavailable.push(format!(
-                    "- the declared external documents {} were not mounted: the context would exceed the configured token budget (current {} tokens, requested {}, budget {})",
-                    limit.requested_files.join(", "),
-                    limit.current_tokens,
-                    limit.requested_tokens,
-                    limit.token_budget
-                ));
                 }
                 for rejection in &outcome.outer_docs_rejected {
                     unavailable.push(format!("- `{}`: {}", rejection.path, rejection.reason));
@@ -141,6 +131,7 @@ impl ContextSession {
 mod tests {
     use super::*;
     use crate::api::Application;
+    use tauqe_core::stop::StopSource;
     #[test]
     fn test_a_trust_refusal_reports_the_declaration_that_authorizes_the_source() {
         let refusal = OuterDocsRefusal {
@@ -206,7 +197,8 @@ mod tests {
         cached_document(root.path());
         let app = application(root.path());
         let identity = app.session_uuid().await;
-        let (_, cancel) = watch::channel(false);
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
         let declared = vec![
             " ".into(),
             " vendor ".into(),
@@ -216,7 +208,7 @@ mod tests {
         ];
         let preload = app
             .context_session()
-            .preload_declared_outer_docs(root.path(), &registry(), &declared, usize::MAX, &cancel)
+            .preload_declared_outer_docs(root.path(), &registry(), &declared, &cancel)
             .await
             .unwrap();
         assert_eq!(preload.diagnostics.len(), 1);
@@ -236,13 +228,7 @@ mod tests {
         assert_eq!(identity, app.session_uuid().await);
         let repeated = app
             .context_session()
-            .preload_declared_outer_docs(
-                root.path(),
-                &registry(),
-                &["vendor".into()],
-                usize::MAX,
-                &cancel,
-            )
+            .preload_declared_outer_docs(root.path(), &registry(), &["vendor".into()], &cancel)
             .await
             .unwrap();
         assert!(repeated.context_update.is_none());
@@ -250,20 +236,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_refusal_preserves_the_cached_snapshot_without_admitting_it() {
+    async fn preload_admits_cached_snapshot_without_a_size_gate() {
         let root = tempfile::tempdir().unwrap();
         let cached = cached_document(root.path());
         let app = application(root.path());
-        let (_, cancel) = watch::channel(false);
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
         let preload = app
             .context_session()
-            .preload_declared_outer_docs(root.path(), &registry(), &["vendor".into()], 0, &cancel)
+            .preload_declared_outer_docs(root.path(), &registry(), &["vendor".into()], &cancel)
             .await
             .unwrap();
-        assert!(preload.context_update.is_none());
-        assert_eq!(preload.diagnostics.len(), 1);
-        assert!(preload.diagnostics[0].contains("exceed the configured token budget"));
-        assert!(app.context_state().await.items.is_empty());
+        assert!(preload.diagnostics.is_empty());
+        assert_eq!(
+            preload.context_update.unwrap().items[0].path,
+            "vendor/guide.md"
+        );
         assert!(cached.exists());
     }
 
@@ -274,14 +262,14 @@ mod tests {
         let app = application(root.path());
         let identity = app.session_uuid().await;
         let revision = app.context_state().await.revision;
-        let (_, cancel) = watch::channel(false);
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
         let refusal = app
             .context_session()
             .preload_declared_outer_docs(
                 root.path(),
                 &registry(),
                 &["vendor".into(), "refused".into()],
-                usize::MAX,
                 &cancel,
             )
             .await

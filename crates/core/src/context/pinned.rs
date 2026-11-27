@@ -18,8 +18,15 @@ impl ContextManager {
     }
 
     pub fn load_pinned(&mut self, pinned_paths: &[String]) {
-        self.pinned_patterns = pinned_paths.to_vec();
-        self.recompute_pinned();
+        self.mutate(|this| {
+            if this.pinned_patterns != pinned_paths {
+                this.pinned_patterns = pinned_paths.to_vec();
+                this.revision += 1;
+            }
+            if this.recompute_pinned() {
+                this.revision += 1;
+            }
+        });
     }
 
     /// Recomputes the pinned context layer with hierarchical resolution.
@@ -45,6 +52,8 @@ impl ContextManager {
                     insert_pinned_candidate(
                         &self.repo_root,
                         &self.pinned,
+                        &self.user,
+                        &self.auto,
                         &mut new_pinned,
                         &mut self.insertion_counter,
                         clean_path,
@@ -77,6 +86,8 @@ impl ContextManager {
                             insert_pinned_candidate(
                                 &self.repo_root,
                                 &self.pinned,
+                                &self.user,
+                                &self.auto,
                                 &mut new_pinned,
                                 &mut self.insertion_counter,
                                 clean_candidate,
@@ -111,6 +122,8 @@ impl ContextManager {
 fn insert_pinned_candidate(
     repo_root: &Path,
     pinned: &IndexMap<String, ContextItem>,
+    user: &IndexMap<String, ContextItem>,
+    auto: &IndexMap<String, ContextItem>,
     target_map: &mut IndexMap<String, ContextItem>,
     insertion_counter: &mut u64,
     clean_path: String,
@@ -127,7 +140,14 @@ fn insert_pinned_candidate(
     } else if let Ok(meta) = std::fs::metadata(&full_path) {
         let size = meta.len();
         let tokens = estimate_tokens_from_bytes(size);
-        *insertion_counter += 1;
+        let insertion_seq = user
+            .get(&clean_path)
+            .or_else(|| auto.get(&clean_path))
+            .map(|item| item.insertion_seq)
+            .unwrap_or_else(|| {
+                *insertion_counter += 1;
+                *insertion_counter
+            });
         target_map.insert(
             clean_path.clone(),
             ContextItem {
@@ -136,7 +156,7 @@ fn insert_pinned_candidate(
                 size_bytes: size,
                 estimated_tokens: tokens,
                 layer: ContextLayer::Pinned,
-                insertion_seq: *insertion_counter,
+                insertion_seq,
             },
         );
     }
@@ -236,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_request_on_pinned_file_never_duplicates_into_auto_layer() {
+    fn test_auto_request_on_pinned_file_uses_temporary_override() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
@@ -249,16 +269,16 @@ mod tests {
         cm.add_auto_file("pinned.rs", ContextAccess::Editable)
             .unwrap();
 
-        // Access is upgraded without duplicating the pinned file into auto.
+        // Auto owns the override; the public state still emits the pinned path once.
         assert!(cm.is_editable("pinned.rs").unwrap());
-        assert!(cm.auto_files().is_empty());
+        assert_eq!(cm.auto_files(), ["pinned.rs"]);
 
         // A read-only re-request stays a no-op for pinned files.
         let rev_before = cm.get_state().revision;
         cm.add_auto_file("pinned.rs", ContextAccess::ReadOnly)
             .unwrap();
         assert_eq!(cm.get_state().revision, rev_before);
-        assert!(cm.auto_files().is_empty());
+        assert_eq!(cm.auto_files(), ["pinned.rs"]);
 
         // The emitted context state reports the path exactly once.
         let state = cm.get_state();
@@ -270,6 +290,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].access, ContextAccess::Editable);
         assert_eq!(rows[0].layer, ContextLayer::Pinned);
+        cm.clear_auto();
+        assert!(!cm.is_editable("pinned.rs").unwrap());
+        assert_eq!(cm.get_state().items[0].layer, ContextLayer::Pinned);
     }
 
     #[test]
@@ -290,6 +313,8 @@ mod tests {
 
         primary.merge_turn_context(&turn_snapshot);
         assert!(primary.is_editable("pinned.rs").unwrap());
+        primary.clear_auto();
+        assert!(!primary.is_editable("pinned.rs").unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

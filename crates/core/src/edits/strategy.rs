@@ -133,7 +133,7 @@ static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
     no_match_hint: "Search block not found (0 matches). Verify exact line content, indentation, and context.",
     no_range_hint: SEARCH_REPLACE_NO_RANGE_HINT,
     ambiguous_match_hint: search_replace_ambiguous_match_hint,
-    retry_instruction: "Re-read the current file version and copy the exact text of the lines you replace, including indentation and whitespace, so the pattern matches exactly one location.",
+    retry_instruction: "Required result: corrected edit blocks for the failed files. Each `old_text` must match exactly one location in the authoritative file content, including indentation and whitespace; `new_text` contains its replacement.",
 };
 
 static APPLY_PATCH: StrategyProfile = StrategyProfile {
@@ -145,7 +145,7 @@ static APPLY_PATCH: StrategyProfile = StrategyProfile {
     no_match_hint: "Copy the exact current context around the hunk.",
     no_range_hint: "Include a context hunk for each replacement.",
     ambiguous_match_hint: |_| "Include enough exact context to match once.".to_string(),
-    retry_instruction: "Submit a complete corrected patch against the current file versions. The refused patch was not applied.",
+    retry_instruction: "The refused patch was not applied. Required result: a complete corrected patch against the authoritative file versions, with each hunk identifying exactly one location.",
 };
 
 /// Profile of the opaque line-anchor strategy.
@@ -158,7 +158,7 @@ static LINE_ANCHOR: StrategyProfile = StrategyProfile {
     no_match_hint: "The change set addressed no line of the file. Copy the anchor of the first and of the last replaced line from the current version of that same file.",
     no_range_hint: LINE_ANCHOR_NO_RANGE_HINT,
     ambiguous_match_hint: line_anchor_ambiguous_match_hint,
-    retry_instruction: "Re-read the current file version and copy the `start` and `end` anchors character for character: an anchor names a line only in the file it was rendered for, and the ranges of one change set must not overlap.",
+    retry_instruction: "Required result: corrected edit blocks for the failed files. The `start` and `end` anchors must belong to the authoritative version of the addressed file, and the ranges of one change set must not overlap.",
 };
 
 /// Explanation of a change set that addresses no replaced line, in the

@@ -167,6 +167,27 @@ fn edit_desync_reason(phase: Option<tauqe_protocol::TurnPhase>) -> String {
     }
 }
 
+/// Applies a context snapshot only when it advances the session revision.
+///
+/// The handshake installs the initial snapshot in `AppState::context`. Both
+/// buffered events and later RPC responses use that same baseline, so a late
+/// response or a duplicate event cannot replace a newer active view.
+pub(super) fn apply_context_snapshot(st: &mut AppState, context: ContextState) {
+    if context.revision <= st.context.revision {
+        return;
+    }
+    st.context = context;
+    let rows = st.context_view.compute_rows(&st.context.items);
+    if rows.is_empty() {
+        st.context_view.cursor_index = 0;
+    } else if st.context_view.cursor_index >= rows.len() {
+        st.context_view.cursor_index = rows.len() - 1;
+    }
+    if st.context_view.adding_file {
+        st.update_filtered_candidates();
+    }
+}
+
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -403,16 +424,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("state") {
                     if let Ok(ctx) = serde_json::from_value::<ContextState>(val.clone()) {
-                        st.context = ctx;
-                        let rows = st.context_view.compute_rows(&st.context.items);
-                        if rows.is_empty() {
-                            st.context_view.cursor_index = 0;
-                        } else if st.context_view.cursor_index >= rows.len() {
-                            st.context_view.cursor_index = rows.len() - 1;
-                        }
-                        if st.context_view.adding_file {
-                            st.update_filtered_candidates();
-                        }
+                        apply_context_snapshot(&mut st, ctx);
                     }
                 }
             }
@@ -1236,6 +1248,20 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.is_batch = false;
                     settle_batch_turn(&mut st, &data.summary);
                     notify_batch_finished(&mut st, BatchKind::Review, &data.summary);
+                    if !data.deferred_groups.is_empty() {
+                        st.model
+                            .text
+                            .push_str(&active_t("repl.deferred_groups_heading"));
+                        for group in &data.deferred_groups {
+                            st.model.text.push_str(&format!("\n- {} / {}: {}\n  {}\n  {}\n",
+                                group.review_id, group.group_id,
+                                active_t(match group.reason {
+                                    tauqe_protocol::ReviewGroupDeferralReason::UnresolvedQuestions => "repl.deferral_questions",
+                                    tauqe_protocol::ReviewGroupDeferralReason::NeedsRefinement => "repl.deferral_refinement",
+                                }), group.diagnostic, group.recovery));
+                        }
+                        st.model.update_markdown();
+                    }
                 }
             }
         }
@@ -1528,9 +1554,108 @@ mod tests {
     use super::*;
     use tauqe_protocol::edit::EditOutcome;
     use tauqe_protocol::{
-        HistoryEntryStatus, ModelCatalogEntry, ModelFinishedEvent, ModelRef, ModelRole,
-        ModelRolesEntries, ModelRolesSummary, ReasoningEffort, UiHistoryItem, UiHistoryKind,
+        ContextAccess, ContextItem, ContextLayer, HistoryEntryStatus, ModelCatalogEntry,
+        ModelFinishedEvent, ModelRef, ModelRole, ModelRolesEntries, ModelRolesSummary,
+        ReasoningEffort, UiHistoryItem, UiHistoryKind,
     };
+
+    fn context_item(path: &str, layer: ContextLayer, access: ContextAccess) -> ContextItem {
+        ContextItem {
+            path: path.into(),
+            access,
+            layer,
+            size_bytes: 12,
+            estimated_tokens: 3,
+            insertion_seq: 1,
+        }
+    }
+
+    fn context_event(state: ContextState) -> Event {
+        Event {
+            method: events::CONTEXT_CHANGED.into(),
+            params: Some(serde_json::json!({ "state": state })),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_events_follow_preload_research_and_auto_clear() {
+        let user = context_item("src/user.rs", ContextLayer::User, ContextAccess::ReadOnly);
+        let auto = context_item(
+            "src/research.rs",
+            ContextLayer::Auto,
+            ContextAccess::Editable,
+        );
+        let mut st = crate::app::test_state();
+        st.context_view.cursor_index = 99;
+        st.context_view.adding_file = true;
+        st.set_repo_files(vec![user.path.clone(), auto.path.clone()]);
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+
+        for snapshot in [
+            ContextState {
+                revision: 1,
+                items: vec![user.clone()],
+                total_estimated_tokens: 3,
+            },
+            ContextState {
+                revision: 2,
+                items: vec![user.clone(), auto.clone()],
+                total_estimated_tokens: 6,
+            },
+            ContextState {
+                revision: 3,
+                items: vec![user.clone()],
+                total_estimated_tokens: 3,
+            },
+        ] {
+            handle_event(context_event(snapshot), &state, &mut is_reasoning).await;
+            let guard = state.lock().await;
+            assert!(
+                guard.context_view.cursor_index
+                    < guard.context_view.compute_rows(&guard.context.items).len()
+            );
+            assert!(!guard.context_view.filtered_candidates.iter().any(|candidate| {
+                matches!(candidate, crate::views::context::ContextCandidate::File(path) if path == &user.path)
+            }));
+        }
+
+        let guard = state.lock().await;
+        assert_eq!(guard.context.revision, 3);
+        assert_eq!(guard.context.items, vec![user]);
+        assert!(guard.context_view.filtered_candidates.iter().any(|candidate| {
+            matches!(candidate, crate::views::context::ContextCandidate::File(path) if path == &auto.path)
+        }));
+    }
+
+    #[tokio::test]
+    async fn duplicate_context_event_preserves_user_layer_and_temporary_access() {
+        let user = context_item("src/user.rs", ContextLayer::User, ContextAccess::ReadOnly);
+        let override_item =
+            context_item("src/user.rs", ContextLayer::Auto, ContextAccess::Editable);
+        let mut st = crate::app::test_state();
+        st.context = ContextState {
+            revision: 8,
+            items: vec![user.clone(), override_item.clone()],
+            total_estimated_tokens: 3,
+        };
+        st.context_view.cursor_index = 1;
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            context_event(ContextState {
+                revision: 8,
+                items: vec![],
+                total_estimated_tokens: 0,
+            }),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let guard = state.lock().await;
+        assert_eq!(guard.context.items, vec![user, override_item]);
+        assert_eq!(guard.context_view.cursor_index, 1);
+    }
 
     fn batch_summary(
         status: BatchFinishStatus,
@@ -2516,6 +2641,7 @@ mod tests {
                 serde_json::to_value(ReviewBatchFinishedEvent {
                     operation_id: "op-review-batch".to_string(),
                     summary: batch_summary(BatchFinishStatus::Failed, 1, 3, 90),
+                    deferred_groups: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -3372,6 +3498,7 @@ mod tests {
                 serde_json::to_value(ReviewBatchFinishedEvent {
                     operation_id: "op-review-batch".to_string(),
                     summary,
+                    deferred_groups: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -3421,6 +3548,57 @@ mod tests {
             "only a failed or blocked queue projects a reason"
         );
         assert!(guard.active_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_review_batch_renders_every_deferral_in_repl() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let event = ReviewBatchFinishedEvent {
+            operation_id: "review-run".into(),
+            summary: batch_summary(BatchFinishStatus::Completed, 1, 1, 10),
+            deferred_groups: vec![
+                tauqe_protocol::DeferredReviewGroup {
+                    review_id: "rev-a".into(),
+                    group_id: "arch-a".into(),
+                    reason: tauqe_protocol::ReviewGroupDeferralReason::NeedsRefinement,
+                    diagnostic: "step blocked\nfull saved details".into(),
+                    recovery: "review/refineGroup rev-a arch-a".into(),
+                    open_findings: 1,
+                },
+                tauqe_protocol::DeferredReviewGroup {
+                    review_id: "rev-b".into(),
+                    group_id: "arch-b".into(),
+                    reason: tauqe_protocol::ReviewGroupDeferralReason::UnresolvedQuestions,
+                    diagnostic: "question #2".into(),
+                    recovery: "record decision".into(),
+                    open_findings: 1,
+                },
+            ],
+        };
+        handle_event(
+            Event {
+                method: events::REVIEW_BATCH_FINISHED.into(),
+                params: Some(serde_json::to_value(event).unwrap()),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        for text in [
+            "rev-a",
+            "arch-a",
+            "full saved details",
+            "review/refineGroup",
+            "rev-b",
+            "arch-b",
+            "question #2",
+            "record decision",
+        ] {
+            assert!(guard.model.text.contains(text), "missing {text}");
+        }
     }
     /// The inspector owns no payload: it reads the live staged set the REPL
     /// view renders, so a streamed start, its hunks, and a settlement need no

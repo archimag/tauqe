@@ -309,10 +309,22 @@ impl PlanCreateDialogState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRefineTarget {
+    Plan {
+        plan_id: String,
+        plan_title: String,
+    },
+    ReviewGroup {
+        review_id: String,
+        group_id: String,
+        group_title: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanRefineDialogState {
-    pub plan_id: String,
-    pub plan_title: String,
+    pub target: PlanRefineTarget,
     /// Architect that drafts the modification.
     pub planner: ModelSelector,
     /// Architect that audits the modification independently.
@@ -328,13 +340,39 @@ pub struct PlanRefineDialogState {
 impl PlanRefineDialogState {
     /// Builds a plan refinement dialog selecting among the configured
     /// `architect_entries` for both the Planner and the Critic role.
+    /// Critique is disabled until the developer explicitly enables it.
     pub fn new(plan_id: String, plan_title: String, architect_entries: Vec<ModelEntry>) -> Self {
+        Self::with_target(
+            PlanRefineTarget::Plan {
+                plan_id,
+                plan_title,
+            },
+            architect_entries,
+        )
+    }
+
+    pub fn for_review_group(
+        review_id: String,
+        group_id: String,
+        group_title: String,
+        architect_entries: Vec<ModelEntry>,
+    ) -> Self {
+        Self::with_target(
+            PlanRefineTarget::ReviewGroup {
+                review_id,
+                group_id,
+                group_title,
+            },
+            architect_entries,
+        )
+    }
+
+    fn with_target(target: PlanRefineTarget, architect_entries: Vec<ModelEntry>) -> Self {
         Self {
-            plan_id,
-            plan_title,
+            target,
             planner: ModelSelector::new(ModelRole::Architect, architect_entries.clone(), 0),
             critic: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
-            skip_critique: false,
+            skip_critique: true,
             instructions_editor: crate::editor::InputEditor::default(),
             focus: PlanFormFocus::default(),
             confirm_button: crate::app::ConfirmDialogButton::Cancel,

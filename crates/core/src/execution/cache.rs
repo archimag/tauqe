@@ -11,6 +11,42 @@
 use std::path::{Path, PathBuf};
 
 use crate::prompt::ContextBlockCache;
+use crate::workflow::research::step::ResearchLoopConfig;
+use tauqe_tools::stop::HardCancellation;
+
+/// Frozen request materials for one repository and configuration snapshot.
+/// The repository catalog contains paths only, not file bodies.
+#[derive(Clone)]
+pub struct PromptEnvironment {
+    pub(crate) root: PathBuf,
+    pub(crate) project: crate::config::project::ProjectConfig,
+    pub(crate) outer_docs: Vec<crate::config::OuterDocEntry>,
+    pub(crate) research: ResearchLoopConfig,
+    pub(crate) available_paths: Vec<String>,
+    pub(crate) repo_map: Option<String>,
+}
+
+impl PromptEnvironment {
+    pub fn project(&self) -> &crate::config::project::ProjectConfig {
+        &self.project
+    }
+
+    pub fn outer_docs(&self) -> &[crate::config::OuterDocEntry] {
+        &self.outer_docs
+    }
+
+    pub fn research(&self) -> &ResearchLoopConfig {
+        &self.research
+    }
+
+    pub fn available_paths(&self) -> &[String] {
+        &self.available_paths
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.root
+    }
+}
 
 /// Per-turn memoization of deterministic proposal inputs.
 #[derive(Default)]
@@ -29,11 +65,6 @@ pub struct TurnInputCache {
     /// later proposal, patch-retry, and healing round reuses the bytes already
     /// held.
     context_contents: std::collections::HashMap<String, MemoizedContextFile>,
-    /// Directory outline captured on the first proposal round of the turn.
-    ///
-    /// `Some` marks the outline as rendered, so an empty tree is frozen as well
-    /// instead of re-walking the tracked file list on every round.
-    repo_dirs: Option<FrozenRepoDirs>,
     /// Project configuration frozen on the first proposal round of the turn.
     project: Option<crate::config::project::ProjectConfig>,
     /// Rendered context elements captured across the rounds of the turn.
@@ -50,10 +81,6 @@ struct FrozenRepoMap {
     map: Option<String>,
 }
 
-/// Compact directory outline frozen for the remaining rounds of a bounded turn.
-struct FrozenRepoDirs {
-    tree: Option<String>,
-}
 /// On-disk identity of a context file as the memo recorded it.
 ///
 /// The pair tells an unchanged file from a rewritten one without reading the
@@ -126,17 +153,100 @@ impl MemoizedContextFile {
     }
 }
 
+/// Load only the pinned entries of a detached context for a Scribe request.
+/// Selection happens before reading, so unrelated context bodies never enter
+/// the request or get fetched just to be discarded by a scenario.
+pub async fn pinned_context_files(
+    context: &crate::context::ContextManager,
+) -> anyhow::Result<Vec<crate::context::ContextFileContent>> {
+    let items: Vec<_> = context
+        .get_state()
+        .items
+        .into_iter()
+        .filter(|item| item.layer == crate::context::ContextLayer::Pinned)
+        .collect();
+    TurnInputCache::default()
+        .context_files(context.repo_root(), &items)
+        .await
+}
+
+/// Capture readable paths and the full arrival watermark for the journal.
+/// File bodies stay inside core and never cross into the scenario.
+pub async fn interactive_context_projection(
+    context: crate::context::ContextManager,
+) -> Result<(Vec<String>, Option<u64>), tauqe_tools::blocking::OffloadError> {
+    crate::blocking::run_blocking_async(move || {
+        let watermark = context
+            .get_state()
+            .items
+            .iter()
+            .map(|item| item.insertion_seq)
+            .max()
+            .filter(|watermark| *watermark > 0);
+        let paths = context
+            .read_context_files()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        (paths, watermark)
+    })
+    .await
+}
+
+/// Read the detached audit context off the async worker, without mutating it.
+/// Preset groups pass no context and remain isolated from interactive files.
+pub(crate) async fn audit_context_files(
+    context: Option<crate::context::ContextManager>,
+) -> Result<(Vec<crate::context::ContextFileContent>, usize), String> {
+    let Some(context) = context else {
+        return Ok((Vec::new(), 0));
+    };
+    crate::blocking::run_blocking_async(move || {
+        let tokens = context.get_state().total_estimated_tokens as usize;
+        (context.read_context_files(), tokens)
+    })
+    .await
+    .map_err(|error| format!("Failed to read the active audit context: {error}"))
+}
+
 impl TurnInputCache {
+    /// Resolve the runner against the captured declaration, not a configuration
+    /// file that might have changed since the operation began.
+    pub(crate) async fn bind_environment(
+        &mut self,
+        root: &Path,
+        snapshot: &crate::config::AppConfig,
+        cancel: Option<&HardCancellation>,
+    ) -> anyhow::Result<PromptEnvironment> {
+        // The project declaration is repository-local. Freeze the same effective
+        // declaration used by staging, including runner recipes, once per turn.
+        let project = self.project(root, cancel).await;
+        let path = root.to_path_buf();
+        let available_paths = crate::blocking::run_blocking_async(move || {
+            crate::git::list_repository_files(Some(&path))
+        })
+        .await?
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "tracked-file catalog is unavailable");
+            Vec::new()
+        });
+        let repo_map = self.repo_map(root).await;
+        Ok(PromptEnvironment {
+            root: root.to_path_buf(),
+            project,
+            outer_docs: snapshot.outer_docs.clone(),
+            research: ResearchLoopConfig::from_context(&snapshot.context),
+            available_paths,
+            repo_map,
+        })
+    }
+
     /// Returns the repository map frozen at the start of the turn.
     ///
-    /// The first call generates the map from tracked files within the token budget,
+    /// The first call generates the complete map from tracked files,
     /// independently of the active context. Later calls reuse the exact result,
     /// even if files change on disk during the turn.
-    pub(crate) async fn repo_map(
-        &mut self,
-        repo_root: &Path,
-        token_budget: usize,
-    ) -> Option<String> {
+    pub(crate) async fn repo_map(&mut self, repo_root: &Path) -> Option<String> {
         if let Some(frozen) = &self.repo_map {
             return frozen.map.clone();
         }
@@ -153,8 +263,6 @@ impl TurnInputCache {
                 crate::repomap::generate_repo_map_with_extractor(
                     &root,
                     &files,
-                    &[],
-                    token_budget,
                     crate::repomap::treesitter::shared_extractor(),
                 )
                 .ok()
@@ -183,59 +291,6 @@ impl TurnInputCache {
         map
     }
 
-    /// Returns the compact directory outline frozen at the start of the turn.
-    ///
-    /// The tree is derived only from the tracked file list, so it is rendered
-    /// once and reused verbatim by every later round: the outline block stays
-    /// byte-identical and the provider keeps matching its cached prefix. Files
-    /// anchored by the pinned context layer are marked, so the model never
-    /// searches for conventions that already travelled with the prompt.
-    pub(crate) async fn repo_dirs(
-        &mut self,
-        repo_root: &Path,
-        pinned_patterns: &[String],
-    ) -> Option<String> {
-        if let Some(frozen) = &self.repo_dirs {
-            return frozen.tree.clone();
-        }
-
-        let root = repo_root.to_path_buf();
-        let pinned = pinned_patterns.to_vec();
-        // Listing the tracked files is blocking subprocess work, so it runs off
-        // the async executor thread.
-        let tree = match crate::blocking::run_blocking_async(move || {
-            crate::git::list_repository_files(Some(&root)).map(|available_files| {
-                let tree =
-                    crate::repomap::dirs::generate_repo_dirs_with_pinned(&available_files, &pinned);
-                if tree.trim().is_empty() {
-                    None
-                } else {
-                    Some(tree)
-                }
-            })
-        })
-        .await
-        {
-            Ok(Ok(tree)) => tree,
-            // A repository whose listing failed is not an empty repository: the
-            // degradation is recorded before the outline is treated as absent.
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to list repository files; the directory outline is unavailable"
-                );
-                None
-            }
-            Err(join_error) => {
-                crate::blocking::log_join_error(&join_error, "directory outline rendering");
-                None
-            }
-        };
-
-        self.repo_dirs = Some(FrozenRepoDirs { tree: tree.clone() });
-        tree
-    }
-
     /// Returns the effective project configuration frozen at the start of the turn.
     ///
     /// The first call reads `tauqe.toml` and, when the project declares a task
@@ -246,13 +301,13 @@ impl TurnInputCache {
     pub(crate) async fn project(
         &mut self,
         repo_root: &Path,
-        cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+        cancel: Option<&HardCancellation>,
     ) -> crate::config::project::ProjectConfig {
         if let Some(project) = &self.project {
             return project.clone();
         }
 
-        let project = crate::toolchain::effective_project_config(repo_root, cancel_rx).await;
+        let project = crate::toolchain::effective_project_config(repo_root, cancel).await;
         self.project = Some(project.clone());
         project
     }
@@ -535,27 +590,21 @@ mod tests {
     async fn repository_changes_only_reach_the_next_turns_map() {
         let (_dir, root) = repo_with_two_files();
         let mut first_turn = TurnInputCache::default();
-        let before = first_turn
-            .repo_map(&root, 1000)
-            .await
-            .expect("first turn map");
+        let before = first_turn.repo_map(&root).await.expect("first turn map");
         assert!(before.contains("pub fn beta"));
         assert_eq!(
-            TurnInputCache::default()
-                .repo_map(&root, 1000)
-                .await
-                .as_deref(),
+            TurnInputCache::default().repo_map(&root).await.as_deref(),
             Some(before.as_str())
         );
 
         std::fs::write(root.join("b.rs"), "pub fn rewritten_beta() {}\n").unwrap();
         assert_eq!(
-            first_turn.repo_map(&root, 1000).await.as_deref(),
+            first_turn.repo_map(&root).await.as_deref(),
             Some(before.as_str())
         );
 
         let after = TurnInputCache::default()
-            .repo_map(&root, 1000)
+            .repo_map(&root)
             .await
             .expect("next turn map");
         assert!(after.contains("pub fn rewritten_beta"));
@@ -563,73 +612,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn empty_repo_map_is_frozen_instead_of_being_regenerated() {
+    async fn bound_environment_includes_map_despite_legacy_toggle() {
         let (_dir, root) = repo_with_two_files();
-        let mut cache = TurnInputCache::default();
-        assert!(cache.repo_map(&root, 0).await.is_none());
-        assert!(cache.repo_map(&root, 1000).await.is_none());
+        let mut snapshot = crate::config::AppConfig::default();
+        snapshot.context.include_repo_map = false;
+        let environment = TurnInputCache::default()
+            .bind_environment(&root, &snapshot, None)
+            .await
+            .unwrap();
+        assert!(environment
+            .repo_map
+            .as_deref()
+            .unwrap()
+            .contains("pub fn beta"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn directory_outline_is_frozen_across_rounds() {
+    async fn bound_environment_freezes_research_limits_with_project() {
+        let (_dir, root) = repo_with_two_files();
+        let mut snapshot = crate::config::AppConfig::default();
+        snapshot.context.max_search_requests_per_round = 17;
+        snapshot.context.max_repo_map_requests_per_round = 3;
+        let mut cache = TurnInputCache::default();
+        let environment = cache
+            .bind_environment(&root, &snapshot, None)
+            .await
+            .unwrap();
+        let expected = environment.research().limits();
+        assert_eq!(
+            expected,
+            crate::workflow::research::ResearchLimits::from_context_config(&snapshot.context)
+        );
+        snapshot.context.max_search_requests_per_round = 1;
+        snapshot.context.max_repo_map_requests_per_round = 1;
+        assert_eq!(environment.research().limits(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_repo_map_is_frozen_instead_of_being_regenerated() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         crate::git::init_repository(Some(&root), true).unwrap();
-        std::fs::create_dir_all(root.join("src/nested")).unwrap();
-        std::fs::write(root.join("src/main.rs"), "pub fn main() {}\n").unwrap();
-        std::fs::write(root.join("src/nested/deep.rs"), "pub fn deep() {}\n").unwrap();
-        let files = vec!["src/main.rs".to_string(), "src/nested/deep.rs".to_string()];
-        crate::git::cmd::stage_files(&root, &files).unwrap();
-        crate::git::cmd::commit_with_developer_author(&root, "Add fixtures", false).unwrap();
-
         let mut cache = TurnInputCache::default();
-        let first = cache.repo_dirs(&root, &[]).await.expect("outline rendered");
-        assert_eq!(first, "src\n  nested\n");
-
-        // A folder tracked later would appear in a regenerated outline; the
-        // frozen one keeps the prompt prefix byte-identical.
-        std::fs::create_dir_all(root.join("extra")).unwrap();
-        std::fs::write(root.join("extra/mod.rs"), "pub fn extra() {}\n").unwrap();
-        crate::git::cmd::stage_files(&root, &["extra/mod.rs".to_string()]).unwrap();
-        crate::git::cmd::commit_with_developer_author(&root, "Add extra", false).unwrap();
-
-        assert_eq!(
-            cache.repo_dirs(&root, &[]).await.as_deref(),
-            Some(first.as_str())
-        );
-    }
-
-    /// A repository whose tracked file list cannot be resolved must degrade
-    /// observably: the outline is frozen as absent for the rest of the turn
-    /// and the failed listing leaves a warn record, so the degradation never
-    /// looks like an empty repository.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unresolvable_repository_freezes_an_absent_outline_with_a_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing_root = dir.path().join("no-such-repository");
-        let mut cache = TurnInputCache::default();
-
-        let (buffer, _guard) = crate::blocking::log_capture::install();
-        assert!(cache.repo_dirs(&missing_root, &[]).await.is_none());
-
-        let logs = crate::blocking::log_capture::contents(&buffer);
-        assert!(
-            logs.contains("failed to list repository files"),
-            "the degradation must be observable: {logs}"
-        );
-        assert!(
-            logs.contains("the directory outline is unavailable"),
-            "the degradation must be observable: {logs}"
-        );
-
-        // The degraded outline is frozen: a later round reuses it without
-        // re-running the listing or emitting a second record.
-        assert!(cache.repo_dirs(&missing_root, &[]).await.is_none());
-        assert_eq!(
-            crate::blocking::log_capture::contents(&buffer),
-            logs,
-            "the frozen degradation must not be re-reported"
-        );
+        assert!(cache.repo_map(&root).await.is_none());
+        assert!(cache.repo_map(&root).await.is_none());
     }
 
     /// A repository that cannot be inspected must degrade observably as well:
@@ -642,7 +668,7 @@ mod tests {
         let mut cache = TurnInputCache::default();
 
         let (buffer, _guard) = crate::blocking::log_capture::install();
-        assert!(cache.repo_map(&missing_root, 1000).await.is_none());
+        assert!(cache.repo_map(&missing_root).await.is_none());
 
         let logs = crate::blocking::log_capture::contents(&buffer);
         assert!(
@@ -656,7 +682,7 @@ mod tests {
 
         // The degraded map is frozen: a later round reuses it without
         // re-running the listing or emitting a second record.
-        assert!(cache.repo_map(&missing_root, 1000).await.is_none());
+        assert!(cache.repo_map(&missing_root).await.is_none());
         assert_eq!(
             crate::blocking::log_capture::contents(&buffer),
             logs,

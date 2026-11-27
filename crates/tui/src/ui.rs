@@ -22,11 +22,11 @@ use crate::dialogs::render::{
     render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_outer_docs_cache_remove_popup,
     render_confirm_quit_popup, render_confirm_remove_context_file_popup,
-    render_confirm_review_analyze_popup, render_confirm_review_truncation_popup,
-    render_diff_inspector, render_disconnected_popup, render_help_popup, render_locale_dialog,
-    render_outer_docs_cache_dialog, render_plan_create_dialog, render_plan_refine_blocked_dialog,
-    render_plan_refine_dialog, render_prompt_modal, render_review_dialog, render_selection_dialog,
-    render_squash_popup, render_status_dialog, render_usage_summary,
+    render_confirm_review_analyze_popup, render_diff_inspector, render_disconnected_popup,
+    render_help_popup, render_locale_dialog, render_outer_docs_cache_dialog,
+    render_plan_create_dialog, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+    render_prompt_modal, render_review_dialog, render_selection_dialog, render_squash_popup,
+    render_status_dialog, render_usage_summary,
 };
 use crate::views::context::render_context_view;
 use crate::views::history::render_history_view;
@@ -343,7 +343,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             render_confirm_delete_review_popup(frame, state);
         }
         Some(ActiveModal::ReviewAnalyze) => render_confirm_review_analyze_popup(frame, state),
-        Some(ActiveModal::ReviewTruncation) => render_confirm_review_truncation_popup(frame, state),
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
         Some(ActiveModal::ExecutePipeline) => render_confirm_execute_pipeline_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),

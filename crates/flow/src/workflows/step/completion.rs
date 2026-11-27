@@ -1,6 +1,7 @@
 //! Terminal edit facts of an isolated bounded step execution.
 use super::run::{StepAttemptReport, StepLoopReport};
-use crate::workflows::{round::RoundError, turn::TurnOutcome};
+use crate::workflows::turn::StepRecovery;
+use crate::workflows::turn::{RoundError, TurnOutcome};
 use tauqe_core::edits::{EditOutcome, VerificationVerdict};
 use tauqe_core::execution::ResponseEnvelope;
 use tauqe_core::llm::{BlockedCommand, LlmCapability, LlmCommand};
@@ -14,6 +15,27 @@ pub(crate) fn step_response(report: &StepAttemptReport) -> Option<&ResponseEnvel
         Ok(TurnOutcome::ProtocolDefect(response)) => Some(response),
         _ => None,
     }
+}
+
+/// The model answer and final policy settlement of one coder attempt travel together.
+pub(crate) struct CoderAttempt {
+    pub settlement: StepTurnSettlement,
+    pub answer: String,
+}
+
+pub(crate) fn step_answer(report: &StepAttemptReport) -> String {
+    step_response(report)
+        .and_then(|response| {
+            response
+                .commands()
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    LlmCommand::Text(message) => Some(message.content.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
 }
 
 fn format_step_blocker(blocked: &BlockedCommand) -> String {
@@ -52,8 +74,28 @@ fn classify_step_result(report: &StepAttemptReport) -> StepTurnResult {
     if report.cancelled {
         return StepTurnResult::Cancelled;
     }
-    if let Some(error) = &report.recovery_error {
-        return StepTurnResult::Failed(StepFailure::infrastructure(error.clone()));
+    if report.recovery.unconfirmed() {
+        let primary = match &report.outcome {
+            Err(error) => Some(error.to_string()),
+            Ok(TurnOutcome::Exhausted { reason }) => Some(reason.clone()),
+            Ok(TurnOutcome::ProtocolDefect(_)) => {
+                Some("The step turn diverged without a completed change set".into())
+            }
+            _ => report.edit.as_ref().and_then(|edit| edit.error.clone()),
+        };
+        let diagnostic = report
+            .recovery
+            .diagnostic()
+            .unwrap_or_else(|| "The file transaction did not confirm recovery".into());
+        return StepTurnResult::Failed(StepFailure::unreverted(match primary {
+            Some(primary) => format!("{primary}\n\nRecovery: {diagnostic}"),
+            None => diagnostic,
+        }));
+    }
+    if matches!(report.recovery, StepRecovery::FinalizationAttempted) && report.edit.is_none() {
+        return StepTurnResult::Failed(StepFailure::unreverted(
+            "Finalization was attempted without a disk receipt",
+        ));
     }
     if let Some(error) = report.edit.as_ref().and_then(|edit| edit.error.as_ref()) {
         return StepTurnResult::Failed(StepFailure::infrastructure(format!(
@@ -159,7 +201,10 @@ pub(crate) fn classify_step_edit_completion(report: &StepLoopReport) -> StepEdit
             }
             completion.disposition = if report.cancelled {
                 StepEditDisposition::Cancelled
-            } else if report.recovery_error.is_some() {
+            } else if report.recovery.unconfirmed()
+                || matches!(report.recovery, StepRecovery::FinalizationAttempted)
+                    && report.edit.is_none()
+            {
                 StepEditDisposition::Failed
             } else if completion.outcome.error.is_some()
                 || matches!(
@@ -174,8 +219,11 @@ pub(crate) fn classify_step_edit_completion(report: &StepLoopReport) -> StepEdit
             } else {
                 StepEditDisposition::Completed
             };
-            if let Some(error) = &report.recovery_error {
-                completion.outcome.error = Some(error.clone());
+            if let Some(error) = report.recovery.diagnostic() {
+                completion.outcome.error = Some(match completion.outcome.error.take() {
+                    Some(primary) => format!("{primary}\n\nRecovery: {error}"),
+                    None => error,
+                });
             }
         }
         StepLoopReport::Failed(reason) => {

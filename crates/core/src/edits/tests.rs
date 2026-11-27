@@ -313,7 +313,11 @@ async fn test_move_file_stages_and_applies() {
         "fn hello() {}"
     );
     assert!(cm.is_editable("new.rs").unwrap());
-    assert!(!cm.contains("old.rs").unwrap());
+    assert!(cm.contains("old.rs").unwrap());
+    assert!(!cm
+        .read_context_files()
+        .iter()
+        .any(|file| file.path == "old.rs"));
 }
 
 #[tokio::test]
@@ -346,7 +350,11 @@ async fn chained_moves_leave_only_the_final_destination_in_context() {
         "fn hello() {}"
     );
     assert!(cm.is_editable("c.rs").unwrap());
-    assert!(!cm.contains("a.rs").unwrap());
+    assert!(cm.contains("a.rs").unwrap());
+    assert!(!cm
+        .read_context_files()
+        .iter()
+        .any(|file| file.path == "a.rs"));
     assert!(!cm.contains("b.rs").unwrap());
 }
 
@@ -1921,7 +1929,11 @@ async fn a_directory_move_lands_on_disk_and_reconciles_the_context() {
 
     // The reconciled context follows the move: the source leaves it and the
     // destinations join the transient auto layer instead of the user layer.
-    assert!(!cm.contains("src/old/a.rs").unwrap());
+    assert!(cm.contains("src/old/a.rs").unwrap());
+    assert!(!cm
+        .read_context_files()
+        .iter()
+        .any(|file| file.path == "src/old/a.rs"));
     assert!(cm.is_editable("src/new/a.rs").unwrap());
     let mut auto = cm.auto_files();
     auto.sort();
@@ -1974,7 +1986,11 @@ async fn a_binary_move_reaches_disk_and_reconciles_the_context() {
         root.join("assets").is_dir(),
         "a directory that still holds a file survives the prune"
     );
-    assert!(!cm.contains("assets/legacy/logo.png").unwrap());
+    assert!(cm.contains("assets/legacy/logo.png").unwrap());
+    assert!(!cm
+        .read_context_files()
+        .iter()
+        .any(|file| file.path == "assets/legacy/logo.png"));
     assert!(cm.is_editable("assets/brand/logo.png").unwrap());
     assert_eq!(cm.auto_files(), vec!["assets/brand/logo.png".to_string()]);
 }
@@ -2033,7 +2049,11 @@ async fn a_directory_move_carries_a_binary_member_to_disk() {
         root.join("src").is_dir(),
         "a directory that still holds a file survives the prune"
     );
-    assert!(!cm.contains("src/old/a.rs").unwrap());
+    assert!(cm.contains("src/old/a.rs").unwrap());
+    assert!(!cm
+        .read_context_files()
+        .iter()
+        .any(|file| file.path == "src/old/a.rs"));
     assert!(cm.is_editable("src/new/logo.bin").unwrap());
     let mut auto = cm.auto_files();
     auto.sort();

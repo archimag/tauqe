@@ -1,6 +1,8 @@
 //! Registered-operation preflight gate shared by plan and review batches.
+use crate::api::{ApplicationEvent, ApplicationObserver, OperationGuard};
 use std::path::Path;
-use tokio::sync::watch;
+use tauqe_core::providers::StreamEvent;
+use tauqe_core::stop::HardCancellation;
 async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
     tokio::task::spawn_blocking(f)
         .await
@@ -22,6 +24,38 @@ pub enum PreflightVerdict {
     Cancelled,
     /// The repository does not build; the report names the failed commands.
     Failed(String),
+}
+
+/// Publishes the batch admission check before any model turn exists.
+/// Every returned verdict closes the toolchain activity; launch refusal or
+/// the first model turn then settles the client's pending launch state.
+pub(crate) async fn run_batch_preflight(
+    repo_root: &Path,
+    operation: &OperationGuard,
+    observer: &dyn ApplicationObserver,
+) -> PreflightVerdict {
+    let id = operation.publication_id();
+    observer.publish(
+        &id,
+        ApplicationEvent::Stream(StreamEvent::ToolchainStarted {
+            command: "pre-flight".into(),
+        }),
+    );
+    let verdict = run_preflight_verification(repo_root, operation.hard_cancellation()).await;
+    let (success, message) = match &verdict {
+        PreflightVerdict::Passed => (true, "Pre-flight gate passed".to_string()),
+        PreflightVerdict::Cancelled => (false, "Pre-flight verification cancelled".to_string()),
+        PreflightVerdict::Failed(report) => (false, report.clone()),
+    };
+    observer.publish(
+        &id,
+        ApplicationEvent::Stream(StreamEvent::ToolchainFinished {
+            command: "pre-flight".into(),
+            success,
+            message: Some(message),
+        }),
+    );
+    verdict
 }
 
 /// Deterministic pre-flight verification shared by server-driven batches.
@@ -47,11 +81,11 @@ pub enum PreflightVerdict {
 /// transaction.
 pub async fn run_preflight_verification(
     repo_root: &Path,
-    cancel_rx: watch::Receiver<bool>,
+    cancel: HardCancellation,
 ) -> PreflightVerdict {
     // A cancel delivered before the gate starts must not launch the pipeline at
     // all: the operation slot is registered and the client waits for its release.
-    if *cancel_rx.borrow() {
+    if cancel.is_cancelled() {
         tracing::info!("pre-flight verification skipped: the operation was already cancelled");
         return PreflightVerdict::Cancelled;
     }
@@ -62,7 +96,7 @@ pub async fn run_preflight_verification(
     // after a model request was already spent. The gate blocks on its backoff, so
     // it runs off the async executor thread.
     let gate_root = repo_root.to_path_buf();
-    let gate_cancel = cancel_rx.clone();
+    let gate_cancel = cancel.clone();
     let gate = match offload(move || {
         tauqe_core::git::ensure_index_available(&gate_root, Some(&gate_cancel))
     })
@@ -88,6 +122,10 @@ pub async fn run_preflight_verification(
         }
     }
 
+    if cancel.is_cancelled() {
+        return PreflightVerdict::Cancelled;
+    }
+
     // The configuration integrity check runs first: a batch must not launch
     // against a `tauqe.toml` whose model roles or command chain are broken,
     // because its steps would fail mid-flight instead of being refused before
@@ -95,7 +133,14 @@ pub async fn run_preflight_verification(
     // reads off the async executor thread, and a repository without a
     // configuration file is governed by built-in defaults and passes.
     if let Err(report) = tauqe_core::config::validate_project_config_on_disk(repo_root) {
+        if cancel.is_cancelled() {
+            return PreflightVerdict::Cancelled;
+        }
         return PreflightVerdict::Failed(report);
+    }
+
+    if cancel.is_cancelled() {
+        return PreflightVerdict::Cancelled;
     }
 
     // A pre-flight gate runs before a turn exists, so it has no change set and
@@ -104,18 +149,17 @@ pub async fn run_preflight_verification(
     // process group and reports an `is_cancelled` result, so no race is
     // re-implemented here.
     let (status, results) =
-        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], Some(&cancel_rx)).await;
+        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], Some(&cancel)).await;
+    if status == tauqe_core::toolchain::VerificationStatus::Cancelled || cancel.is_cancelled() {
+        tracing::warn!("pre-flight verification was cancelled by the operation");
+        return PreflightVerdict::Cancelled;
+    }
     // A project that declares no verification lifecycle states its own choice,
     // so the gate passes transparently instead of refusing a batch the project
     // never asked to verify.
     if status.allows_commit() {
         return PreflightVerdict::Passed;
     }
-    if results.iter().any(|result| result.is_cancelled) {
-        tracing::warn!("pre-flight verification was cancelled by the operation");
-        return PreflightVerdict::Cancelled;
-    }
-
     let mut failed_commands = Vec::new();
     for result in results.iter().filter(|r| !r.success) {
         failed_commands.push(format!("`{}`", result.command));
@@ -126,4 +170,58 @@ pub async fn run_preflight_verification(
         format!("Command {} failed.", failed_commands.join(", "))
     };
     PreflightVerdict::Failed(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::operation::OperationRegistry;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Observer(Mutex<Vec<(String, StreamEvent)>>);
+
+    impl ApplicationObserver for Observer {
+        fn publish(&self, id: &str, event: ApplicationEvent) {
+            let ApplicationEvent::Stream(event) = event else {
+                panic!("preflight must not start a model turn");
+            };
+            self.0.lock().unwrap().push((id.into(), event));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_preflight_publishes_a_balanced_activity_for_every_verdict() {
+        for case in ["passed", "failed", "cancelled"] {
+            let dir = tempfile::tempdir().unwrap();
+            tauqe_core::git::state::init_repository(Some(dir.path()), true).unwrap();
+            if case == "failed" {
+                std::fs::write(dir.path().join("tauqe.toml"), "[invalid").unwrap();
+            }
+            let registry = Arc::new(OperationRegistry::default());
+            let operation = registry.begin().unwrap();
+            if case == "cancelled" {
+                registry.hard_cancel();
+            }
+            let observer = Observer::default();
+            let verdict = run_batch_preflight(dir.path(), &operation, &observer).await;
+            assert!(matches!(
+                (case, &verdict),
+                ("passed", PreflightVerdict::Passed)
+                    | ("failed", PreflightVerdict::Failed(_))
+                    | ("cancelled", PreflightVerdict::Cancelled)
+            ));
+            let events = observer.0.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(events
+                .iter()
+                .all(|(id, _)| id == &operation.publication_id()));
+            assert!(
+                matches!(&events[0].1, StreamEvent::ToolchainStarted { command } if command == "pre-flight")
+            );
+            assert!(
+                matches!(&events[1].1, StreamEvent::ToolchainFinished { command, success, message } if command == "pre-flight" && *success == (case == "passed") && message.is_some())
+            );
+        }
+    }
 }

@@ -57,6 +57,9 @@ modules or a specification of today's wire fields.
   reusable prefix by accident.
 - Bound context and history by declared budgets. Do not hide a context-limit
   failure by truncating material whose completeness is required for a decision.
+- Admit the complete serialized model request against its shared input limit.
+  Audit window expansion does not impose a separate file allowance or drop
+  readable matches to make an oversized request appear admissible.
 - A turn that is cancelled, blocked, or rolled back must not pretend it
   committed changes. Keep recoverable research available until its lifecycle
   is explicitly settled.

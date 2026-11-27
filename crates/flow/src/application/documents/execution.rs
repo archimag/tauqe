@@ -1,13 +1,86 @@
 //! Durable writes requested by plan and review execution.
 
 use super::Documents;
+use tauqe_core::blocking::{OperationHandle, StartedOperations};
 use tauqe_core::models::ArchitectTier;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::plan::{Plan, PlanImplementation, PlanItem, PlanItemStatus};
-use tauqe_core::review::{storage::ReviewStorage, IssueStatus};
+use tauqe_core::review::{
+    storage::{InitialGroupHorizon, InitialGroupHorizonError, ReviewStorage},
+    IssueStatus, ReviewGroup, ReviewItem,
+};
 use tauqe_core::workflow::implementation::StepFailure;
 
 impl Documents {
+    /// Admit the atomic replacement into a retained completion owner. Losing
+    /// the async waiter cannot discard or repeat an admitted write.
+    pub(crate) fn start_group_horizon_replacement(
+        &self,
+        operations: &StartedOperations,
+        address: (String, String),
+        expected: (ReviewGroup, Vec<ReviewItem>),
+        items: Vec<PlanItem>,
+        tier: ArchitectTier,
+    ) -> Result<
+        OperationHandle<
+            Result<ReviewGroup, tauqe_core::review::storage::GroupHorizonReplacementError>,
+        >,
+        &'static str,
+    > {
+        let root = self.root.clone();
+        #[cfg(test)]
+        let gates = crate::workflows::review::refinement::test_gates::for_root(&root);
+        operations.start(
+            move || {
+                #[cfg(test)]
+                if let Some(gates) = gates {
+                    // The worker has already been admitted. Keep the actual write
+                    // inside the retained operation while the test holds it.
+                    gates.in_write.entered.notify_one();
+                    let permit = loop {
+                        if let Ok(permit) = gates.in_write.release.try_acquire() {
+                            break permit;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    };
+                    permit.forget();
+                }
+                ReviewStorage::replace_uncompleted_group_subplan(
+                    &root,
+                    &address.0,
+                    &address.1,
+                    &expected.0,
+                    &expected.1,
+                    items,
+                    tier,
+                )
+            },
+            None,
+        )
+    }
+
+    /// The review workflow consumes this adapter when initial synthesis is wired in.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn write_initial_group_horizon(
+        &self,
+        review: &str,
+        group: &str,
+        items: Vec<PlanItem>,
+        tier: ArchitectTier,
+    ) -> Result<InitialGroupHorizon, InitialGroupHorizonError> {
+        let root = self.root.clone();
+        let review = review.to_owned();
+        let group = group.to_owned();
+        tauqe_core::blocking::run_blocking_async(move || {
+            ReviewStorage::write_initial_group_horizon(&root, &review, &group, items, tier)
+        })
+        .await
+        .map_err(|error| {
+            InitialGroupHorizonError::Storage(anyhow::anyhow!(
+                "Initial group horizon worker failed: {error}"
+            ))
+        })?
+    }
     pub(crate) async fn write_new_plan_horizon(
         &self,
         mut draft: Plan,

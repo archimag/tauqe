@@ -10,6 +10,7 @@ use crate::components::model_selector::{model_select_hint, ModelSelector};
 use crate::config::PrimaryModifier;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
+use crate::views::plans::PlanRefineTarget;
 
 use super::plan_form::{
     plan_form_area, plan_form_geometry, render_plan_form, PlanFormGeometry, PlanFormView,
@@ -91,16 +92,38 @@ pub fn render_plan_refine_dialog(
     let dim = engine.fg(palette.text_muted);
     let area = plan_form_area(frame.area(), REFINE_DIALOG_WIDTH, REFINE_DIALOG_HEIGHT);
 
+    let (title, label, name, address, note) = match &dialog.target {
+        PlanRefineTarget::Plan {
+            plan_id,
+            plan_title,
+        } => (
+            active_t("dialog.refine.title"),
+            active_t("dialog.refine.plan_label"),
+            plan_title.as_str(),
+            plan_id.clone(),
+            active_t("dialog.refine.header_note"),
+        ),
+        PlanRefineTarget::ReviewGroup {
+            review_id,
+            group_id,
+            group_title,
+        } => (
+            active_t("dialog.refine_group.title"),
+            active_t("dialog.refine_group.group_label"),
+            group_title.as_str(),
+            active_t("dialog.refine_group.address")
+                .replacen("{}", review_id, 1)
+                .replacen("{}", group_id, 1),
+            active_t("dialog.refine_group.header_note"),
+        ),
+    };
     let header_lines = vec![
         Line::from(vec![
-            Span::styled(active_t("dialog.refine.plan_label"), dim),
-            Span::styled(
-                dialog.plan_title.clone(),
-                engine.fg(palette.text_primary).bold(),
-            ),
-            Span::styled(format!(" [{}]", dialog.plan_id), dim),
+            Span::styled(label, dim),
+            Span::styled(name.to_string(), engine.fg(palette.text_primary).bold()),
+            Span::styled(format!(" [{}]", address), dim),
         ]),
-        Line::from(Span::styled(active_t("dialog.refine.header_note"), dim)),
+        Line::from(Span::styled(note, dim)),
     ];
 
     let hint = if dialog.focus.is_actions() {
@@ -115,7 +138,7 @@ pub fn render_plan_refine_dialog(
         frame,
         &PlanFormView {
             area,
-            title: active_t("dialog.refine.title"),
+            title,
             header_height: REFINE_HEADER_HEIGHT,
             header_lines,
             planner_title: ladder_title(
@@ -128,6 +151,7 @@ pub fn render_plan_refine_dialog(
             critic_title: critic_title(dialog),
             critic: &dialog.critic,
             critic_focused: dialog.focus.is_critic_list(),
+            critic_enabled: !dialog.skip_critique,
             editor_title: active_t("dialog.refine.editor_title"),
             editor_placeholder: active_t("dialog.refine.editor_placeholder"),
             editor: &dialog.instructions_editor,

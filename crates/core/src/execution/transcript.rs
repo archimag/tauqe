@@ -2,31 +2,18 @@
 
 use crate::context::{ContextAccess, ContextFileContent};
 use crate::edits::StagedEditsState;
-use crate::history::{HistorySnapshot, TurnRoundRecord};
+use crate::history::HistorySnapshot;
 use crate::llm::CapabilityTree;
 use crate::providers::ChatMessage;
 use crate::workflow::PatchStrategy;
 use indexmap::IndexMap;
 use std::path::Path;
 
-/// Identifies one accepted record within its turn, including across reseeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcceptedRoundId(u32);
-
-impl AcceptedRoundId {
-    pub fn identifies(self, record: &TurnRoundRecord) -> bool {
-        self.0 == record.index
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TranscriptEntry {
     Discovery(ChatMessage),
     Feedback(ChatMessage),
-    Answer {
-        round: TurnRoundRecord,
-        scratchpad: String,
-    },
+    Answer { message: String, scratchpad: String },
 }
 
 /// Round transcript of one bounded turn.
@@ -37,8 +24,8 @@ enum TranscriptEntry {
 /// rounds; this storage mechanism never schedules a request.
 ///
 /// A change of capabilities can reseed the head. File updates travel at the tail.
-#[derive(Debug)]
-pub struct TurnTranscript {
+#[derive(Debug, Clone)]
+pub(crate) struct TurnTranscript {
     /// First text delivered for each path in this turn, in arrival order.
     originals: IndexMap<String, ContextFileContent>,
     /// Staged destinations that had no file when the turn created them.
@@ -51,7 +38,6 @@ pub struct TurnTranscript {
     task: ChatMessage,
     /// Accepted answers, feedback and discovered files in delivery order.
     tail: Vec<TranscriptEntry>,
-    scratchpad_chars: usize,
     /// Serialized capability tree the prefix was seeded with.
     seed_signature: Option<String>,
     /// History rendered into the seeded prefix, including explicit absence.
@@ -67,7 +53,6 @@ impl Default for TurnTranscript {
             prefix: Vec::new(),
             task: ChatMessage::user(String::new()),
             tail: Vec::new(),
-            scratchpad_chars: 0,
             seed_signature: None,
             seed_history: None,
         }
@@ -75,21 +60,6 @@ impl Default for TurnTranscript {
 }
 
 impl TurnTranscript {
-    /// Read-only recovery handle for accepted rounds, usable after the task exits.
-    pub fn history_reader(
-        transcript: &std::sync::Arc<std::sync::Mutex<Self>>,
-    ) -> impl FnOnce() -> Vec<TurnRoundRecord> + Send + 'static {
-        let transcript = std::sync::Arc::clone(transcript);
-        move || {
-            transcript
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .rounds()
-                .cloned()
-                .collect()
-        }
-    }
-
     pub(crate) fn remember_files(&mut self, files: &[ContextFileContent]) {
         for file in files {
             if !self.created.contains(&file.path) && !self.originals.contains_key(&file.path) {
@@ -102,7 +72,7 @@ impl TurnTranscript {
     ///
     /// The first round of a turn seeds a snapshot of the assembly it was built from,
     /// so the prefix and the task message stay frozen for every round that follows.
-    pub fn seed(
+    pub(crate) fn seed(
         &mut self,
         prefix: Vec<ChatMessage>,
         task: ChatMessage,
@@ -117,7 +87,7 @@ impl TurnTranscript {
     ///
     /// A phase transition re-renders the capabilities the turn advertises, so the
     /// new prefix already includes the files in earlier discovery blocks.
-    pub fn reseed_prefix(
+    pub(crate) fn reseed_prefix(
         &mut self,
         prefix: Vec<ChatMessage>,
         capabilities: &CapabilityTree,
@@ -132,7 +102,7 @@ impl TurnTranscript {
     }
 
     /// Returns the stable prefix, task, and original files discovered later.
-    pub fn messages(&self) -> Vec<ChatMessage> {
+    pub(crate) fn messages(&self) -> Vec<ChatMessage> {
         if !self.is_seeded() {
             return Vec::new();
         }
@@ -143,8 +113,11 @@ impl TurnTranscript {
             TranscriptEntry::Discovery(message) | TranscriptEntry::Feedback(message) => {
                 Some(message.clone())
             }
-            TranscriptEntry::Answer { round, scratchpad } => {
-                let mut content = round.message.clone();
+            TranscriptEntry::Answer {
+                message,
+                scratchpad,
+            } => {
+                let mut content = message.clone();
                 if !scratchpad.is_empty() {
                     if !content.is_empty() {
                         content.push_str("\n\n");
@@ -161,15 +134,16 @@ impl TurnTranscript {
 
     /// Projection used when a new grant or history replaces the rendered
     /// prefix. All original files will be in that prefix, not repeated here.
-    pub fn reseed_continuation(&self) -> Vec<ChatMessage> {
+    pub(crate) fn reseed_continuation(&self) -> Vec<ChatMessage> {
         let messages = self.messages();
         let mut continuation = vec![self.task.clone()];
         let mut rendered = messages.into_iter().skip(self.prefix.len() + 1);
         for entry in &self.tail {
             let has_message = match entry {
-                TranscriptEntry::Answer { round, scratchpad } => {
-                    !round.message.is_empty() || !scratchpad.is_empty()
-                }
+                TranscriptEntry::Answer {
+                    message,
+                    scratchpad,
+                } => !message.is_empty() || !scratchpad.is_empty(),
                 _ => true,
             };
             if has_message {
@@ -184,7 +158,7 @@ impl TurnTranscript {
     }
 
     /// Reports whether the transcript has been seeded with a prefix and a task.
-    pub fn is_seeded(&self) -> bool {
+    pub(crate) fn is_seeded(&self) -> bool {
         self.seed_signature.is_some()
     }
 
@@ -193,7 +167,7 @@ impl TurnTranscript {
     /// A different tree is the phase boundary of the turn: the head the turn renders
     /// is rewritten once, while the task message and the rounds already exchanged keep
     /// their exact bytes.
-    pub fn advertises(
+    pub(crate) fn advertises(
         &self,
         capabilities: &CapabilityTree,
         history: Option<&HistorySnapshot>,
@@ -207,7 +181,7 @@ impl TurnTranscript {
     }
 
     /// Adds originals discovered since the last render to the stable sequence.
-    pub fn append_discoveries(&mut self, strategy: PatchStrategy) {
+    pub(crate) fn append_discoveries(&mut self, strategy: PatchStrategy) {
         if self.delivered_originals == self.originals.len() {
             return;
         }
@@ -225,45 +199,18 @@ impl TurnTranscript {
         self.delivered_originals = self.originals.len();
     }
 
-    pub fn accept_round(
-        &mut self,
-        round: usize,
-        message: &str,
-        notes: &str,
-        limit: usize,
-    ) -> AcceptedRoundId {
-        let scratchpad: String = notes
-            .trim()
-            .chars()
-            .take(limit.saturating_sub(self.scratchpad_chars))
-            .collect();
-        self.scratchpad_chars += scratchpad.chars().count();
-        let record = crate::history::entry::round_record(round as u32, message, "");
-        let id = AcceptedRoundId(record.index);
+    pub(crate) fn record_answer(&mut self, message: &str, notes: &str) {
+        let scratchpad = notes.trim().to_string();
+        let clean_message = crate::history::entry::sanitize_round_message(message);
         self.tail.push(TranscriptEntry::Answer {
-            round: record,
+            message: clean_message,
             scratchpad,
         });
-        id
     }
 
-    pub(crate) fn rounds(&self) -> impl DoubleEndedIterator<Item = &TurnRoundRecord> {
-        self.tail.iter().filter_map(|entry| match entry {
-            TranscriptEntry::Answer { round, .. } => Some(round),
-            _ => None,
-        })
-    }
-
-    pub fn remember_feedback(&mut self, feedback: &str) {
+    pub(crate) fn record_feedback(&mut self, feedback: &str) {
         if feedback.is_empty() {
             return;
-        }
-        if let Some(round) = self.tail.iter_mut().rev().find_map(|entry| match entry {
-            TranscriptEntry::Answer { round, .. } => Some(round),
-            _ => None,
-        }) {
-            // History shows a short excerpt; the next request receives the full diagnostics.
-            round.feedback = feedback.trim().chars().take(240).collect();
         }
         self.tail
             .push(TranscriptEntry::Feedback(ChatMessage::user(feedback)));
@@ -271,14 +218,86 @@ impl TurnTranscript {
 }
 
 /// File views for one request. Only original file blocks enter the stable prefix.
-pub struct RoundFiles {
+pub(crate) struct RoundFiles {
     pub originals: Vec<ContextFileContent>,
     pub current: Vec<ContextFileContent>,
     pub current_versions: Option<String>,
 }
 
+/// Evidence frozen from an admitted request, independent of later disk state.
+#[derive(Debug, Clone)]
+pub struct ResearchEvidence {
+    files: Vec<ContextFileContent>,
+    repo_map: Option<String>,
+    findings: Vec<String>,
+}
+
+impl ResearchEvidence {
+    pub(crate) fn new(
+        files: Vec<ContextFileContent>,
+        repo_map: Option<String>,
+        journal: &crate::workflow::research::journal::TurnResearchJournal,
+    ) -> Self {
+        Self {
+            files,
+            repo_map,
+            findings: journal.evidence().to_vec(),
+        }
+    }
+
+    pub fn files(&self) -> &[ContextFileContent] {
+        &self.files
+    }
+
+    /// Preserve delivered bytes and order while appending genuinely new material.
+    pub(crate) fn extend(
+        &self,
+        files: Vec<ContextFileContent>,
+        journal: &crate::workflow::research::journal::TurnResearchJournal,
+    ) -> Self {
+        let mut extended = self.clone();
+        for file in files {
+            if !extended.files.iter().any(|known| known.path == file.path) {
+                extended.files.push(file);
+            }
+        }
+        for finding in journal.evidence() {
+            if !extended.findings.contains(finding) {
+                extended.findings.push(finding.clone());
+            }
+        }
+        extended
+    }
+
+    /// Render only evidence for a reader without access to the prior turn.
+    pub fn read_only_projection(&self, strategy: PatchStrategy) -> String {
+        let mut text = String::new();
+        if let Some(map) = &self.repo_map {
+            text.push_str("<repo_map>\n");
+            text.push_str(map);
+            text.push_str("\n</repo_map>\n");
+        }
+        if !self.files.is_empty() {
+            text.push_str("<context>\n");
+            for file in &self.files {
+                text.push_str(&crate::prompt::render_context_element(
+                    file,
+                    ContextAccess::ReadOnly,
+                    strategy,
+                ));
+            }
+            text.push_str("</context>\n");
+        }
+        for finding in &self.findings {
+            text.push_str(finding);
+            text.push('\n');
+        }
+        text
+    }
+}
+
 impl TurnTranscript {
-    pub fn remember_created_paths(&mut self, paths: &[String]) {
+    pub(crate) fn remember_created_paths(&mut self, paths: &[String]) {
         for path in paths {
             if !self.originals.contains_key(path) {
                 self.created.insert(path.clone());
@@ -286,7 +305,7 @@ impl TurnTranscript {
         }
     }
 
-    pub fn project_files(
+    pub(crate) fn project_files(
         &mut self,
         mut context_files: Vec<ContextFileContent>,
         staged_state: Option<&StagedEditsState>,
@@ -403,24 +422,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratchpad_only_replies_share_the_turn_limit_across_prefix_reseeds() {
+    fn evidence_keeps_effective_bytes_and_order_without_private_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |path: &str, content: &str| ContextFileContent {
+            path: path.into(),
+            access: ContextAccess::Editable,
+            content: content.into(),
+            insertion_seq: 1,
+        };
+        let first = file("unique.rs", "unique contents 417\n");
+        let doc = file("external/api.md", "external documentation 624\n");
+        std::fs::write(dir.path().join("unique.rs"), &first.content).unwrap();
+        let mut journal = crate::workflow::research::journal::TurnResearchJournal::default();
+        journal.push_evidence_block(
+            "<search_feedback>match without loading file 922</search_feedback>",
+        );
+        journal.push_block("<response_directive>rounds exhausted</response_directive>");
+        let mut transcript = TurnTranscript::default();
+        transcript.record_answer("internal reasoning", "private scratchpad 500");
+        // A deleted file is absent from the effective view; a changed file
+        // retains the bytes delivered, not whatever is now on disk.
+        let evidence =
+            ResearchEvidence::new(vec![first, doc], Some("frozen outline".into()), &journal);
+        std::fs::write(dir.path().join("unique.rs"), "changed on disk").unwrap();
+        std::fs::remove_file(dir.path().join("unique.rs")).unwrap();
+        let projection = evidence.read_only_projection(PatchStrategy::SearchReplace);
+        assert!(projection.contains("unique contents 417"));
+        assert!(projection.contains("external documentation 624"));
+        assert!(projection.contains("match without loading file 922"));
+        assert!(projection.contains("frozen outline"));
+        assert!(projection.find("unique.rs") < projection.find("external/api.md"));
+        assert_eq!(projection.matches("unique contents 417").count(), 1);
+        assert!(!projection.contains("rounds exhausted"));
+        assert!(!projection.contains("private scratchpad"));
+        assert!(!projection.contains("internal reasoning"));
+        assert!(!projection.contains("changed on disk"));
+    }
+
+    #[test]
+    fn extending_evidence_preserves_existing_paths_and_deduplicates_findings() {
+        let file = |path: &str, content: &str| ContextFileContent {
+            path: path.into(),
+            access: ContextAccess::Editable,
+            content: content.into(),
+            insertion_seq: 1,
+        };
+        let mut initial = crate::workflow::research::journal::TurnResearchJournal::default();
+        initial.push_evidence_block("<search_feedback>first</search_feedback>");
+        let saved = ResearchEvidence::new(
+            vec![file("old.rs", "original")],
+            Some("saved map".into()),
+            &initial,
+        );
+        let mut later = crate::workflow::research::journal::TurnResearchJournal::default();
+        later.push_evidence_block("<search_feedback>first</search_feedback>");
+        later.push_evidence_block("<search_feedback>second</search_feedback>");
+        later.push_block("<response_directive>continue</response_directive>");
+        let extended = saved.extend(
+            vec![file("old.rs", "changed"), file("new.rs", "new")],
+            &later,
+        );
+        assert_eq!(extended.files().len(), 2);
+        assert_eq!(extended.files()[0].content, "original");
+        assert_eq!(extended.files()[1].path, "new.rs");
+        let rendered = extended.read_only_projection(PatchStrategy::SearchReplace);
+        assert_eq!(rendered.matches("saved map").count(), 1);
+        assert_eq!(
+            rendered
+                .matches("<search_feedback>first</search_feedback>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered
+                .matches("<search_feedback>second</search_feedback>")
+                .count(),
+            1
+        );
+        assert!(!rendered.contains("continue"));
+        assert!(rendered.find("old.rs") < rendered.find("new.rs"));
+    }
+
+    #[test]
+    fn scratchpad_only_replies_keep_complete_unicode_notes_across_prefix_reseeds() {
         let mut transcript = TurnTranscript::default();
         let capabilities = CapabilityTree::from_leaves([crate::llm::LlmCapability::Scratchpad]);
         transcript.seed(Vec::new(), ChatMessage::user("task"), &capabilities, None);
-        transcript.accept_round(1, "", "界<", 3);
+        let long_notes = "界<ё".repeat(2000);
+        transcript.record_answer("", &long_notes);
         transcript.reseed_prefix(Vec::new(), &capabilities, None);
-        transcript.accept_round(2, "", "ёx", 3);
-        transcript.accept_round(3, "", "extra", 3);
+        transcript.record_answer("", "ёx");
+        transcript.record_answer("", "extra");
         assert_eq!(
             transcript.messages(),
             [
                 ChatMessage::user("task"),
-                ChatMessage::assistant("<scratchpad>界&lt;</scratchpad>"),
-                ChatMessage::assistant("<scratchpad>ё</scratchpad>"),
+                ChatMessage::assistant(format!(
+                    "<scratchpad>{}</scratchpad>",
+                    "界&lt;ё".repeat(2000)
+                )),
+                ChatMessage::assistant("<scratchpad>ёx</scratchpad>"),
+                ChatMessage::assistant("<scratchpad>extra</scratchpad>"),
             ]
         );
-        assert!(transcript
-            .rounds()
-            .all(|round| round.message.is_empty() && round.feedback.is_empty()));
     }
 }

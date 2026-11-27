@@ -1,11 +1,14 @@
 //! Streaming transport for one already assembled provider request.
 
 use crate::edits::stream::EditStreamFilter;
+use crate::models::ProviderKind;
 use crate::providers::{LlmProvider, LlmRequest, StreamEvent};
-use tokio::sync::{mpsc, watch};
+use crate::stop::HardCancellation;
+use tokio::sync::mpsc;
 
 use super::outcome::ExecutionError;
 use super::support::EventSink;
+use super::usage::{UsageBinding, UsageSource};
 
 /// Response bytes and terminal facts, before the caller applies its acceptance rules.
 pub(crate) struct RequestStream {
@@ -16,14 +19,61 @@ pub(crate) struct RequestStream {
     pub completed: bool,
 }
 
+/// A full request admitted for one transport call. Dropping this value before
+/// transport also releases its registered usage source.
+pub(crate) struct AdmittedRequest {
+    source: UsageSource,
+}
+
+pub(crate) fn admit(
+    request: &LlmRequest<'_>,
+    provider: ProviderKind,
+    cancel: &HardCancellation,
+    limit: usize,
+    usage: &UsageBinding,
+) -> Result<AdmittedRequest, ExecutionError> {
+    if cancel.is_cancelled() {
+        return Err(ExecutionError::Cancelled);
+    }
+    super::budget::admit(request, provider, limit)?;
+    if cancel.is_cancelled() {
+        return Err(ExecutionError::Cancelled);
+    }
+    let source = usage.register()?;
+    if cancel.is_cancelled() {
+        return Err(ExecutionError::Cancelled);
+    }
+    Ok(AdmittedRequest { source })
+}
+
 /// Executes one frozen request and joins its event forwarder even if the provider fails.
-pub(crate) async fn execute(
+pub(crate) async fn execute_with_limit(
+    provider: &dyn LlmProvider,
+    request: LlmRequest<'_>,
+    filter: Box<dyn EditStreamFilter>,
+    events: &EventSink,
+    cancel: HardCancellation,
+    limit: usize,
+    usage: &UsageBinding,
+) -> Result<RequestStream, ExecutionError> {
+    let admitted = admit(&request, provider.kind(), &cancel, limit, usage)?;
+    execute_admitted(provider, request, filter, events, cancel, admitted).await
+}
+
+/// Transport only: the caller may publish round start after admission and
+/// before entering this future, without running a second budget check.
+pub(crate) async fn execute_admitted(
     provider: &dyn LlmProvider,
     request: LlmRequest<'_>,
     mut filter: Box<dyn EditStreamFilter>,
     events: &EventSink,
-    cancel: watch::Receiver<bool>,
+    cancel: HardCancellation,
+    admitted: AdmittedRequest,
 ) -> Result<RequestStream, ExecutionError> {
+    if cancel.is_cancelled() {
+        return Err(ExecutionError::Cancelled);
+    }
+    let AdmittedRequest { source } = admitted;
     let (tx, mut rx) = mpsc::channel::<StreamEvent>(64);
     let sink = events.clone();
     let forward = tokio::spawn(async move {
@@ -37,6 +87,10 @@ pub(crate) async fn execute(
         let mut text_failed = false;
         while let Some(event) = rx.recv().await {
             match event {
+                StreamEvent::Usage(report) => {
+                    source.record(&report);
+                    sink.emit(StreamEvent::Usage(report));
+                }
                 StreamEvent::TextDelta(delta) => {
                     if !text_failed {
                         result.text.push_str(&delta);
@@ -79,20 +133,50 @@ pub(crate) async fn execute(
         result
     });
 
-    let provider_result = provider.stream(request, tx, cancel).await;
-    let stream = forward
+    let provider_result = provider.stream(request, tx, cancel.clone()).await;
+    // Joining the forwarder is mandatory: Usage already accepted into its
+    // channel must be recorded even when the provider stopped on Hard.
+    let mut stream = forward
         .await
         .map_err(|error| ExecutionError::Other(format!("request stream task failed: {error}")))?;
+    if cancel.is_cancelled() && !stream.cancelled {
+        stream.cancelled = true;
+        events.emit(StreamEvent::Cancelled);
+    }
     provider_result.map_err(|error| ExecutionError::Provider(error.to_string()))?;
     Ok(stream)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::usage::{UsageScope, UsageSink};
     use super::*;
     use crate::models::ProviderKind;
     use crate::providers::{ModelUsageInfo, ProviderError, ProviderResult};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<ModelUsageInfo>>);
+
+    impl UsageSink for Recorder {
+        fn record(&self, usage: &ModelUsageInfo) {
+            self.0.lock().unwrap().push(usage.clone());
+        }
+    }
+
+    fn binding() -> UsageBinding {
+        let scope = UsageScope::new(Arc::new(Recorder::default()));
+        scope.activate();
+        UsageBinding::Bound(scope)
+    }
+
+    fn report(tokens: u32) -> StreamEvent {
+        StreamEvent::Usage(ModelUsageInfo {
+            prompt_tokens: tokens,
+            total_tokens: tokens,
+            ..Default::default()
+        })
+    }
 
     #[derive(Default)]
     struct FilterState {
@@ -136,7 +220,7 @@ mod tests {
             &self,
             _: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            _: watch::Receiver<bool>,
+            _: HardCancellation,
         ) -> ProviderResult {
             for event in &self.events {
                 tx.send(event.clone()).await.unwrap();
@@ -158,13 +242,15 @@ mod tests {
     ) {
         let state = Arc::new(Mutex::new(FilterState::default()));
         let (sink, mut rx) = EventSink::channel();
-        let (_, cancel) = watch::channel(false);
-        let result = execute(
+        let cancel = HardCancellation::never();
+        let result = execute_with_limit(
             &script,
             LlmRequest::new("test", Vec::new()),
             Box::new(Filter(Arc::clone(&state))),
             &sink,
             cancel,
+            crate::config::RequestConfig::default().max_input_tokens,
+            &binding(),
         )
         .await;
         let forwarded = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -295,5 +381,180 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, StreamEvent::ReasoningDelta(text) if text == "thinking")));
+    }
+
+    #[tokio::test]
+    async fn bound_usage_survives_reset_and_terminals_without_an_event_subscriber() {
+        let recorder = Arc::new(Recorder::default());
+        let scope = UsageScope::new(recorder.clone());
+        scope.activate();
+        let (sink, rx) = EventSink::channel();
+        drop(rx);
+        let state = Arc::new(Mutex::new(FilterState::default()));
+        let cancel = HardCancellation::never();
+        let result = execute_with_limit(
+            &Script {
+                events: vec![
+                    report(1),
+                    StreamEvent::ResetStream,
+                    report(2),
+                    StreamEvent::Done,
+                    report(3),
+                    StreamEvent::Error("late".into()),
+                    report(4),
+                ],
+                failure: true,
+            },
+            LlmRequest::new("test", vec![]),
+            Box::new(Filter(state)),
+            &sink,
+            cancel,
+            crate::config::RequestConfig::default().max_input_tokens,
+            &UsageBinding::Bound(scope.clone()),
+        )
+        .await;
+        assert!(matches!(result, Err(ExecutionError::Provider(_))));
+        scope.stop_accepting();
+        scope.drain().await;
+        assert_eq!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|u| u.prompt_tokens)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_waiter_drains_accepted_usage_before_scope_finishes() {
+        struct Parked {
+            sent: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for Parked {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::OpenRouter
+            }
+            async fn stream(
+                &self,
+                _: LlmRequest<'_>,
+                tx: mpsc::Sender<StreamEvent>,
+                _: HardCancellation,
+            ) -> ProviderResult {
+                tx.send(report(7)).await.unwrap();
+                self.sent.notify_one();
+                std::future::pending().await
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let scope = UsageScope::new(recorder.clone());
+        scope.activate();
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let provider = Parked { sent: sent.clone() };
+        let state = Arc::new(Mutex::new(FilterState::default()));
+        let cancel = HardCancellation::never();
+        let sink = EventSink::noop();
+        let binding = UsageBinding::Bound(scope.clone());
+        let mut waiter = Box::pin(execute_with_limit(
+            &provider,
+            LlmRequest::new("test", vec![]),
+            Box::new(Filter(state)),
+            &sink,
+            cancel,
+            crate::config::RequestConfig::default().max_input_tokens,
+            &binding,
+        ));
+        tokio::select! {
+            _ = &mut waiter => panic!("provider unexpectedly finished"),
+            _ = sent.notified() => {},
+        }
+        drop(waiter);
+        scope.stop_accepting();
+        scope.drain().await;
+        assert_eq!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|u| u.prompt_tokens)
+                .collect::<Vec<_>>(),
+            [7]
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_request_is_refused_before_activation_and_after_admission_closes() {
+        let recorder = Arc::new(Recorder::default());
+        let scope = UsageScope::new(recorder);
+        let provider = Script {
+            events: vec![report(1), StreamEvent::Done],
+            failure: false,
+        };
+        let binding = UsageBinding::Bound(scope.clone());
+        for active in [false, true] {
+            if active {
+                scope.activate();
+                scope.stop_accepting();
+            }
+            let cancel = HardCancellation::never();
+            let result = execute_with_limit(
+                &provider,
+                LlmRequest::new("test", vec![]),
+                Box::new(Filter(Arc::new(Mutex::new(FilterState::default())))),
+                &EventSink::noop(),
+                cancel,
+                crate::config::RequestConfig::default().max_input_tokens,
+                &binding,
+            )
+            .await;
+            assert!(matches!(result, Err(ExecutionError::UsageNotActive)));
+        }
+        scope.drain().await;
+    }
+
+    #[tokio::test]
+    async fn closing_races_registration_without_losing_accepted_reports() {
+        let recorder = Arc::new(Recorder::default());
+        let scope = UsageScope::new(recorder.clone());
+        scope.activate();
+        let binding = UsageBinding::Bound(scope.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker = std::thread::spawn({
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                if let Ok(source) = binding.register() {
+                    source.record(&ModelUsageInfo {
+                        prompt_tokens: 9,
+                        ..Default::default()
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+        });
+        barrier.wait();
+        scope.stop_accepting();
+        let accepted = worker.join().unwrap();
+        scope.drain().await;
+        assert!(matches!(
+            UsageBinding::Bound(scope).register(),
+            Err(ExecutionError::UsageNotActive)
+        ));
+        assert_eq!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|u| u.prompt_tokens)
+                .collect::<Vec<_>>(),
+            if accepted { vec![9] } else { vec![] }
+        );
     }
 }

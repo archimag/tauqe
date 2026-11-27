@@ -13,7 +13,6 @@ pub(super) struct PreparedImplementationRefinement {
     pub(crate) tier: ArchitectTier,
     pub(crate) task: String,
     pub(crate) intro_header: String,
-    pub(crate) budget_hint: String,
 }
 
 #[derive(Debug)]
@@ -61,8 +60,6 @@ pub(super) async fn prepare_implementation_refinement(
         tier,
         task,
         intro_header,
-        budget_hint: "The plan is too broad and should be manually decomposed or scoped down."
-            .to_string(),
     })
 }
 

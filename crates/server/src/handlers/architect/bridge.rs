@@ -4,17 +4,15 @@ use std::sync::Arc;
 
 use crate::handlers::common::emit;
 use crate::state::{AppState, OperationGuard};
-#[cfg(test)]
-use crate::usage::UsageGuard;
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::models::ArchitectTier;
 use tauqe_core::plan::prompt::StructuredRefineOutcome;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
+use tauqe_core::stop::HardCancellation;
 use tauqe_protocol::events;
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::watch;
 
 #[cfg(test)]
 use tauqe_flow::api::ContourRelaySummary;
@@ -22,16 +20,14 @@ use tauqe_flow::api::ContourRelaySummary;
 async fn relay_contour_events(
     state: Arc<AppState>,
     op_id: String,
-    usage: UsageGuard,
     events_rx: mpsc::Receiver<StreamEvent>,
-    cancel: watch::Receiver<bool>,
+    cancel: HardCancellation,
 ) -> ContourRelaySummary {
     tauqe_flow::api::test_relay_architect_events(
         Arc::new(crate::publication::Publisher {
             out: state.out.clone(),
         }),
         op_id,
-        usage,
         events_rx,
         cancel,
     )
@@ -47,7 +43,6 @@ pub(crate) async fn run_contour_synthesis(
     context: ContextManager,
     tier: ArchitectTier,
     intro_header: String,
-    budget_hint: String,
 ) -> (anyhow::Result<StructuredRefineOutcome>, ContourRelaySummary) {
     state
         .application
@@ -60,7 +55,6 @@ pub(crate) async fn run_contour_synthesis(
                 scope: tauqe_flow::api::ArchitectScope::Plan("test".into()),
                 tier,
                 intro_header,
-                budget_hint,
             },
             Arc::new(crate::publication::Publisher {
                 out: state.out.clone(),
@@ -84,6 +78,7 @@ mod tests {
     use tauqe_core::plan::prompt::StructuredRefineStatus;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ModelUsageInfo;
+    use tauqe_core::stop::StopSource;
     use tauqe_core::workflow::turn::TurnPhase;
 
     use crate::handlers::common::test_support::scratch_root;
@@ -134,19 +129,17 @@ mod tests {
 
     /// The relay is the single translation seam between the contour vocabulary
     /// and the wire: every streamed coordinate reaches the client, a withdrawn
-    /// attempt drops the fragments it already streamed, and the usage window is
-    /// closed exactly once.
+    /// attempt drops the fragments it already streamed, without owning the
+    /// request-bound accounting window.
     #[tokio::test]
-    async fn relay_translates_contour_events_and_closes_the_usage_window() {
+    async fn relay_translates_contour_events_without_accounting() {
         let (state, mut rx, root) = test_state("relay");
-        let usage = state.begin_usage("op-relay").await;
 
         let (events_tx, events_rx) = mpsc::channel(64);
-        let (_cancel_tx, cancel) = watch::channel(false);
+        let cancel = StopSource::new().token().hard_cancellation();
         let relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-relay".to_string(),
-            usage,
             events_rx,
             cancel,
         ));
@@ -192,11 +185,7 @@ mod tests {
         assert_eq!(summary.assistant_text, "Second attempt.");
         assert!(!summary.cancelled);
         assert!(summary.error.is_none());
-        assert_eq!(
-            state.usage_snapshot().await.operations,
-            1,
-            "the relay must close the usage window of the synthesis"
-        );
+        assert_eq!(state.usage_snapshot().await.operations, 0);
 
         let mut raw_events = Vec::new();
         while let Ok(raw) = rx.try_recv() {
@@ -250,11 +239,7 @@ mod tests {
         assert_eq!(retrying[0]["delay_secs"], 2);
         assert_eq!(retrying[0]["reason"], "connection reset mid-stream");
 
-        // The observed usage is folded into the session totals the final
-        // snapshot publishes.
-        let snapshots = collect(&raw_events, events::MODEL_USAGE_TOTALS);
-        let last = snapshots.last().expect("the relay publishes the snapshot");
-        assert_eq!(last["snapshot"]["session"]["total_tokens"], 15);
+        assert!(collect(&raw_events, events::MODEL_USAGE_TOTALS).is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -264,14 +249,12 @@ mod tests {
     #[tokio::test]
     async fn relay_reports_cancellation_and_failure_on_the_summary() {
         let (state, mut rx, root) = test_state("relay-cancel");
-        let usage = state.begin_usage("op-cancel").await;
 
         let (events_tx, events_rx) = mpsc::channel(16);
-        let (_cancel_tx, cancel) = watch::channel(false);
+        let cancel = StopSource::new().token().hard_cancellation();
         let relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-cancel".to_string(),
-            usage,
             events_rx,
             cancel,
         ));
@@ -306,20 +289,25 @@ mod tests {
 
     /// The skeleton resolves the initial client through the injected seam, runs
     /// the contour to a typed synthesized outcome, accounts the run as one
-    /// operation, and merges the context the contour worked on back into the
-    /// shared state.
+    /// operation, and publishes the merged context before clearing transient
+    /// material at the end of the contour.
     ///
     /// The current-thread flavor is the deliberate host: no seam of the launch
     /// skeleton may require the daemon's multi-threaded runtime.
     #[tokio::test]
     async fn contour_skeleton_synthesizes_and_merges_the_context() {
-        let (state, _events, root) = test_state("skeleton");
+        let (state, mut events, root) = test_state("skeleton");
         tauqe_core::git::init_repository(Some(&root), true).expect("init the fixture repository");
         std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").expect("write the fixture");
 
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
             success_payload("The horizon follows from the gathered material"),
-        )]));
+        )
+        .with_usage(ModelUsageInfo {
+            total_tokens: 17,
+            cost: Some(0.25),
+            ..Default::default()
+        })]));
         state
             .application
             .test_set_provider(provider.clone() as Arc<dyn LlmProvider>)
@@ -333,7 +321,7 @@ mod tests {
         // synthesis works on its own clone and reports the result back.
         let mut snapshot = state.context_snapshot().await;
         snapshot
-            .add_file("a.rs", ContextAccess::Editable)
+            .add_auto_file("a.rs", ContextAccess::Editable)
             .expect("admit the fixture into the snapshot");
         assert!(
             !state
@@ -355,7 +343,6 @@ mod tests {
             snapshot,
             tier,
             String::new(),
-            String::new(),
         )
         .await;
 
@@ -374,14 +361,30 @@ mod tests {
             1,
             "the whole synthesis is accounted as one operation"
         );
+        let accounting = state.usage_snapshot().await;
+        assert_eq!(accounting.prev.total_tokens, 17);
+        assert_eq!(accounting.session.total_tokens, 17);
+        assert_eq!(accounting.lifetime.total_tokens, 17);
+        assert!(accounting.cur.is_none());
 
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = events.try_recv() {
+            raw_events.push(raw);
+        }
+        let context_events = collect(&raw_events, events::CONTEXT_CHANGED);
         assert!(
-            state
+            context_events
+                .iter()
+                .any(|event| event.to_string().contains("a.rs")),
+            "the contour must publish its merged automatic context"
+        );
+        assert!(
+            !state
                 .context_snapshot()
                 .await
                 .contains("a.rs")
                 .expect("the shared context reads"),
-            "the contour context must be merged back into the shared state"
+            "the contour must release transient context after synthesis"
         );
 
         drop(operation);
@@ -397,10 +400,29 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([
             MockResponse::text(
                 r#"{"status":"needs_context","explanation":"Inspect evidence","context_requests":["a.txt","missing.txt"]}"#,
+            )
+            .with_usage(ModelUsageInfo {
+                total_tokens: 3,
+                cost: Some(0.03),
+                ..Default::default()
+            }),
+            MockResponse::text("not JSON").with_usage(ModelUsageInfo {
+                total_tokens: 5,
+                cost: Some(0.05),
+                ..Default::default()
+            }),
+            MockResponse::text(success_payload("First horizon")).with_usage(ModelUsageInfo {
+                total_tokens: 7,
+                cost: Some(0.07),
+                ..Default::default()
+            }),
+            MockResponse::text(success_payload("Independent horizon")).with_usage(
+                ModelUsageInfo {
+                    total_tokens: 11,
+                    cost: Some(0.11),
+                    ..Default::default()
+                },
             ),
-            MockResponse::text("not JSON"),
-            MockResponse::text(success_payload("First horizon")),
-            MockResponse::text(success_payload("Independent horizon")),
         ]));
         state.application.test_set_provider(provider.clone()).await;
         let tier = state
@@ -410,7 +432,7 @@ mod tests {
             .config
             .models
             .architect_tier(0);
-        for id in ["first", "second"] {
+        for (id, tokens, operations) in [("first", 15, 1), ("second", 11, 2)] {
             let operation = state.try_begin_operation().unwrap();
             let (outcome, _) = run_contour_synthesis(
                 &state,
@@ -420,17 +442,21 @@ mod tests {
                 state.context_snapshot().await,
                 tier.clone(),
                 String::new(),
-                String::new(),
             )
             .await;
             assert_eq!(outcome.unwrap().status, StructuredRefineStatus::Synthesized);
+            let usage = state.usage_snapshot().await;
+            assert_eq!(usage.operations, operations);
+            assert_eq!(usage.prev.total_tokens, tokens);
+            assert!(usage.cur.is_none());
         }
+        assert_eq!(state.usage_snapshot().await.session.total_tokens, 26);
         let requests = provider.requests();
         assert_eq!(requests.len(), 4);
         for marker in [
             "First synthesis evidence",
             "missing.txt",
-            "did not satisfy the response schema",
+            "did not satisfy the active response schema",
         ] {
             assert!(requests[2]
                 .messages
@@ -441,6 +467,83 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains(marker)));
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A stream reset withdraws presentation, not the request-bound usage that
+    /// arrived before it. Nobody needs to drain the outbound client queue for
+    /// the accounting supervisor to finish the contour.
+    #[tokio::test]
+    async fn contour_keeps_usage_across_reset_without_a_client_reader() {
+        struct ResetProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ResetProvider {
+            fn kind(&self) -> tauqe_core::models::ProviderKind {
+                tauqe_core::models::ProviderKind::OpenRouter
+            }
+
+            async fn stream(
+                &self,
+                _request: tauqe_core::providers::LlmRequest<'_>,
+                tx: mpsc::Sender<StreamEvent>,
+                _cancel: tauqe_core::stop::HardCancellation,
+            ) -> tauqe_core::providers::ProviderResult {
+                tx.send(StreamEvent::Usage(ModelUsageInfo {
+                    total_tokens: 4,
+                    cost: Some(0.04),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+                tx.send(StreamEvent::ResetStream).await.unwrap();
+                tx.send(StreamEvent::TextDelta(success_payload("Recovered")))
+                    .await
+                    .unwrap();
+                tx.send(StreamEvent::Usage(ModelUsageInfo {
+                    total_tokens: 6,
+                    cost: Some(0.06),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+                tx.send(StreamEvent::Done).await.unwrap();
+                Ok(())
+            }
+        }
+
+        let (state, _unread_client, root) = test_state("reset-accounting");
+        state
+            .application
+            .test_set_provider(Arc::new(ResetProvider))
+            .await;
+        let tier = state
+            .application
+            .configuration()
+            .await
+            .config
+            .models
+            .architect_tier(0);
+        let operation = state.try_begin_operation().unwrap();
+        let (outcome, summary) = run_contour_synthesis(
+            &state,
+            &operation,
+            "op-reset-accounting",
+            "Synthesize the horizon".into(),
+            state.context_snapshot().await,
+            tier,
+            String::new(),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().status, StructuredRefineStatus::Synthesized);
+        assert!(!summary.cancelled);
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.operations, 1);
+        assert_eq!(usage.prev.total_tokens, 10);
+        assert_eq!(usage.session.total_tokens, 10);
+        assert_eq!(usage.lifetime.total_tokens, 10);
+        assert!(usage.cur.is_none());
+        drop(operation);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -506,13 +609,11 @@ mod tests {
         let (state, rx, root) = test_state("relay-pacing");
         stall_outbound_transport(&state);
 
-        let usage = state.begin_usage("op-paced").await;
         let (events_tx, events_rx) = mpsc::channel(16);
-        let (_cancel_tx, cancel) = watch::channel(false);
+        let cancel = StopSource::new().token().hard_cancellation();
         let mut relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-paced".to_string(),
-            usage,
             events_rx,
             cancel,
         ));
@@ -572,13 +673,12 @@ mod tests {
         let (state, mut rx, root) = test_state("relay-pacing-cancel");
         stall_outbound_transport(&state);
 
-        let usage = state.begin_usage("op-paced-cancel").await;
         let (events_tx, events_rx) = mpsc::channel(16);
-        let (cancel_tx, cancel) = watch::channel(false);
+        let cancel_source = StopSource::new();
+        let cancel = cancel_source.token().hard_cancellation();
         let relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-paced-cancel".to_string(),
-            usage,
             events_rx,
             cancel,
         ));
@@ -595,7 +695,7 @@ mod tests {
             "the stalled client must hold the relay"
         );
 
-        let _ = cancel_tx.send(true);
+        cancel_source.request_hard();
         events_tx
             .send(StreamEvent::Done)
             .await
@@ -645,15 +745,13 @@ mod tests {
             let (state, mut rx, root) = test_state(&format!("relay-terminal-{label}"));
             stall_outbound_transport(&state);
 
-            let usage = state.begin_usage(&format!("op-terminal-{label}")).await;
             let (events_tx, events_rx) = mpsc::channel(16);
             // No hard cancel is raised: the provider reports the notice on its
             // own, exactly as a stream that ends in `Cancelled` or `Error` does.
-            let (_cancel_tx, cancel) = watch::channel(false);
+            let cancel = StopSource::new().token().hard_cancellation();
             let relay = tokio::spawn(relay_contour_events(
                 Arc::clone(&state),
                 format!("op-terminal-{label}"),
-                usage,
                 events_rx,
                 cancel,
             ));

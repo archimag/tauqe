@@ -25,7 +25,8 @@ pub use topic::DocTopic;
 mod usage;
 
 pub use batch::{
-    BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent, ReviewBatchFinishedEvent,
+    BatchFinishStatus, BatchFinishSummary, DeferredReviewGroup, PlanBatchFinishedEvent,
+    ReviewBatchFinishedEvent, ReviewGroupDeferralReason,
 };
 pub use catalog::ModelCatalogEntry;
 pub use effort::{ModelRolesEffort, ReasoningEffort};

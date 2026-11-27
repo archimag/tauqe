@@ -1,16 +1,14 @@
 //! Scribe squash-message generation, Git rewrite, and history policy.
 use crate::api::{
-    Application, ApplicationEvent, ApplicationObserver, OperationGuard, UsageGuard,
-    UsageTotalsSnapshot,
+    Application, ApplicationEvent, ApplicationObserver, OperationGuard, UsageTotalsSnapshot,
 };
 use crate::application::infrastructure::execution::PlanExecutionEnvironment;
-use crate::application::infrastructure::structured_task::{self, StructuredTaskError};
+use crate::workflows::structured::{self, StructuredFailure};
 use std::sync::Arc;
 use std::time::Duration;
-use tauqe_core::execution::structured::StructuredError;
 use tauqe_core::git::CommitSummary;
 use tauqe_core::models::{ModelRole, ModelSelection};
-use tauqe_core::providers::{ChatMessage, StreamEvent};
+use tauqe_core::providers::ChatMessage;
 #[derive(Debug, thiserror::Error)]
 pub enum SquashMessageError {
     #[error("Cannot generate a squash message while a model operation is in progress")]
@@ -71,27 +69,10 @@ impl Application {
             Err(err) => return Err(SquashMessageError::Commits(err)),
         };
 
-        let (ctx_snapshot, pinned_paths) = {
-            let ctx = self.context_for_turn().await;
-            let state_ctx = ctx.get_state();
-            let pinned_paths: std::collections::HashSet<String> = state_ctx
-                .items
-                .into_iter()
-                .filter(|i| i.layer == tauqe_core::context::ContextLayer::Pinned)
-                .map(|i| i.path)
-                .collect();
-            (ctx.clone(), pinned_paths)
-        };
-
-        let pinned_files = offload(move || {
-            let all_files = ctx_snapshot.read_context_files();
-            all_files
-                .into_iter()
-                .filter(|f| pinned_paths.contains(&f.path))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
+        let context = self.context_for_turn().await;
+        let pinned_files = tauqe_core::execution::cache::pinned_context_files(&context)
+            .await
+            .map_err(|error| SquashMessageError::Model(error.to_string()))?;
 
         let prompt = tauqe_core::prompt::build_squash_commit_prompt(
             &commits_ahead,
@@ -129,67 +110,53 @@ impl Application {
             // closes exactly one accounted operation.
             let op_id = format!("op-{}", crate::api::next_operation_id());
             let publisher = Arc::clone(&observer);
-            let usage_guard = self
-                .begin_usage(&op_id, move |id, snapshot| {
-                    publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
-                })
-                .await;
-            let cancel = operation.cancel_receiver();
-            let result = structured_task::run(
-                self,
+            let cancel = operation.hard_cancellation();
+            let (result, receipt) = structured::run_bound(
+                &self.execution_session(),
+                self.context_session(),
                 &operation,
                 &execution,
                 tauqe_core::prompt::squash_commit_contract(),
                 vec![ChatMessage::user(&prompt)],
                 &op_id,
                 exit_deadline,
-                |event| {
-                    let usage = &usage_guard;
-                    async move {
-                        if let StreamEvent::Usage(reported) = event {
-                            usage.observe(&reported).await;
-                        }
-                    }
+                move |id, snapshot| {
+                    publisher.publish(id, ApplicationEvent::UsageTotals(snapshot.clone()))
                 },
+                |_| async {},
             )
-            .await;
-            let snapshot = close_squash_usage(self, usage_guard, &op_id, &observer).await;
-            if *cancel.borrow() {
+            .await
+            .map_err(|error| {
+                SquashMessageError::Model(match error.classify("squash message") {
+                    StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                        message
+                    }
+                    _ => "Squash message generation was cancelled".into(),
+                })
+            })?;
+            let snapshot = receipt.snapshot;
+            observer.publish(&op_id, ApplicationEvent::Usage(snapshot.clone()));
+            if cancel.is_cancelled() {
                 return Err(SquashMessageError::Cancelled(
                     "Squash message generation was cancelled".into(),
                 ));
             }
             let message = match result {
                 Ok(message) => message,
-                Err(StructuredTaskError::Request(StructuredError::Empty)) => None,
-                Err(StructuredTaskError::Cancelled)
-                | Err(StructuredTaskError::Request(StructuredError::Cancelled)) => {
-                    return Err(SquashMessageError::Cancelled(
-                        "Squash message generation was cancelled".into(),
-                    ));
-                }
-                Err(StructuredTaskError::Stream(message))
-                | Err(StructuredTaskError::Task(message))
-                | Err(StructuredTaskError::Request(StructuredError::Failed(message)))
-                | Err(StructuredTaskError::Request(StructuredError::Decode(message))) => {
-                    return Err(SquashMessageError::Model(message));
-                }
-                Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
-                    return Err(SquashMessageError::Model(
-                        "Structured request closed without Done".into(),
-                    ));
-                }
-                Err(StructuredTaskError::ForeignOperation) => {
-                    return Err(SquashMessageError::Model(
-                        "squash message requires an active operation for this session".into(),
-                    ));
-                }
-                Err(StructuredTaskError::Orphaned) => {
-                    return Err(SquashMessageError::Model(format!(
-                        "Squash message stream task did not stop within the {} ms task-exit deadline",
-                        exit_deadline.as_millis()
-                    )));
-                }
+                Err(error) => match error.classify("squash message") {
+                    StructuredFailure::Empty => None,
+                    StructuredFailure::InputLimit(error) => {
+                        return Err(SquashMessageError::Model(error.to_string()));
+                    }
+                    StructuredFailure::Cancelled => {
+                        return Err(SquashMessageError::Cancelled(
+                            "Squash message generation was cancelled".into(),
+                        ));
+                    }
+                    StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                        return Err(SquashMessageError::Model(message));
+                    }
+                },
             };
             let msg = message.unwrap_or_else(|| {
                 commits_ahead
@@ -216,18 +183,6 @@ impl Application {
         })
     }
 }
-async fn close_squash_usage(
-    app: &Application,
-    guard: UsageGuard,
-    id: &str,
-    observer: &Arc<dyn ApplicationObserver>,
-) -> UsageTotalsSnapshot {
-    guard.flush().await;
-    let snapshot = app.usage_snapshot().await;
-    observer.publish(id, ApplicationEvent::Usage(snapshot.clone()));
-    snapshot
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SquashApplyError {
     #[error("Cannot squash commits while a model operation is in progress")]

@@ -14,8 +14,10 @@
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::escape::{escape_xml_text, single_line};
 use crate::execution::structured::{StructuredContract, StructuredVisibility};
+use crate::execution::ResearchEvidence;
 use crate::plan::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
+use crate::workflow::PatchStrategy;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -220,12 +222,12 @@ pub fn build_plan_critique_system_prompt() -> String {
     out.push_str(
         "   - You audit a draft you did not write, and you inherit none of its assumptions.\n",
     );
-    out.push_str("   - Judge the draft strictly by the concept, the developer directives, and the invariants below; the Planner's own explanation is context, never evidence.\n");
+    out.push_str("   - Judge the draft by the concept, developer directives, researched source materials, and the invariants below; the Planner's own explanation is context, never evidence.\n");
     out.push_str("   - Do not report a step you would merely have written differently: a different but valid decomposition is not a defect.\n\n");
     out.push_str("2. Read-Only Audit Contract:\n");
     out.push_str("   - You never rewrite, reorder, or re-emit the draft, and you never issue a plan of your own: the Planner reconciles your findings in a later round.\n");
     out.push_str("   - A finding is actionable only when `detail` names the violation and the concrete repair. A finding without a stated repair is noise.\n");
-    out.push_str("   - You request no context and run no research: the plan and its draft reach you in full, so a defect you cannot decide from them is reported as a finding of its category instead of a question.\n\n");
+    out.push_str("   - You request no context and run no research: the plan, draft, and read-only research evidence reach you in full; report a defect you cannot decide from them as a finding, not a question. Private Architect notes and control directives are not evidence.\n\n");
     out.push_str("3. Concept Immutability (\"What\" vs \"How\"):\n");
     out.push_str("   - When the plan carries a concept tree, it is the developer's immutable decision: a draft that alters, dilutes, or contradicts it is a defect, never an accepted improvement.\n");
     out.push_str("   - When the plan is being created from directives and carries no concept yet, the developer directives are the requirement, and a draft that contradicts them is a defect.\n");
@@ -300,6 +302,21 @@ pub fn build_plan_critique_prompt(
     out
 }
 
+/// Assemble the critic's complete read-only user message from the draft and
+/// the actual research snapshot, without the Architect's private transcript.
+pub fn build_plan_critique_message(
+    plan: &Plan,
+    draft: &PlanRefinementOutput,
+    directives: Option<&str>,
+    evidence: &ResearchEvidence,
+    strategy: PatchStrategy,
+) -> String {
+    let mut message = build_plan_critique_prompt(plan, draft, directives);
+    message.push_str("\n## Architect Research Evidence (read-only):\n");
+    message.push_str(&evidence.read_only_projection(strategy));
+    message
+}
+
 /// Builds the user prompt of the reconciliation round.
 ///
 /// The round is the horizon synthesis itself, so it reuses
@@ -336,7 +353,7 @@ pub fn build_plan_reconciliation_prompt(
     out.push_str("2. Re-emit the WHOLE unfinished horizon: the harness replaces the unfinished horizon with your answer and preserves the completed (DONE) foundation verbatim. Do NOT restate a completed step and do NOT resend the previous draft unchanged.\n");
     out.push_str("3. Keep every element the critique did not challenge: reconciliation repairs defects, it does not rewrite a valid decomposition.\n");
     out.push_str("4. Answer with the `plan_refinement` contract of the horizon synthesis: `status`, `explanation`, `reason`, `abort`, `context_requests`, `repo_searches`, `repo_maps`, and `items`.\n");
-    out.push_str("5. The reconciliation round is not a research round: carry `context_requests: []`, `repo_searches: []`, and `repo_maps: []` unless a finding genuinely cannot be adjudicated without an exact contract. A contract you must verify answers with `status: \"needs_context\"`, the request that resolves it, and `items: []`.\n");
+    out.push_str("5. Continue from the retained research evidence. If a finding genuinely requires another exact contract, answer with `status: \"needs_context\"`, the request that resolves it, and `items: []`; otherwise keep the research request lists empty.\n");
     out.push_str("6. When a finding reveals an architectural contradiction only the developer can resolve, set `status` to `blocked`, leave `items: []`, and state the exact decision required in `reason`. Never resolve it by offering alternatives inside a step.\n");
     out.push_str("7. A host-environment condition only the developer can repair is never a blocker: report it through `abort` with `is_aborted: true`, name the concrete missing capability in `reason`, carry the exact command the developer must run in `recommendation`, and leave `items: []`.\n");
     out.push_str("8. Preserve the decomposition invariants of the synthesis: leaf-only target files, cohesive leaf granularity, decidable details, no verification-only step, and concept traceability.\n");
@@ -536,6 +553,8 @@ fn render_critique(out: &mut String, critique: &PlanCritiqueOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{ContextAccess, ContextFileContent};
+    use crate::workflow::research::journal::TurnResearchJournal;
 
     fn sample_plan() -> Plan {
         Plan::from_parts(
@@ -609,6 +628,38 @@ mod tests {
                 detail: "Add a test that validates the schema.".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn critique_message_carries_research_bytes_without_private_notes() {
+        let mut journal = TurnResearchJournal::default();
+        journal.push_evidence_block("<search_feedback>verified signature</search_feedback>");
+        journal.push_block("<response_directive>private control</response_directive>");
+        let evidence = ResearchEvidence::new(
+            vec![ContextFileContent {
+                path: "src/contract.rs".into(),
+                content: "pub trait Contract {}\n".into(),
+                access: ContextAccess::Editable,
+                insertion_seq: 1,
+            }],
+            Some("repository contour".into()),
+            &journal,
+        );
+        let message = build_plan_critique_message(
+            &sample_plan(),
+            &draft(),
+            Some("Implement the critique"),
+            &evidence,
+            PatchStrategy::SearchReplace,
+        );
+        assert!(message.contains("Implement the critique"));
+        assert!(message.contains("#1 Shared DTOs"));
+        assert!(message.contains("#2.1 Critique prompts"));
+        assert!(message.contains("pub trait Contract {}"));
+        assert!(message.contains("access=\"read_only\""));
+        assert!(message.contains("repository contour"));
+        assert!(message.contains("verified signature"));
+        assert!(!message.contains("private control"));
     }
 
     #[test]

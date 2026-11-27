@@ -165,6 +165,7 @@ pub(crate) struct PlanFormView<'a> {
     pub(crate) critic_title: String,
     pub(crate) critic: &'a ModelSelector,
     pub(crate) critic_focused: bool,
+    pub(crate) critic_enabled: bool,
     /// Raw editor label; the renderer wraps it in surrounding spaces.
     pub(crate) editor_title: String,
     pub(crate) editor_placeholder: String,
@@ -184,10 +185,18 @@ fn render_ladder(
     title: String,
     selector: &ModelSelector,
     focused: bool,
+    enabled: bool,
 ) {
     let engine = current_engine();
     let palette = engine.palette();
-    let border = if focused {
+    let border = if !enabled {
+        let muted = engine.fg(palette.text_muted);
+        if focused {
+            muted.bold()
+        } else {
+            muted
+        }
+    } else if focused {
         engine.fg(palette.status_info).bold()
     } else {
         engine.fg(palette.border)
@@ -212,7 +221,18 @@ fn render_ladder(
         );
         return;
     }
-    let rows = selector.render_list_lines(inner.height as usize);
+    let mut rows = selector.render_list_lines(inner.height as usize);
+    if !enabled {
+        // Replace span styles as well: a paragraph style cannot override the
+        // selector's explicit selected-row foreground and background.
+        let muted = engine.fg(palette.text_muted);
+        for row in &mut rows {
+            row.style = muted;
+            for span in &mut row.spans {
+                span.style = muted;
+            }
+        }
+    }
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
@@ -247,6 +267,7 @@ pub(crate) fn render_plan_form(frame: &mut ratatui::Frame, view: &PlanFormView<'
         view.planner_title.clone(),
         view.planner,
         view.planner_focused,
+        true,
     );
     render_ladder(
         frame,
@@ -254,6 +275,7 @@ pub(crate) fn render_plan_form(frame: &mut ratatui::Frame, view: &PlanFormView<'
         view.critic_title.clone(),
         view.critic,
         view.critic_focused,
+        view.critic_enabled,
     );
 
     // Instructions editor. The cursor is drawn only when the editor owns focus.
@@ -337,4 +359,66 @@ pub(crate) fn render_plan_form(frame: &mut ratatui::Frame, view: &PlanFormView<'
     // `palette.overlay`, so it reads as persistent chrome instead of a second
     // row of buttons (Conventions §6.4).
     render_dialog_footer(frame, geometry.footer, &verb_hint(view.hint.as_str()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, style::Modifier, Terminal};
+    use tauqe_protocol::{ModelEntry, ModelRef, ModelRole};
+
+    #[test]
+    fn disabled_ladder_mutes_border_and_selected_row() {
+        let selector = ModelSelector::new(
+            ModelRole::Architect,
+            vec![ModelEntry::new(ModelRef::openrouter("critic"), None)],
+            0,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        let engine = current_engine();
+        let palette = engine.palette();
+        for focused in [false, true] {
+            terminal
+                .draw(|frame| {
+                    render_ladder(
+                        frame,
+                        frame.area(),
+                        " Critic ".into(),
+                        &selector,
+                        focused,
+                        false,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].fg, engine.color(palette.text_muted));
+            for x in 1..20 {
+                let cell = &buffer[(x, 1)];
+                if cell.symbol() != " " {
+                    assert_eq!(cell.fg, engine.color(palette.text_muted));
+                    assert_eq!(cell.bg, engine.color(palette.surface));
+                    assert!(!cell.modifier.contains(Modifier::BOLD));
+                }
+            }
+        }
+        terminal
+            .draw(|frame| {
+                render_ladder(
+                    frame,
+                    frame.area(),
+                    " Critic ".into(),
+                    &selector,
+                    true,
+                    true,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].fg,
+            engine.color(palette.status_info)
+        );
+        assert!(terminal.backend().buffer()[(2, 1)]
+            .modifier
+            .contains(Modifier::BOLD));
+    }
 }

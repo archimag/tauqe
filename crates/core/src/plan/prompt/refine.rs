@@ -1,3 +1,4 @@
+use crate::edits::normalize_repo_path;
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::llm::discussion::normalize_repo_map_path;
 use crate::llm::discussion::RepoSearchRequest;
@@ -28,8 +29,20 @@ pub fn architect_synthesis_capability_expr() -> CapabilityTree {
     ])
 }
 
+/// Synthesis grant after research is exhausted, derived from the full profile.
+pub fn architect_synthesis_terminal_capability_expr() -> CapabilityTree {
+    CapabilityTree::from_leaves(
+        architect_synthesis_capability_expr()
+            .leaves()
+            .into_iter()
+            .filter(|capability| {
+                !crate::workflow::research::step::RESEARCH_CAPABILITIES.contains(capability)
+            }),
+    )
+}
+
 /// Host-environment failure that needs an action from the developer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbortReport {
     pub reason: String,
     pub recommendation: String,
@@ -49,7 +62,6 @@ impl AbortReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuredRefineStatus {
     Synthesized,
-    BudgetExceeded { diagnostic: String },
     Blocked { reason: String },
     Aborted(AbortReport),
     Cancelled,
@@ -64,7 +76,7 @@ pub struct StructuredRefineOutcome {
 }
 
 /// Interpretation of one Architect response, before the scenario acts on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoundStatus {
     Success,
     Blocked(String),
@@ -75,7 +87,7 @@ pub enum RoundStatus {
 
 /// Decode a synthesis round without deciding whether to issue another request.
 pub fn parse_round(raw_text: &str) -> Result<(PlanRefinementOutput, RoundStatus), String> {
-    let output = parse_plan_refinement_output(raw_text).map_err(|err| err.to_string())?;
+    let mut output = parse_plan_refinement_output(raw_text).map_err(|err| err.to_string())?;
     let status = if let Some(abort) = output.abort.as_ref().filter(|abort| abort.is_aborted) {
         RoundStatus::Aborted(AbortReport {
             reason: nonblank(&abort.reason)
@@ -103,6 +115,22 @@ pub fn parse_round(raw_text: &str) -> Result<(PlanRefinementOutput, RoundStatus)
             other => return Err(format!("Unsupported plan refinement status '{other}'")),
         }
     };
+    // An active abort supersedes research. Otherwise reject the whole result
+    // before any research command can be issued from a partial payload.
+    if !matches!(status, RoundStatus::Aborted(_)) {
+        for (index, path) in output.context_requests.iter_mut().enumerate() {
+            *path = normalize_repo_path(path)
+                .map_err(|error| format!("invalid context_requests[{index}]: {error}"))?;
+        }
+        for (index, search) in output.repo_searches.iter_mut().enumerate() {
+            search.path = normalize_repo_map_path(&search.path)
+                .ok_or_else(|| format!("invalid repo_searches[{index}].path"))?;
+        }
+        for (index, path) in output.repo_maps.iter_mut().enumerate() {
+            *path = normalize_repo_map_path(path)
+                .ok_or_else(|| format!("invalid repo_maps[{index}]"))?;
+        }
+    }
     Ok((output, status))
 }
 
@@ -181,19 +209,14 @@ pub struct PlanRefinementOutput {
 
 /// Deserializes the `repo_maps` field of [`PlanRefinementOutput`].
 ///
-/// A `null` payload yields an empty list, and every entry is normalized through
-/// [`normalize_repo_map_path`], so a decoded architect output can never carry a
-/// contour request that addresses a location outside the repository.
+/// A `null` payload yields an empty list. Path validation happens after status
+/// interpretation so a valid abort can supersede incidental research fields.
 fn deserialize_repo_map_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let paths = Option::<Vec<String>>::deserialize(deserializer)?;
-    Ok(paths
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|path| normalize_repo_map_path(path))
-        .collect())
+    Ok(paths.unwrap_or_default())
 }
 
 /// Parses the raw JSON string returned by the model into a `PlanRefinementOutput`.
@@ -391,12 +414,17 @@ fn abort_property() -> serde_json::Value {
 /// Unrolls nested plan items up to `MAX_PLAN_REFINEMENT_DEPTH` to guarantee
 /// compliance with LLM Structured Output engines that forbid recursive `$ref` schemas.
 pub(crate) fn plan_refine_response_schema() -> serde_json::Value {
+    plan_refine_response_schema_for(&architect_synthesis_capability_expr())
+}
+
+/// Project the response schema onto the capabilities of the current request.
+pub(crate) fn plan_refine_response_schema_for(grant: &CapabilityTree) -> serde_json::Value {
     let items_description = format!(
         "New unfinished horizon: the hierarchical list of NEW executable steps (up to {} levels of nesting). Do NOT include already-DONE steps; the harness preserves and prepends the completed foundation. If status is 'blocked' or 'needs_context', or when an active `abort` supersedes the synthesis, this must be empty.",
         MAX_PLAN_REFINEMENT_DEPTH
     );
     let abort = abort_property();
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "type": "object",
         "properties": {
             "status": {
@@ -459,7 +487,33 @@ pub(crate) fn plan_refine_response_schema() -> serde_json::Value {
         },
         "required": ["status", "explanation", "reason", "abort", "context_requests", "repo_searches", "repo_maps", "items"],
         "additionalProperties": false
-    })
+    });
+    let research = [
+        ("context_requests", LlmCapability::ContextRequest),
+        ("repo_searches", LlmCapability::RepoSearch),
+        ("repo_maps", LlmCapability::RepoMap),
+    ];
+    for (field, capability) in research {
+        if !grant.contains(capability) {
+            schema["properties"][field]["maxItems"] = serde_json::json!(0);
+            schema["properties"][field]["description"] = serde_json::json!(
+                "Unavailable in this request; this required array must be empty."
+            );
+        }
+    }
+    if !research
+        .iter()
+        .any(|(_, capability)| grant.contains(*capability))
+    {
+        schema["properties"]["status"]["enum"] = serde_json::json!(["success", "blocked"]);
+        schema["properties"]["status"]["description"] = serde_json::json!(
+            "Result status: 'success' if the unfinished horizon was synthesized into actionable steps, or 'blocked' if blockers or insufficient evidence prevent synthesis."
+        );
+        schema["properties"]["items"]["description"] = serde_json::json!(
+            "New unfinished horizon: the hierarchical list of NEW executable steps. Do NOT include already-DONE steps; the harness preserves them. If status is 'blocked', or when an active `abort` supersedes synthesis, this must be empty."
+        );
+    }
+    schema
 }
 
 /// JSON Schema definition wrapper for provider configuration.
@@ -531,7 +585,7 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
     out.push_str("   - Eager contour generation may be disabled, so `<repo_map>` can cover only part of the codebase. A module absent from the contours is never evidence that it is empty: request its contours via `repo_maps` before designing a step that touches it.\n");
     out.push_str("   - RepoMap contours are blinkers, not contracts: they reveal only the shape of the codebase (names, kinds, and rough signatures), never exact type definitions, field layouts, trait bounds, error semantics, lifetimes, or crate boundaries.\n");
-    out.push_str("   - Whenever a step you synthesize must interact with an existing interface, struct, enum, function, trait, module, or external crate, you MUST NOT infer its contract from contours alone. You MUST set `status: \"needs_context\"`, request concrete source files in `context_requests: [...]`, execute regex symbol searches via `repo_searches: [{\"path\": \"...\", \"regex\": \"...\"}]`, or request Tree-sitter symbol contours of a specific subsystem via `repo_maps: [\"crates/core/src/plan\"]`, leave `items: []`, and explain in `explanation` which contracts you are verifying and why.\n");
+    out.push_str("   - Whenever a step you synthesize must interact with an existing interface, struct, enum, function, trait, module, or external crate, you MUST NOT infer its contract from contours alone. When the active response contract permits research, set `status: \"needs_context\"`, request concrete source files in `context_requests: [...]`, execute regex symbol searches via `repo_searches: [{\"path\": \"...\", \"regex\": \"...\"}]`, or request Tree-sitter symbol contours of a specific subsystem via `repo_maps: [\"crates/core/src/plan\"]`, leave `items: []`, and explain in `explanation` which contracts you are verifying and why. If the active contract does not permit research and evidence is insufficient, report `blocked` rather than inventing a plan.\n");
     out.push_str("   - Contour requests (`repo_maps`) accept a repository-relative directory or file prefix; an empty string or `.` names the whole repository. They reveal module shape only, so an exact contract still has to be verified through `context_requests` or `repo_searches`.\n");
     out.push_str("   - Repository Search Syntax: searches use Rust / ripgrep regular expressions. Supported: standard character classes (\\w, \\d, \\s), boundaries (\\b, \\B), groups ((?:...)), alternation (|), and case-insensitive flags ((?i)). Lookaround assertions ((?=...), (?!...), (?<=...), (?<!...)) and backreferences are NOT supported and will trigger an error.\n");
     out.push_str("   - Never emit speculative field names, argument types, return types, generic parameters, or method signatures derived from a contour line. A guessed contract is a hard contract violation.\n");
@@ -682,7 +736,7 @@ pub fn build_plan_horizon_user_prompt(
     out.push_str("## Architect Instructions:\n");
     out.push_str("1. Conduct deep technical dependency analysis using the repository outline and the loaded context files.\n");
     out.push_str("2. Synthesize the COMPLETE unfinished horizon as dependency-ordered leaf steps with `status: \"todo\"`. Do NOT include any DONE step; the harness preserves the completed foundation verbatim and prepends it. State `commit: null` on every returned step: the harness records a commit only for a step whose own turn verified and committed the change set.\n");
-    out.push_str("3. Follow the Architect Research Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract by requesting the relevant source files or searching for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. Never infer contracts from RepoMap contours alone.\n");
+    out.push_str("3. Follow the Architect Research Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract. When the active response contract permits research, request the relevant source files or search for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. If the active contract does not permit research and evidence is insufficient, report `blocked` rather than inventing a plan. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("4. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with an exact `reason`.\n");
     out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, external specifications the project publishes in `outer_docs` (`id` for a declared root, `id/relative.md` for a document below it), addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Declare `outer_docs` whenever the step must be implemented against an external contract, so the harness pre-loads the specification and the executor spends no discovery round on it. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
     out.push_str("6. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the concept tree and the developer, and a genuine ambiguity is reported through `status: \"blocked\"` with the exact decision the developer must make, instead of being resolved by offering alternatives; a step owns 'How' only and never decides the architecture.\n");
@@ -837,18 +891,20 @@ mod tests {
             "reason": null,
             "context_requests": [],
             "repo_searches": [],
-            "repo_maps": ["./crates/core/", ".", "../escape.rs"],
+            "repo_maps": ["./crates/core/", "."],
             "items": []
         }"#;
         let parsed = parse_plan_refinement_output(json).unwrap();
         // `./` prefixes collapse, `.` names the whole repository, and the
-        // traversal entry is dropped instead of escaping the repository. The
+        // traversal entry is rejected instead of escaping the repository. The
         // declared order is preserved, so a request list decodes exactly as it
         // was written.
-        assert_eq!(
-            parsed.repo_maps,
-            vec!["crates/core".to_string(), String::new()]
-        );
+        assert_eq!(parsed.repo_maps, vec!["./crates/core/", "."]);
+        let (normalized, status) = parse_round(json).unwrap();
+        assert_eq!(status, RoundStatus::NeedsContext);
+        assert_eq!(normalized.repo_maps, vec!["crates/core", ""]);
+        let invalid = json.replace("\".\"", "\"../escape.rs\"");
+        assert!(parse_round(&invalid).is_err());
 
         // An absent or null field yields an empty list.
         let minimal = r#"{
@@ -864,6 +920,52 @@ mod tests {
             .unwrap()
             .repo_maps
             .is_empty());
+    }
+
+    #[test]
+    fn mixed_research_paths_reject_the_whole_architect_round() {
+        let base = serde_json::json!({
+            "status": "needs_context",
+            "explanation": "Inspect the contract",
+            "reason": null,
+            "context_requests": ["./src/a.rs"],
+            "repo_searches": [{"path": ".", "regex": "fn run"}],
+            "repo_maps": ["."],
+            "items": []
+        });
+        for (field, invalid, expected) in [
+            (
+                "context_requests",
+                serde_json::json!(["src/a.rs", "../escape.rs"]),
+                "context_requests[1]",
+            ),
+            (
+                "repo_searches",
+                serde_json::json!([{"path":".","regex":"fn run"},{"path":"../escape","regex":"fn other"}]),
+                "repo_searches[1]",
+            ),
+            (
+                "repo_maps",
+                serde_json::json!([".", "../escape"]),
+                "repo_maps[1]",
+            ),
+        ] {
+            let mut reply = base.clone();
+            reply[field] = invalid;
+            let error = parse_round(&reply.to_string()).expect_err("reject partial research");
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+        let mut aborted = base;
+        aborted["repo_maps"] = serde_json::json!([".", "../escape"]);
+        aborted["abort"] = serde_json::json!({
+            "is_aborted": true,
+            "reason": "missing utility",
+            "recommendation": "install utility"
+        });
+        assert!(matches!(
+            parse_round(&aborted.to_string()),
+            Ok((_, RoundStatus::Aborted(_)))
+        ));
     }
 
     #[test]

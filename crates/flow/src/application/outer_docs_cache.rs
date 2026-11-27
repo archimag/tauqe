@@ -1,13 +1,10 @@
 //! Cache inspection and removal with resident-context reconciliation.
 
 use crate::api::Application;
-use tauqe_core::context::ContextState;
 use tauqe_core::outer_docs::{self, CacheError, CacheRemoval, CachedDocument};
 
 pub struct OuterDocsCacheRemoval {
     pub removed: CacheRemoval,
-    /// A notification is needed only when resident material was released.
-    pub context_update: Option<ContextState>,
 }
 
 impl Application {
@@ -32,14 +29,10 @@ impl Application {
         })
         .await
         .map_err(|error| CacheError::Failed(format!("blocking task failed: {error}")))??;
-        let (released, state) = self
-            .release_cached_documents(logical)
+        self.release_cached_documents(logical)
             .await
             .map_err(|error| CacheError::Failed(error.to_string()))?;
-        Ok(OuterDocsCacheRemoval {
-            removed,
-            context_update: released.then_some(state),
-        })
+        Ok(OuterDocsCacheRemoval { removed })
     }
 }
 
@@ -86,7 +79,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.removed.removed_files, 2);
         assert_eq!(outcome.removed.removed_bytes, 9);
-        let update = outcome.context_update.unwrap();
+        let update = app.context_state().await;
         assert_eq!(update.items.len(), 1);
         assert_eq!(update.items[0].path, "vendor-next/api.md");
         assert_eq!(update.revision, app.context_state().await.revision);
@@ -118,7 +111,6 @@ mod tests {
             .remove_outer_docs_cache("vendor/api.md".into())
             .await
             .unwrap();
-        assert!(outcome.context_update.is_none());
         assert_eq!(identity, app.session_uuid().await);
         assert_eq!(revision, app.context_state().await.revision);
         assert_eq!(outcome.removed.removed_files, 1);

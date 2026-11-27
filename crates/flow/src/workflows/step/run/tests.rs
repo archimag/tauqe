@@ -225,6 +225,78 @@ async fn failed_step_retains_research_without_dialogue_history() {
 }
 
 #[tokio::test]
+async fn observed_step_publishes_research_and_retains_it_after_blocking() {
+    let root = tempfile::tempdir().unwrap();
+    tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
+    std::fs::write(root.path().join("helper.rs"), "reference\n").unwrap();
+    tauqe_core::git::cmd::stage_files(root.path(), &["helper.rs".into()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(root.path(), "Add helper", false).unwrap();
+    let app = application(root.path());
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(
+            r#"{"message":"Read helper","action":{"kind":"research","context_requests":[{"path":"helper.rs","access":"read_only"}]}}"#,
+        ),
+        MockResponse::text(
+            r#"{"message":"Cannot proceed","action":{"kind":"blocked","blocked":{"reason":"missing prerequisite","details":"","is_blocked":true}}}"#,
+        ),
+    ]));
+    app.test_set_provider(provider.clone()).await;
+    let operation = app.try_begin_operation().unwrap();
+    let prepared = step(&app, &operation, "Read helper").await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let report = app
+        .step_resources()
+        .execute_observed_step(
+            &operation,
+            "observed-step",
+            prepared,
+            EventSink::noop(),
+            Arc::new(Observer(events)),
+        )
+        .await;
+    assert!(matches!(step_result(report), StepTurnResult::Blocked(_)));
+    let snapshots: Vec<_> = std::iter::from_fn(|| received.try_recv().ok())
+        .filter_map(|event| match event {
+            ApplicationEvent::Context(state) => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert!(snapshots.iter().any(|state| state
+        .items
+        .iter()
+        .any(|item| item.path == "helper.rs" && item.layer == ContextLayer::Auto)));
+    assert_eq!(snapshots.last(), Some(&app.context_state().await));
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn rejected_step_does_not_activate_context_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let app = application(root.path());
+    app.test_set_provider(Arc::new(MockLlmProvider::new()))
+        .await;
+    let operation = app.try_begin_operation().unwrap();
+    let prepared = step(&app, &operation, "Do work").await;
+    let other = Application::default();
+    let foreign = other.try_begin_operation().unwrap();
+    let (events, mut received) = mpsc::unbounded_channel();
+    assert!(matches!(
+        app.step_resources()
+            .execute_observed_step(
+                &foreign,
+                "rejected-step",
+                prepared,
+                EventSink::noop(),
+                Arc::new(Observer(events)),
+            )
+            .await,
+        StepLoopReport::Failed(_)
+    ));
+    assert!(received.try_recv().is_err());
+    assert!(app.context_state().await.items.is_empty());
+}
+
+#[tokio::test]
 async fn successful_step_clears_transient_context_and_publishes_snapshot() {
     let root = tempfile::tempdir().unwrap();
     tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
@@ -260,10 +332,16 @@ async fn successful_step_clears_transient_context_and_publishes_snapshot() {
         )
         .await
         .unwrap();
-    let (sink, mut events) = EventSink::channel();
+    let (events, mut received) = mpsc::unbounded_channel();
     let report = app
         .step_resources()
-        .execute_prepared_single_step(&operation, "edit-step", prepared, sink)
+        .execute_observed_step(
+            &operation,
+            "edit-step",
+            prepared,
+            EventSink::noop(),
+            Arc::new(Observer(events)),
+        )
         .await;
     assert!(matches!(
         &report,
@@ -283,9 +361,8 @@ async fn successful_step_clears_transient_context_and_publishes_snapshot() {
     assert_eq!(completion.outcome.changed_files, ["source.rs"]);
     assert!(completion.outcome.commit_hash.is_none());
     assert!(completion.outcome.error.is_none());
-    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(
-        |event| matches!(event, StreamEvent::ContextChanged(state) if state.items.is_empty())
-    ));
+    assert!(std::iter::from_fn(|| received.try_recv().ok())
+        .any(|event| matches!(event, ApplicationEvent::Context(state) if state.items.is_empty())));
 }
 
 #[tokio::test]
@@ -375,7 +452,7 @@ async fn neighboring_step_units_do_not_inherit_failed_staging() {
     tauqe_core::git::cmd::stage_files(root.path(), &["source.rs".into()]).unwrap();
     tauqe_core::git::cmd::commit_with_developer_author(root.path(), "Add source", false).unwrap();
     let app = application(root.path());
-    app.test_mutate_context(|context| context.add_file("source.rs", ContextAccess::Editable))
+    app.test_mutate_context(|context| context.add_auto_file("source.rs", ContextAccess::Editable))
         .await
         .unwrap()
         .unwrap();
@@ -433,6 +510,21 @@ async fn neighboring_step_units_do_not_inherit_failed_staging() {
     );
 }
 
+#[test]
+fn plan_retry_formatter_keeps_previous_response_and_diagnostic() {
+    let prompt = tauqe_core::plan::prompt::format_plan_step_retry_prompt(
+        "# Target Plan Step Execution: [plan:1] Repair source",
+        "Previous attempt <failed>",
+        Some("The patch did not apply"),
+        tauqe_core::workflow::EditProtocolKind::Structured,
+        None,
+    );
+    assert!(prompt
+        .contains("<previous_response>\nPrevious attempt &lt;failed&gt;\n</previous_response>"));
+    assert!(prompt.contains("The patch did not apply"));
+    assert!(prompt.contains("# Target Plan Step Execution: [plan:1] Repair source"));
+}
+
 #[tokio::test]
 async fn isolated_step_preserves_partial_staging_across_research() {
     use tauqe_tools::edits::anchor::encode_anchor;
@@ -459,10 +551,12 @@ async fn isolated_step_preserves_partial_staging_across_research() {
     let (history, _) = mpsc::unbounded_channel();
     let app = Application::for_repository(config, root.path().into(), history);
     for path in ["target.txt", "other.txt"] {
-        app.test_mutate_context(move |context| context.add_file(path, ContextAccess::Editable))
-            .await
-            .unwrap()
-            .unwrap();
+        app.test_mutate_context(move |context| {
+            context.add_auto_file(path, ContextAccess::Editable)
+        })
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     let replacement = |path: &str, anchor: &str, content: &str| {
@@ -503,6 +597,7 @@ async fn isolated_step_preserves_partial_staging_across_research() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
+    assert!(requests[1].messages.starts_with(&requests[0].messages));
     for request in &requests[1..] {
         let versions = &request.messages.last().unwrap().content;
         assert!(versions.starts_with("<current_versions>"));

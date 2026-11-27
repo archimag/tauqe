@@ -20,8 +20,9 @@
 //! concerns while still returning a single aggregate report.
 
 use crate::providers::ModelUsageInfo;
+use crate::stop::{HardCancellation, StopState, StopToken};
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::providers::StreamEvent;
 
@@ -130,8 +131,7 @@ impl BatchStepOutcome {
     }
 
     /// Attaches token usage to the outcome, returning the updated value.
-    #[cfg(test)]
-    fn with_usage(mut self, usage: ModelUsageInfo) -> Self {
+    pub fn with_usage(mut self, usage: ModelUsageInfo) -> Self {
         self.usage = Some(usage);
         self
     }
@@ -197,6 +197,13 @@ impl BatchUsage {
             _ => None,
         };
     }
+
+    /// Include the accounting projection attached to an executed outcome.
+    pub fn accumulate_outcome(&mut self, outcome: &BatchStepOutcome) {
+        if let Some(usage) = &outcome.usage {
+            self.accumulate(usage);
+        }
+    }
 }
 
 /// Interruption observed before starting the next member of an ordered run.
@@ -205,11 +212,18 @@ pub enum QueueInterruption {
     Stopped,
 }
 
+/// Whether a queue stops at its next boundary on Soft.
+#[derive(Clone, Copy)]
+pub enum SoftStopPolicy {
+    Observe,
+    Ignore,
+}
+
 impl QueueInterruption {
-    pub fn before_next(cancelled: bool, soft_stop: Option<&watch::Receiver<bool>>) -> Option<Self> {
-        if cancelled {
+    pub fn before_next(state: StopState, policy: SoftStopPolicy) -> Option<Self> {
+        if state == StopState::Hard {
             Some(Self::Cancelled)
-        } else if soft_stop.is_some_and(|rx| *rx.borrow()) {
+        } else if state == StopState::Soft && matches!(policy, SoftStopPolicy::Observe) {
             Some(Self::Stopped)
         } else {
             None
@@ -270,7 +284,7 @@ pub trait BatchStepExecutor: Send + Sync {
         &mut self,
         step: &BatchStep,
         stream_tx: mpsc::Sender<StreamEvent>,
-        cancel_rx: watch::Receiver<bool>,
+        cancel_rx: HardCancellation,
     ) -> anyhow::Result<BatchStepOutcome>;
 }
 
@@ -309,8 +323,8 @@ impl BatchExecution {
         steps: &[BatchStep],
         executor: &mut E,
         stream_tx: &mpsc::Sender<StreamEvent>,
-        cancel_rx: &watch::Receiver<bool>,
-        soft_stop_rx: &watch::Receiver<bool>,
+        stop_token: &StopToken,
+        soft_policy: SoftStopPolicy,
     ) -> BatchReport {
         let mut executed = Vec::with_capacity(steps.len());
         let mut usage = BatchUsage::default();
@@ -320,7 +334,7 @@ impl BatchExecution {
 
         for step in steps {
             if let Some(interruption) =
-                QueueInterruption::before_next(*cancel_rx.borrow(), Some(soft_stop_rx))
+                QueueInterruption::before_next(stop_token.state(), soft_policy)
             {
                 stop = match interruption {
                     QueueInterruption::Cancelled => BatchStop::Cancelled,
@@ -332,16 +346,14 @@ impl BatchExecution {
             tracing::info!(step_id = step.id.as_str(), "batch step started");
 
             let outcome = match executor
-                .execute_step(step, stream_tx.clone(), cancel_rx.clone())
+                .execute_step(step, stream_tx.clone(), stop_token.hard_cancellation())
                 .await
             {
                 Ok(outcome) => outcome,
                 Err(err) => BatchStepOutcome::failed(err.to_string()),
             };
 
-            if let Some(ref step_usage) = outcome.usage {
-                usage.accumulate(step_usage);
-            }
+            usage.accumulate_outcome(&outcome);
 
             let status = outcome.status;
             let block_reason = outcome.blocked_reason.clone();
@@ -403,6 +415,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::stop::StopSource;
 
     struct ScriptedExecutor {
         script: VecDeque<BatchStepOutcome>,
@@ -424,7 +437,7 @@ mod tests {
             &mut self,
             step: &BatchStep,
             _stream_tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
+            _cancel_rx: HardCancellation,
         ) -> anyhow::Result<BatchStepOutcome> {
             self.seen.push(step.id.clone());
             Ok(self
@@ -442,7 +455,7 @@ mod tests {
             &mut self,
             _step: &BatchStep,
             _stream_tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
+            _cancel_rx: HardCancellation,
         ) -> anyhow::Result<BatchStepOutcome> {
             Err(anyhow::anyhow!("transport failure"))
         }
@@ -483,11 +496,16 @@ mod tests {
             BatchStepOutcome::succeeded().with_usage(usage(30, 12, 0.03)),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -517,11 +535,16 @@ mod tests {
             BatchStepOutcome::succeeded().with_usage(usage(10, 5, 0.01)),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -538,11 +561,16 @@ mod tests {
             BatchStepOutcome::succeeded(),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(!report.is_success());
@@ -570,11 +598,16 @@ mod tests {
             BatchStepOutcome::succeeded(),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(!report.is_success());
@@ -595,11 +628,16 @@ mod tests {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![BatchStepOutcome::cancelled()]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(report.stop, BatchStop::Cancelled);
@@ -615,11 +653,16 @@ mod tests {
             BatchStepOutcome::succeeded(),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -639,11 +682,16 @@ mod tests {
             BatchStepOutcome::succeeded().with_usage(usage(10, 5, 0.02)),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -672,11 +720,16 @@ mod tests {
             BatchStepOutcome::skipped(),
         ]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -693,12 +746,17 @@ mod tests {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![]);
         let (stream_tx, _stream_rx) = channel();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
-        cancel_tx.send(true).unwrap();
+        let stop = StopSource::new();
+        stop.request_hard();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(report.stop, BatchStop::Cancelled);
@@ -711,11 +769,16 @@ mod tests {
         let steps = make_steps(&["1", "2"]);
         let mut executor = FailingExecutor;
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(
@@ -736,11 +799,16 @@ mod tests {
         let steps: Vec<BatchStep> = Vec::new();
         let mut executor = ScriptedExecutor::new(vec![]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert!(report.is_success());
@@ -754,12 +822,17 @@ mod tests {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![]);
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
-        soft_stop_tx.send(true).unwrap();
+        let stop = StopSource::new();
+        stop.request_soft();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(report.stop, BatchStop::Stopped);
@@ -770,7 +843,7 @@ mod tests {
     /// Executor that raises the soft-stop signal once it has run `stop_after`
     /// steps, simulating a graceful request arriving mid-batch.
     struct SoftStopAfterStep {
-        soft_stop_tx: watch::Sender<bool>,
+        stop: StopSource,
         stop_after: usize,
         seen: Vec<String>,
     }
@@ -781,11 +854,11 @@ mod tests {
             &mut self,
             step: &BatchStep,
             _stream_tx: mpsc::Sender<StreamEvent>,
-            _cancel_rx: watch::Receiver<bool>,
+            _cancel_rx: HardCancellation,
         ) -> anyhow::Result<BatchStepOutcome> {
             self.seen.push(step.id.clone());
             if self.seen.len() >= self.stop_after {
-                let _ = self.soft_stop_tx.send(true);
+                self.stop.request_soft();
             }
             Ok(BatchStepOutcome::succeeded())
         }
@@ -794,17 +867,22 @@ mod tests {
     #[tokio::test]
     async fn soft_stop_keeps_completed_step_and_stops_before_next() {
         let steps = make_steps(&["1", "2", "3"]);
-        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let stop = StopSource::new();
         let mut executor = SoftStopAfterStep {
-            soft_stop_tx,
+            stop: stop.clone(),
             stop_after: 1,
             seen: Vec::new(),
         };
         let (stream_tx, _stream_rx) = channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(report.stop, BatchStop::Stopped);
@@ -818,17 +896,58 @@ mod tests {
         let steps = make_steps(&["1", "2"]);
         let mut executor = ScriptedExecutor::new(vec![]);
         let (stream_tx, _stream_rx) = channel();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
-        cancel_tx.send(true).unwrap();
-        soft_stop_tx.send(true).unwrap();
+        let stop = StopSource::new();
+        stop.request_soft();
+        stop.request_hard();
+        stop.request_soft();
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Observe,
+            )
             .await;
 
         assert_eq!(report.stop, BatchStop::Cancelled);
         assert!(report.executed.is_empty());
         assert!(executor.seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignoring_soft_finishes_the_active_queue_but_not_hard() {
+        let steps = make_steps(&["1", "2"]);
+        let stop = StopSource::new();
+        let mut executor = SoftStopAfterStep {
+            stop: stop.clone(),
+            stop_after: 1,
+            seen: Vec::new(),
+        };
+        let (stream_tx, _stream_rx) = channel();
+        let report = BatchExecution::new()
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Ignore,
+            )
+            .await;
+        assert_eq!(report.stop, BatchStop::Completed);
+        assert_eq!(executor.seen, ["1", "2"]);
+        stop.request_hard();
+        let report = BatchExecution::new()
+            .run(
+                &steps,
+                &mut executor,
+                &stream_tx,
+                &stop.token(),
+                SoftStopPolicy::Ignore,
+            )
+            .await;
+        assert_eq!(report.stop, BatchStop::Cancelled);
+        assert_eq!(executor.seen, ["1", "2"]);
     }
 }

@@ -6,7 +6,7 @@ use crate::api::{ApplicationObserver, BatchOutcome, OperationGuard, PlanBatchOpt
 use crate::application::PlanExecutionEnvironment;
 use std::sync::Arc;
 use tauqe_core::models::ModelSelection;
-use tauqe_core::workflow::batch::QueueInterruption;
+use tauqe_core::workflow::batch::{QueueInterruption, SoftStopPolicy};
 
 pub(crate) async fn run_pipeline(
     resources: &PlanResources,
@@ -20,10 +20,9 @@ pub(crate) async fn run_pipeline(
         model,
         step_id: None,
     };
-    let cancel = operation.cancel_receiver();
-    let soft_stop = operation.soft_stop_receiver();
+    let stop = operation.stop_token();
     for plan_id in plan_ids {
-        if QueueInterruption::before_next(*cancel.borrow(), Some(&soft_stop)).is_some() {
+        if QueueInterruption::before_next(stop.state(), SoftStopPolicy::Observe).is_some() {
             break;
         }
         let outcome = run_batch(

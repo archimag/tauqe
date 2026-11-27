@@ -132,7 +132,8 @@ fn execution_error_code(error: &ReviewAnalysisExecutionError) -> &'static str {
         ReviewAnalysisExecutionError::Preparation(error) => preparation_error_code(error),
         ReviewAnalysisExecutionError::Completion(error) => match error {
             ReviewAnalysisCompletionError::Cancelled(_) => errors::CANCELLED,
-            ReviewAnalysisCompletionError::Provider(_) => errors::MODEL_ERROR,
+            ReviewAnalysisCompletionError::Provider(_)
+            | ReviewAnalysisCompletionError::InputLimit(_) => errors::MODEL_ERROR,
             ReviewAnalysisCompletionError::EmptyResponse(_)
             | ReviewAnalysisCompletionError::Parse(_) => errors::PARSE_ERROR,
             ReviewAnalysisCompletionError::Schema(_) => errors::SCHEMA_ERROR,

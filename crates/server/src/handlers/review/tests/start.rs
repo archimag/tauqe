@@ -13,8 +13,9 @@ use crate::transport::OutChannel;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::review::ReviewStorage;
+use tauqe_core::stop::StopState;
 use tauqe_protocol::{events, Request};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_handle_review_start_defaults_to_reviewer_role() {
@@ -35,7 +36,7 @@ async fn test_handle_review_start_defaults_to_reviewer_role() {
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
 
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -71,7 +72,7 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
     state.application.test_set_provider(provider).await;
 
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -129,6 +130,7 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
         Some("The architecture is sound, but locking is racy.")
     );
     assert_eq!(session.items.len(), 1);
+    assert_eq!(session.description.as_deref(), Some(streamed.as_str()));
     let issues = session.issues();
     assert_eq!(issues[0].issue_type, tauqe_core::review::IssueType::Bug);
 }
@@ -147,7 +149,7 @@ async fn review_start_does_not_publish_or_save_success_after_a_provider_error() 
         )])))
         .await;
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .unwrap()
         .unwrap();
@@ -193,10 +195,8 @@ async fn test_handle_review_cancel_soft_keeps_operation_active() {
     );
 
     let operation = state.try_begin_operation().expect("register operation");
-    let soft_rx = operation.soft_stop_receiver();
-    let cancel_rx = operation.cancel_receiver();
-    assert!(!*soft_rx.borrow());
-    assert!(!*cancel_rx.borrow());
+    let stop = operation.stop_token();
+    assert_eq!(stop.state(), StopState::Running);
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -206,8 +206,7 @@ async fn test_handle_review_cancel_soft_keeps_operation_active() {
     let res = handle_review_cancel(req, &state).await;
     assert!(res.error.is_none());
 
-    assert!(*soft_rx.borrow());
-    assert!(!*cancel_rx.borrow());
+    assert_eq!(stop.state(), StopState::Soft);
     assert!(state.is_operation_active());
 }
 
@@ -227,8 +226,7 @@ async fn test_handle_review_cancel_refuses_a_malformed_payload_without_cancellin
     );
 
     let operation = state.try_begin_operation().expect("register operation");
-    let cancel_rx = operation.cancel_receiver();
-    let soft_rx = operation.soft_stop_receiver();
+    let stop = operation.stop_token();
 
     // An unknown mode string and a wrongly typed field are both malformed
     // payloads, so both are answered with the parameter error.
@@ -249,11 +247,11 @@ async fn test_handle_review_cancel_refuses_a_malformed_payload_without_cancellin
             tauqe_protocol::errors::INVALID_PARAMS
         );
         assert!(
-            !*cancel_rx.borrow(),
+            stop.state() == StopState::Running,
             "a refused payload must not hard-cancel the review"
         );
         assert!(
-            !*soft_rx.borrow(),
+            stop.state() == StopState::Running,
             "a refused payload must not request a soft stop"
         );
     }
@@ -280,7 +278,7 @@ impl LlmProvider for StreamCancellingProvider {
         &self,
         _request: tauqe_core::providers::LlmRequest<'_>,
         tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
+        _cancel: tauqe_core::stop::HardCancellation,
     ) -> tauqe_core::providers::ProviderResult {
         let _ = tx.send(StreamEvent::Cancelled).await;
         Ok(())
@@ -307,7 +305,7 @@ async fn test_review_start_surfaces_stream_cancelled_event() {
         .await;
 
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -375,7 +373,7 @@ async fn test_review_start_withdraws_the_aborted_attempt_before_the_retry() {
     state.application.test_set_provider(provider).await;
 
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -483,7 +481,7 @@ async fn test_review_start_withholds_the_summary_until_the_outbound_queue_drains
     );
     state.application.test_set_provider(provider).await;
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();
@@ -569,7 +567,7 @@ async fn test_review_start_cancellation_releases_the_stalled_relay() {
     );
     state.application.test_set_provider(provider).await;
     state
-        .mutate_context(|context| context.add_file("file.rs", ContextAccess::ReadOnly))
+        .mutate_context(|context| context.add_auto_file("file.rs", ContextAccess::ReadOnly))
         .await
         .expect("fixture context mutation runs")
         .unwrap();

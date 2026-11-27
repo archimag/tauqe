@@ -6,6 +6,7 @@ use crate::api::{
     OperationInProgress, ReloadSelection,
 };
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use tauqe_core::config::AppConfig;
 use tauqe_core::models::ModelSelection;
@@ -57,23 +58,44 @@ impl ConfigurationOperation {
 
     /// Rebinds repository-owned state under the operation's exclusive admission.
     /// Usage publication remains synchronous and must not re-enter accounting.
-    pub(crate) async fn rebind_repository<F>(&self, root: &Path, publish_usage: F)
-    where
-        F: Fn(&str, &crate::api::UsageTotalsSnapshot) + Send + Sync + 'static,
-    {
+    pub(crate) async fn rebind_repository(
+        self,
+        root: &Path,
+        observer: Arc<dyn crate::api::ApplicationObserver>,
+    ) {
         if root.as_os_str().is_empty() {
             return;
         }
-        let config = self.application.load_configuration(Some(root)).await;
-        self.application
-            .replace_configuration(config, ReloadSelection::Default)
-            .await;
-        if let Err(error) = self.application.rebind_context(root.to_path_buf()).await {
-            tracing::warn!(%error, "Failed to rebind the context to the initialized repository");
-        }
-        self.application.reload_usage_lifetime(publish_usage).await;
-        if let Err(error) = self.application.rebind_history(root.to_path_buf()).await {
-            tracing::warn!(%error, "Failed to rebuild the interaction history for the repository");
+        let root = root.to_path_buf();
+        // The worker retains the operation and its publication source while a
+        // blocking context mutation finishes, even if the caller is dropped.
+        let worker = tokio::spawn(async move {
+            let context = self.application.context_session().clone();
+            if !context.activate_manual_publication(&self._guard, observer.clone()) {
+                tracing::warn!("Could not bind repository context publication");
+            }
+            let config = self.application.load_configuration(Some(&root)).await;
+            self.application
+                .replace_configuration(config, ReloadSelection::Default)
+                .await;
+            if let Err(error) = self.application.rebind_context(root.clone()).await {
+                tracing::warn!(%error, "Failed to rebind the context to the initialized repository");
+            }
+            self.application
+                .reload_usage_lifetime(move |id, snapshot| {
+                    observer.publish(
+                        id,
+                        crate::api::ApplicationEvent::UsageTotals(snapshot.clone()),
+                    );
+                })
+                .await;
+            if let Err(error) = self.application.rebind_history(root).await {
+                tracing::warn!(%error, "Failed to rebuild the interaction history for the repository");
+            }
+            context.close_manual_publication(&self._guard);
+        });
+        if let Err(error) = worker.await {
+            tracing::warn!(%error, "Repository rebind worker failed");
         }
     }
     #[cfg(test)]

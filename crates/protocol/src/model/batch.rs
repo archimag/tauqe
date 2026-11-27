@@ -75,11 +75,38 @@ pub struct PlanBatchFinishedEvent {
 pub struct ReviewBatchFinishedEvent {
     pub operation_id: String,
     pub summary: BatchFinishSummary,
+    #[serde(default)]
+    pub deferred_groups: Vec<DeferredReviewGroup>,
+}
+
+/// An architectural group excluded from an implicit run without changing its saved state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredReviewGroup {
+    pub review_id: String,
+    pub group_id: String,
+    pub reason: ReviewGroupDeferralReason,
+    pub diagnostic: String,
+    pub recovery: String,
+    pub open_findings: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGroupDeferralReason {
+    UnresolvedQuestions,
+    NeedsRefinement,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_review_batch_event_decodes_without_deferrals() {
+        let old = serde_json::json!({"operation_id":"op", "summary": summary_with_counters(None, None, None)});
+        let event: ReviewBatchFinishedEvent = serde_json::from_value(old).unwrap();
+        assert!(event.deferred_groups.is_empty());
+    }
 
     #[test]
     fn test_batch_finish_status_serializes_every_variant() {

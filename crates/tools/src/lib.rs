@@ -15,6 +15,8 @@ pub mod git;
 pub mod mockups;
 pub mod path_patterns;
 pub mod paths;
+pub(crate) mod process;
 pub mod repomap;
+pub mod stop;
 pub mod tokens;
 pub mod toolchain;

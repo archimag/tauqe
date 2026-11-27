@@ -3,10 +3,8 @@
 use super::{resolve_frame, PlanResources};
 use crate::api::{OperationGuard, OuterDocsRefusal};
 use crate::application::documents::Documents;
-use crate::application::CompactionEnvironment;
 use std::path::Path;
 use tauqe_core::config::AppConfig;
-use tauqe_core::context::ContextState;
 use tauqe_core::outer_docs::OuterDocsRegistry;
 use tauqe_core::prompt::outer_docs::append_outer_docs_diagnostics;
 use tauqe_core::workflow::implementation::{
@@ -30,42 +28,26 @@ impl StepPreparationError {
     }
 }
 
-/// Publish snapshots synchronously, including updates that precede a trust refusal.
+/// Shared manager mutations publish through the operation-bound context source.
 pub(crate) async fn prepare_implementation_step(
     resources: &PlanResources,
     operation: &OperationGuard,
     root: &Path,
     config: &AppConfig,
-    compaction: &CompactionEnvironment,
     request: &StepTurnRequest,
-    on_context: impl Fn(ContextState) + Send,
 ) -> Result<String, StepPreparationError> {
     if !resources.step.execution.owns(operation) {
         return Err(StepPreparationError::OperationNotOwned);
     }
-    if let Err(error) = resources
-        .history
-        .compact_history(&resources.step.execution, operation, compaction)
-        .await
-    {
-        tracing::warn!(error = %error, "session history is unavailable for compaction");
-    }
-    if let Ok(snapshot) = resources.clear_transient_context().await {
-        on_context(snapshot);
-    }
+    let _ = resources.clear_transient_context().await;
     let context = &resources.step.context;
-    if let Ok(admission) = context
+    let _ = context
         .preload_declared_context(
             root.to_path_buf(),
             request.files.clone(),
             request.readonly_files.clone(),
         )
-        .await
-    {
-        if !admission.outcome.added.is_empty() {
-            on_context(admission.state);
-        }
-    }
+        .await;
     // Re-read only the active leaf's declarations. An unavailable plan is
     // not fatal to this optional preload.
     let declared = match (&request.scope, request.queue.active()) {
@@ -89,14 +71,12 @@ pub(crate) async fn prepare_implementation_step(
             root,
             &OuterDocsRegistry::new(&config.outer_docs),
             &declared,
-            config.context.token_budget,
             &request.cancel_rx,
         )
         .await
         .map_err(StepPreparationError::Documentation)?;
-    if let Some(snapshot) = documents.context_update {
-        on_context(snapshot);
-    }
+    // The shared manager has already notified its publication owner.
+    let _ = &documents.context_update;
     let mut prompt = request.prompt.clone();
     append_developer_directives(&mut prompt, request.instructions.as_deref());
     append_outer_docs_diagnostics(&mut prompt, &documents.diagnostics);
@@ -115,35 +95,22 @@ fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::Application;
-    use crate::application::PlanExecutionEnvironment;
-    use std::sync::Mutex;
-    use tauqe_core::context::{ContextAccess, ContextLayer};
+    use crate::api::{Application, ApplicationEvent, ApplicationObserver};
+    use std::sync::{Arc, Mutex};
+    use tauqe_core::context::{ContextAccess, ContextLayer, ContextState};
     use tauqe_core::models::{ModelRef, ModelSelection};
     use tauqe_core::plan::{Plan, PlanItem};
     use tauqe_core::workflow::turn::TurnWorkItem;
     use tauqe_core::workflow::turn::TurnWorkQueue;
 
-    impl Application {
-        async fn prepare_implementation_step(
-            &self,
-            operation: &OperationGuard,
-            root: &Path,
-            config: &AppConfig,
-            compaction: &CompactionEnvironment,
-            request: &StepTurnRequest,
-            publish: impl Fn(ContextState) + Send,
-        ) -> Result<String, StepPreparationError> {
-            prepare_implementation_step(
-                &self.plan_resources(),
-                operation,
-                root,
-                config,
-                compaction,
-                request,
-                publish,
-            )
-            .await
+    #[derive(Default)]
+    struct ContextObserver(Mutex<Vec<ContextState>>);
+
+    impl ApplicationObserver for ContextObserver {
+        fn publish(&self, _: &str, event: ApplicationEvent) {
+            if let ApplicationEvent::Context(state) = event {
+                self.0.lock().unwrap().push(state);
+            }
         }
     }
 
@@ -195,7 +162,7 @@ mod tests {
         };
         let (history, _) = tokio::sync::mpsc::unbounded_channel();
         let app = Application::for_repository(config.clone(), root.to_path_buf(), history);
-        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let source = tauqe_core::stop::StopSource::new();
         let request = StepTurnRequest {
             scope: ExecutionScope::Plan {
                 plan_id: "step-plan".into(),
@@ -220,7 +187,7 @@ mod tests {
             instructions: Some("  Keep API  ".into()),
             marker: None,
             session_id: None,
-            cancel_rx,
+            cancel_rx: source.token().hard_cancellation(),
         };
         (app, config, request)
     }
@@ -229,29 +196,26 @@ mod tests {
     async fn preparation_clears_then_preloads_and_publishes_each_state_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let (app, config, request) = fixture(dir.path(), &["vendor"]);
-        app.test_mutate_context(|context| {
+        app.test_mutate_manual_context(|context| {
             context
-                .add_auto_file("old.rs", ContextAccess::ReadOnly)
+                .scenario_mut(|scenario| scenario.add_auto_file("old.rs", ContextAccess::ReadOnly))
                 .unwrap();
             context
-                .add_file("kept.rs", ContextAccess::ReadOnly)
+                .add_file("kept.rs", ContextAccess::ReadOnly, ContextLayer::User)
                 .unwrap();
         })
         .await
         .unwrap();
         let identity = app.session_uuid().await;
-        let updates = Mutex::new(Vec::new());
+        let updates = Arc::new(ContextObserver::default());
         let operation = app.try_begin_operation().unwrap();
-        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
-            .compaction_environment();
         let prompt = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &operation,
                 dir.path(),
                 &config,
-                &compaction,
                 &request,
-                |snapshot| updates.lock().unwrap().push(snapshot),
+                updates.clone(),
             )
             .await
             .unwrap();
@@ -259,18 +223,20 @@ mod tests {
             prompt,
             "Execute step.\n## Developer Directives:\nKeep API\n"
         );
-        let updates = updates.into_inner().unwrap();
-        assert_eq!(updates.len(), 3);
+        let updates = updates.0.lock().unwrap().clone();
+        assert_eq!(updates.len(), 4);
         assert_eq!(updates[0].items.len(), 1);
         assert_eq!(updates[0].items[0].path, "kept.rs");
         assert_eq!(updates[0].items[0].layer, ContextLayer::User);
-        assert_eq!(updates[1].items.len(), 3);
-        let target = updates[1]
+        assert_eq!(updates[1].items.len(), 2);
+        assert!(updates[1].items.iter().any(|item| item.path == "target.rs"));
+        assert_eq!(updates[2].items.len(), 3);
+        let target = updates[2]
             .items
             .iter()
             .find(|item| item.path == "target.rs")
             .unwrap();
-        let reference = updates[1]
+        let reference = updates[2]
             .items
             .iter()
             .find(|item| item.path == "reference.rs")
@@ -278,8 +244,8 @@ mod tests {
         assert_eq!(target.layer, ContextLayer::Auto);
         assert_eq!(target.access, ContextAccess::Editable);
         assert_eq!(reference.access, ContextAccess::ReadOnly);
-        assert_eq!(updates[2].items.len(), 4);
-        let document = updates[2]
+        assert_eq!(updates[3].items.len(), 4);
+        let document = updates[3]
             .items
             .iter()
             .find(|item| item.layer == ContextLayer::OuterDocs)
@@ -289,7 +255,7 @@ mod tests {
         assert!(updates
             .windows(2)
             .all(|pair| pair[0].revision < pair[1].revision));
-        assert_eq!(updates[2].revision, app.context_state().await.revision);
+        assert_eq!(updates[3].revision, app.context_state().await.revision);
         assert_ne!(identity, app.session_uuid().await);
         assert!(app.try_begin_operation().is_err());
     }
@@ -299,17 +265,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app, config, request) = fixture(dir.path(), &["vendor", "refused"]);
         let operation = app.try_begin_operation().unwrap();
-        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
-            .compaction_environment();
-        let updates = Mutex::new(Vec::new());
+        let updates = Arc::new(ContextObserver::default());
         let error = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &operation,
                 dir.path(),
                 &config,
-                &compaction,
                 &request,
-                |snapshot| updates.lock().unwrap().push(snapshot),
+                updates.clone(),
             )
             .await
             .unwrap_err();
@@ -317,10 +280,11 @@ mod tests {
         assert!(
             matches!(error.into_step_result(), StepTurnResult::Abort(message) if message.contains("The step was not started"))
         );
-        let updates = updates.into_inner().unwrap();
-        assert_eq!(updates.len(), 2);
-        assert!(updates[0].items.is_empty());
+        let updates = updates.0.lock().unwrap().clone();
+        assert_eq!(updates.len(), 2, "empty cleanup must not publish");
+        assert_eq!(updates[0].items.len(), 1);
         assert_eq!(updates[1].items.len(), 2);
+        assert!(updates[0].revision < updates[1].revision);
         assert_eq!(updates[1].revision, app.context_state().await.revision);
         assert!(app
             .context_state()
@@ -341,19 +305,15 @@ mod tests {
         let other = Application::default();
         let foreign = other.try_begin_operation().unwrap();
         let _own = app.try_begin_operation().unwrap();
-        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &_own)
-            .compaction_environment();
         let identity = app.session_uuid().await;
         let before = app.context_state().await;
-        let updates = Mutex::new(Vec::new());
         let error = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &foreign,
                 dir.path(),
                 &config,
-                &compaction,
                 &request,
-                |snapshot| updates.lock().unwrap().push(snapshot),
+                Arc::new(ContextObserver::default()),
             )
             .await
             .unwrap_err();
@@ -364,7 +324,6 @@ mod tests {
                 "Step preparation requires an active operation for this session"
             ))
         );
-        assert!(updates.into_inner().unwrap().is_empty());
         assert_eq!(before.revision, app.context_state().await.revision);
         assert_eq!(identity, app.session_uuid().await);
     }
@@ -374,16 +333,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app, config, request) = fixture(dir.path(), &["missing"]);
         let operation = app.try_begin_operation().unwrap();
-        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
-            .compaction_environment();
         let prompt = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &operation,
                 dir.path(),
                 &config,
-                &compaction,
                 &request,
-                |_| {},
+                Arc::new(ContextObserver::default()),
             )
             .await
             .unwrap();
@@ -397,45 +353,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preload_uses_the_frozen_registry_and_budget() {
+    async fn preload_uses_the_frozen_registry_without_a_size_gate() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, mut frozen, request) = fixture(dir.path(), &["vendor"]);
+        let (_, frozen, request) = fixture(dir.path(), &["vendor"]);
         let (history, _) = tokio::sync::mpsc::unbounded_channel();
         let app =
             Application::for_repository(AppConfig::default(), dir.path().to_path_buf(), history);
         let operation = app.try_begin_operation().unwrap();
-        let compaction = PlanExecutionEnvironment::new(app.configuration().await, &operation)
-            .compaction_environment();
 
-        frozen.context.token_budget = 0;
         let prompt = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &operation,
                 dir.path(),
                 &frozen,
-                &compaction,
                 &request,
-                |_| {},
+                Arc::new(ContextObserver::default()),
             )
             .await
             .unwrap();
-        assert!(prompt.contains("exceed the configured token budget"));
-        assert!(app
-            .context_state()
-            .await
-            .items
-            .iter()
-            .all(|item| item.layer != ContextLayer::OuterDocs));
-
-        frozen.context.token_budget = usize::MAX;
+        assert!(!prompt.contains("Declared External Documentation Unavailable"));
         let prompt = app
-            .prepare_implementation_step(
+            .test_prepare_implementation_step(
                 &operation,
                 dir.path(),
                 &frozen,
-                &compaction,
                 &request,
-                |_| {},
+                Arc::new(ContextObserver::default()),
             )
             .await
             .unwrap();

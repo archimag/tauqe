@@ -409,7 +409,14 @@ mod tests {
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         state
-            .mutate_context(|context| context.add_file("user.rs", ContextAccess::Editable))
+            .application
+            .test_mutate_manual_context(|context| {
+                context.add_file(
+                    "user.rs",
+                    ContextAccess::Editable,
+                    tauqe_core::context::ContextLayer::User,
+                )
+            })
             .await
             .expect("fixture context mutation runs")
             .unwrap();

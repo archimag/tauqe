@@ -12,8 +12,7 @@ use serde_json::Value;
 use super::journal::TurnResearchJournal;
 use crate::context::ContextManager;
 use crate::execution::{CancellationToken, EventSink, ExecutionError, ResponseEnvelope};
-use crate::providers::StreamEvent;
-use crate::workflow::research::{execute_research_commands, ResearchLimits};
+use crate::workflow::research::{execute_research_commands, ResearchLimits, ResearchRoundOutcome};
 
 /// Capabilities processed by the research and investigation contour.
 pub const RESEARCH_CAPABILITIES: &[LlmCapability] = &[
@@ -33,6 +32,7 @@ pub struct ResearchEnvironment<'a> {
     pub context_manager: &'a mut ContextManager,
     pub journal: &'a mut TurnResearchJournal,
     pub outer_docs: &'a [crate::config::OuterDocEntry],
+    pub project: &'a crate::config::project::ProjectConfig,
     pub cancel: &'a CancellationToken,
     pub events: &'a EventSink,
     pub round: usize,
@@ -41,7 +41,6 @@ pub struct ResearchEnvironment<'a> {
 /// Feedback and outcomes aggregated from executing research commands.
 #[derive(Debug, Clone, Default)]
 pub struct ResearchFeedback {
-    /// Repository files added to the auto context layer.
     /// Repository files added to the auto context layer.
     added_files: Vec<String>,
     /// Repository files requested that were missing from disk.
@@ -59,11 +58,6 @@ pub struct ResearchFeedback {
 /// Flat configuration of the research loop.
 #[derive(Debug, Clone)]
 pub struct ResearchLoopConfig {
-    /// Aggregate token budget of the context a round may widen.
-    /// Aggregate token budget of the context a round may widen.
-    token_budget: usize,
-    /// Token budget of a targeted repository map rendered by the round.
-    repomap_token_budget: usize,
     /// Operational caps applied to one research round.
     research_limits: ResearchLimits,
 }
@@ -72,10 +66,12 @@ impl ResearchLoopConfig {
     /// Creates research loop configuration from project context configuration.
     pub fn from_context(config: &crate::config::ContextConfig) -> Self {
         Self {
-            token_budget: config.token_budget,
-            repomap_token_budget: config.repomap_token_budget,
             research_limits: ResearchLimits::from_context_config(config),
         }
+    }
+
+    pub fn limits(&self) -> ResearchLimits {
+        self.research_limits
     }
 }
 
@@ -93,13 +89,10 @@ async fn handle_research_commands(
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
     repairing: bool,
-) -> Result<Option<ResearchFeedback>, ExecutionError> {
+) -> Result<Option<(ResearchFeedback, ResearchRoundOutcome)>, ExecutionError> {
     if ctx.cancel.is_cancelled() {
         return Err(ExecutionError::Cancelled);
     }
-
-    // Accepted scratchpad notes already belong to the turn transcript.
-    let has_scratchpad = !envelope.take(LlmCapability::Scratchpad).is_empty();
 
     let mut commands = envelope.take_any(RESEARCH_CAPABILITIES);
     if commands.is_empty() {
@@ -111,10 +104,7 @@ async fn handle_research_commands(
     // instead of receiving the whole turn's investigation again.
     ctx.journal.begin_round(ctx.journal.round_index() + 1);
 
-    let mut feedback = ResearchFeedback {
-        has_scratchpad,
-        ..Default::default()
-    };
+    let mut feedback = ResearchFeedback::default();
 
     // Partition custom tools and codebase research commands
     let mut tool_invocations = Vec::new();
@@ -131,15 +121,8 @@ async fn handle_research_commands(
     }
 
     // 1. Execute outer docs materialization if requested
-    let outer_docs_entries = if !ctx.outer_docs.is_empty() {
-        ctx.outer_docs.to_vec()
-    } else {
-        crate::blocking::run_blocking({
-            let root = ctx.repo_root.to_path_buf();
-            move || crate::config::load_section(&root, "outer_docs")
-        })
-    };
-    let registry = crate::outer_docs::OuterDocsRegistry::new(&outer_docs_entries);
+    let registry = crate::outer_docs::OuterDocsRegistry::new(ctx.outer_docs);
+    let hard = ctx.cancel.clone();
 
     let mut outer_docs_failures = Vec::new();
     let mut outer_docs_cache_requests = Vec::new();
@@ -153,7 +136,7 @@ async fn handle_research_commands(
                             ctx.repo_root,
                             path,
                             crate::outer_docs::MAX_DOCUMENT_BYTES,
-                            Some(&ctx.cancel.receiver()),
+                            Some(&hard),
                         )
                         .await
                     {
@@ -178,7 +161,7 @@ async fn handle_research_commands(
                             ctx.repo_root,
                             id,
                             crate::outer_docs::MAX_DOCUMENT_BYTES,
-                            Some(&ctx.cancel.receiver()),
+                            Some(&hard),
                         )
                         .await
                     {
@@ -200,17 +183,16 @@ async fn handle_research_commands(
         }
     }
     regular_commands.extend(outer_docs_cache_requests);
+    let mut research_outcome = ResearchRoundOutcome::default();
     // 2. Execute codebase research commands (context requests, searches, maps, docs)
     if !regular_commands.is_empty() {
         let mut outcome = execute_research_commands(
             ctx.context_manager,
             ctx.repo_root,
             &regular_commands,
-            config.token_budget,
-            config.repomap_token_budget,
             config.research_limits,
             !repairing,
-            Some(&ctx.cancel.receiver()),
+            Some(&hard),
         )
         .await;
 
@@ -229,37 +211,34 @@ async fn handle_research_commands(
                 "<context_feedback round=\"{}\">\nLoaded {} file(s) into context in this round:\n{paths}\n</context_feedback>",
                 ctx.round, outcome.added_files.len()
             ));
-            ctx.events
-                .emit(StreamEvent::ContextChanged(ctx.context_manager.get_state()));
         }
 
         ctx.journal.record_outcome(&outcome);
         feedback.widened = outcome.has_progress(false);
-        feedback.added_files = outcome.added_files;
-        feedback.missing_files = outcome.missing_files;
-        feedback.already_satisfied_files = outcome.already_satisfied_files;
-        feedback.feedback_blocks.extend(outcome.feedback_blocks);
+        feedback.added_files = outcome.added_files.clone();
+        feedback.missing_files = outcome.missing_files.clone();
+        feedback.already_satisfied_files = outcome.already_satisfied_files.clone();
+        feedback
+            .feedback_blocks
+            .extend(outcome.feedback_blocks.clone());
+        research_outcome = outcome;
     }
 
     // 3. Execute project command custom tools against declared allowlist
     if !tool_invocations.is_empty() {
         feedback.widened = true;
-        let project =
-            crate::toolchain::effective_project_config(ctx.repo_root, Some(&ctx.cancel.receiver()))
-                .await;
-
         for (name, args) in tool_invocations {
             if ctx.cancel.is_cancelled() {
                 return Err(ExecutionError::Cancelled);
             }
             let block =
-                execute_custom_tool(ctx.repo_root, &project, &name, &args, ctx.cancel).await;
-            ctx.journal.push_block(block.as_str());
+                execute_custom_tool(ctx.repo_root, ctx.project, &name, &args, ctx.cancel).await;
+            ctx.journal.push_evidence_block(block.as_str());
             feedback.feedback_blocks.push(block);
         }
     }
 
-    Ok(Some(feedback))
+    Ok(Some((feedback, research_outcome)))
 }
 
 /// Classification of one executed discovery round.
@@ -278,12 +257,14 @@ pub enum ResearchStepKind {
 }
 
 /// What one executed discovery round delivered.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ResearchStep {
     /// Classification of the round.
     pub kind: ResearchStepKind,
     /// Feedback the round produced, empty when it carried no discovery command.
     feedback: ResearchFeedback,
+    /// Detailed facts recorded by the research handlers in the journal once.
+    pub outcome: ResearchRoundOutcome,
 }
 
 impl ResearchStep {
@@ -302,13 +283,26 @@ pub async fn execute_research_step(
     envelope: &mut ResponseEnvelope,
     config: &ResearchLoopConfig,
     repairing: bool,
-) -> Result<ResearchStep, ExecutionError> {
-    let Some(feedback) = handle_research_commands(ctx, envelope, config, repairing).await? else {
-        return Ok(ResearchStep::default());
+    has_scratchpad: bool,
+) -> Result<(), ExecutionError> {
+    ctx.journal.reset_step();
+    let Some((feedback, outcome)) =
+        handle_research_commands(ctx, envelope, config, repairing).await?
+    else {
+        return Ok(());
     };
 
+    let feedback = ResearchFeedback {
+        has_scratchpad,
+        ..feedback
+    };
     let kind = classify_research_round(&feedback);
-    Ok(ResearchStep { kind, feedback })
+    ctx.journal.record_step(ResearchStep {
+        kind,
+        feedback,
+        outcome,
+    });
+    Ok(())
 }
 
 /// Classifies the round the step just executed.
@@ -376,12 +370,13 @@ async fn execute_custom_tool(
         }
     };
 
+    let hard = cancel.clone();
     match crate::toolchain::run_project_command_with_config(
         repo_root,
         project,
         name,
         &arguments,
-        Some(&cancel.receiver()),
+        Some(&hard),
     )
     .await
     {
@@ -445,6 +440,7 @@ mod tests {
         dir: tempfile::TempDir,
         context: ContextManager,
         journal: TurnResearchJournal,
+        project: crate::config::project::ProjectConfig,
         cancel: CancellationToken,
         events: EventSink,
     }
@@ -458,7 +454,8 @@ mod tests {
                 dir,
                 context,
                 journal: TurnResearchJournal::default(),
-                cancel: CancellationToken::new(),
+                project: Default::default(),
+                cancel: CancellationToken::never(),
                 events: EventSink::noop(),
             }
         }
@@ -469,6 +466,7 @@ mod tests {
                 context_manager: &mut self.context,
                 journal: &mut self.journal,
                 outer_docs: &[],
+                project: &self.project,
                 cancel: &self.cancel,
                 events: &self.events,
                 round: 1,
@@ -522,14 +520,15 @@ mod tests {
         .await
         .expect("executes");
         assert!(result.is_some());
-        let fb = result.unwrap();
+        let (fb, outcome) = result.unwrap();
         assert!(!fb.feedback_blocks.is_empty());
+        assert!(outcome.has_progress(false));
         assert!(envelope.is_empty());
         assert!(!fixture.journal.is_empty());
     }
 
     #[tokio::test]
-    async fn handle_research_commands_absorbs_scratchpad() {
+    async fn handle_research_commands_leaves_scratchpad_untouched() {
         let mut fixture = Fixture::new(Vec::new());
         let mut envelope =
             ResponseEnvelope::from_commands(&[LlmCommand::Scratchpad(ScratchpadCommand {
@@ -546,11 +545,42 @@ mod tests {
         .await
         .expect("executes");
         assert!(result.is_none());
-        assert!(envelope.is_empty());
+        assert_eq!(envelope.len(), 1);
+        assert!(envelope.has(LlmCapability::Scratchpad));
         assert!(
             fixture.journal.is_empty(),
             "private notes must stay out of research feedback"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_research_resets_result_without_draining_other_commands() {
+        let mut fixture = Fixture::new(Vec::new());
+        fixture.journal.record_step(ResearchStep {
+            kind: ResearchStepKind::Widened,
+            ..Default::default()
+        });
+        let commands = [
+            LlmCommand::Text(TextCommand {
+                content: "answer".into(),
+            }),
+            LlmCommand::Scratchpad(ScratchpadCommand {
+                notes: "private".into(),
+            }),
+        ];
+        let mut envelope = ResponseEnvelope::from_commands(&commands);
+        execute_research_step(
+            &mut fixture.context(),
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+            true,
+        )
+        .await
+        .expect("idle round");
+        assert_eq!(fixture.journal.last_step().kind, ResearchStepKind::Idle);
+        assert_eq!(envelope.commands(), &commands);
+        assert!(fixture.journal.rendered().is_none());
     }
 
     #[tokio::test]
@@ -565,15 +595,22 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(
+        execute_research_step(
             &mut ctx,
             &mut envelope,
             &ResearchLoopConfig::default(),
             false,
+            false,
         )
         .await
         .expect("executes");
+        let step = ctx.journal.last_step();
         assert_eq!(step.kind, ResearchStepKind::Widened);
+        assert!(step.outcome.has_progress(true));
+        assert_eq!(
+            step.outcome.architect_banner_summary(),
+            "Added 1 file(s) to context: helper.rs"
+        );
         assert!(
             ctx.context_manager
                 .contains("helper.rs")
@@ -598,20 +635,28 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(
+        execute_research_step(
             &mut ctx,
             &mut envelope,
             &ResearchLoopConfig::default(),
             false,
+            false,
         )
         .await
         .expect("executes");
+        let step = ctx.journal.last_step();
         assert_eq!(step.kind, ResearchStepKind::AlreadySatisfied);
         assert_eq!(step.feedback.already_satisfied_files, ["helper.rs"]);
+        assert!(!step.outcome.has_progress(false));
+        assert!(step.outcome.has_progress(true));
+        assert_eq!(
+            step.outcome.architect_banner_summary(),
+            "Files already in context: helper.rs"
+        );
     }
 
     #[tokio::test]
-    async fn execute_research_step_explains_a_round_that_widened_nothing() {
+    async fn execute_research_step_does_not_apply_a_separate_context_budget() {
         let mut fixture = Fixture::new(Vec::new());
         crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
         fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
@@ -621,16 +666,18 @@ mod tests {
                 access: ContextAccess::ReadOnly,
             })]);
         let mut ctx = fixture.context();
-        let config = ResearchLoopConfig {
-            token_budget: 1,
-            ..ResearchLoopConfig::default()
-        };
-
-        let step = execute_research_step(&mut ctx, &mut envelope, &config, false)
-            .await
-            .expect("executes");
-        assert_eq!(step.kind, ResearchStepKind::DeadEnd);
-        assert!(!step.feedback.widened);
+        execute_research_step(
+            &mut ctx,
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+            false,
+        )
+        .await
+        .expect("executes");
+        let step = ctx.journal.last_step();
+        assert_eq!(step.kind, ResearchStepKind::Widened);
+        assert!(step.feedback.widened);
     }
 
     #[tokio::test]
@@ -645,26 +692,72 @@ mod tests {
             })]);
         let mut ctx = fixture.context();
 
-        let step = execute_research_step(
+        execute_research_step(
             &mut ctx,
             &mut envelope,
             &ResearchLoopConfig::default(),
             false,
+            false,
         )
         .await
         .expect("executes");
+        let step = ctx.journal.last_step();
         assert_eq!(step.kind, ResearchStepKind::Widened);
         assert_eq!(step.feedback.missing_files, vec!["missing.rs".to_string()]);
         assert!(step.feedback.widened);
     }
 
+    #[tokio::test]
+    async fn detailed_facts_do_not_record_the_round_twice() {
+        let mut fixture = Fixture::new(Vec::new());
+        crate::git::init_repository(Some(fixture.dir.path()), true).expect("repository");
+        fixture.commit("helper.rs", "pub const ANSWER: i32 = 42;\n");
+        let mut envelope = ResponseEnvelope::from_commands(&[
+            LlmCommand::ContextRequest(ContextRequestCommand {
+                path: "helper.rs".into(),
+                access: ContextAccess::ReadOnly,
+            }),
+            LlmCommand::DocRequest(DocRequestCommand {
+                topic: DocTopic::Workflow,
+            }),
+        ]);
+        execute_research_step(
+            &mut fixture.context(),
+            &mut envelope,
+            &ResearchLoopConfig::default(),
+            false,
+            false,
+        )
+        .await
+        .expect("executes");
+        let step = fixture.journal.last_step();
+        assert_eq!(step.kind, ResearchStepKind::Widened);
+        assert!(step.outcome.has_progress(true));
+        assert!(step.summary().contains("1 file(s) added"));
+        let feedback = fixture.journal.render_round_feedback();
+        assert_eq!(feedback.matches("Loaded 1 file(s)").count(), 1);
+        assert_eq!(feedback.matches("<system_documentation>").count(), 1);
+        assert_eq!(
+            fixture
+                .journal
+                .rendered()
+                .unwrap()
+                .matches("<system_documentation>")
+                .count(),
+            1
+        );
+    }
+
     #[test]
-    fn research_loop_config_from_context_preserves_token_budget() {
+    fn research_loop_config_from_context_preserves_operational_limits() {
         let context_config = crate::config::ContextConfig {
-            token_budget: 123456,
+            max_search_requests_per_round: 17,
             ..Default::default()
         };
         let config = ResearchLoopConfig::from_context(&context_config);
-        assert_eq!(config.token_budget, 123456);
+        assert_eq!(
+            config.limits(),
+            ResearchLimits::from_context_config(&context_config)
+        );
     }
 }

@@ -1,11 +1,11 @@
-//! Keyboard routing for the single-target review-execution confirmation.
+//! Keyboard routing for every review-execution target.
 //!
 //! The dialog belongs to the model-list family, so its keyboard contract lives
 //! in the shared core at [`super::model_list`]: the embedded Coder list, the
 //! directives editor, and the action buttons are resolved once for every dialog
 //! of the family, which keeps the letter accelerators on bare presses and both
 //! `Shift+Tab` spellings moving the focus backward. This adapter keeps only what
-//! belongs to the review target itself — the single-target guard, the dialog
+//! belongs to the review target itself — the dialog
 //! geometry, and the launch it dispatches.
 
 use std::sync::Arc;
@@ -31,19 +31,14 @@ pub(super) async fn handle_execute_review_dialog(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
     let mut target = match st.modals.confirm_execute_review.take() {
-        Some(target) if target.is_single_target() => target,
-        other => {
-            st.modals.confirm_execute_review = other;
-            return Ok(None);
-        }
+        Some(target) => target,
+        None => return Ok(None),
     };
 
-    let visible_rows = crate::dialogs::render::execute_review_dialog_geometry(
-        st.last_frame_area,
-        target.selector.len(),
-    )
-    .model_rows
-    .height as usize;
+    let visible_rows =
+        crate::dialogs::render::execute_review_dialog_geometry(st.last_frame_area, &target)
+            .model_rows
+            .height as usize;
 
     match handle_dialog_key(&mut target, key, &st.tui_config.input, visible_rows) {
         ModelListKeyOutcome::Submit => {

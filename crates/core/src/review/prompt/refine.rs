@@ -1,13 +1,11 @@
 use crate::escape::escape_xml_text;
-#[cfg(test)]
 use crate::escape::single_line;
-#[cfg(test)]
 use crate::plan::PlanItem;
-#[cfg(test)]
 use crate::review::ReviewGroup;
 use crate::review::ReviewItem;
-#[cfg(test)]
 use crate::review::ReviewSession;
+
+use super::implementation::render_group_implementation;
 
 /// Target size range (in changed lines) for one cohesive leaf implementation step.
 #[cfg(test)]
@@ -105,12 +103,12 @@ pub(crate) fn build_review_group_refine_system_prompt() -> String {
     out.push_str("3. Strict Blocker Protocol (Refusal to Plan):\n");
     out.push_str("   - If you discover that the findings do not share the stated root cause, that the group is a false positive, or that it cannot be resolved without developer guidance:\n");
     out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive technical explanation in `reason`.\n");
-    out.push_str("   - A finding that carries a recorded decision is never a reason to report a blocker: the engineer already answered it, so only a question left open may be escalated.\n\n");
+    out.push_str("   - Do not ask again about a recorded decision. If the actual implementation cannot satisfy it, report the concrete technical conflict as a blocker instead of treating the decision itself as an open question.\n\n");
 
     out.push_str("4. Recorded Engineering Decisions (Binding Developer Directives):\n");
     out.push_str("   - A finding may carry a recorded decision: the engineer already answered the question it raised in review discussion.\n");
     out.push_str("   - A recorded decision is a requirement (\"What\"), not a suggestion: design the remediation strictly within it, and never restate it as a doubt, an open question, or a blocker.\n");
-    out.push_str("   - A group in which every finding carries a recorded decision is settled: escalate nothing and return the decomposition that implements those decisions.\n\n");
+    out.push_str("   - A group in which every finding carries a recorded decision has no unanswered decision to escalate; report a concrete implementation conflict if one prevents decomposition.\n\n");
 
     push_step_granularity_contract(&mut out);
 
@@ -165,7 +163,6 @@ fn push_output_format_contract(out: &mut String) {
 /// A group replan is the same Architect operation as its initial decomposition:
 /// the failed approach is named in the prompt, so the remaining horizon is
 /// reprojected around it instead of being repeated step by step.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewGroupRefineDiagnostics<'a> {
     /// Identifier of the sub-step whose execution failed.
@@ -184,7 +181,6 @@ pub(super) fn render_path_list(paths: &[String]) -> String {
 }
 
 /// Renders the session preamble every refinement prompt opens with.
-#[cfg(test)]
 fn push_session_preamble(out: &mut String, session: &ReviewSession) {
     out.push_str("## Target Review Session:\n");
     let clean_title = single_line(&session.title);
@@ -193,18 +189,24 @@ fn push_session_preamble(out: &mut String, session: &ReviewSession) {
     } else {
         &clean_title
     };
-    out.push_str(&format!("- **Session**: {} ({})\n", title, session.id));
+    out.push_str(&format!(
+        "- **Session**: {} ({})\n",
+        escape_xml_text(title),
+        escape_xml_text(&session.id)
+    ));
     if let Some(desc) = &session.description {
         let trimmed = desc.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("- **Scope / Summary**: {}\n", trimmed));
+            out.push_str(&format!(
+                "- **Scope / Summary**: {}\n",
+                escape_xml_text(trimmed)
+            ));
         }
     }
     out.push('\n');
 }
 
 /// Renders the replanning diagnostics of a failed sub-step.
-#[cfg(test)]
 fn push_replan_diagnostics(
     out: &mut String,
     failed_step: Option<&PlanItem>,
@@ -215,26 +217,36 @@ fn push_replan_diagnostics(
     match failed_step {
         Some(step) => out.push_str(&format!(
             "- **Failed Sub-step**: #{} {}\n",
-            step.id, step.title
+            escape_xml_text(&step.id),
+            escape_xml_text(&step.title)
         )),
-        None => out.push_str(&format!("- **Failed Sub-step**: #{}\n", failed_step_id)),
+        None => out.push_str(&format!(
+            "- **Failed Sub-step**: #{}\n",
+            escape_xml_text(failed_step_id)
+        )),
     }
     if let Some(step) = failed_step {
         if !step.files.is_empty() {
             out.push_str(&format!(
                 "- **Declared Target Files**: {}\n",
-                step.files.join(", ")
+                render_path_list(&step.files)
             ));
         }
         if let Some(details) = &step.details {
             let trimmed = details.trim();
             if !trimmed.is_empty() {
-                out.push_str(&format!("- **Declared Contract**:\n{}\n", trimmed));
+                out.push_str(&format!(
+                    "- **Declared Contract**:\n{}\n",
+                    escape_xml_text(trimmed)
+                ));
             }
         }
     }
     match failure_reason.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(reason) => out.push_str(&format!("- **Execution Failure Report**: {}\n", reason)),
+        Some(reason) => out.push_str(&format!(
+            "- **Execution Failure Report**: {}\n",
+            escape_xml_text(reason)
+        )),
         None => out.push_str("- **Execution Failure Report**: (no diagnostics provided)\n"),
     }
     out.push_str("- **Horizon Contract**: return ONLY the new, unfinished steps that remain. Completed (DONE) sub-steps are preserved verbatim by the harness and MUST NOT be restated.\n");
@@ -247,7 +259,6 @@ fn push_replan_diagnostics(
 /// files, and the findings discovery accumulated — is composed by the turn kernel
 /// of the structured contour, so this builder renders the directives alone and
 /// never restates material the kernel already provides.
-#[cfg(test)]
 fn push_developer_directives(out: &mut String, instructions: Option<&str>) {
     if let Some(ins) = instructions {
         let trimmed = ins.trim();
@@ -269,8 +280,7 @@ fn push_developer_directives(out: &mut String, instructions: Option<&str>) {
 /// files — is composed by the turn kernel of the structured contour, so the
 /// builder renders only the group, its findings, the replanning diagnostics, and
 /// the developer directives.
-#[cfg(test)]
-pub(crate) fn build_review_group_refine_user_prompt(
+pub fn build_review_group_refine_user_prompt(
     session: &ReviewSession,
     group: &ReviewGroup,
     findings: &[ReviewItem],
@@ -287,14 +297,17 @@ pub(crate) fn build_review_group_refine_user_prompt(
     let mut out = String::new();
     out.push_str(&format!(
         "# Review Group Refinement: [{}] {}\n\n",
-        single_line(&session.id),
+        escape_xml_text(&single_line(&session.id)),
         escape_xml_text(&title)
     ));
 
     push_session_preamble(&mut out, session);
 
     out.push_str("## Target Group to Decompose:\n");
-    out.push_str(&format!("- **ID**: `{}`\n", single_line(&group.id)));
+    out.push_str(&format!(
+        "- **ID**: `{}`\n",
+        escape_xml_text(&single_line(&group.id))
+    ));
     out.push_str(&format!("- **Title**: {}\n", escape_xml_text(&title)));
     if let Some(desc) = &group.description {
         let trimmed = desc.trim();
@@ -307,7 +320,10 @@ pub(crate) fn build_review_group_refine_user_prompt(
     }
     out.push('\n');
 
+    out.push_str(&render_group_implementation(group));
+
     out.push_str("## Group Findings to Decompose:\n");
+    out.push_str("Open findings (DISCUSSION, TODO, IN_PROGRESS) describe work or unresolved decisions; FIXED, SKIPPED, and REJECTED findings are historical context and must not generate new work.\n");
     for finding in findings {
         push_group_finding(&mut out, finding);
     }
@@ -324,10 +340,10 @@ pub(crate) fn build_review_group_refine_user_prompt(
 
     out.push_str("## Architect Instructions:\n");
     out.push_str("1. Identify the single architectural root cause the findings of this group share, then determine the code changes that remove it.\n");
-    out.push_str("2. Synthesize one decomposed, dependency-ordered subplan of leaf steps with `status: \"todo\"` that resolves every finding of the group.\n");
-    out.push_str("2. Synthesize one decomposed, dependency-ordered implementation horizon of leaf steps with `status: \"todo\"` that resolves every finding of the group.\n");
-    out.push_str("4. Design strictly within every recorded engineering decision: the question is already answered, so it is never a reason to report `status: \"blocked\"`.\n");
-    out.push_str("5. If the group cannot be implemented within the recorded decisions, report `status: \"blocked\"` with `reason`.\n");
+    out.push_str("2. Return ONLY the new unfinished, dependency-ordered implementation horizon for open findings. FIXED, SKIPPED, and REJECTED findings are historical context, not work to repeat. The harness preserves already Done steps and their commits unchanged; do not repeat them. Account for every saved step blocker, including nested Blocked steps, even when no group blocker is recorded.\n");
+    out.push_str("3. Declare exact editable paths in `files` and reference contracts in `readonly_files` for every leaf; containers have no editable files.\n");
+    out.push_str("4. Design strictly within every recorded engineering decision; do not ask the decided question again.\n");
+    out.push_str("5. If implementation within a recorded decision is technically impossible, report `status: \"blocked\"` with the concrete conflict in `reason`.\n");
     out.push_str("6. Follow the Architect Research Protocol: before designing any step that interacts with an existing interface, type, trait, module, or crate, verify its real contract by reporting `status: \"needs_context\"` with the required `context_requests`, `repo_searches`, or `repo_maps`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("7. Language Directive: Formulate all titles, details, explanations, and reasons strictly in the same natural language as the group and its findings.\n");
 
@@ -335,13 +351,13 @@ pub(crate) fn build_review_group_refine_user_prompt(
 }
 
 /// Renders one finding of a group as decomposition input.
-#[cfg(test)]
 fn push_group_finding(out: &mut String, finding: &ReviewItem) {
     out.push_str(&format!(
-        "### Finding `#{}` [{}] {}\n",
+        "### Finding `#{}` [{}] {} (status: {})\n",
         finding.id,
         finding.issue_type,
-        escape_xml_text(&single_line(&finding.title))
+        escape_xml_text(&single_line(&finding.title)),
+        finding.status
     ));
     if !finding.files.is_empty() {
         out.push_str(&format!(
@@ -374,13 +390,12 @@ fn push_group_finding(out: &mut String, finding: &ReviewItem) {
 ///
 /// A recorded decision is one answer the group can no longer ask for, so it is
 /// stated as a requirement ("What") beside the findings it settles.
-#[cfg(test)]
 fn push_recorded_decisions(out: &mut String, decisions: &[RecordedDecision<'_>]) {
     if decisions.is_empty() {
         return;
     }
     out.push_str("## Recorded Engineering Decisions (Binding Developer Directives):\n");
-    out.push_str("- The engineer already answered these questions in review discussion, so each one is a requirement (\"What\") and never an open question: design the remediation strictly within it, and never report it as a blocker or ask it again.\n");
+    out.push_str("- The engineer already answered these questions in review discussion, so each one is a requirement (\"What\") and never an open question: design the remediation strictly within it and do not ask it again. Report a concrete technical conflict if implementation within the decision is impossible.\n");
     for decision in decisions {
         let id = decision.finding_id;
         let title = escape_xml_text(decision.title);
@@ -465,7 +480,7 @@ mod tests {
         let rule = "Recorded Engineering Decisions (Binding Developer Directives)";
 
         assert!(system.contains(rule));
-        assert!(system.contains("is never a reason to report a blocker"));
+        assert!(system.contains("report the concrete technical conflict as a blocker"));
         // The new rule takes the fourth position, so the rules that follow keep
         // a gap-free numbering.
         assert!(system.contains("5. Step Granularity and Compilability Invariants:"));
@@ -488,7 +503,7 @@ mod tests {
         assert!(user.contains(header));
         assert!(user.contains("**Finding `#7` — Guard the parser**"));
         assert!(user.contains("Keep the public API stable"));
-        assert!(user.contains("never report it as a blocker"));
+        assert!(user.contains("Report a concrete technical conflict"));
         // The decisions are decomposition input, so they precede the architect
         // instructions.
         let decisions_at = user
@@ -498,6 +513,30 @@ mod tests {
             .find("## Architect Instructions:")
             .expect("instructions");
         assert!(decisions_at < instructions_at);
+    }
+    #[test]
+    fn initial_prompt_includes_group_and_finding_decisions_and_paths() {
+        let mut group = group();
+        group.resolution_notes = Some("  Preserve the shared error contract  ".into());
+        let mut item = finding(Some("Keep the public API stable"));
+        item.files = vec!["src/parser.rs".into()];
+        item.readonly_files = vec!["src/api.rs".into()];
+        let prompt = build_review_group_refine_user_prompt(&session(), &group, &[item], None, None);
+        for expected in [
+            "rev-grp",
+            "Unified error handling",
+            "Every module invents its own error type",
+            "The parser returns bare strings",
+            "Return a structured error",
+            "src/parser.rs",
+            "src/api.rs",
+            "Preserve the shared error contract",
+            "Keep the public API stable",
+        ] {
+            assert!(prompt.contains(expected), "missing {expected}");
+        }
+        assert!(!prompt.contains("Failed Sub-step Diagnostics"));
+        assert_eq!(prompt.matches("Return ONLY the new unfinished").count(), 1);
     }
     #[test]
     fn has_recorded_decision_accepts_only_a_non_empty_note() {

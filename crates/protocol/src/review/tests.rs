@@ -691,9 +691,9 @@ fn test_review_analyze_events_roundtrip() {
 }
 
 #[test]
-fn test_review_preview_window_reports_truncation_only_from_the_token_budget() {
-    // A window that drops nothing is intact, so the client skips the consent
-    // step and audits exactly what the developer selected.
+fn test_review_preview_window_retains_legacy_truncation_decode() {
+    // This compatibility predicate describes only a retired file-window
+    // counter, never whether the complete model request will be admitted.
     let intact = ReviewPreviewWindow {
         matched_files: 3,
         selected_files: 3,
@@ -703,8 +703,7 @@ fn test_review_preview_window_reports_truncation_only_from_the_token_budget() {
     };
     assert!(!intact.is_truncated());
 
-    // The budget is the only knife: the files it stops are reported by the
-    // aggregate and by the budget breakdown, so the two counters agree.
+    // Older serialized previews still decode with their original counters.
     let truncated = ReviewPreviewWindow {
         matched_files: 3,
         selected_files: 1,
@@ -717,13 +716,27 @@ fn test_review_preview_window_reports_truncation_only_from_the_token_budget() {
     assert!(truncated.is_truncated());
     assert_eq!(truncated.omitted_files, truncated.omitted_by_budget);
 
-    // The verdict is read from the budget breakdown alone, so no count of files
-    // can become a second truncation cause.
+    // A legacy budget counter still has its historical interpretation.
     let budget_only = ReviewPreviewWindow {
         omitted_by_budget: 1,
         ..Default::default()
     };
     assert!(budget_only.is_truncated());
+}
+
+#[test]
+fn test_review_preview_window_new_projection_has_zero_legacy_budget_fields() {
+    let window = ReviewPreviewWindow {
+        matched_files: 3,
+        selected_files: 2,
+        unreadable_files: 1,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&window).unwrap();
+    assert_eq!(json["omitted_files"], 0);
+    assert_eq!(json["omitted_by_budget"], 0);
+    assert_eq!(json["files_token_budget"], 0);
+    assert!(!window.is_truncated());
 }
 
 #[test]

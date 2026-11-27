@@ -6,9 +6,10 @@ use crate::review::ReviewUpdateProposal;
 use crate::review::{IssueStatus, ReviewIssue, ReviewItem, ReviewSession};
 
 use super::groups::{apply_group_decision, finding_in_group};
-use super::ReviewStorage;
+use super::{PreparedReviewDecisions, ReviewBatchCommitError, ReviewStorage, SiblingBatch};
+use crate::execution::CancellationToken;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDecisionOutcome {
     MissingSession,
     MissingFinding,
@@ -19,6 +20,88 @@ pub enum ReviewDecisionOutcome {
 }
 
 impl ReviewStorage {
+    /// Commit the prepared session and its marker as a reversible file batch.
+    pub fn commit_prepared_decisions(
+        repo_root: &Path,
+        prepared: PreparedReviewDecisions,
+        cancel: &CancellationToken,
+    ) -> Result<ReviewSession, ReviewBatchCommitError> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let current = std::fs::read(&prepared.path)?;
+            if current != prepared.original {
+                return Err(ReviewBatchCommitError::Conflict(prepared.path));
+            }
+            let marker = Self::reviews_dir(repo_root).join("active");
+            let active = match std::fs::read(&marker) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if active != prepared.active_before {
+                return Err(ReviewBatchCommitError::Conflict(marker));
+            }
+            let mut files = SiblingBatch::default();
+            files.replace(
+                prepared.path,
+                Some(serde_json::to_vec_pretty(&prepared.session)?),
+            );
+            if active.is_none() {
+                files.replace(marker, Some(prepared.session.id.as_bytes().to_vec()));
+            }
+            files.apply(|| cancel.is_cancelled(), || !cancel.is_cancelled())?;
+            Ok(prepared.session)
+        })
+    }
+
+    /// Apply a branch's decisions to one owned session without persisting it.
+    pub fn prepare_decisions(
+        repo_root: &Path,
+        focus: &DiscussionTarget,
+        decisions: &[ReviewUpdateProposal],
+    ) -> Result<(Option<PreparedReviewDecisions>, Vec<ReviewDecisionOutcome>)> {
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            let review_id = match focus {
+                DiscussionTarget::Review { id } => id,
+                DiscussionTarget::ReviewGroup { session_id, .. } => session_id,
+                DiscussionTarget::Plan { .. } => {
+                    return Ok((
+                        None,
+                        vec![ReviewDecisionOutcome::TargetMismatch; decisions.len()],
+                    ));
+                }
+            };
+            let Some((path, session)) = Self::resolve_session_file_unlocked(repo_root, review_id)?
+            else {
+                return Ok((
+                    None,
+                    vec![ReviewDecisionOutcome::MissingSession; decisions.len()],
+                ));
+            };
+            let original = std::fs::read(&path)?;
+            let active = Self::reviews_dir(repo_root).join("active");
+            let active_before = match std::fs::read(active) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let mut prepared = PreparedReviewDecisions {
+                path,
+                original,
+                session,
+                active_before,
+            };
+            let outcomes = decisions
+                .iter()
+                .map(|decision| {
+                    Self::apply_decision_to_session(&mut prepared.session, focus, decision)
+                })
+                .collect();
+            Ok((Some(prepared), outcomes))
+        })
+    }
+
     /// Updates a review item by id within the explicitly named session.
     ///
     /// The session id is mandatory: review mutations are strictly scoped to the
@@ -132,51 +215,68 @@ impl ReviewStorage {
     ) -> Result<ReviewDecisionOutcome> {
         crate::blocking::run_blocking(|| {
             let _guard = Self::lock();
-            let (review_id, focused_group) = match focus {
+            let review_id = match focus {
                 DiscussionTarget::Review { id } => (id, None),
                 DiscussionTarget::ReviewGroup {
                     session_id,
                     group_id,
                 } => (session_id, Some(group_id.as_str())),
                 DiscussionTarget::Plan { .. } => return Ok(ReviewDecisionOutcome::TargetMismatch),
-            };
-            let proposed_group = decision.group_id.as_deref();
-            if proposed_group.is_some() && proposed_group != focused_group {
-                return Ok(ReviewDecisionOutcome::TargetMismatch);
             }
+            .0;
             let Some((path, mut session)) =
                 Self::resolve_session_file_unlocked(repo_root, review_id)?
             else {
                 return Ok(ReviewDecisionOutcome::MissingSession);
             };
-            if let Some(group_id) = focused_group {
-                if !session.groups.iter().any(|group| group.id == group_id) {
-                    return Ok(ReviewDecisionOutcome::MissingGroup);
-                }
-                if !session
-                    .find_item(decision.item_id)
-                    .is_some_and(|item| finding_in_group(item, group_id))
-                {
-                    return Ok(ReviewDecisionOutcome::MissingFinding);
-                }
+            let result = Self::apply_decision_to_session(&mut session, focus, decision);
+            if result == ReviewDecisionOutcome::Saved {
+                Self::write_session_unlocked(repo_root, &path, &session)?;
             }
-            if let Some(group_id) = proposed_group {
-                if decision.note.trim().is_empty() {
-                    return Ok(ReviewDecisionOutcome::EmptyGroupNote);
-                }
-                if !apply_group_decision(&mut session, group_id, decision) {
-                    return Ok(ReviewDecisionOutcome::MissingGroup);
-                }
-            } else if update_item(&mut session, decision.item_id, |issue| {
-                issue.apply_decision(decision);
-            })
-            .is_none()
-            {
-                return Ok(ReviewDecisionOutcome::MissingFinding);
-            }
-            Self::write_session_unlocked(repo_root, &path, &session)?;
-            Ok(ReviewDecisionOutcome::Saved)
+            Ok(result)
         })
+    }
+
+    fn apply_decision_to_session(
+        session: &mut ReviewSession,
+        focus: &DiscussionTarget,
+        decision: &ReviewUpdateProposal,
+    ) -> ReviewDecisionOutcome {
+        let focused_group = match focus {
+            DiscussionTarget::Review { .. } => None,
+            DiscussionTarget::ReviewGroup { group_id, .. } => Some(group_id.as_str()),
+            DiscussionTarget::Plan { .. } => return ReviewDecisionOutcome::TargetMismatch,
+        };
+        let proposed_group = decision.group_id.as_deref();
+        if proposed_group.is_some() && proposed_group != focused_group {
+            return ReviewDecisionOutcome::TargetMismatch;
+        }
+        if let Some(group_id) = focused_group {
+            if !session.groups.iter().any(|group| group.id == group_id) {
+                return ReviewDecisionOutcome::MissingGroup;
+            }
+            if !session
+                .find_item(decision.item_id)
+                .is_some_and(|item| finding_in_group(item, group_id))
+            {
+                return ReviewDecisionOutcome::MissingFinding;
+            }
+        }
+        if let Some(group_id) = proposed_group {
+            if decision.note.trim().is_empty() {
+                return ReviewDecisionOutcome::EmptyGroupNote;
+            }
+            if !apply_group_decision(session, group_id, decision) {
+                return ReviewDecisionOutcome::MissingGroup;
+            }
+        } else if update_item(session, decision.item_id, |issue| {
+            issue.apply_decision(decision);
+        })
+        .is_none()
+        {
+            return ReviewDecisionOutcome::MissingFinding;
+        }
+        ReviewDecisionOutcome::Saved
     }
 }
 

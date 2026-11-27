@@ -13,6 +13,7 @@ pub mod step;
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use tauqe_tools::stop::HardCancellation;
 
 use crate::llm::discussion::DirListRequest;
 use crate::llm::discussion::RepoSearchRequest;
@@ -39,10 +40,6 @@ pub(crate) use search::{execute_repo_searches, format_search_feedback, RepoSearc
 pub struct ResearchLimits {
     /// Repository search queries honored in one round.
     max_search_requests_per_round: usize,
-    /// Matching files reported for a single search query.
-    max_matched_files_per_search: usize,
-    /// Entries rendered by a single directory listing.
-    max_dir_list_entries: usize,
     /// Distinct targeted map requests honored in one round.
     max_repo_map_requests_per_round: usize,
 }
@@ -58,8 +55,6 @@ impl ResearchLimits {
     pub fn from_context_config(config: &ContextConfig) -> Self {
         Self {
             max_search_requests_per_round: config.max_search_requests_per_round,
-            max_matched_files_per_search: config.max_matched_files_per_search,
-            max_dir_list_entries: config.max_dir_list_entries,
             max_repo_map_requests_per_round: config.max_repo_map_requests_per_round,
         }
     }
@@ -71,15 +66,6 @@ fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) ->
         Some(ContextAccess::ReadOnly) => requested == ContextAccess::ReadOnly,
         None => false,
     }
-}
-
-/// Diagnostic details when the requested material exceeds the configured token budget.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextLimitExceeded {
-    pub current_tokens: usize,
-    pub requested_tokens: usize,
-    pub token_budget: usize,
-    pub requested_files: Vec<String>,
 }
 
 /// One external document the OuterDocs layer refused.
@@ -112,16 +98,14 @@ pub struct ContextApplicationOutcome {
     pub added: Vec<String>,
     missing: Vec<String>,
     already_satisfied: Vec<String>,
-    pub limit_exceeded: Option<ContextLimitExceeded>,
     pub outer_docs_rejected: Vec<OuterDocsRejection>,
 }
 
 /// Reconciles the auto context layer during Research (pure append-only growth).
 ///
 /// Requested files are added to the Auto layer or have their access upgraded,
-/// while a declared external document enters the dedicated reference layer. The
-/// `token_budget` limit is evaluated against the total estimated tokens of
-/// current context files plus candidate additions.
+/// while a declared external document enters the dedicated reference layer.
+/// Size admission belongs to the assembled model request.
 ///
 /// A candidate is admitted either because Git tracks it or because it already
 /// exists on disk inside one of the harness-owned sandboxes: `.tauqe/mockups/`
@@ -133,26 +117,17 @@ pub struct ContextApplicationOutcome {
 /// relative link.
 ///
 /// A snapshot is read-only by construction and enters the dedicated OuterDocs
-/// layer through [`ContextManager::add_outer_docs_file`]. It is priced exactly
-/// like a repository file — its content plus the wrapper its own `<file>`
-/// element renders — so both kinds of candidate compete for the single
-/// `[context].token_budget` ceiling. Requesting an already loaded snapshot
-/// changes nothing: the snapshot is immutable for the whole task and the layer
+/// layer through [`ContextManager::add_outer_docs_file`]. Requesting an already
+/// loaded snapshot changes nothing: the snapshot is immutable for the whole task and the layer
 /// keeps no eviction order.
 fn reconcile_research_context(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    token_budget: usize,
 ) -> ContextApplicationOutcome {
     let mut outcome = ContextApplicationOutcome::default();
 
-    // 1. Identify candidate additions and validate against the repository
-    // Each candidate keeps the access it will be rendered with, because the
-    // length of the `access` attribute belongs to the token price of its
-    // `<file>` wrapper.
-    let mut valid_new_files: Vec<(String, ContextAccess)> = Vec::new();
-
+    // Admit in order so a later request may upgrade an earlier read-only one.
     for request in requests {
         let Ok(path) = context_manager.normalize_path(&request.path) else {
             if !outcome.missing.contains(&request.path) {
@@ -160,94 +135,24 @@ fn reconcile_research_context(
             }
             continue;
         };
-        // A snapshot is read-only by construction, so a request for write
-        // access is coerced instead of trusted.
-        let requested_access = if outer_docs::is_outer_docs_cache_path(&path) {
-            ContextAccess::ReadOnly
-        } else {
-            request.access
-        };
         if !admits_research_path(context_manager, &path, available_files) {
             if !outcome.missing.contains(&path) {
                 outcome.missing.push(path);
             }
             continue;
         }
+        let requested_access = if outer_docs::is_outer_docs_cache_path(&path) {
+            ContextAccess::ReadOnly
+        } else {
+            request.access
+        };
         if access_satisfies(
             context_manager.effective_access_for(&path),
             requested_access,
         ) {
-            // A repeated request for a loaded snapshot changes nothing: the
-            // snapshot is immutable for the whole task.
-            if !outcome.already_satisfied.contains(&path) {
+            if !outcome.added.contains(&path) && !outcome.already_satisfied.contains(&path) {
                 outcome.already_satisfied.push(path);
             }
-            continue;
-        }
-        if !context_manager.contains(&path).unwrap_or(false) {
-            // A path requested twice is priced once. The editable spelling wins,
-            // because that is the attribute the element renders after the
-            // upgrade, so the wrapper is measured at its widest.
-            if let Some(entry) = valid_new_files
-                .iter_mut()
-                .find(|entry| entry.0.as_str() == path.as_str())
-            {
-                if requested_access == ContextAccess::Editable {
-                    entry.1 = ContextAccess::Editable;
-                }
-            } else {
-                valid_new_files.push((path, requested_access));
-            }
-        }
-    }
-
-    // 2. Check the aggregate token budget
-    // Token estimates rely on cached context sizes and file metadata instead of
-    // reading full file contents, avoiding heavy blocking I/O on the async worker.
-    // Both sides of the comparison are priced the same way. A file already in
-    // context pays its content plus the wrapper its own `<file>` element
-    // renders, so the budget never under-counts the material the model holds.
-    let current_tokens: usize = context_manager
-        .get_state()
-        .items
-        .iter()
-        .map(|item| {
-            item.estimated_tokens as usize
-                + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
-        })
-        .sum();
-
-    // A candidate costs its content plus the same wrapper. Both terms come from
-    // the builder that renders the `<context>` block, so the budget never
-    // measures less than the model reads.
-    let mut new_tokens = 0usize;
-    for (path, access) in &valid_new_files {
-        let full_path = context_manager.repo_root().join(path);
-        if let Ok(meta) = std::fs::metadata(&full_path) {
-            new_tokens += crate::prompt::estimate_tokens_from_bytes(meta.len()) as usize
-                + crate::prompt::context_element_overhead_tokens(path, *access);
-        }
-    }
-
-    if current_tokens + new_tokens > token_budget {
-        outcome.limit_exceeded = Some(ContextLimitExceeded {
-            current_tokens,
-            requested_tokens: new_tokens,
-            token_budget,
-            requested_files: valid_new_files
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect(),
-        });
-        return outcome;
-    }
-
-    // 3. Apply additions and access upgrades
-    for request in requests {
-        let Ok(path) = context_manager.normalize_path(&request.path) else {
-            continue;
-        };
-        if outcome.missing.contains(&path) || outcome.already_satisfied.contains(&path) {
             continue;
         }
         if outer_docs::is_outer_docs_cache_path(&path) {
@@ -276,11 +181,18 @@ fn reconcile_research_context(
             }
             continue;
         }
-        if context_manager.add_auto_file(&path, request.access).is_ok()
-            && access_satisfies(context_manager.effective_access_for(&path), request.access)
-            && !outcome.added.contains(&path)
+        if context_manager
+            .add_auto_file(&path, requested_access)
+            .is_ok()
+            && access_satisfies(
+                context_manager.effective_access_for(&path),
+                requested_access,
+            )
         {
-            outcome.added.push(path);
+            outcome.already_satisfied.retain(|entry| entry != &path);
+            if !outcome.added.contains(&path) {
+                outcome.added.push(path);
+            }
         }
     }
 
@@ -312,17 +224,14 @@ fn admits_research_path(
 /// Registers model-requested repository files and external documents in the
 /// context with detailed diagnostics.
 ///
-/// Every candidate — a repository file and a materialized external document
-/// alike — is priced as its content plus the wrapper its own `<file>` element
-/// renders, and the whole addition set is admitted under the single
-/// `[context].token_budget` ceiling.
+/// The complete prepared request is admitted against the shared input limit
+/// before the next provider call.
 pub fn apply_context_requests_detailed(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    token_budget: usize,
 ) -> ContextApplicationOutcome {
-    reconcile_research_context(context_manager, requests, available_files, token_budget)
+    reconcile_research_context(context_manager, requests, available_files)
 }
 
 /// Registers model-requested repository files in the Auto layer.
@@ -332,26 +241,20 @@ fn apply_context_requests(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    token_budget: usize,
 ) -> Vec<String> {
-    apply_context_requests_detailed(context_manager, requests, available_files, token_budget).added
+    apply_context_requests_detailed(context_manager, requests, available_files).added
 }
 
 /// Immutable inputs shared by every Research capability handler.
 ///
 /// The dispatcher resolves repository facts once per round and hands them to
 /// every handler, so a handler never performs its own file listing and never
-/// re-derives the same budget.
+/// re-derives the same repository state.
 struct ResearchRoundContext<'a> {
     /// Repository root used for path validation and file scans.
     repo_root: &'a Path,
     /// Repository-relative files known to exist in the working tree.
     available_files: &'a [String],
-    /// Single token budget of the context: repository files and external
-    /// documents are priced the same way under it.
-    token_budget: usize,
-    /// Token budget for a targeted repository map rendered this round.
-    repomap_token_budget: usize,
     /// Operational caps resolved from the project configuration.
     limits: ResearchLimits,
     /// Whether a request already satisfied by the context counts as progress.
@@ -365,8 +268,6 @@ struct ResearchRoundContext<'a> {
 /// individual request types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResearchRoundOutcome {
-    /// Set when context additions would breach the files token budget.
-    pub(crate) limit_exceeded: Option<ContextLimitExceeded>,
     /// Files that widened the effective context this round.
     added_files: Vec<String>,
     /// Requested files that do not exist in the repository.
@@ -392,11 +293,18 @@ pub struct ResearchRoundOutcome {
     repo_maps_loaded: usize,
     /// Feedback blocks to inject into the next proposal round.
     feedback_blocks: Vec<String>,
+    /// Results of research commands, excluding instructions and admission diagnostics.
+    evidence_blocks: Vec<String>,
 }
 
 impl ResearchRoundOutcome {
-    pub fn limit_exceeded(&self) -> Option<&ContextLimitExceeded> {
-        self.limit_exceeded.as_ref()
+    pub fn evidence_blocks(&self) -> &[String] {
+        &self.evidence_blocks
+    }
+
+    fn push_evidence(&mut self, block: String) {
+        self.evidence_blocks.push(block.clone());
+        self.feedback_blocks.push(block);
     }
 
     /// Reports whether the round changed what the model can see or taught it
@@ -553,7 +461,7 @@ trait ResearchCapabilityHandler: Send + Sync {
     );
 }
 
-/// Executes context-file requests under the files token budget.
+/// Executes context-file requests.
 struct ContextRequestHandler;
 
 impl ResearchCapabilityHandler for ContextRequestHandler {
@@ -582,18 +490,12 @@ impl ResearchCapabilityHandler for ContextRequestHandler {
             return;
         }
 
-        let applied = reconcile_research_context(
-            context_manager,
-            &requests,
-            round.available_files,
-            round.token_budget,
-        );
+        let applied = reconcile_research_context(context_manager, &requests, round.available_files);
         outcome.added_files.extend(applied.added);
         outcome.missing_files.extend(applied.missing);
         outcome
             .already_satisfied_files
             .extend(applied.already_satisfied);
-        outcome.limit_exceeded = applied.limit_exceeded;
 
         if !outcome.missing_files.is_empty() {
             outcome.feedback_blocks.push(format!(
@@ -657,9 +559,7 @@ impl ResearchCapabilityHandler for RepoSearchHandler {
             round.limits,
         );
         if !results.is_empty() {
-            outcome
-                .feedback_blocks
-                .push(format_search_feedback(&results));
+            outcome.push_evidence(format_search_feedback(&results));
         }
         outcome.searches_executed.extend(results);
     }
@@ -700,7 +600,7 @@ impl ResearchCapabilityHandler for RepoDirsHandler {
         } else {
             tree.trim_end().to_string()
         };
-        outcome.feedback_blocks.push(format!(
+        outcome.push_evidence(format!(
             "<repo_dirs_feedback>\n{}\n</repo_dirs_feedback>",
             body
         ));
@@ -756,7 +656,6 @@ impl ResearchCapabilityHandler for RepoMapRequestHandler {
                 round.repo_root,
                 round.available_files,
                 &target,
-                round.repomap_token_budget,
             ) {
                 Ok(map) => map,
                 Err(err) => {
@@ -776,7 +675,7 @@ impl ResearchCapabilityHandler for RepoMapRequestHandler {
             } else {
                 map.trim_end().to_string()
             };
-            outcome.feedback_blocks.push(format!(
+            outcome.push_evidence(format!(
                 "<repomap_feedback path=\"{}\">\n{}\n</repomap_feedback>",
                 display_path, body
             ));
@@ -800,7 +699,6 @@ impl ResearchCapabilityHandler for DirListHandler {
         _context_manager: &mut ContextManager,
         outcome: &mut ResearchRoundOutcome,
     ) {
-        let max_entries = round.limits.max_dir_list_entries;
         let mut requested: Vec<DirListRequest> = Vec::new();
         for command in commands {
             let LlmCommand::DirList(command) = command else {
@@ -832,16 +730,9 @@ impl ResearchCapabilityHandler for DirListHandler {
             // The listing is derived deterministically from the tracked file
             // set, so the model reads the directory contents instead of
             // guessing which files exist.
-            let mut entries =
+            let entries =
                 render_dir_listing(round.available_files, &request.path, request.recursive);
-            // A listing is a navigation aid, not a file dump: a recursive
-            // request over a wide tree would otherwise consume the whole context
-            // budget, so the configured cap is applied and reported explicitly.
-            let omitted = entries.len().saturating_sub(max_entries);
-            if omitted > 0 {
-                entries.truncate(max_entries);
-            }
-            let mut body = if entries.is_empty() {
+            let body = if entries.is_empty() {
                 format!(
                     "No tracked files under `{}`. Check <repo_dirs> for existing paths.",
                     display_path
@@ -849,13 +740,7 @@ impl ResearchCapabilityHandler for DirListHandler {
             } else {
                 entries.join("\n")
             };
-            if omitted > 0 {
-                body.push_str(&format!(
-                    "\n[{} more entries omitted: a listing is capped at {} entries]",
-                    omitted, max_entries
-                ));
-            }
-            outcome.feedback_blocks.push(format!(
+            outcome.push_evidence(format!(
                 "<dir_list_feedback path=\"{}\" recursive=\"{}\">\n{}\n</dir_list_feedback>",
                 display_path, request.recursive, body
             ));
@@ -929,7 +814,7 @@ impl ResearchCapabilityHandler for DocRequestHandler {
             .collect::<Vec<_>>()
             .join("\n\n");
         if !documentation.trim().is_empty() {
-            outcome.feedback_blocks.push(format!(
+            outcome.push_evidence(format!(
                 "<system_documentation>\n{}\n</system_documentation>",
                 documentation.trim()
             ));
@@ -960,22 +845,17 @@ fn research_handlers() -> &'static [&'static dyn ResearchCapabilityHandler] {
 /// from inside `run_blocking` / `with_context_mutation`, so no handler ever
 /// blocks an async worker thread. The `limits` caps travel with the call, so a
 /// round applies exactly the bounds the project declared.
-#[allow(clippy::too_many_arguments)]
 fn execute_research_commands_sync(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     available_files: &[String],
     commands: &[LlmCommand],
-    token_budget: usize,
-    repomap_token_budget: usize,
     limits: ResearchLimits,
     allow_already_satisfied_feedback: bool,
 ) -> ResearchRoundOutcome {
     let round = ResearchRoundContext {
         repo_root,
         available_files,
-        token_budget,
-        repomap_token_budget,
         limits,
         allow_already_satisfied_feedback,
     };
@@ -986,11 +866,6 @@ fn execute_research_commands_sync(
             continue;
         }
         handler.execute(&round, commands, context_manager, &mut outcome);
-        // A breached budget rejects the whole addition set, so later
-        // capabilities must not run against a context that was never widened.
-        if outcome.limit_exceeded.is_some() {
-            return outcome;
-        }
     }
 
     // The already-satisfied note depends on what the whole round did: it only
@@ -1051,11 +926,6 @@ fn uninspectable_repository_outcome() -> ResearchRoundOutcome {
     );
     outcome
 }
-/// Reports whether the turn cancellation signal already fired.
-fn cancel_requested(cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> bool {
-    cancel_rx.is_some_and(|receiver| *receiver.borrow())
-}
-
 /// Executes Research commands asynchronously, resolving repository facts off
 /// the async executor thread.
 ///
@@ -1068,18 +938,15 @@ fn cancel_requested(cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> b
 /// The optional cancel signal is the turn's own: a round the developer already
 /// abandoned resolves immediately, before the repository file list is read and
 /// before a single handler runs.
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_research_commands(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     commands: &[LlmCommand],
-    token_budget: usize,
-    repomap_token_budget: usize,
     limits: ResearchLimits,
     allow_already_satisfied_feedback: bool,
-    cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> ResearchRoundOutcome {
-    if commands.is_empty() || cancel_requested(cancel_rx) {
+    if commands.is_empty() || cancel.is_some_and(HardCancellation::is_cancelled) {
         return ResearchRoundOutcome::default();
     }
     let needs_file_list = commands.iter().any(|command| {
@@ -1114,8 +981,6 @@ pub async fn execute_research_commands(
             repo_root,
             &available_files,
             commands,
-            token_budget,
-            repomap_token_budget,
             limits,
             allow_already_satisfied_feedback,
         )
@@ -1149,19 +1014,19 @@ mod tests {
             },
         ];
 
-        let added = apply_context_requests(&mut cm, &requests, &available, 300_000);
+        let added = apply_context_requests(&mut cm, &requests, &available);
         assert_eq!(added, vec!["a.rs".to_string()]);
         assert!(cm.is_editable("a.rs").unwrap());
 
         // Already satisfied: no further changes.
-        assert!(apply_context_requests(&mut cm, &requests, &available, 300_000).is_empty());
+        assert!(apply_context_requests(&mut cm, &requests, &available).is_empty());
 
         cm.clear_auto();
         assert!(!cm.contains("a.rs").unwrap());
     }
 
     #[test]
-    fn test_apply_context_requests_respects_token_budget() {
+    fn test_apply_context_requests_admits_large_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() { let x = 12345; }").unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
@@ -1171,54 +1036,36 @@ mod tests {
             access: ContextAccess::ReadOnly,
         }];
 
-        // Budget is only 2 tokens; file content is ~7 tokens.
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 2);
-        let limit = outcome.limit_exceeded.expect("Expected limit_exceeded");
-        assert_eq!(limit.token_budget, 2);
-        assert!(limit.requested_tokens > 2);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available);
+        assert_eq!(outcome.added, vec!["a.rs"]);
+        assert!(cm.contains("a.rs").unwrap());
     }
 
     #[test]
-    fn test_the_budget_check_charges_the_file_wrapper() {
+    fn test_repeated_requests_upgrade_access() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let available = vec!["a.rs".to_string()];
-        let requests = vec![ContextRequest {
-            path: "a.rs".to_string(),
-            access: ContextAccess::Editable,
-        }];
-
-        let content_tokens = crate::prompt::estimate_tokens("fn a() {}\n");
-        let wrapper =
-            crate::prompt::context_element_overhead_tokens("a.rs", ContextAccess::Editable);
-        assert!(wrapper > 0, "the rendered <file> element costs tokens");
-
-        // A budget that fits the bare content but not the element the model
-        // actually reads refuses the file and reports the priced cost.
-        let outcome = apply_context_requests_detailed(
-            &mut cm,
-            &requests,
-            &available,
-            content_tokens + wrapper - 1,
-        );
-        let limit = outcome.limit_exceeded.expect("the wrapper must be charged");
-        assert_eq!(limit.requested_tokens, content_tokens + wrapper);
-        assert!(outcome.added.is_empty());
-
-        // One token more admits the very same file.
-        let outcome = apply_context_requests_detailed(
-            &mut cm,
-            &requests,
-            &available,
-            content_tokens + wrapper,
-        );
-        assert!(outcome.limit_exceeded.is_none());
+        cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
+        let requests = vec![
+            ContextRequest {
+                path: "a.rs".into(),
+                access: ContextAccess::ReadOnly,
+            },
+            ContextRequest {
+                path: "a.rs".into(),
+                access: ContextAccess::Editable,
+            },
+        ];
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available);
         assert_eq!(outcome.added, vec!["a.rs".to_string()]);
+        assert!(outcome.already_satisfied.is_empty());
+        assert!(cm.is_editable("a.rs").unwrap());
     }
 
     #[test]
-    fn test_the_budget_check_charges_the_wrapper_of_a_loaded_file() {
+    fn test_loaded_file_does_not_prevent_another_admission() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("loaded.rs"), "fn loaded() {}\n").unwrap();
         std::fs::write(dir.path().join("next.rs"), "fn next() {}\n").unwrap();
@@ -1230,31 +1077,9 @@ mod tests {
             access: ContextAccess::ReadOnly,
         }];
 
-        let loaded_tokens = crate::prompt::estimate_tokens("fn loaded() {}\n")
-            + crate::prompt::context_element_overhead_tokens("loaded.rs", ContextAccess::ReadOnly);
-        let next_tokens = crate::prompt::estimate_tokens("fn next() {}\n")
-            + crate::prompt::context_element_overhead_tokens("next.rs", ContextAccess::ReadOnly);
-
-        // The file already in context is priced together with its own wrapper,
-        // so the reported current cost exceeds its bare content.
-        let outcome = apply_context_requests_detailed(
-            &mut cm,
-            &requests,
-            &available,
-            loaded_tokens + next_tokens - 1,
-        );
-        let limit = outcome.limit_exceeded.expect("the budget is exceeded");
-        assert_eq!(limit.current_tokens, loaded_tokens);
-        assert_eq!(limit.requested_tokens, next_tokens);
-
-        let outcome = apply_context_requests_detailed(
-            &mut cm,
-            &requests,
-            &available,
-            loaded_tokens + next_tokens,
-        );
-        assert!(outcome.limit_exceeded.is_none());
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available);
         assert_eq!(outcome.added, vec!["next.rs".to_string()]);
+        assert!(cm.contains("loaded.rs").unwrap());
     }
 
     #[test]
@@ -1270,7 +1095,7 @@ mod tests {
             path: "user.rs".to_string(),
             access: ContextAccess::Editable,
         }];
-        let added = apply_context_requests(&mut cm, &requests, &available, 300_000);
+        let added = apply_context_requests(&mut cm, &requests, &available);
         assert_eq!(added, vec!["user.rs".to_string()]);
         assert!(cm.is_editable("user.rs").unwrap());
     }
@@ -1294,7 +1119,7 @@ mod tests {
             },
         ];
 
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 300_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available);
         assert!(outcome.added.is_empty());
         assert_eq!(outcome.already_satisfied, vec!["a.rs".to_string()]);
         assert_eq!(outcome.missing, vec!["missing.rs".to_string()]);
@@ -1309,7 +1134,6 @@ mod tests {
             }],
             total_matched_files: 1,
             total_matches: 2,
-            omitted_files: 0,
             unsearched_files: 0,
             error: None,
         }
@@ -1376,8 +1200,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1397,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_research_commands_stops_on_token_budget() {
+    fn test_execute_research_commands_admits_files_and_continues_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("big.rs"),
@@ -1422,21 +1244,13 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            1,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
 
-        let limit = outcome
-            .limit_exceeded
-            .as_ref()
-            .expect("budget must be exceeded");
-        assert_eq!(limit.token_budget, 1);
-        assert!(outcome.added_files.is_empty());
-        // The dispatcher halts before later capabilities run.
-        assert!(outcome.doc_topics_loaded.is_empty());
-        assert!(!outcome.has_progress(false));
+        assert_eq!(outcome.added_files, ["big.rs"]);
+        assert_eq!(outcome.doc_topics_loaded, [DocTopic::Workflow]);
+        assert!(outcome.has_progress(false));
     }
 
     #[test]
@@ -1458,8 +1272,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1472,8 +1284,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             true,
         );
@@ -1499,8 +1309,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1533,8 +1341,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1556,8 +1362,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1568,18 +1372,13 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_research_commands_caps_a_listing_at_the_configured_bound() {
+    fn test_execute_research_commands_returns_every_listing_entry() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
-        let available: Vec<String> = (0..5).map(|index| format!("src/file_{index}.rs")).collect();
-
-        // The listing cap is configuration-driven, so a project raises or
-        // narrows it in `tauqe.toml` instead of recompiling the engine.
-        let limits = ResearchLimits {
-            max_dir_list_entries: 2,
-            ..default_limits()
-        };
+        let available: Vec<String> = (0..150)
+            .map(|index| format!("src/file_{index:03}.rs"))
+            .collect();
         let commands = vec![LlmCommand::DirList(crate::llm::DirListCommand {
             path: "src".to_string(),
             recursive: true,
@@ -1589,18 +1388,16 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
-            limits,
+            default_limits(),
             false,
         );
 
         assert_eq!(outcome.dir_lists_loaded, 1);
         let feedback = outcome.combined_feedback();
-        assert!(feedback.contains("file_0.rs"));
-        assert!(feedback.contains("file_1.rs"));
-        assert!(!feedback.contains("file_2.rs"));
-        assert!(feedback.contains("[3 more entries omitted: a listing is capped at 2 entries]"));
+        for file in &available {
+            assert!(feedback.contains(file.strip_prefix("src/").unwrap()));
+        }
+        assert!(!feedback.contains("omitted"));
     }
 
     #[test]
@@ -1616,8 +1413,6 @@ mod tests {
             dir.path(),
             &[],
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             true,
         );
@@ -1655,8 +1450,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1691,8 +1484,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1740,8 +1531,6 @@ mod tests {
             dir.path(),
             &available,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             limits,
             false,
         );
@@ -1775,8 +1564,6 @@ mod tests {
             &mut cm,
             &missing_root,
             &commands,
-            300_000,
-            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
             None,
@@ -1819,7 +1606,7 @@ mod tests {
 
         // The file is invisible to Git, so an empty tracked list proves the
         // sandbox rule is what admits it.
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[]);
 
         assert_eq!(outcome.added, vec![mockup.clone()]);
         assert!(outcome.missing.is_empty());
@@ -1843,7 +1630,7 @@ mod tests {
             access: ContextAccess::Editable,
         }];
 
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[]);
 
         assert_eq!(outcome.added, vec![cached.clone()]);
         // The layer addresses the document by its logical path, never by the
@@ -1874,16 +1661,16 @@ mod tests {
             }]
         };
 
-        let outcome = apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &request(&first), &[]);
         assert_eq!(outcome.added, vec![first.clone()]);
 
-        let repeat = apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000);
+        let repeat = apply_context_requests_detailed(&mut cm, &request(&first), &[]);
         assert!(repeat.added.is_empty());
         assert_eq!(repeat.already_satisfied, vec![first.clone()]);
 
         // A second document joins the first: the layer holds both instead of
         // evicting by a recency rank it no longer keeps.
-        let outcome = apply_context_requests_detailed(&mut cm, &request(&second), &[], 300_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &request(&second), &[]);
         assert_eq!(outcome.added, vec![second.clone()]);
         assert_eq!(
             cm.outer_docs_files(),
@@ -1891,13 +1678,9 @@ mod tests {
         );
     }
 
-    /// An external document is priced exactly like a repository file, so a
-    /// document that alone exceeds the single token budget is refused by the
-    /// shared limit report instead of widening the context past the ceiling.
-    /// The refusal never deletes the snapshot: a later round with a wider budget
-    /// can read the very same file.
+    /// A large snapshot enters context without an independent size gate.
     #[test]
-    fn test_an_external_document_beyond_the_token_budget_is_reported() {
+    fn test_a_large_external_document_is_admitted() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let cache = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
@@ -1910,29 +1693,17 @@ mod tests {
             access: ContextAccess::ReadOnly,
         }];
 
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 1);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[]);
 
-        let limit = outcome
-            .limit_exceeded
-            .as_ref()
-            .expect("the aggregate budget refuses the whole request");
-        assert_eq!(limit.token_budget, 1);
-        assert_eq!(limit.requested_files, vec![cached.clone()]);
-        assert!(outcome.added.is_empty());
+        assert_eq!(outcome.added.as_slice(), std::slice::from_ref(&cached));
         assert!(outcome.outer_docs_rejected.is_empty());
-        assert!(cm.outer_docs_files().is_empty());
-        assert!(
-            root.join(&cached).is_file(),
-            "a refused document must stay in the harness cache for a later round"
-        );
+        assert_eq!(cm.outer_docs_files(), ["huge.md"]);
+        assert!(root.join(&cached).is_file());
     }
 
-    /// Repository files and materialized external documents compete for the
-    /// single `token_budget` ceiling: both are priced as their content plus the
-    /// `<file>` wrapper, and one breached budget refuses the whole set while
-    /// naming every requested path.
+    /// Repository files and snapshots are admitted together without eviction.
     #[test]
-    fn test_external_documents_are_priced_with_the_repository_files() {
+    fn test_mixed_repository_files_and_external_documents_are_admitted() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
@@ -1953,33 +1724,11 @@ mod tests {
         ];
         let available = vec!["a.rs".to_string()];
 
-        // One file's content fits the ceiling; the same ceiling priced for two
-        // entries of either kind does not.
-        let one_file = crate::prompt::estimate_tokens("pub fn alpha() {}\n")
-            + crate::prompt::context_element_overhead_tokens("a.rs", ContextAccess::ReadOnly);
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, one_file);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available);
 
-        let limit = outcome
-            .limit_exceeded
-            .as_ref()
-            .expect("the mixed request breaches the shared ceiling");
-        assert_eq!(limit.token_budget, one_file);
-        assert_eq!(
-            limit.requested_files,
-            vec!["a.rs".to_string(), cached.clone()]
-        );
-        assert!(outcome.added.is_empty());
-        assert!(cm.outer_docs_files().is_empty());
-
-        // A ceiling that pays for both admits them together.
-        let both = one_file
-            + crate::prompt::estimate_tokens("upstream notes\n")
-            + crate::prompt::context_element_overhead_tokens(&cached, ContextAccess::ReadOnly);
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, both);
-
-        assert!(outcome.limit_exceeded.is_none());
         assert_eq!(outcome.added, vec!["a.rs".to_string(), cached.clone()]);
         assert_eq!(cm.outer_docs_files(), vec!["api.md".to_string()]);
+        assert!(cm.contains("a.rs").unwrap());
     }
     /// A trust decision is recorded apart from a delivery failure: the round
     /// outcome carries the exact cause and the declaration that would authorize

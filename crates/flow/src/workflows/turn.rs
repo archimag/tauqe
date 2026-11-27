@@ -1,36 +1,31 @@
 //! Technical turn transitions. Document interpretation belongs to the caller.
 //!
-//! Disk operations belong to a supervised worker, not to the round task.
+//! The policy retains file state while the technical computation runs.
 
-use super::round::{RoundError, RoundInput, RoundWorkflow};
+use super::round::{run_round, EditServices, RoundServices};
 use super::state::TurnState;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tauqe_core::config::project::ProjectConfig;
-use tauqe_core::context::{ContextAccess, ContextManager};
+use tauqe_core::context::ContextAccess;
 use tauqe_core::edits::execution::{
-    declared_commit_message, diagnostic_file_candidates, execute_edit_step, EditEnvironment,
-    EditState, EditStepVerdict, EDIT_CAPABILITIES,
+    declared_commit_message, diagnostic_file_candidates, EditState, EditStepVerdict,
 };
-use tauqe_core::edits::staging::{
-    execute_staging_step, render_failures, StagingEnvironment, StagingState,
-};
-use tauqe_core::edits::transaction::{RollbackOutcome, TurnTransaction};
-use tauqe_core::edits::{EditOutcome, VerificationVerdict};
-use tauqe_core::execution::transcript::AcceptedRoundId;
+use tauqe_core::edits::staging::StagingState;
+use tauqe_core::edits::transaction::RollbackOutcome;
+use tauqe_core::edits::EditOutcome;
+use tauqe_core::execution::executor::{ExecuteInput, PromptMessage, RequestRound};
+use tauqe_core::execution::AcceptedRoundId;
 use tauqe_core::execution::{
-    CancellationToken, EventSink, ExecutionError, PromptOutcome, ResponseEnvelope,
+    CancellationToken, EventSink, ExecutionError, PromptExecutor, ResponseEnvelope,
 };
 use tauqe_core::llm::LlmCapability;
+use tauqe_core::prompt::TurnBrief;
 use tauqe_core::providers::{StreamEvent, TurnRequestReason};
-use tauqe_core::workflow::policy::ApplyPolicy;
-use tauqe_core::workflow::research::step::{
-    execute_research_step, ResearchEnvironment, ResearchLoopConfig, ResearchStepKind,
-    RESEARCH_CAPABILITIES,
-};
-use tauqe_core::workflow::turn::TurnPhase;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tauqe_core::workflow::policy::owned::{OwnedApplyPolicy, Settlement};
+use tauqe_core::workflow::research::step::ResearchStepKind;
+mod execution;
+pub(crate) use execution::{run_technical_turn, TechnicalObservation, TechnicalTurnReport};
 
 // Preserve the existing correction policy; all requests also spend TurnState's
 // shared budget, including requests following an empty response.
@@ -41,6 +36,16 @@ const MAX_HEALING_AUTO_FILES: usize = 4;
 const EMPTY_REMINDER: &str = "Your previous reply produced no actionable result. Provide a concrete result that conforms to the active response schema.";
 const DEAD_END_DIRECTIVE: &str = "<response_directive>Discovery did not widen the context. Do not repeat unresolved requests. Use exact repository paths for other material, or conclude using a terminal branch of the active response schema.</response_directive>";
 const SATISFIED_DIRECTIVE: &str = "<response_directive>Every requested file is already in context. Do not request those paths again. Use the material already supplied and respond through the active response schema.</response_directive>";
+
+/// Initial semantic request for a technical turn; per-round execution details
+/// belong to the owning loop.
+pub(crate) struct TurnInput<'a> {
+    pub task: &'a str,
+    pub repo_root: &'a Path,
+    pub brief: Option<&'a TurnBrief>,
+    pub feedback: Option<&'a str>,
+    pub reason: Option<TurnRequestReason>,
+}
 
 /// Technical facts, not a declaration that a document operation succeeded.
 /// In particular, commit_error means verified bytes were not finalized; the
@@ -60,250 +65,83 @@ pub(crate) enum TurnOutcome {
     ProtocolDefect(ResponseEnvelope),
 }
 
-pub(crate) struct TurnSettlement {
-    pub outcome: Result<TurnOutcome, RoundError>,
-    pub rollback: Arc<RollbackOutcome>,
-    pub cancelled: bool,
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RoundError {
+    #[error("turn round budget exhausted after {spent} admitted requests")]
+    BudgetExhausted { spent: usize },
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
 }
 
-#[derive(Debug)]
-pub(crate) struct DiskSettlement(DiskOutcome);
-
-#[derive(Debug)]
-enum DiskOutcome {
+/// Recovery facts used to classify the terminal result of an isolated step.
+#[derive(Debug, Clone)]
+pub(crate) enum StepRecovery {
     RolledBack(Arc<RollbackOutcome>),
-    Finalized(EditOutcome),
-    WorkerFailed(String),
+    FinalizationAttempted,
 }
 
-impl DiskSettlement {
-    pub(crate) fn worker_failed(&self) -> bool {
-        matches!(&self.0, DiskOutcome::WorkerFailed(_))
+impl StepRecovery {
+    pub(crate) fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::RolledBack(outcome) => outcome.diagnostic(),
+            Self::FinalizationAttempted => None,
+        }
     }
 
-    pub(crate) fn finalized_edit(&self) -> Option<EditOutcome> {
-        let DiskOutcome::Finalized(edit) = &self.0 else {
-            return None;
-        };
-        Some(edit.clone())
-    }
-
-    pub(crate) fn notice(&self) -> Option<String> {
-        match &self.0 {
-            DiskOutcome::WorkerFailed(error) => Some(error.clone()),
-            DiskOutcome::RolledBack(outcome) => outcome.diagnostic(),
-            DiskOutcome::Finalized(edit) => Some(match (&edit.error, &edit.commit_hash) {
-                (Some(error), _) => error.clone(),
-                (None, Some(hash)) => format!("The edit transaction finalized as commit {hash}."),
-                (None, None) => "The edit transaction finalized without a Git commit.".into(),
-            }),
+    pub(crate) fn unconfirmed(&self) -> bool {
+        match self {
+            Self::RolledBack(outcome) => matches!(
+                outcome.as_ref(),
+                RollbackOutcome::RestoredFromBackup {
+                    policy_error: Some(_)
+                } | RollbackOutcome::Incomplete { .. }
+            ),
+            Self::FinalizationAttempted => false,
         }
     }
 }
 
-struct DiskPass {
-    project: ProjectConfig,
-    staging: StagingState,
-    context: ContextManager,
-    cancel: CancellationToken,
-    events: EventSink,
+struct TurnEngine<'a> {
+    executor: &'a mut PromptExecutor,
+    events: &'a EventSink,
+    cancel: &'a CancellationToken,
+    project: &'a ProjectConfig,
 }
 
-type PassResult = (ContextManager, Result<EditStepVerdict, ExecutionError>);
+pub(crate) struct TurnWorkflow;
 
-enum DiskCommand {
-    Apply(Box<DiskPass>, oneshot::Sender<PassResult>),
-    Finalize(
-        String,
-        VerificationVerdict,
-        oneshot::Sender<Result<EditOutcome, ExecutionError>>,
-    ),
-    Settle(
-        Box<ContextManager>,
-        oneshot::Sender<(ContextManager, Arc<RollbackOutcome>)>,
-    ),
-}
-
-pub(crate) struct TurnDisk(mpsc::Sender<DiskCommand>);
-
-/// The supervisor holds the last sender until the round task has joined.
-/// Closing the inbox drains admitted work and then settles the transaction.
-pub(crate) struct DiskWorker {
-    keep_open: mpsc::Sender<DiskCommand>,
-    task: JoinHandle<DiskSettlement>,
-}
-
-impl DiskWorker {
-    pub(crate) async fn finish(self) -> DiskSettlement {
-        drop(self.keep_open);
-        match self.task.await {
-            Ok(settlement) => settlement,
-            Err(error) => DiskSettlement(DiskOutcome::WorkerFailed(format!(
-                "The turn disk worker did not complete: {error}"
-            ))),
+impl TurnWorkflow {
+    /// The direct entry point does not settle the policy: its task supervisor
+    /// retains that obligation even if this future is forcibly stopped.
+    pub(crate) async fn run_direct(
+        executor: &mut PromptExecutor,
+        events: &EventSink,
+        cancel: &CancellationToken,
+        project: &ProjectConfig,
+        state: &mut TurnState,
+        input: TurnInput<'_>,
+        policy: &OwnedApplyPolicy,
+    ) -> Result<TurnOutcome, RoundError> {
+        TurnEngine {
+            executor,
+            events,
+            cancel,
+            project,
         }
+        .run_inner(state, &input, policy)
+        .await
     }
 }
 
-impl TurnDisk {
-    pub(crate) fn start(root: PathBuf, policy: Box<dyn ApplyPolicy>) -> (Self, DiskWorker) {
-        let (tx, rx) = mpsc::channel(1);
-        let worker = DiskWorker {
-            keep_open: tx.clone(),
-            task: tokio::spawn(run_disk(root, policy, rx)),
-        };
-        (Self(tx), worker)
-    }
-
-    async fn request<T>(
-        &self,
-        command: impl FnOnce(oneshot::Sender<T>) -> DiskCommand,
-    ) -> Result<T, ExecutionError> {
-        let (reply, result) = oneshot::channel();
-        let stopped =
-            || ExecutionError::Other("The turn disk worker stopped without a result".into());
-        self.0.send(command(reply)).await.map_err(|_| stopped())?;
-        result.await.map_err(|_| stopped())
-    }
-}
-
-async fn run_disk(
-    root: PathBuf,
-    mut policy: Box<dyn ApplyPolicy>,
-    mut commands: mpsc::Receiver<DiskCommand>,
-) -> DiskSettlement {
-    let mut transaction = TurnTransaction::new(&root);
-    let mut edit = None;
-    let mut last_context = None;
-    let mut finalized = None;
-    while let Some(command) = commands.recv().await {
-        match command {
-            DiskCommand::Apply(pass, reply) => {
-                let DiskPass {
-                    project,
-                    staging,
-                    mut context,
-                    cancel,
-                    events,
-                } = *pass;
-                let edit = match edit {
-                    Some(ref mut state) => state,
-                    None => {
-                        let path = root.clone();
-                        match tauqe_core::blocking::run_blocking_async(move || {
-                            tauqe_core::git::state::snapshot_worktree(&path)
-                        })
-                        .await
-                        {
-                            Ok(baseline) => edit.insert(EditState::new(project, baseline)),
-                            Err(error) => {
-                                let _ = reply
-                                    .send((context, Err(ExecutionError::Other(error.to_string()))));
-                                continue;
-                            }
-                        }
-                    }
-                };
-                edit.adopt_staging(&staging);
-                let verdict = execute_edit_step(
-                    &mut EditEnvironment {
-                        repo_root: &root,
-                        context_manager: &mut context,
-                        policy: policy.as_mut(),
-                        cancel: &cancel,
-                        events: &events,
-                    },
-                    edit,
-                    &mut transaction,
-                )
-                .await;
-                last_context = Some(context.clone());
-                let _ = reply.send((context, verdict));
-            }
-            DiskCommand::Finalize(summary, verification, reply) => {
-                let Some(edit) = edit.as_ref() else {
-                    let _ = reply.send(Err(ExecutionError::Other(
-                        "Cannot finalize the edit transaction before a disk pass".into(),
-                    )));
-                    continue;
-                };
-                let commit = transaction
-                    .finalize(policy.as_mut(), edit.modified_paths(), &summary)
-                    .await;
-                let outcome = EditOutcome {
-                    applied: commit.commit_error.is_none(),
-                    commit_hash: commit.commit_hash,
-                    error: commit.commit_error,
-                    changed_files: edit.modified_paths().to_vec(),
-                    verification: Some(verification),
-                };
-                finalized = Some(outcome.clone());
-                let _ = reply.send(Ok(outcome));
-            }
-            DiskCommand::Settle(context, reply) => {
-                let mut context = *context;
-                let (outcome, rollback) = match finalized {
-                    Some(edit) => (
-                        DiskOutcome::Finalized(edit),
-                        Arc::new(RollbackOutcome::FinalizationAttempted),
-                    ),
-                    None => {
-                        let rollback =
-                            Arc::new(transaction.rollback(policy.as_mut(), &mut context).await);
-                        (DiskOutcome::RolledBack(rollback.clone()), rollback)
-                    }
-                };
-                let _ = reply.send((context, rollback));
-                return DiskSettlement(outcome);
-            }
-        }
-    }
-    if let Some(edit) = finalized {
-        return DiskSettlement(DiskOutcome::Finalized(edit));
-    }
-    let outcome = match last_context {
-        Some(mut context) => transaction.rollback(policy.as_mut(), &mut context).await,
-        None => RollbackOutcome::NothingToDo,
-    };
-    DiskSettlement(DiskOutcome::RolledBack(Arc::new(outcome)))
-}
-
-pub(crate) struct TurnWorkflow<'a> {
-    pub round: RoundWorkflow<'a>,
-    pub disk: &'a TurnDisk,
-    pub research: &'a ResearchLoopConfig,
-}
-
-impl TurnWorkflow<'_> {
-    pub async fn run(&mut self, state: &mut TurnState, input: RoundInput<'_>) -> TurnSettlement {
-        let outcome = self.run_inner(state, &input).await;
-        let rollback = match self
-            .disk
-            .request(|reply| DiskCommand::Settle(Box::new(state.context.clone()), reply))
-            .await
-        {
-            Ok((context, rollback)) => {
-                state.context = context;
-                rollback
-            }
-            Err(error) => Arc::new(RollbackOutcome::Incomplete {
-                policy_error: None,
-                backup_error: error.to_string(),
-            }),
-        };
-        TurnSettlement {
-            outcome,
-            rollback,
-            cancelled: self.round.cancel.is_cancelled(),
-        }
-    }
-
+impl TurnEngine<'_> {
     async fn run_inner(
         &mut self,
         state: &mut TurnState,
-        input: &RoundInput<'_>,
+        input: &TurnInput<'_>,
+        policy: &OwnedApplyPolicy,
     ) -> Result<TurnOutcome, RoundError> {
         let mut staging = StagingState::default();
+        let mut edit_state = EditState::new(self.project.clone());
         let mut summary = None;
         let mut pending_response = None;
         let mut repair = String::new();
@@ -313,35 +151,79 @@ impl TurnWorkflow<'_> {
         let mut empty_retries = 0;
         let mut satisfied = 0;
         let mut dead_ends = 0;
-        let patch_strategy = self.round.executor.patch_strategy();
+        let patch_strategy = self.executor.patch_strategy();
 
         loop {
             self.check_cancelled()?;
-            let reply = self
-                .round
-                .run(
-                    state,
-                    RoundInput {
-                        task: input.task,
-                        repo_root: input.repo_root,
-                        project: input.project,
-                        repo_map: input.repo_map,
-                        repo_dirs: input.repo_dirs,
-                        outer_docs: input.outer_docs,
-                        brief: input.brief,
-                        feedback: Some(&feedback),
-                        reason,
-                        staged: staging.staged_state(),
+            if state.budget.exhausted() {
+                return Err(RoundError::BudgetExhausted {
+                    spent: state.budget.spent,
+                });
+            }
+            let admitted_before = self.executor.admitted_requests();
+            let directives = state.budget.final_directive();
+            let request_round = RequestRound {
+                round: state.budget.spent + 1,
+                max_rounds: state.budget.max_rounds.unwrap_or(usize::MAX),
+                reason,
+            };
+            let staged = staging.staged_state().cloned();
+            let reply = run_round(
+                self.executor,
+                ExecuteInput {
+                    message: if admitted_before == 0 {
+                        PromptMessage::Task(input.task.to_owned())
+                    } else {
+                        PromptMessage::Continuation
                     },
-                )
-                .await?;
-            let mut response_round = reply.accepted_round;
-            let mut response = match reply.result.outcome {
-                PromptOutcome::Completed(response) => response,
-                PromptOutcome::ProtocolError(response) => {
-                    return Ok(TurnOutcome::ProtocolDefect(response));
+                    directives: directives.map(str::to_owned),
+                    round: Some(request_round),
+                    context_items: state.context.get_state().items,
+                    history: state.history.clone(),
+                    capabilities: state.capabilities.clone(),
+                    brief: input.brief.cloned(),
+                    feedback: Some(feedback.clone()),
+                    staged: staged.as_ref(),
+                    created_paths: state.created_paths.clone(),
+                    journal: None,
+                },
+                RoundServices {
+                    context: &mut state.context,
+                    journal: &mut state.journal,
+                    repairing: !staging.failures().is_empty(),
+                    edits: Some(EditServices {
+                        staging: &mut staging,
+                        edit: &mut edit_state,
+                        policy,
+                    }),
+                },
+                self.events,
+                self.cancel,
+            )
+            .await;
+            state
+                .budget
+                .charge(admitted_before, self.executor.admitted_requests());
+            let mut response_round;
+            let discovery;
+            let edited = staging.last_step().addressed;
+            state
+                .created_paths
+                .extend(staging.last_step().new_paths.iter().cloned());
+            let mut response = match reply {
+                Ok(commands) => {
+                    response_round = self.executor.last_accepted_round();
+                    discovery = state.journal.last_step().clone();
+                    ResponseEnvelope::from_commands(&commands)
                 }
-                PromptOutcome::Empty => {
+                Err(ExecutionError::Protocol(message)) => {
+                    return Ok(TurnOutcome::ProtocolDefect(
+                        ResponseEnvelope::from_commands(&[
+                            tauqe_core::llm::LlmCommand::ProtocolError { message },
+                        ]),
+                    ));
+                }
+                Err(ExecutionError::EmptyResponse) => {
                     if empty_retries == MAX_EMPTY_RETRIES {
                         return Ok(TurnOutcome::Exhausted {
                             reason: format!("The model produced an empty response after {empty_retries} additional attempt(s)."),
@@ -358,29 +240,12 @@ impl TurnWorkflow<'_> {
                     reason = Some(TurnRequestReason::EmptyResponseRetry);
                     continue;
                 }
+                Err(error) => return Err(error.into()),
             };
             empty_retries = 0;
             feedback.clear();
             reason = None;
             let repairing = !staging.failures().is_empty();
-            if RESEARCH_CAPABILITIES.iter().any(|cap| response.has(*cap)) {
-                self.announce(TurnPhase::Research);
-            }
-            let discovery = execute_research_step(
-                &mut ResearchEnvironment {
-                    repo_root: input.repo_root,
-                    context_manager: &mut state.context,
-                    journal: &mut state.journal,
-                    outer_docs: input.outer_docs,
-                    cancel: self.round.cancel,
-                    events: self.round.events,
-                    round: state.budget.spent,
-                },
-                &mut response,
-                self.research,
-                repairing,
-            )
-            .await?;
             self.check_cancelled()?;
             let continue_research = match discovery.kind {
                 ResearchStepKind::Idle => false,
@@ -406,46 +271,22 @@ impl TurnWorkflow<'_> {
                 discovery.kind,
                 ResearchStepKind::Widened | ResearchStepKind::AlreadySatisfied
             ) {
-                self.round
-                    .events
+                self.events
                     .emit_text_delta(format!("\n\n{}\n\n", discovery.summary()));
             }
 
-            if EDIT_CAPABILITIES.iter().any(|cap| response.has(*cap)) {
-                self.announce(TurnPhase::Staging);
+            if edited {
                 if summary.is_none() {
                     summary = declared_commit_message(&response);
                 }
-                let attempt = tauqe_core::blocking::run_blocking(|| {
-                    execute_staging_step(
-                        &mut StagingEnvironment {
-                            repo_root: input.repo_root,
-                            context_manager: &state.context,
-                            patch_strategy,
-                            events: self.round.events,
-                        },
-                        &mut response,
-                        &mut staging,
-                    )
-                });
-                state
-                    .transcript
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remember_created_paths(&attempt.new_paths);
                 self.check_cancelled()?;
-                if !attempt.addressed {
-                    return Ok(TurnOutcome::Exhausted {
-                        reason: "The change set could not be staged".into(),
-                    });
-                }
                 if !staging.failures().is_empty() {
-                    for (path, diagnostic) in attempt.refusals {
-                        self.round.events.emit(StreamEvent::EditFileRetrying {
-                            path,
+                    for (path, diagnostic) in &staging.last_step().refusals {
+                        self.events.emit(StreamEvent::EditFileRetrying {
+                            path: path.clone(),
                             attempt: staging.attempts(),
                             max_retries: 0,
-                            reason: diagnostic,
+                            reason: diagnostic.clone(),
                         });
                     }
                     satisfied = 0;
@@ -465,42 +306,32 @@ impl TurnWorkflow<'_> {
                 if let Some(original) = pending_response.take() {
                     (response, response_round) = original;
                 }
-                let abandoned = render_failures(staging.abandoned(), patch_strategy);
-                if !abandoned.is_empty() {
-                    let lines = abandoned
-                        .into_iter()
-                        .map(|(path, error)| format!("- `{path}`: {error}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    self.round.events.emit_text_delta(format!("\n\n[Change Set Incomplete] Unretried files remain outside the change set:\n{lines}\n\n"));
-                }
-                self.announce(TurnPhase::Verification);
-                let pass = DiskPass {
-                    project: input.project.clone(),
-                    staging: std::mem::take(&mut staging),
-                    context: state.context.clone(),
-                    cancel: self.round.cancel.clone(),
-                    events: self.round.events.clone(),
-                };
-                let (context, verdict) = self
-                    .disk
-                    .request(|reply| DiskCommand::Apply(Box::new(pass), reply))
-                    .await?;
-                state.context = context;
-                // Cancellation takes precedence over an apply or hook failure.
-                self.check_cancelled()?;
-                match verdict? {
+                let verdict = edit_state.last_verdict().ok_or_else(|| {
+                    ExecutionError::Other("Converged edit has no verification verdict".into())
+                })?;
+                match verdict {
                     EditStepVerdict::Passed(verification) => {
-                        let edit = self
-                            .disk
-                            .request(|reply| {
-                                DiskCommand::Finalize(
-                                    summary.unwrap_or_else(|| "Apply verified changes".into()),
-                                    verification,
-                                    reply,
+                        let verification = *verification;
+                        let summary = summary.unwrap_or_else(|| "Apply verified changes".into());
+                        let edit = match policy.finalize(&summary, verification).await {
+                            Ok(Settlement::Finalized { edit, .. }) => edit,
+                            Ok(Settlement::NoChanges { .. }) => EditOutcome {
+                                applied: true,
+                                commit_hash: None,
+                                error: None,
+                                changed_files: Vec::new(),
+                                verification: Some(verification),
+                            },
+                            Ok(Settlement::RolledBack(_)) => {
+                                return Err(ExecutionError::Other(
+                                    "Finalization unexpectedly rolled back".into(),
                                 )
-                            })
-                            .await??;
+                                .into());
+                            }
+                            Err(error) => {
+                                return Err(ExecutionError::Other(error.to_string()).into());
+                            }
+                        };
                         return Ok(TurnOutcome::Settled(TurnArtifact {
                             response,
                             response_round,
@@ -509,17 +340,14 @@ impl TurnWorkflow<'_> {
                         }));
                     }
                     EditStepVerdict::ApplyFailed { message } => {
-                        return Err(ExecutionError::Other(format!(
-                            "Failed to commit staged edits to disk: {message}"
-                        ))
-                        .into());
+                        return Err(ExecutionError::Other(message.clone()).into());
                     }
                     EditStepVerdict::HookFailed { report } => {
-                        healing = self.prepare_healing(state, input, &report).await;
+                        healing = self.prepare_healing(state, input, report).await;
                         reason = Some(TurnRequestReason::PostHookRepair);
                     }
                     EditStepVerdict::VerificationFailed { report } => {
-                        healing = self.prepare_healing(state, input, &report).await;
+                        healing = self.prepare_healing(state, input, report).await;
                         reason = Some(TurnRequestReason::VerificationRepair);
                     }
                 }
@@ -563,31 +391,21 @@ impl TurnWorkflow<'_> {
     }
 
     fn check_cancelled(&self) -> Result<(), RoundError> {
-        if self.round.cancel.is_cancelled() {
+        if self.cancel.is_cancelled() {
             Err(ExecutionError::Cancelled.into())
         } else {
             Ok(())
         }
     }
 
-    fn announce(&self, phase: TurnPhase) {
-        tracing::info!(%phase, "technical turn entered a phase");
-        self.round.events.emit(StreamEvent::TurnPhase {
-            phase,
-            round: None,
-            max_rounds: None,
-            detail: None,
-        });
-    }
-
     async fn prepare_healing(
         &self,
         state: &mut TurnState,
-        input: &RoundInput<'_>,
+        input: &TurnInput<'_>,
         report: &str,
     ) -> String {
         let candidates = diagnostic_file_candidates(input.repo_root, report).await;
-        let added = tauqe_core::blocking::run_blocking(|| {
+        tauqe_core::blocking::run_blocking(|| {
             let mut added = 0;
             for path in candidates {
                 if added == MAX_HEALING_AUTO_FILES {
@@ -607,13 +425,7 @@ impl TurnWorkflow<'_> {
                     added += 1;
                 }
             }
-            added
         });
-        if added > 0 {
-            self.round
-                .events
-                .emit(StreamEvent::ContextChanged(state.context.get_state()));
-        }
         format!("Code verification failed with the following errors:\n\n{report}\n\nPropose corrected edits using the active edit protocol. Request additional material through the active research protocol if needed.")
     }
 }
@@ -628,28 +440,44 @@ fn join_feedback(first: &str, second: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::execution::supervise_technical_task;
     use super::*;
+    use crate::application::operation::OperationRegistry;
     use std::path::Path;
     use std::sync::Arc;
     use tauqe_core::config::project::ProjectConfig;
     use tauqe_core::context::ContextManager;
-    use tauqe_core::execution::{CancellationToken, EventSink, PromptExecutor};
+    use tauqe_core::edits::VerificationVerdict;
+    use tauqe_core::execution::executor::PromptIdentity;
     use tauqe_core::llm::CapabilityTree;
+    use tauqe_core::models::ModelRef;
     use tauqe_core::prompt::json::JsonPromptProtocol;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::{LlmProvider, LlmRequest};
+    use tauqe_core::stop::StopSource;
+    use tauqe_core::workflow::policy::ApplyPolicy;
     use tauqe_core::workflow::{GitTransactionPolicy, PatchStrategy};
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, oneshot};
 
     fn executor(provider: Arc<dyn LlmProvider>) -> PromptExecutor {
+        struct Recorder(std::sync::Mutex<Vec<tauqe_core::providers::ModelUsageInfo>>);
+        impl tauqe_core::execution::usage::UsageSink for Recorder {
+            fn record(&self, report: &tauqe_core::providers::ModelUsageInfo) {
+                self.0.lock().unwrap().push(report.clone());
+            }
+        }
+        let scope = tauqe_core::execution::usage::UsageScope::new(Arc::new(Recorder(
+            std::sync::Mutex::new(Vec::new()),
+        )));
+        scope.activate();
         PromptExecutor::new(
             provider,
             Box::new(JsonPromptProtocol::new(grant())),
-            "mock/model".into(),
-            None,
+            PromptIdentity::new(ModelRef::openrouter("mock/model"), None, None, None),
             None,
             PatchStrategy::ApplyPatch,
         )
+        .with_usage(tauqe_core::execution::usage::UsageBinding::Bound(scope))
     }
 
     fn grant() -> CapabilityTree {
@@ -708,6 +536,7 @@ mod tests {
     struct Fixture {
         dir: tempfile::TempDir,
         state: TurnState,
+        read_rounds: Vec<tauqe_core::history::TurnRoundRecord>,
         project: ProjectConfig,
         cancel: CancellationToken,
         events: EventSink,
@@ -725,13 +554,16 @@ mod tests {
             tauqe_core::git::cmd::commit_with_developer_author(root, "initial", false).unwrap();
             std::fs::write(root.join("a.txt"), "developer work\n").unwrap();
             let mut context = ContextManager::new(root.to_path_buf());
-            context.add_file("a.txt", ContextAccess::Editable).unwrap();
-            let state = TurnState::new(context, grant(), None, Some(limit), 32);
+            context
+                .add_auto_file("a.txt", ContextAccess::Editable)
+                .unwrap();
+            let state = TurnState::new(context, grant(), None, Some(limit));
             Self {
                 dir,
                 state,
+                read_rounds: Vec::new(),
                 project: ProjectConfig::default(),
-                cancel: CancellationToken::new(),
+                cancel: CancellationToken::never(),
                 events: EventSink::noop(),
             }
         }
@@ -747,48 +579,68 @@ mod tests {
             provider: Arc<dyn LlmProvider>,
             policy: Box<dyn ApplyPolicy>,
         ) -> Result<TurnOutcome, RoundError> {
-            let settlement = self.settle(provider, policy).await;
-            if settlement.cancelled {
+            let report = self.settle(provider, policy).await;
+            if report.cancelled {
                 return Err(ExecutionError::Cancelled.into());
             }
-            settlement.outcome
+            report.outcome
         }
 
         async fn settle(
             &mut self,
             provider: Arc<dyn LlmProvider>,
             policy: Box<dyn ApplyPolicy>,
-        ) -> TurnSettlement {
-            let mut executor = executor(provider);
-            let (disk, worker) = TurnDisk::start(self.dir.path().to_path_buf(), policy);
-            let settlement = TurnWorkflow {
-                round: RoundWorkflow {
-                    executor: &mut executor,
-                    events: &self.events,
-                    cancel: &self.cancel,
-                },
-                disk: &disk,
-                research: &ResearchLoopConfig::default(),
-            }
-            .run(
+        ) -> TechnicalTurnReport {
+            let root = self.dir.path().to_path_buf();
+            let executor = executor(provider)
+                .bind_ready(&root, &Default::default(), None)
+                .await
+                .unwrap();
+            let reader = executor.history_reader();
+            let state = std::mem::replace(
                 &mut self.state,
-                RoundInput {
-                    task: "Update the file",
-                    repo_root: self.dir.path(),
-                    project: &self.project,
-                    repo_map: None,
-                    repo_dirs: None,
-                    outer_docs: &[],
-                    brief: None,
-                    feedback: None,
-                    reason: None,
-                    staged: None,
-                },
-            )
-            .await;
-            drop(disk);
-            worker.finish().await;
-            settlement
+                TurnState::new(ContextManager::new(root.clone()), grant(), None, Some(1)),
+            );
+            let events = self.events.clone();
+            let cancel = self.cancel.clone();
+            let project = self.project.clone();
+            let registry = Arc::new(OperationRegistry::default());
+            let operation = registry.begin().unwrap();
+            let hold = operation.retain_supervision().unwrap();
+            let fallback = state.context.clone();
+            let policy = OwnedApplyPolicy::bind(policy, &root, cancel.clone());
+            let work_policy = policy.clone();
+            let work_cancel = cancel.clone();
+            let computation = tokio::spawn(async move {
+                let mut state = state;
+                let mut executor = executor;
+                let outcome = TurnWorkflow::run_direct(
+                    &mut executor,
+                    &events,
+                    &work_cancel,
+                    &project,
+                    &mut state,
+                    TurnInput {
+                        task: "Update the file",
+                        repo_root: &root,
+                        brief: None,
+                        feedback: None,
+                        reason: None,
+                    },
+                    &work_policy,
+                )
+                .await;
+                (outcome, state, executor)
+            });
+            let mut report =
+                supervise_technical_task(computation, policy, cancel, None, fallback, hold)
+                    .await
+                    .unwrap();
+            self.read_rounds = reader();
+            if let Some(continuation) = report.continuation.take() {
+                self.state = continuation.state;
+            }
+            report
         }
 
         fn bytes(&self) -> String {
@@ -819,6 +671,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concrete_turn_entry_runs_and_releases_its_task_registration() {
+        let Fixture {
+            dir, state, events, ..
+        } = Fixture::new(5);
+        let root = dir.path().to_path_buf();
+        let provider = Arc::new(MockLlmProvider::scripted([answer()]));
+        let executor = executor(provider.clone())
+            .bind_ready(&root, &Default::default(), None)
+            .await
+            .unwrap();
+        let registry = Arc::new(OperationRegistry::default());
+        let operation = registry.begin().unwrap();
+        let report = run_technical_turn(
+            &operation,
+            root,
+            state,
+            executor,
+            Box::new(GitTransactionPolicy::new()),
+            "Answer without editing".into(),
+            None,
+            events,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(settled(report.outcome.unwrap()).rounds_spent, 1);
+        assert!(report.continuation.is_some());
+        assert!(!report.cancelled);
+        assert!(report.diagnostic.is_none());
+        assert_eq!(provider.requests().len(), 1);
+        assert!(!registry.abort(operation.id()));
+        assert_eq!(registry.current_id(), Some(operation.id()));
+        drop(operation);
+        assert_eq!(registry.current_id(), None);
+    }
+
+    #[tokio::test]
     async fn research_then_answer_retains_context_and_transcript() {
         let mut f = Fixture::new(5);
         let provider = Arc::new(MockLlmProvider::scripted([
@@ -839,7 +728,20 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.contains("helper material")));
-        assert_eq!(f.state.history_reader()().len(), 2);
+        assert_eq!(f.read_rounds.len(), 2);
+        f.assert_restored();
+    }
+
+    #[tokio::test]
+    async fn zero_budget_refuses_before_transport() {
+        let mut f = Fixture::new(0);
+        let provider = Arc::new(MockLlmProvider::scripted([answer()]));
+        assert!(matches!(
+            f.run(provider.clone(), Box::new(GitTransactionPolicy::new()))
+                .await,
+            Err(RoundError::BudgetExhausted { spent: 0 })
+        ));
+        assert!(provider.requests().is_empty());
         f.assert_restored();
     }
 
@@ -871,7 +773,7 @@ mod tests {
         assert!(edit.error.is_none());
         assert_eq!(edit.changed_files, ["a.txt"]);
         assert_eq!(result.rounds_spent, 7);
-        let rounds = f.state.history_reader()();
+        let rounds = &f.read_rounds;
         let source = result.response_round.unwrap();
         assert!(source.identifies(&rounds[4]));
         assert!(!source.identifies(&rounds[6]));
@@ -926,64 +828,31 @@ mod tests {
                 .unwrap();
             if count == 2 {
                 assert_eq!(settled(outcome).rounds_spent, 3);
-                assert_eq!(f.state.history_reader()().len(), 1);
+                assert_eq!(f.read_rounds.len(), 1);
             } else {
                 let TurnOutcome::Exhausted { reason } = outcome else {
                     panic!("expected exhaustion")
                 };
                 assert!(reason.contains("2 additional"));
-                assert!(f.state.history_reader()().is_empty());
+                assert!(f.read_rounds.is_empty());
             }
             assert_eq!(provider.requests().len(), 3);
         }
     }
 
     #[tokio::test]
-    async fn repeated_satisfied_and_dead_end_research_stop_without_spending_the_whole_budget() {
+    async fn repeated_satisfied_research_stops_without_spending_the_whole_budget() {
         for dead_end in [false, true] {
             let mut f = Fixture::new(10);
-            let mut context_config = tauqe_core::config::ContextConfig::default();
-            context_config.token_budget = 1;
-            let research_config = if dead_end {
-                ResearchLoopConfig::from_context(&context_config)
-            } else {
-                ResearchLoopConfig::default()
-            };
-            let path = if dead_end { "helper.txt" } else { "a.txt" };
-            let provider = Arc::new(MockLlmProvider::scripted([research(path), research(path)]));
-            let mut executor = executor(provider.clone());
-            let (disk, worker) = TurnDisk::start(
-                f.dir.path().to_path_buf(),
-                Box::new(GitTransactionPolicy::new()),
-            );
-            let settlement = TurnWorkflow {
-                round: RoundWorkflow {
-                    executor: &mut executor,
-                    events: &f.events,
-                    cancel: &f.cancel,
-                },
-                disk: &disk,
-                research: &research_config,
-            }
-            .run(
-                &mut f.state,
-                RoundInput {
-                    task: "inspect",
-                    repo_root: f.dir.path(),
-                    project: &f.project,
-                    repo_map: None,
-                    repo_dirs: None,
-                    outer_docs: &[],
-                    brief: None,
-                    feedback: None,
-                    reason: None,
-                    staged: None,
-                },
-            )
-            .await;
-            drop(disk);
-            worker.finish().await;
-            assert_eq!(settled(settlement.outcome.unwrap()).rounds_spent, 2);
+            let path = if dead_end { "missing.txt" } else { "a.txt" };
+            let provider = Arc::new(MockLlmProvider::scripted([
+                research(path),
+                if dead_end { answer() } else { research(path) },
+            ]));
+            let report = f
+                .settle(provider.clone(), Box::new(GitTransactionPolicy::new()))
+                .await;
+            assert_eq!(settled(report.outcome.unwrap()).rounds_spent, 2);
             assert_eq!(provider.requests().len(), 2);
         }
     }
@@ -1002,7 +871,7 @@ mod tests {
             panic!("expected defect")
         };
         assert!(!response.commands().is_empty());
-        assert!(f.state.history_reader()().is_empty());
+        assert!(f.read_rounds.is_empty());
         f.assert_restored();
     }
 
@@ -1079,7 +948,7 @@ mod tests {
             &self,
             request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            cancel: watch::Receiver<bool>,
+            cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             if self.provider.requests().len() == 1 {
                 assert_eq!(std::fs::read(self.root.join("a.txt")).unwrap(), b"broken\n");
@@ -1110,7 +979,7 @@ mod tests {
             std::fs::write(root.join("helper.txt"), b"other developer work\n").unwrap();
             f.state
                 .context
-                .add_file("helper.txt", ContextAccess::Editable)
+                .add_auto_file("helper.txt", ContextAccess::Editable)
                 .unwrap();
             let change = serde_json::json!({
                 "message": "change both files",
@@ -1141,19 +1010,21 @@ mod tests {
                 std::fs::read(root.join("helper.txt")).unwrap(),
                 b"other developer work\n"
             );
-            match settlement.rollback.as_ref() {
-                RollbackOutcome::RestoredByPolicy if !refuse_rollback => f.assert_restored(),
-                RollbackOutcome::RestoredFromBackup {
+            match &settlement.settlement {
+                Settlement::RolledBack(RollbackOutcome::RestoredByPolicy) if !refuse_rollback => {
+                    f.assert_restored()
+                }
+                Settlement::RolledBack(RollbackOutcome::RestoredFromBackup {
                     policy_error: Some(error),
-                } if !conflict && refuse_rollback => {
+                }) if !conflict && refuse_rollback => {
                     assert!(error.contains("index.lock"), "{error}");
                     assert_eq!(f.bytes(), "developer work\n");
                     assert!(root.join(".tauqe/active-transaction.json").exists());
                 }
-                RollbackOutcome::Incomplete {
+                Settlement::RolledBack(RollbackOutcome::Incomplete {
                     policy_error: Some(error),
                     backup_error,
-                } if conflict => {
+                }) if conflict => {
                     assert!(error.contains("index.lock"), "{error}");
                     assert!(backup_error.contains("`a.txt`"), "{backup_error}");
                     assert!(root.join("a.txt").is_dir());
@@ -1165,7 +1036,7 @@ mod tests {
 
     struct CancelAfterApplication {
         first: MockLlmProvider,
-        cancel: watch::Sender<bool>,
+        cancel: StopSource,
         root: std::path::PathBuf,
     }
 
@@ -1178,7 +1049,7 @@ mod tests {
             &self,
             request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            cancel: watch::Receiver<bool>,
+            cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             if self.first.requests().is_empty() {
                 self.first.stream(request, tx, cancel).await
@@ -1187,7 +1058,7 @@ mod tests {
                     std::fs::read_to_string(self.root.join("a.txt")).unwrap(),
                     "broken\n"
                 );
-                self.cancel.send(true).unwrap();
+                self.cancel.request_hard();
                 Ok(())
             }
         }
@@ -1198,8 +1069,8 @@ mod tests {
     async fn cancellation_after_temporary_application_restores_before_returning() {
         let mut f = Fixture::new(5);
         f.verification();
-        let (tx, rx) = watch::channel(false);
-        f.cancel = CancellationToken::from_receiver(rx);
+        let tx = StopSource::new();
+        f.cancel = tx.token().hard_cancellation();
         let provider = CancelAfterApplication {
             first: MockLlmProvider::scripted([patch("developer work", "broken")]),
             cancel: tx,
@@ -1211,14 +1082,20 @@ mod tests {
             Err(RoundError::Execution(ExecutionError::Cancelled))
         ));
         f.assert_restored();
-        assert_eq!(f.state.history_reader()().len(), 1);
+        assert_eq!(f.read_rounds.len(), 1);
     }
+
+    type WriteGate = (
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    );
 
     #[derive(Default)]
     struct FinalizationFailure {
         direct: tauqe_core::workflow::DirectApplyPolicy,
         rollbacks: Arc<std::sync::atomic::AtomicUsize>,
-        write_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        write_gate: Option<WriteGate>,
+        writes: tauqe_core::blocking::StartedOperations,
     }
 
     #[async_trait::async_trait]
@@ -1230,7 +1107,7 @@ mod tests {
             context: &ContextManager,
             edits: &[tauqe_core::edits::EditOperation],
             staged: Option<&tauqe_core::edits::StagedEditsState>,
-            cancel: Option<&watch::Receiver<bool>>,
+            cancel: Option<&tauqe_core::stop::HardCancellation>,
         ) -> tauqe_core::edits::StageEditsResult {
             self.direct
                 .staging(root, project, context, edits, staged, cancel)
@@ -1243,9 +1120,21 @@ mod tests {
             context: &mut ContextManager,
             batches: &[&[tauqe_core::edits::EditOperation]],
         ) -> anyhow::Result<Vec<String>> {
-            if let Some((started, release)) = &self.write_gate {
-                started.notify_one();
-                release.notified().await;
+            if let Some((started, release)) = self.write_gate.take() {
+                let path = root.join("a.txt");
+                let write = self
+                    .writes
+                    .start(
+                        move || {
+                            std::fs::write(path, b"broken\n").unwrap();
+                            started.notify_one();
+                            release.lock().unwrap().recv().unwrap();
+                        },
+                        None,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                write.take_result().await.unwrap()?;
+                return Ok(vec!["a.txt".into()]);
             }
             self.direct
                 .apply_temporary_batches(root, project, context, batches)
@@ -1259,10 +1148,51 @@ mod tests {
         ) -> anyhow::Result<Option<String>> {
             anyhow::bail!("finalization failed")
         }
-        async fn rollback(&mut self, _: &Path) -> anyhow::Result<bool> {
+        async fn stop_and_wait(&mut self) -> anyhow::Result<()> {
+            self.writes.close();
+            anyhow::ensure!(
+                self.writes.wait().await.unconfirmed == 0,
+                "write was not confirmed"
+            );
+            self.direct.stop_and_wait().await
+        }
+        async fn finalize_resumable(
+            &mut self,
+            root: &Path,
+            changed_files: &[String],
+            summary: &str,
+            cancel: Option<&tauqe_core::stop::HardCancellation>,
+        ) -> anyhow::Result<tauqe_core::workflow::policy::FinalizationStatus> {
+            use tauqe_core::workflow::policy::FinalizationStatus;
+
+            if cancel.is_some_and(tauqe_core::stop::HardCancellation::is_cancelled) {
+                return Ok(FinalizationStatus::NotAdmitted);
+            }
+            self.stop_and_wait().await?;
+            Ok(FinalizationStatus::Completed {
+                result: self
+                    .apply_final(root, changed_files, summary)
+                    .await
+                    .map_err(|error| error.to_string()),
+                cancelled: cancel.is_some_and(tauqe_core::stop::HardCancellation::is_cancelled),
+            })
+        }
+        async fn finalization_result(
+            &mut self,
+            _: &Path,
+            _: &[String],
+            _: &str,
+            _: Option<&tauqe_core::stop::HardCancellation>,
+        ) -> anyhow::Result<tauqe_core::workflow::policy::FinalizationStatus> {
+            Ok(tauqe_core::workflow::policy::FinalizationStatus::NotAdmitted)
+        }
+        async fn rollback(
+            &mut self,
+            _: &Path,
+        ) -> anyhow::Result<tauqe_core::workflow::policy::PolicyRollback> {
             self.rollbacks
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(false)
+            Ok(tauqe_core::workflow::policy::PolicyRollback::NoCheckpoint)
         }
     }
 
@@ -1273,7 +1203,10 @@ mod tests {
         let policy = FinalizationFailure::default();
         let rollbacks = policy.rollbacks.clone();
         let settlement = f.settle(Arc::new(provider), Box::new(policy)).await;
-        assert_eq!(*settlement.rollback, RollbackOutcome::FinalizationAttempted);
+        assert!(matches!(
+            settlement.settlement,
+            Settlement::Finalized { .. }
+        ));
         let result = settled(settlement.outcome.unwrap());
         let edit = result.edit.unwrap();
         assert_eq!(edit.verification, Some(VerificationVerdict::NotConfigured));
@@ -1301,7 +1234,7 @@ mod tests {
             &self,
             request: LlmRequest<'_>,
             tx: mpsc::Sender<StreamEvent>,
-            cancel: watch::Receiver<bool>,
+            cancel: tauqe_core::stop::HardCancellation,
         ) -> tauqe_core::providers::ProviderResult {
             if self.first.requests().is_empty() {
                 self.first.stream(request, tx, cancel).await
@@ -1315,188 +1248,218 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn forced_abort_waits_for_disk_work_and_restores_once() {
-        use crate::api::{Application, InteractiveTaskError, InteractiveTaskOutcome};
         use std::sync::atomic::Ordering;
         use std::time::Duration;
         use tokio::sync::Notify;
 
-        for during_write in [true, false] {
+        for (during_write, drop_waiter) in [(true, false), (false, false), (true, true)] {
             let mut f = Fixture::new(5);
             f.verification();
             let root = f.dir.path().to_path_buf();
-            let (history, _) = mpsc::unbounded_channel();
-            let app = Application::for_repository(Default::default(), root.clone(), history);
-            let operation = Arc::new(app.try_begin_operation().unwrap());
             let reached = Arc::new(Notify::new());
-            let release = Arc::new(Notify::new());
+            let (release, held) = std::sync::mpsc::channel();
             let provider = Arc::new(ParkDuringRepair {
                 first: MockLlmProvider::scripted([patch("developer work", "broken")]),
                 repairing: reached.clone(),
             });
             let policy = FinalizationFailure {
-                write_gate: during_write.then(|| (reached.clone(), release.clone())),
+                write_gate: during_write
+                    .then(|| (reached.clone(), Arc::new(std::sync::Mutex::new(held)))),
                 ..Default::default()
             };
             let rollbacks = policy.rollbacks.clone();
-            let (disk, worker) = TurnDisk::start(root.clone(), Box::new(policy));
-            let mut state = f.state;
-            let read_rounds = state.history_reader();
-            let project = f.project;
-            let cancel = CancellationToken::from_receiver(operation.cancel_receiver());
-            let task = app
-                .start_interactive_task(operation.clone(), move |_| async move {
-                    let mut executor = executor(provider);
-                    TurnWorkflow {
-                        round: RoundWorkflow {
-                            executor: &mut executor,
-                            events: &EventSink::noop(),
-                            cancel: &cancel,
-                        },
-                        disk: &disk,
-                        research: &ResearchLoopConfig::default(),
-                    }
-                    .run(
+            let state = std::mem::replace(
+                &mut f.state,
+                TurnState::new(ContextManager::new(root.clone()), grant(), None, Some(1)),
+            );
+            let project = f.project.clone();
+            let cancel = f.cancel.clone();
+            let executor = executor(provider)
+                .bind_ready(&root, &Default::default(), None)
+                .await
+                .unwrap();
+            let read_rounds = executor.history_reader();
+            let registry = Arc::new(OperationRegistry::default());
+            let operation = registry.begin().unwrap();
+            let operation_id = operation.id();
+            let hold = operation.retain_supervision().unwrap();
+            let fallback = state.context.clone();
+            let policy = OwnedApplyPolicy::bind(Box::new(policy), &root, cancel.clone());
+            let work_policy = policy.clone();
+            let work_cancel = cancel.clone();
+            let task = tokio::spawn(async move {
+                let computation = tokio::spawn(async move {
+                    let mut state = state;
+                    let mut executor = executor;
+                    let outcome = TurnWorkflow::run_direct(
+                        &mut executor,
+                        &EventSink::noop(),
+                        &work_cancel,
+                        &project,
                         &mut state,
-                        RoundInput {
+                        TurnInput {
                             task: "Update the file",
                             repo_root: &root,
-                            project: &project,
-                            repo_map: None,
-                            repo_dirs: None,
-                            outer_docs: &[],
                             brief: None,
                             feedback: None,
                             reason: None,
-                            staged: None,
                         },
+                        &work_policy,
                     )
                     .await;
-                    InteractiveTaskOutcome {
-                        result: Err(ExecutionError::Other("Expected forced abort".into())),
-                        context: state.context,
-                    }
-                })
-                .unwrap()
-                .with_disk_worker(worker);
+                    (outcome, state, executor)
+                });
+                supervise_technical_task(computation, policy, cancel, None, fallback, hold)
+                    .await
+                    .unwrap()
+            });
             tokio::time::timeout(Duration::from_secs(10), reached.notified())
                 .await
                 .unwrap();
             let file = f.dir.path().join("a.txt");
-            let temporary = if during_write {
-                "developer work\n"
-            } else {
-                "broken\n"
-            };
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), temporary);
-            assert!(app.abort_operation(operation.id()));
-            let mut joined = Box::pin(task.join());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken\n");
+            assert!(registry.abort(operation_id));
+            if drop_waiter {
+                task.abort();
+                assert!(task.await.err().unwrap().is_cancelled());
+                drop(operation);
+                assert_eq!(registry.current_id(), Some(operation_id));
+                assert!(registry.begin().is_err());
+                assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while registry.current_id().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(read_rounds().len(), 1);
+                f.assert_restored();
+                assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            let mut joined = Box::pin(task);
             if during_write {
                 assert!(tokio::time::timeout(Duration::from_millis(20), &mut joined)
                     .await
                     .is_err());
                 assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
-                release.notify_one();
+                release.send(()).unwrap();
             }
             let result = tokio::time::timeout(Duration::from_secs(10), joined)
                 .await
+                .unwrap()
                 .unwrap();
-            assert!(
-                matches!(result.task, Err(InteractiveTaskError::Interrupted(cause)) if cause.is_cancelled())
-            );
-            assert!(
-                matches!(result.disk, Some(DiskSettlement(DiskOutcome::RolledBack(outcome)))
-                if *outcome == RollbackOutcome::RestoredFromBackup { policy_error: None })
-            );
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "developer work\n");
-            assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                result.outcome,
+                Err(RoundError::Execution(ExecutionError::Cancelled))
+            ));
+            assert!(result.continuation.is_none());
+            assert!(matches!(
+                result.settlement,
+                Settlement::RolledBack(RollbackOutcome::RestoredFromBackup { policy_error: None })
+            ));
             assert_eq!(read_rounds().len(), 1);
-            assert!(app.try_begin_operation().is_err());
+            f.assert_restored();
+            assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
         }
     }
 
     #[tokio::test]
     async fn finalized_disk_result_is_independent_of_task_interruption() {
-        use crate::api::{Application, InteractiveTaskError, InteractiveTaskOutcome};
-        use crate::workflows::repl::{ReplResult, ReplText};
         use std::time::Duration;
 
         for interrupt in [false, true] {
             let Fixture {
                 dir,
-                mut state,
+                state,
                 project,
                 events,
                 ..
             } = Fixture::new(5);
             let root = dir.path().to_path_buf();
-            let (history, _) = mpsc::unbounded_channel();
-            let app = Application::for_repository(Default::default(), root.clone(), history);
-            let operation = Arc::new(app.try_begin_operation().unwrap());
-            let cancel = CancellationToken::from_receiver(operation.cancel_receiver());
-            let (disk, worker) =
-                TurnDisk::start(root.clone(), Box::new(GitTransactionPolicy::new()));
+            let cancel = CancellationToken::never();
             let (finalized, ready) = oneshot::channel();
-            let task = app
-                .start_interactive_task(operation.clone(), move |_| async move {
-                    let provider = MockLlmProvider::scripted([patch("developer work", "accepted")]);
-                    let mut executor = executor(Arc::new(provider));
-                    let settlement = TurnWorkflow {
-                        round: RoundWorkflow {
-                            executor: &mut executor,
-                            events: &events,
-                            cancel: &cancel,
-                        },
-                        disk: &disk,
-                        research: &ResearchLoopConfig::default(),
-                    }
-                    .run(
+            let executor = executor(Arc::new(MockLlmProvider::scripted([patch(
+                "developer work",
+                "accepted",
+            )])))
+            .bind_ready(&root, &Default::default(), None)
+            .await
+            .unwrap();
+            let read_rounds = executor.history_reader();
+            let registry = Arc::new(OperationRegistry::default());
+            let operation = registry.begin().unwrap();
+            let hold = operation.retain_supervision().unwrap();
+            let fallback = state.context.clone();
+            let policy = OwnedApplyPolicy::bind(
+                Box::new(GitTransactionPolicy::new()),
+                &root,
+                cancel.clone(),
+            );
+            let work_policy = policy.clone();
+            let work_cancel = cancel.clone();
+            let task = tokio::spawn(async move {
+                let computation = tokio::spawn(async move {
+                    let mut state = state;
+                    let mut executor = executor;
+                    let outcome = TurnWorkflow::run_direct(
+                        &mut executor,
+                        &events,
+                        &work_cancel,
+                        &project,
                         &mut state,
-                        RoundInput {
+                        TurnInput {
                             task: "Update the file",
                             repo_root: &root,
-                            project: &project,
-                            repo_map: None,
-                            repo_dirs: None,
-                            outer_docs: &[],
                             brief: None,
                             feedback: None,
                             reason: None,
-                            staged: None,
                         },
+                        &work_policy,
                     )
                     .await;
-                    let edit = settled(settlement.outcome.unwrap()).edit.unwrap();
-                    finalized.send(edit.commit_hash.clone().unwrap()).unwrap();
+                    let TurnOutcome::Settled(artifact) = outcome.as_ref().unwrap() else {
+                        panic!("expected a finalized edit")
+                    };
+                    let hash = artifact.edit.as_ref().unwrap().commit_hash.clone().unwrap();
+                    finalized.send(hash).unwrap();
                     if interrupt {
                         std::future::pending::<()>().await;
                     }
-                    InteractiveTaskOutcome {
-                        result: Ok(ReplResult::Edit {
-                            text: ReplText::Environment("done".into()),
-                            outcome: edit,
-                        }),
-                        context: state.context,
-                    }
-                })
-                .unwrap()
-                .with_disk_worker(worker);
+                    (outcome, state, executor)
+                });
+                supervise_technical_task(computation, policy, cancel, None, fallback, hold)
+                    .await
+                    .unwrap()
+            });
             let hash = tokio::time::timeout(Duration::from_secs(10), ready)
                 .await
                 .unwrap()
                 .unwrap();
             if interrupt {
-                assert_eq!(app.cancel_active_operation(), Some(operation.id()));
-                assert!(app.abort_operation(operation.id()));
+                assert!(registry.abort(operation.id()));
             }
-            let report = task.join().await;
+            let report = task.await.unwrap();
             if interrupt {
-                assert!(
-                    matches!(report.task, Err(InteractiveTaskError::Interrupted(cause)) if cause.is_cancelled())
-                );
+                assert!(matches!(
+                    report.outcome,
+                    Err(RoundError::Execution(ExecutionError::Cancelled))
+                ));
+                assert!(report.continuation.is_none());
             } else {
-                assert!(report.task.unwrap().result.is_ok());
+                let artifact = settled(report.outcome.unwrap());
+                assert_eq!(
+                    artifact.edit.unwrap().commit_hash.as_deref(),
+                    Some(hash.as_str())
+                );
             }
-            let edit = report.disk.unwrap().finalized_edit().unwrap();
+            let edit = match &report.settlement {
+                Settlement::Finalized { edit, .. } => edit.clone(),
+                other => panic!("expected finalized edit: {other:?}"),
+            };
+            assert_eq!(read_rounds().len(), 1);
             assert!(edit.applied);
             assert_eq!(edit.commit_hash.as_deref(), Some(hash.as_str()));
             assert_eq!(

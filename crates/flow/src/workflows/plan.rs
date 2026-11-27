@@ -15,15 +15,14 @@ pub use preparation::StepPreparationError;
 pub(crate) use run::run_batch;
 
 use crate::api::{
-    ApplicationObserver, ContextClearScope, ContextError, OperationGuard, PlanBatchOptions,
-    PlanBatchStarted, PlanPipelineStarted, PlanQueueError, PlanQueueFailure,
+    ApplicationObserver, ContextError, OperationGuard, PlanBatchOptions, PlanBatchStarted,
+    PlanPipelineStarted, PlanQueueError, PlanQueueFailure,
 };
 use crate::application::configuration::Configuration;
-use crate::application::dialogue::DialogueSession;
 use crate::application::documents::Documents;
 use crate::application::focus::FocusSession;
 use crate::application::history::HistorySession;
-use crate::application::preflight::{run_preflight_verification, PreflightVerdict};
+use crate::application::preflight::{run_batch_preflight, PreflightVerdict};
 use crate::application::PlanExecutionEnvironment;
 use crate::workflows::step::run::StepResources;
 use std::path::Path;
@@ -69,15 +68,11 @@ pub struct PlanExecutionError {
 pub(crate) struct PlanResources {
     pub(crate) step: StepResources,
     pub(crate) history: HistorySession,
-    pub(crate) dialogue: Arc<DialogueSession>,
 }
 
 impl PlanResources {
     async fn clear_transient_context(&self) -> Result<ContextState, ContextError> {
-        self.step
-            .context
-            .clear_context(&self.dialogue, ContextClearScope::Transient)
-            .await
+        self.step.context.clear_transient_context().await
     }
 
     pub(crate) async fn launch_batch(
@@ -106,10 +101,20 @@ impl PlanResources {
             observer.as_ref(),
         )
         .await?;
+        if !self
+            .step
+            .context
+            .activate_manual_publication(&operation, observer.clone())
+        {
+            return Err(PlanLaunchError::Verification(
+                "Could not bind plan context publication".into(),
+            ));
+        }
         let plan_id = started.plan_id.clone();
         let execution = PlanExecutionEnvironment::new(configuration.snapshot().await, &operation);
         tokio::spawn(async move {
             run::run_batch(&self, &execution, &plan_id, &operation, &options, observer).await;
+            self.step.context.close_manual_publication(&operation);
         });
         Ok(started)
     }
@@ -139,10 +144,20 @@ impl PlanResources {
             observer.as_ref(),
         )
         .await?;
+        if !self
+            .step
+            .context
+            .activate_manual_publication(&operation, observer.clone())
+        {
+            return Err(PlanLaunchError::Verification(
+                "Could not bind pipeline context publication".into(),
+            ));
+        }
         let plan_ids = started.plan_ids.clone();
         let execution = PlanExecutionEnvironment::new(configuration.snapshot().await, &operation);
         tokio::spawn(async move {
             queue::run_pipeline(&self, &execution, plan_ids, model, &operation, observer).await;
+            self.step.context.close_manual_publication(&operation);
         });
         Ok(started)
     }
@@ -189,7 +204,7 @@ async fn verify_launch(
     observer: &dyn ApplicationObserver,
     pipeline: bool,
 ) -> Result<String, PlanLaunchError> {
-    match run_preflight_verification(root, operation.cancel_receiver()).await {
+    match run_batch_preflight(root, operation, observer).await {
         PreflightVerdict::Passed => {}
         PreflightVerdict::Cancelled => {
             let scope = if pipeline { "pipeline" } else { "batch" };

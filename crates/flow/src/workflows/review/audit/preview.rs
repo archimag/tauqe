@@ -6,7 +6,7 @@ use crate::application::context::ContextSession;
 use std::path::Path;
 use tauqe_core::{
     config::AppConfig,
-    review::window::{expand_window, ReviewWindow, WindowBudgets, WindowContext},
+    review::window::{expand_window, ReviewWindow},
 };
 struct ConfiguredGroup {
     title: String,
@@ -35,17 +35,14 @@ impl AuditResources {
         paths: &[String],
     ) -> Result<ReviewPreview, ReviewPreviewError> {
         let config = configuration.snapshot().await.config;
-        let budgets = WindowBudgets {
-            files_tokens: config.context.token_budget,
-        };
         match preset_name(preset) {
             Some(name) => {
                 let groups = configured_groups(&config, name)
                     .ok_or_else(|| ReviewPreviewError::PresetNotFound(name.into()))?;
                 let root = self.context.repository_root().await;
-                preview_preset(&root, &groups, budgets).await
+                preview_preset(&root, &groups).await
             }
-            None => preview_single(&self.context, paths, budgets).await,
+            None => preview_single(&self.context, paths).await,
         }
         .map_err(ReviewPreviewError::Read)
     }
@@ -74,29 +71,12 @@ fn configured_groups(config: &AppConfig, name: &str) -> Option<Vec<ConfiguredGro
 async fn preview_single(
     context: &ContextSession,
     path_patterns: &[String],
-    budgets: WindowBudgets,
 ) -> Result<ReviewPreview, String> {
     let context_snapshot = context.context_for_turn().await;
     let repo_root = context_snapshot.repo_root().to_path_buf();
-    let context_tokens = context_snapshot.get_state().total_estimated_tokens as usize;
-    // Reading the active context touches the file system, so it runs on the
-    // blocking pool exactly as the launch reads it.
-    let files = tokio::task::spawn_blocking(move || context_snapshot.read_context_files())
+    let expanded = expand_window(&repo_root, Some(context_snapshot), path_patterns)
         .await
-        .map_err(|err| format!("blocking task failed: {err}"))
-        .map_err(|err| format!("Failed to read the active context: {}", err))?;
-
-    let expanded = expand_window(
-        &repo_root,
-        WindowContext {
-            files: &files,
-            tokens: context_tokens,
-        },
-        path_patterns,
-        budgets,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
 
     Ok(ReviewPreview {
         window: expanded.window,
@@ -107,19 +87,17 @@ async fn preview_single(
 /// Measures every configured group and folds the windows into one projection.
 ///
 /// Groups audit their own slices, so the aggregate sums the counters of the
-/// per-group windows: the confirmation a client renders then describes the whole
-/// session instead of one slice of it.
+/// per-group windows: the confirmation describes the whole session.
 async fn preview_preset(
     repo_root: &Path,
     groups: &[ConfiguredGroup],
-    budgets: WindowBudgets,
 ) -> Result<ReviewPreview, String> {
     let mut aggregated = ReviewWindow::default();
     let mut projected = Vec::with_capacity(groups.len());
     for group in groups {
         // A preset launch reads no interactive context, so every group expands
         // from an empty base exactly as the grouped audit does.
-        let expanded = expand_window(repo_root, WindowContext::empty(), &group.paths, budgets)
+        let expanded = expand_window(repo_root, None, &group.paths)
             .await
             .map_err(|e| e.to_string())?;
         aggregated.accumulate(&expanded.window);
@@ -128,9 +106,8 @@ async fn preview_preset(
             window: expanded.window,
         });
     }
-    // Every group window obeys its own configured file budget, so the aggregate
-    // allowance is what each group may spend; comparing a summed spend against a
-    // single group's limit would misreport the whole session.
+    // Expansion keeps every readable match. Request admission, not preview,
+    // decides whether the full input fits the shared model-request limit.
     Ok(ReviewPreview {
         window: aggregated,
         groups: projected,
@@ -167,5 +144,31 @@ mod tests {
             matches!(app.preview_review(Some("missing"), &[]).await, Err(ReviewPreviewError::PresetNotFound(name)) if name == "missing")
         );
         assert_eq!(app.active_operation_id(), Some(operation.id()));
+    }
+
+    #[tokio::test]
+    async fn preset_preview_counts_every_group_without_a_file_allowance() {
+        let root = tempfile::tempdir().unwrap();
+        tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
+        for path in ["a.rs", "b.rs"] {
+            std::fs::write(root.path().join(path), "fn sample() {}\n").unwrap();
+        }
+        tauqe_core::git::cmd::stage_files(root.path(), &["a.rs".into(), "b.rs".into()]).unwrap();
+        let mut config: AppConfig = toml::from_str(
+            "[[review.presets]]\nname = 'audit'\n[[review.presets.groups]]\nname = 'first'\npaths = ['a.rs']\n[[review.presets.groups]]\nname = 'second'\npaths = ['b.rs']\n",
+        ).unwrap();
+        config.request.max_input_tokens = 1;
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        let app = Application::for_repository(config, root.path().into(), sender);
+        let preview = app.preview_review(Some("audit"), &[]).await.unwrap();
+        assert_eq!(preview.groups.len(), 2);
+        assert_eq!(preview.window.selected_files, 2);
+        assert_eq!(preview.window.omitted_by_budget, 0);
+        assert_eq!(preview.window.files_token_budget, 0);
+        assert!(preview
+            .groups
+            .iter()
+            .all(|group| group.window.selected_files == 1));
+        assert!(app.active_operation_id().is_none());
     }
 }

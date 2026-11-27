@@ -41,6 +41,10 @@ review criteria, not an inventory of current RPC routes or event fields.
 - Reuse core execution mechanisms instead of copying turn logic into each
   scenario. The scenario determines its target, permissions, continuation,
   and durable result; the engine executes the prepared work.
+- Publish the model and effort of an isolated attempt from its prepared
+  operation-bound execution, never by resolving a second configuration snapshot.
+  Preview reports the complete audit window; only full-request admission may
+  refuse its size, and a failed group remains failed even if later groups run.
 - Reuse queue mechanics where sequencing is the same. Keep plan and review
   decisions about readiness, failure, replanning, and closure with their
   respective scenarios rather than imposing one domain's rules on another.

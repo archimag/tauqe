@@ -2,10 +2,12 @@
 //!
 //! `review/preview` describes the composition of the window `review/start`
 //! would audit without launching it: how many files the active context
-//! contributes, how many the declared paths matched, how many survived the
-//! configured limits, and how many the batch and token budgets dropped. The
-//! contract mirrors `review/get`: a read RPC claims no operation slot, writes no
-//! active pointer, mutates no context, and calls no model, while every
+//! contributes, how many the declared paths matched, how many readable files
+//! enter the window, and how many matches cannot be read. This
+//! does not admit the complete model request: launch checks the shared input
+//! limit before provider I/O. The contract mirrors `review/get`: a read RPC
+//! claims no operation slot, writes no active pointer, mutates no context, and
+//! calls no model, while every
 //! repository listing and file read runs on the blocking pool so the stdin read
 //! loop keeps accepting requests.
 
@@ -164,7 +166,7 @@ mod tests {
     /// A preset projection reports every group and folds their counters into one
     /// aggregate, so the developer sees the whole coverage of the launch.
     #[tokio::test]
-    async fn a_preset_projection_aggregates_every_group_and_reports_what_was_dropped() {
+    async fn a_preset_projection_aggregates_every_complete_group() {
         let root = scratch_root("review-preview-preset");
         init_repository_with_files(
             &root,
@@ -180,17 +182,9 @@ mod tests {
                 ],
             }],
         }));
-        // One matched file per group fits the file token budget, so the
-        // projection must report the dropped files per group and in aggregate.
-        let content_tokens =
-            tauqe_core::prompt::estimate_tokens_from_bytes("pub fn target() {}\n".len() as u64)
-                as usize;
-        let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
-            "alpha/a.rs",
-            tauqe_core::context::ContextAccess::ReadOnly,
-        );
-        config.context.token_budget = content_tokens.saturating_add(wrapper);
-        let budget = config.context.token_budget;
+        // Preview reports the complete window even when the assembled request
+        // would exceed the shared input limit.
+        config.request.max_input_tokens = 1;
         let state = test_state(&root, config);
 
         let result = projection(
@@ -206,19 +200,19 @@ mod tests {
         assert_eq!(result.groups[1].title, "Beta");
         for group in &result.groups {
             assert_eq!(group.window.matched_files, 2);
-            assert_eq!(group.window.selected_files, 1);
-            assert_eq!(group.window.omitted_by_budget, 1);
+            assert_eq!(group.window.selected_files, 2);
+            assert_eq!(group.window.omitted_by_budget, 0);
         }
 
         let window = &result.window;
         assert_eq!(window.context_files, 0, "a preset launch reads no context");
         assert_eq!(window.matched_files, 4);
-        assert_eq!(window.selected_files, 2);
-        assert_eq!(window.omitted_by_budget, 2);
-        assert_eq!(window.omitted_files, 2);
-        assert_eq!(window.files_token_budget, budget.saturating_mul(2));
+        assert_eq!(window.selected_files, 4);
+        assert_eq!(window.omitted_by_budget, 0);
+        assert_eq!(window.omitted_files, 0);
+        assert_eq!(window.files_token_budget, 0);
         assert!(window.selected_tokens > 0);
-        assert!(window.is_truncated());
+        assert!(!window.is_truncated());
 
         assert!(!state.is_operation_active());
 

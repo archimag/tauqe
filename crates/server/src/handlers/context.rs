@@ -36,9 +36,9 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
             params.path,
             context_access_domain(params.access),
             params.layer.map(context_layer_domain),
-            &Publisher {
+            Arc::new(Publisher {
                 out: state.out.clone(),
-            },
+            }),
         )
         .await
     {
@@ -75,9 +75,9 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
         .add_context_pattern(
             params.pattern,
             context_access_domain(params.access),
-            &Publisher {
+            Arc::new(Publisher {
                 out: state.out.clone(),
-            },
+            }),
         )
         .await
     {
@@ -110,9 +110,9 @@ pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Respo
         .application
         .remove_context_file(
             params.path,
-            &Publisher {
+            Arc::new(Publisher {
                 out: state.out.clone(),
-            },
+            }),
         )
         .await
     {
@@ -142,9 +142,9 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
         .set_context_access(
             params.path,
             context_access_domain(params.access),
-            &Publisher {
+            Arc::new(Publisher {
                 out: state.out.clone(),
-            },
+            }),
         )
         .await
     {
@@ -179,9 +179,9 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
         .application
         .clear_manual_context(
             params.layer.map(context_layer_domain),
-            &Publisher {
+            Arc::new(Publisher {
                 out: state.out.clone(),
-            },
+            }),
         )
         .await
     {
@@ -251,7 +251,7 @@ mod tests {
         std::fs::write(&file_path, "pub fn hello() {}\n").unwrap();
         state
             .mutate_context(|context| {
-                context.add_file("lib.rs", tauqe_core::context::ContextAccess::ReadOnly)
+                context.add_auto_file("lib.rs", tauqe_core::context::ContextAccess::ReadOnly)
             })
             .await
             .expect("fixture context mutation runs")
@@ -329,6 +329,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_context_rpc_events_match_get_without_duplicate_revisions() {
+        let dir = TestDir::new();
+        let (state, mut rx) = test_state(&dir);
+        std::fs::write(dir.path().join("manual.rs"), "fn manual() {}\n").unwrap();
+        let request = |id, method: &str, params| Request {
+            id: RequestId::Number(id),
+            method: method.into(),
+            params,
+        };
+        let add = serde_json::to_value(ContextAddParams {
+            path: "manual.rs".into(),
+            access: ContextAccess::ReadOnly,
+            layer: Some(ContextLayer::User),
+        })
+        .unwrap();
+        let result = handle_context_add(request(1, methods::CONTEXT_ADD, Some(add)), &state).await;
+        assert!(result.error.is_none());
+        let first: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["method"], events::CONTEXT_CHANGED);
+        let get = handle_context_get(request(2, methods::CONTEXT_GET, None), &state).await;
+        assert_eq!(first["params"]["state"], get.result.unwrap());
+        assert_eq!(first["params"]["state"]["items"][0]["layer"], "user");
+        assert_eq!(first["params"]["state"]["items"][0]["access"], "read_only");
+        assert!(rx.try_recv().is_err(), "one mutation publishes once");
+
+        let set = |id, access| {
+            request(
+                id,
+                methods::CONTEXT_SET_ACCESS,
+                Some(
+                    serde_json::to_value(ContextSetAccessParams {
+                        path: "manual.rs".into(),
+                        access,
+                    })
+                    .unwrap(),
+                ),
+            )
+        };
+        assert!(
+            handle_context_set_access(set(3, ContextAccess::ReadOnly), &state)
+                .await
+                .error
+                .is_none()
+        );
+        assert!(rx.try_recv().is_err(), "a no-op does not publish");
+        assert!(
+            handle_context_set_access(set(4, ContextAccess::Editable), &state)
+                .await
+                .error
+                .is_none()
+        );
+        let last: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(last["method"], events::CONTEXT_CHANGED);
+        let get = handle_context_get(request(5, methods::CONTEXT_GET, None), &state).await;
+        assert_eq!(last["params"]["state"], get.result.unwrap());
+        assert_eq!(last["params"]["state"]["items"][0]["layer"], "user");
+        assert_eq!(last["params"]["state"]["items"][0]["access"], "editable");
+        assert!(
+            last["params"]["state"]["revision"].as_u64().unwrap()
+                > first["params"]["state"]["revision"].as_u64().unwrap()
+        );
+        assert!(rx.try_recv().is_err(), "one access change publishes once");
+    }
+
+    #[tokio::test]
     async fn test_handle_context_add_pattern() {
         let dir = TestDir::new();
         tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
@@ -390,7 +455,7 @@ mod tests {
 
         state
             .mutate_context(|context| {
-                context.add_file("test.rs", tauqe_core::context::ContextAccess::ReadOnly)
+                context.add_auto_file("test.rs", tauqe_core::context::ContextAccess::ReadOnly)
             })
             .await
             .expect("fixture context mutation runs")
@@ -477,8 +542,13 @@ mod tests {
 
         // Populate user and auto
         state
-            .mutate_context(|context| {
-                context.add_file("user.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            .application
+            .test_mutate_manual_context(|context| {
+                context.add_file(
+                    "user.rs",
+                    tauqe_core::context::ContextAccess::ReadOnly,
+                    tauqe_core::context::ContextLayer::User,
+                )
             })
             .await
             .expect("fixture context mutation runs")
@@ -718,8 +788,13 @@ mod tests {
             .expect("fixture context mutation runs")
             .unwrap();
         state
-            .mutate_context(|context| {
-                context.add_file("user.rs", tauqe_core::context::ContextAccess::ReadOnly)
+            .application
+            .test_mutate_manual_context(|context| {
+                context.add_file(
+                    "user.rs",
+                    tauqe_core::context::ContextAccess::ReadOnly,
+                    tauqe_core::context::ContextLayer::User,
+                )
             })
             .await
             .expect("fixture context mutation runs")

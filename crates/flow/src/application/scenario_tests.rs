@@ -12,6 +12,88 @@ use tokio::sync::mpsc;
 
 mod batch_routes;
 mod repl_settlement;
+mod review_refinement;
+
+#[tokio::test]
+async fn plan_reconciliation_uses_the_escalated_planner_tier() {
+    use crate::api::PlanSynthesisInput;
+    use tauqe_core::models::{ModelRef, ModelSelection};
+    use tauqe_core::plan::PlanSynthesisResult;
+
+    let root = tempfile::tempdir().unwrap();
+    tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
+    let mut config: AppConfig = toml::from_str(
+        "[models]\nrepl = ['openrouter:planner/first']\narchitect = [{ model = 'openrouter:planner/first', attempts = 1 }, { model = 'openrouter:planner/second', attempts = 1 }]\n",
+    ).unwrap();
+    config.context.include_repo_map = false;
+    let (history, _) = mpsc::unbounded_channel();
+    let app = Application::for_repository(config, root.path().into(), history);
+    let horizon = |title: &str| {
+        metered(
+            serde_json::json!({
+                "status": "success", "explanation": title, "reason": null,
+                "abort": {"is_aborted": false, "reason": "", "recommendation": ""},
+                "context_requests": [], "repo_searches": [], "repo_maps": [],
+                "items": [{"id": "1", "title": title, "status": "todo", "files": ["source.rs"]}]
+            })
+            .to_string(),
+        )
+    };
+    let provider = Arc::new(MockLlmProvider::scripted([
+        metered("not a plan response"),
+        horizon("Draft"),
+        metered(
+            r#"{"verdict":"changes_required","summary":"Repair","findings":[{"category":"decomposition_defect","target":"1","detail":"Repair the step"}]}"#,
+        ),
+        horizon("Reconciled"),
+    ]));
+    app.test_set_provider(provider.clone()).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let result = app
+        .synthesize_plan(
+            PlanSynthesisInput::Create {
+                directives: "Plan a source change".into(),
+                planner_model: None,
+                critic_model: Some(ModelSelection::Specific(ModelRef::openrouter(
+                    "critic/model",
+                ))),
+                skip_critique: false,
+            },
+            Arc::new(Observer(events)),
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+    let PlanSynthesisResult::Success { plan, .. } = result else {
+        panic!("synthesis must succeed")
+    };
+    assert_eq!(plan.implementation.items[0].title, "Reconciled");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.model.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "planner/first",
+            "planner/second",
+            "critic/model",
+            "planner/second"
+        ]
+    );
+    assert_eq!(requests[1].session_id, requests[3].session_id);
+    let mut reconciliation_header = false;
+    while let Ok((_, event)) = received.try_recv() {
+        if let ApplicationEvent::Stream(tauqe_core::providers::StreamEvent::TextDelta(text)) = event
+        {
+            reconciliation_header |= text
+                .contains("Reconciling the independent critique with openrouter:planner/second");
+        }
+    }
+    assert!(reconciliation_header);
+    assert_eq!(app.usage_snapshot().await.operations, 3);
+}
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -48,6 +130,102 @@ async fn released(app: &Application) {
     })
     .await
     .expect("operation releases after terminal publication");
+}
+
+#[tokio::test]
+async fn first_request_overflow_never_calls_provider_or_publishes_an_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.repl.workflow = WorkflowKind::Naive;
+    config.context.include_repo_map = false;
+    config.request.max_input_tokens = 1;
+    let (history, _) = mpsc::unbounded_channel();
+    let app = Application::for_repository(config, root.path().into(), history);
+    let provider = Arc::new(MockLlmProvider::new());
+    app.test_set_provider(provider.clone()).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    app.ask(
+        ModelAskInput::Prompt {
+            text: "Do not truncate this task".into(),
+        },
+        Arc::new(Observer(events)),
+    )
+    .await
+    .unwrap();
+    released(&app).await;
+    assert!(provider.requests().is_empty());
+    let mut failures = 0;
+    while let Ok((_, event)) = received.try_recv() {
+        match event {
+            ApplicationEvent::Result { completion, .. } => {
+                assert!(completion.error.as_deref().unwrap().contains("input"));
+                failures += 1;
+            }
+            ApplicationEvent::Finished(text) => assert!(text.contains("input")),
+            _ => {}
+        }
+    }
+    assert_eq!(failures, 1);
+    assert!(app.try_begin_operation().is_ok());
+}
+
+#[tokio::test]
+async fn discovered_file_overflow_retains_the_accepted_round_without_a_second_call() {
+    let root = tempfile::tempdir().unwrap();
+    tauqe_core::git::init_repository(Some(root.path()), true).unwrap();
+    let marker = "discovered material must not be truncated".repeat(10_000);
+    std::fs::write(root.path().join("large.rs"), &marker).unwrap();
+    tauqe_core::git::cmd::stage_files(root.path(), &["large.rs".into()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(root.path(), "initial", false).unwrap();
+    let mut config: AppConfig =
+        toml::from_str("[models]\nrepl = ['openrouter:mock/model']\n").unwrap();
+    config.repl.workflow = WorkflowKind::Naive;
+    config.context.include_repo_map = false;
+    config.request.max_input_tokens = 30_000;
+    let (history, _) = mpsc::unbounded_channel();
+    let app = Application::for_repository(config, root.path().into(), history);
+    let provider = Arc::new(MockLlmProvider::scripted([metered(
+        r#"{"message":"Research accepted.","action":{"kind":"research","context_requests":[{"path":"large.rs","access":"read_only"}]}}"#,
+    )]));
+    app.test_set_provider(provider.clone()).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    app.ask(
+        ModelAskInput::Prompt {
+            text: "Read the full file".into(),
+        },
+        Arc::new(Observer(events)),
+    )
+    .await
+    .unwrap();
+    released(&app).await;
+    assert_eq!(provider.requests().len(), 1);
+    assert!(provider.requests()[0]
+        .messages
+        .iter()
+        .all(|m| !m.content.contains(&marker)));
+    let mut failed = false;
+    while let Ok((_, event)) = received.try_recv() {
+        if let ApplicationEvent::Result { completion, .. } = event {
+            assert!(completion.error.as_deref().unwrap().contains("input"));
+            failed = true;
+        }
+    }
+    assert!(failed);
+    let page = application(root.path())
+        .history_page(None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.items[0].rounds[0].message, "Research accepted.");
+    assert!(!page
+        .items
+        .iter()
+        .any(|item| item.text == "Research accepted."));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("large.rs")).unwrap(),
+        marker
+    );
+    assert!(!root.path().join(".tauqe/active-transaction.json").exists());
+    assert!(app.try_begin_operation().is_ok());
 }
 
 #[tokio::test]
@@ -135,6 +313,88 @@ async fn ask_returns_the_published_operation_id_and_settles_headlessly() {
         .messages
         .iter()
         .any(|message| message.role == "user" && message.content.contains(QUESTION)));
+}
+
+#[tokio::test]
+async fn started_identity_matches_the_request_for_role_and_explicit_selection() {
+    use tauqe_core::config::OpenRouterConfig;
+    use tauqe_core::models::{
+        ModelCatalogEntry, ModelEntry, ModelRef, ModelRole, ModelSelection, ReasoningEffort,
+    };
+
+    for (selection, role, effort) in [
+        (
+            ModelSelection::Role(ModelRole::Architect),
+            Some(ModelRole::Architect),
+            Some(ReasoningEffort::High),
+        ),
+        (
+            ModelSelection::Specific(ModelRef::openrouter("other/model")),
+            None,
+            None,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.context.include_repo_map = false;
+        config.models.repl = vec![ModelEntry::new(ModelRef::openrouter("base/model"), None)];
+        config.models.architect = Some(vec![ModelEntry::new(
+            ModelRef::openrouter("other/model"),
+            Some(ReasoningEffort::High),
+        )]);
+        config.providers.openrouter = Some(OpenRouterConfig {
+            api_key: None,
+            models: vec![
+                ModelCatalogEntry {
+                    model: ModelRef::openrouter("base/model"),
+                    alias: Some("Base".into()),
+                },
+                ModelCatalogEntry {
+                    model: ModelRef::openrouter("other/model"),
+                    alias: Some("Other".into()),
+                },
+            ],
+        });
+        let (history, _) = mpsc::unbounded_channel();
+        let app = Application::for_repository(config, root.path().into(), history);
+        app.begin_configuration_change()
+            .unwrap()
+            .select_model(selection)
+            .await
+            .unwrap();
+        let provider = Arc::new(MockLlmProvider::scripted([metered(
+            r#"{"message":"Reply","action":{"kind":"answer"}}"#,
+        )]));
+        app.test_set_provider(provider.clone()).await;
+        let (events, mut received) = mpsc::unbounded_channel();
+        app.ask(
+            ModelAskInput::Prompt {
+                text: "Question".into(),
+            },
+            Arc::new(Observer(events)),
+        )
+        .await
+        .unwrap();
+        released(&app).await;
+        let started = std::iter::from_fn(|| received.try_recv().ok())
+            .find_map(|(_, event)| match event {
+                ApplicationEvent::Started {
+                    model,
+                    role,
+                    alias,
+                    effort,
+                    ..
+                } => Some((model, role, alias, effort)),
+                _ => None,
+            })
+            .unwrap();
+        let request = &provider.requests()[0];
+        assert_eq!(started.0.name, request.model);
+        assert_eq!(started.1, role);
+        assert_eq!(started.2.as_deref(), Some("Other"));
+        assert_eq!(started.3, request.reasoning_effort);
+        assert_eq!(started.3, effort);
+    }
 }
 
 #[tokio::test]
@@ -307,7 +567,7 @@ async fn ask_refuses_to_execute_when_the_turn_cannot_be_recorded() {
 }
 
 #[tokio::test]
-async fn ask_records_equal_replies_separately_and_keeps_the_round_before_a_budget_notice() {
+async fn ask_records_equal_replies_separately_and_keeps_the_round_before_a_budget_error() {
     const PROGRESS: &str = "Same reply.";
     for budget in [1, 2] {
         let root = tempfile::tempdir().unwrap();
@@ -353,7 +613,9 @@ async fn ask_records_equal_replies_separately_and_keeps_the_round_before_a_budge
         assert_eq!(page.items[0].rounds.len(), 1);
         assert_eq!(page.items[0].rounds[0].message, PROGRESS);
         if budget == 1 {
-            assert!(page.items[1].text.contains("Round Budget Reached"));
+            assert!(page.items[1]
+                .text
+                .contains("budget was exhausted after 1 call(s)"));
             assert!(!page.items[1].text.contains(PROGRESS));
         } else {
             assert_eq!(page.items[1].text, PROGRESS);
@@ -396,7 +658,7 @@ async fn ask_keeps_both_patch_replies_in_order_without_repeating_the_edit_source
         "a.txt".into(),
         tauqe_core::context::ContextAccess::Editable,
         None,
-        observer.as_ref(),
+        observer.clone(),
     )
     .await
     .unwrap();
@@ -404,7 +666,7 @@ async fn ask_keeps_both_patch_replies_in_order_without_repeating_the_edit_source
         "helper.txt".into(),
         tauqe_core::context::ContextAccess::Editable,
         None,
-        observer.as_ref(),
+        observer.clone(),
     )
     .await
     .unwrap();
@@ -802,7 +1064,7 @@ async fn ask_heals_verification_before_publishing_a_committed_edit() {
         "a.txt".into(),
         tauqe_core::context::ContextAccess::Editable,
         None,
-        observer.as_ref(),
+        observer.clone(),
     )
     .await
     .unwrap();
@@ -1065,13 +1327,16 @@ async fn ask_plan_update_correction_advertises_only_the_original_mutation() {
 }
 
 #[tokio::test]
-async fn ask_compacts_history_before_announcing_the_turn() {
+async fn ask_compacts_history_only_after_first_request_admission_fails() {
     struct StartObserver(Observer, Arc<MockLlmProvider>);
 
     impl ApplicationObserver for StartObserver {
         fn publish(&self, id: &str, event: ApplicationEvent) {
             if matches!(&event, ApplicationEvent::Started { .. }) {
-                assert_eq!(self.1.requests().len(), 1, "only the Scribe has run");
+                assert!(
+                    self.1.requests().is_empty(),
+                    "admission precedes the Scribe"
+                );
             }
             self.0.publish(id, event);
         }
@@ -1081,14 +1346,15 @@ async fn ask_compacts_history_before_announcing_the_turn() {
     let mut config = AppConfig::default();
     config.repl.workflow = WorkflowKind::Naive;
     config.context.include_repo_map = false;
-    config.history.budget_tokens = 500;
-    config.history.tail_turns = 1;
+    config.request.max_input_tokens = 22_000;
+    config.history.tail_turns = 0;
+    config.history.budget_tokens = 100;
     let (history, _history_events) = mpsc::unbounded_channel();
     let app = Application::for_repository(config, root.path().to_path_buf(), history);
     for _ in 0..4 {
         app.history_session()
             .record_history_exchange(
-                "Previous task ".repeat(200),
+                "Previous task ".repeat(1_000),
                 Vec::new(),
                 "Done".into(),
                 None,
@@ -1125,12 +1391,195 @@ async fn ask_compacts_history_before_announcing_the_turn() {
     .await
     .unwrap();
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.len(),
+        2,
+        "{}",
+        app.history_page(Some(1), None)
+            .await
+            .unwrap()
+            .items
+            .last()
+            .unwrap()
+            .text
+    );
+    assert!(requests[0]
+        .messages
+        .iter()
+        .any(|message| message.content.contains("Previous task ")));
     assert!(requests[1]
         .messages
         .iter()
         .any(|message| message.content.contains("Earlier tasks completed.")));
 }
+#[tokio::test]
+async fn compacted_ask_accounts_for_scribe_and_answer_in_one_window() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.repl.workflow = WorkflowKind::Naive;
+    config.context.include_repo_map = false;
+    config.history.tail_turns = 0;
+    config.history.budget_tokens = 100;
+    config.request.max_input_tokens = 22_000;
+    let (history, _) = mpsc::unbounded_channel();
+    let app = Application::for_repository(config, root.path().into(), history);
+    for _ in 0..4 {
+        app.history_session()
+            .record_history_exchange("Old task ".repeat(1_000), vec![], "Done".into(), None)
+            .await
+            .unwrap();
+    }
+    let scribe = MockResponse::text(r#"{"summary":"Earlier tasks completed."}"#).with_usage(
+        tauqe_core::providers::ModelUsageInfo {
+            prompt_tokens: 11,
+            completion_tokens: 13,
+            total_tokens: 24,
+            ..Default::default()
+        },
+    );
+    let provider = Arc::new(MockLlmProvider::scripted([
+        scribe,
+        metered(r#"{"message":"First answer.","action":{"kind":"answer"}}"#),
+        metered(r#"{"message":"Second answer.","action":{"kind":"answer"}}"#),
+    ]));
+    app.test_set_provider(provider.clone()).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    app.ask(
+        ModelAskInput::Prompt {
+            text: "Current task".into(),
+        },
+        Arc::new(Observer(events)),
+    )
+    .await
+    .unwrap();
+    released(&app).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]
+        .messages
+        .iter()
+        .any(|m| m.content.contains("Old task")));
+    assert!(requests[0]
+        .messages
+        .iter()
+        .all(|m| !m.content.contains("Current task")));
+    assert!(requests[1]
+        .messages
+        .iter()
+        .any(|m| m.content.contains("Earlier tasks completed.")));
+    let mut closed_before_result = false;
+    let mut results = 0;
+    while let Ok((_, event)) = received.try_recv() {
+        match event {
+            ApplicationEvent::Usage(snapshot) => {
+                assert!(snapshot.cur.is_none());
+                assert_eq!(snapshot.prev.total_tokens, 31);
+                closed_before_result = true;
+            }
+            ApplicationEvent::Result { usage, completion } => {
+                assert!(closed_before_result);
+                assert!(completion.error.is_none());
+                assert!(usage.cur.is_none());
+                assert_eq!(usage.prev.total_tokens, 31);
+                results += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(results, 1);
+    let page = app.history_page(Some(100), None).await.unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|item| item.text == "Current task")
+            .count(),
+        1
+    );
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|item| item.text == "First answer.")
+            .count(),
+        1
+    );
+
+    let (next_events, mut next_received) = mpsc::unbounded_channel();
+    app.ask(
+        ModelAskInput::Prompt {
+            text: "Next task".into(),
+        },
+        Arc::new(Observer(next_events)),
+    )
+    .await
+    .unwrap();
+    released(&app).await;
+    assert_eq!(provider.requests().len(), 3);
+    assert!(
+        std::iter::from_fn(|| next_received.try_recv().ok()).any(|(_, event)| {
+            matches!(event, ApplicationEvent::Result { usage, .. }
+            if usage.cur.is_none() && usage.prev.total_tokens == 7 && usage.operations == 2)
+        })
+    );
+    let usage = app.usage_snapshot().await;
+    assert_eq!(usage.session.total_tokens, 38);
+    assert_eq!(usage.prev.total_tokens, 7);
+    assert_eq!(usage.operations, 2);
+}
+
+#[tokio::test]
+async fn failed_ask_after_scribe_usage_keeps_cost_without_a_successful_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.repl.workflow = WorkflowKind::Naive;
+    config.context.include_repo_map = false;
+    config.history.tail_turns = 0;
+    config.history.budget_tokens = 100;
+    config.request.max_input_tokens = 22_000;
+    let (history, _) = mpsc::unbounded_channel();
+    let app = Application::for_repository(config, root.path().into(), history);
+    for _ in 0..4 {
+        app.history_session()
+            .record_history_exchange("Old task ".repeat(1_000), vec![], "Done".into(), None)
+            .await
+            .unwrap();
+    }
+    let provider = Arc::new(MockLlmProvider::scripted([
+        metered(r#"{"summary":"Earlier tasks completed."}"#),
+        MockResponse::error("offline after compaction"),
+    ]));
+    app.test_set_provider(provider.clone()).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    app.ask(
+        ModelAskInput::Prompt {
+            text: "Failed current task".into(),
+        },
+        Arc::new(Observer(events)),
+    )
+    .await
+    .unwrap();
+    released(&app).await;
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(app.usage_snapshot().await.prev.total_tokens, 7);
+    assert!(app.usage_snapshot().await.cur.is_none());
+    assert!(!std::iter::from_fn(|| received.try_recv().ok()).any(|(_, event)| {
+        matches!(event, ApplicationEvent::Finished(_))
+            || matches!(event, ApplicationEvent::Result { completion, .. } if completion.error.is_none())
+    }));
+    let page = app.history_page(Some(100), None).await.unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|item| item.text == "Failed current task")
+            .count(),
+        1
+    );
+    assert!(page
+        .items
+        .iter()
+        .any(|item| item.text.contains("offline after compaction")));
+    assert!(app.try_begin_operation().is_ok());
+}
+
 #[tokio::test]
 async fn a_busy_ask_keeps_stale_focus_and_makes_no_provider_call() {
     let root = tempfile::tempdir().unwrap();
@@ -1226,7 +1675,7 @@ async fn a_review_launch_materializes_and_publishes_the_saved_session_headlessly
         "source.rs".into(),
         tauqe_core::context::ContextAccess::ReadOnly,
         None,
-        observer.as_ref(),
+        observer.clone(),
     )
     .await
     .unwrap();

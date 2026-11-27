@@ -18,6 +18,7 @@ use crate::input::InputResult;
 use crate::rpc::RpcConnection;
 
 use super::plan_form::{handle_plan_form_key, hoisted_plan_form_yank, PlanFormKeyOutcome};
+use crate::views::plans::PlanRefineTarget;
 
 /// Routes key events for the plan refinement form.
 pub(super) async fn handle_refine_dialog(
@@ -125,23 +126,49 @@ pub(crate) async fn submit_refine_dialog(
             })
     };
 
-    let params = tauqe_protocol::PlanRefineParams {
-        plan_id: dialog.plan_id.clone(),
-        model: selected_planner,
-        critic_model: selected_critic,
-        skip_critique,
-        instructions,
+    let (method, params) = match &dialog.target {
+        PlanRefineTarget::Plan { plan_id, .. } => (
+            methods::PLAN_REFINE,
+            serde_json::to_value(tauqe_protocol::PlanRefineParams {
+                plan_id: plan_id.clone(),
+                model: selected_planner,
+                critic_model: selected_critic,
+                skip_critique,
+                instructions,
+            })?,
+        ),
+        PlanRefineTarget::ReviewGroup {
+            review_id,
+            group_id,
+            ..
+        } => (
+            methods::REVIEW_REFINE_GROUP,
+            serde_json::to_value(tauqe_protocol::ReviewRefineGroupParams {
+                review_id: review_id.clone(),
+                group_id: group_id.clone(),
+                model: selected_planner,
+                critic_model: selected_critic,
+                skip_critique,
+                instructions,
+            })?,
+        ),
     };
-    let params = serde_json::to_value(params)?;
-
-    let plan_id = dialog.plan_id.clone();
+    let target = dialog.target.clone();
     super::start_turn(
         state,
         st,
         server_writer,
-        methods::PLAN_REFINE,
+        method,
         params,
-        move |st| super::begin_plan_refine_turn(st, plan_id),
+        move |st| match target {
+            PlanRefineTarget::Plan { plan_id, .. } => super::begin_plan_refine_turn(st, plan_id),
+            PlanRefineTarget::ReviewGroup { .. } => {
+                let focus = st.discussion_focus.clone();
+                super::begin_repl_turn(st);
+                st.discussion_focus = focus;
+                st.model.is_batch = false;
+            }
+        },
     )
     .await;
     Ok(Some(InputResult::Continue))
@@ -678,6 +705,9 @@ mod tests {
             dialog.critic.select_index(1);
         }
 
+        set_focus(&state, PlanFormFocus::CriticList).await;
+        press_dialog(&state, &mut conn, key(KeyCode::Char(' '))).await;
+
         press_dialog(
             &state,
             &mut conn,
@@ -688,20 +718,16 @@ mod tests {
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains("plan/refine"), "{payload}");
         assert!(payload.contains("architect-b"), "{payload}");
+        assert!(payload.contains("\"critic_model\""), "{payload}");
         assert!(payload.contains("\"skip_critique\":false"), "{payload}");
     }
 
-    /// Disabling the critique phase drops the critic selection from the request
-    /// instead of sending a contradictory pair (c-typed-plan-mutation-dialog).
+    /// Refinement does not request a critic without explicit opt-in, even when
+    /// the configured architect ladder provides a selected critic entry.
     #[tokio::test]
-    async fn skipping_the_critique_sends_no_critic_model() {
+    async fn refinement_sends_no_critic_model_by_default() {
         let state = Arc::new(Mutex::new(refine_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        {
-            let mut guard = state.lock().await;
-            let dialog = guard.modals.refine_dialog.as_mut().expect("dialog");
-            dialog.skip_critique = true;
-        }
 
         press_dialog(
             &state,
@@ -716,9 +742,8 @@ mod tests {
         assert!(!payload.contains("critic_model"), "{payload}");
     }
 
-    /// The critic ladder is a first-class section: a bare digit selects its rung
-    /// while it owns the keyboard, and Space toggles the independent audit
-    /// phase instead of launching the turn (Conventions §5, §6).
+    /// Disabled critique keeps the toggle reachable but makes model selection
+    /// inert. Re-enabling restores selection without losing the chosen model.
     #[tokio::test]
     async fn critic_section_selects_and_toggles_the_critique() {
         let state = Arc::new(Mutex::new(refine_state()));
@@ -727,8 +752,24 @@ mod tests {
 
         press_dialog(&state, &mut conn, key(KeyCode::Char('2'))).await;
         let selected = open_dialog(&state).await;
-        assert_eq!(selected.critic.selected_index(), 1);
-        assert!(!selected.skip_critique);
+        assert_eq!(selected.critic.selected_index(), 0);
+        assert!(selected.skip_critique);
+
+        for event in [
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::PageUp),
+            key(KeyCode::PageDown),
+            key(KeyCode::Home),
+            key(KeyCode::End),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+        ] {
+            press_dialog(&state, &mut conn, event).await;
+            let open = open_dialog(&state).await;
+            assert_eq!(open.critic.selected_index(), 0);
+            assert_eq!(open.planner.selected_index(), 0);
+        }
 
         press_dialog(
             &state,
@@ -737,8 +778,83 @@ mod tests {
         )
         .await;
         let toggled = open_dialog(&state).await;
-        assert!(toggled.skip_critique);
-        assert_eq!(toggled.critic.selected_index(), 1);
+        assert!(!toggled.skip_critique);
+        assert_eq!(toggled.critic.selected_index(), 0);
         assert!(conn.written().is_empty());
+
+        press_dialog(&state, &mut conn, key(KeyCode::Char('2'))).await;
+        assert_eq!(open_dialog(&state).await.critic.selected_index(), 1);
+
+        press_dialog(&state, &mut conn, key(KeyCode::Char(' '))).await;
+        let disabled = open_dialog(&state).await;
+        assert!(disabled.skip_critique);
+        assert_eq!(disabled.critic.selected_index(), 1);
+        assert!(conn.written().is_empty());
+
+        press_dialog(&state, &mut conn, key(KeyCode::Char('1'))).await;
+        assert_eq!(open_dialog(&state).await.critic.selected_index(), 1);
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("\"skip_critique\":true"), "{payload}");
+        assert!(!payload.contains("critic_model"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn group_refinement_confirms_as_a_non_batch_request() {
+        use tauqe_protocol::{DiscussionFocus, DiscussionTarget};
+
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        st.discussion_focus = DiscussionFocus::from_target(
+            DiscussionTarget::ReviewGroup {
+                session_id: "rev-1".into(),
+                group_id: "arch".into(),
+            },
+            vec!["step:2".into()],
+        );
+        st.modals.refine_dialog = Some(PlanRefineDialogState::for_review_group(
+            "rev-1".into(),
+            "arch".into(),
+            "Shared cause".into(),
+            vec![architect("architect-a")],
+        ));
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_dialog(&state, &mut conn, key(KeyCode::Enter)).await;
+        assert!(conn.written().is_empty(), "safe Cancel launches nothing");
+        assert_eq!(state.lock().await.view_mode, ViewMode::Review);
+
+        state.lock().await.modals.refine_dialog = Some(PlanRefineDialogState::for_review_group(
+            "rev-1".into(),
+            "arch".into(),
+            "Shared cause".into(),
+            vec![architect("architect-a")],
+        ));
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+        let request: tauqe_protocol::Request = serde_json::from_slice(conn.written()).unwrap();
+        assert_eq!(request.method, tauqe_protocol::methods::REVIEW_REFINE_GROUP);
+        let params = request.params.unwrap();
+        assert_eq!(params["review_id"], "rev-1");
+        assert_eq!(params["group_id"], "arch");
+        assert!(params.get("step_id").is_none());
+        let guard = state.lock().await;
+        assert!(!guard.model.is_batch);
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+        assert_eq!(
+            guard.discussion_focus.focused_items(),
+            ["step:2".to_string()].as_slice()
+        );
+        assert!(!guard.plans_view.refining);
     }
 }

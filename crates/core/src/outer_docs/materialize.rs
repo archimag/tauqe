@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tauqe_tools::stop::HardCancellation;
 
 use super::trust::{literal_address, load_trust, RefsTrust, TrustRefusal};
 use super::{document_cache_path, relative_cache_path, OuterDoc};
@@ -133,7 +133,7 @@ pub(crate) async fn materialize_document_with(
     repo_root: &Path,
     doc: &OuterDoc,
     max_bytes: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
     trust: Option<RefsTrust>,
 ) -> Result<String, MaterializeError> {
     let cache_path = document_cache_path(doc);
@@ -146,7 +146,7 @@ pub(crate) async fn materialize_document_with(
 
     let declaration = resolve_trust(repo_root, trust).await;
     let bytes = match &doc.source {
-        OuterDocSource::Remote(url) => fetch_bytes(url, max_bytes, &declaration, cancel_rx).await?,
+        OuterDocSource::Remote(url) => fetch_bytes(url, max_bytes, &declaration, cancel).await?,
         OuterDocSource::Local(path) => {
             read_local_source(&path.to_string_lossy(), max_bytes, declaration).await?
         }
@@ -167,7 +167,7 @@ pub(crate) async fn materialize_relative_with(
     doc: &OuterDoc,
     relative: &str,
     max_bytes: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
     trust: Option<RefsTrust>,
 ) -> Result<String, MaterializeError> {
     let cache_path = relative_cache_path(doc, relative);
@@ -185,7 +185,7 @@ pub(crate) async fn materialize_relative_with(
     let bytes = match &doc.source {
         OuterDocSource::Remote(base) => {
             let url = join_remote(base, relative)?;
-            fetch_bytes(&url, max_bytes, &declaration, cancel_rx).await?
+            fetch_bytes(&url, max_bytes, &declaration, cancel).await?
         }
         OuterDocSource::Local(root) => {
             let resolved = resolve_beside(root, relative, &doc.id)?;
@@ -303,7 +303,7 @@ async fn fetch_bytes(
     url: &str,
     max_bytes: u64,
     trust: &RefsTrust,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel: Option<&HardCancellation>,
 ) -> Result<Vec<u8>, MaterializeError> {
     let parsed = reqwest::Url::parse(url).map_err(|error| {
         MaterializeError::Delivery(format!(
@@ -311,7 +311,7 @@ async fn fetch_bytes(
         ))
     })?;
     trust.check_remote_url(&parsed)?;
-    if cancel_requested(cancel_rx) {
+    if cancel.is_some_and(HardCancellation::is_cancelled) {
         return Err(cancelled(url));
     }
 
@@ -322,7 +322,12 @@ async fn fetch_bytes(
     let transfer = fetch_hops(&client, &parsed, max_bytes, trust);
 
     tokio::select! {
-        () = wait_for_cancellation(cancel_rx) => Err(cancelled(&display)),
+        () = async {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => Err(cancelled(&display)),
         bytes = transfer => bytes,
     }
 }
@@ -648,26 +653,6 @@ async fn resolve_trust(repo_root: &Path, trust: Option<RefsTrust>) -> RefsTrust 
     }
 }
 
-/// Reports whether the turn cancellation signal already fired.
-fn cancel_requested(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
-    cancel_rx.is_some_and(|receiver| *receiver.borrow())
-}
-
-/// Resolves once the turn cancellation signal fires.
-async fn wait_for_cancellation(cancel_rx: Option<&watch::Receiver<bool>>) {
-    let Some(receiver) = cancel_rx else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    let mut receiver = receiver.clone();
-    // `wait_for` yields a `watch::Ref` guard, which is not `Send`. The guard is
-    // dropped before this future returns, so no caller future is forced to hold
-    // it across an await.
-    if receiver.wait_for(|cancelled| *cancelled).await.is_err() {
-        std::future::pending::<()>().await;
-    }
-}
-
 /// The reason a cancelled materialization reports.
 fn cancelled(url: &str) -> MaterializeError {
     MaterializeError::Delivery(format!(
@@ -685,7 +670,9 @@ fn oversized(url: &str, max_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
+    use tauqe_tools::stop::StopSource;
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -928,6 +915,97 @@ mod tests {
         let stored = std::fs::read_to_string(dir.path().join(&cache_path)).unwrap();
         assert_eq!(stored, "upstream notes");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn soft_does_not_cancel_a_network_wait_but_hard_does() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("slow")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let doc = document(
+            "slow",
+            OuterDocSource::Remote(format!("{}/slow.md", server.uri())),
+        );
+        let source = StopSource::new();
+        let hard = source.token().hard_cancellation();
+        let transfer = materialize_document_with(
+            dir.path(),
+            &doc,
+            TEST_MAX_BYTES,
+            Some(&hard),
+            Some(loopback_trust()),
+        );
+        tokio::pin!(transfer);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut transfer)
+                .await
+                .is_err()
+        );
+        source.request_soft();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut transfer)
+                .await
+                .is_err()
+        );
+        source.request_hard();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut transfer)
+            .await
+            .unwrap()
+            .expect_err("Hard cancels the transfer");
+        assert!(error.reason().contains("cancelled"), "{error}");
+        assert!(!dir.path().join(document_cache_path(&doc)).exists());
+    }
+
+    #[tokio::test]
+    async fn closing_a_soft_source_does_not_cancel_a_network_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("completed")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let doc = document(
+            "slow",
+            OuterDocSource::Remote(format!("{}/slow.md", server.uri())),
+        );
+        let source = StopSource::new();
+        source.request_soft();
+        let hard = source.token().hard_cancellation();
+        drop(source);
+        let transfer = materialize_document_with(
+            dir.path(),
+            &doc,
+            TEST_MAX_BYTES,
+            Some(&hard),
+            Some(loopback_trust()),
+        );
+        tokio::pin!(transfer);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut transfer)
+                .await
+                .is_err()
+        );
+        let cached = tokio::time::timeout(Duration::from_secs(3), &mut transfer)
+            .await
+            .unwrap()
+            .expect("closed Soft source does not cancel");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(cached)).unwrap(),
+            "completed"
+        );
     }
 
     #[tokio::test]

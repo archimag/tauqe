@@ -6,13 +6,14 @@ use crate::application::infrastructure::execution::ExecutionEnvironment;
 #[cfg(test)]
 use std::sync::Arc;
 use tauqe_core::config::AppConfig;
-use tauqe_core::models::{ModelRef, ModelRole, ModelSelection, ReasoningEffort};
+#[cfg(test)]
+use tauqe_core::models::ModelSelection;
+use tauqe_core::models::{ModelRef, ModelRole, ReasoningEffort};
 #[cfg(test)]
 use tauqe_core::providers::LlmProvider;
 
 pub struct ResolvedTurnModel {
     pub config: AppConfig,
-    pub selection: ModelSelection,
     pub model: ModelRef,
     pub role: Option<ModelRole>,
     pub effort: Option<ReasoningEffort>,
@@ -41,7 +42,7 @@ impl Application {
     ) -> Result<Arc<dyn LlmProvider>, TurnProviderError> {
         ExecutionEnvironment::new(crate::application::configuration::ConfigurationSnapshot {
             config: model.config.clone(),
-            selection: model.selection.clone(),
+            selection: model.config.default_selection(),
         })
         .provider(self, model.model.provider)
         .await
@@ -108,10 +109,6 @@ mod tests {
         let resolved = app
             .resolve_turn_model(None, None, ModelRole::Architect)
             .await;
-        assert_eq!(
-            resolved.selection,
-            ModelSelection::Role(ModelRole::Architect)
-        );
         assert_eq!(resolved.model, ModelRef::openrouter("shared/model"));
         assert_eq!(resolved.role, Some(ModelRole::Architect));
         assert_eq!(resolved.effort, Some(ReasoningEffort::Max));

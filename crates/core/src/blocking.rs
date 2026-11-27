@@ -9,7 +9,10 @@
 //! The test-only log capture stays here: it observes the records emitted on the
 //! installing thread, and every failure arm it pins runs inside this crate.
 
-pub use tauqe_tools::blocking::{log_join_error, run_blocking, run_blocking_async};
+pub use tauqe_tools::blocking::{
+    log_join_error, run_blocking, run_blocking_async, start_blocking_operation, BlockingOperation,
+    OperationHandle, OperationSummary, StartedOperations,
+};
 
 /// Per-thread log capture for unit tests asserting semantic log records.
 ///

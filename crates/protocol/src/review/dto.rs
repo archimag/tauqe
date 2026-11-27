@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{CancelMode, ModelSelection};
+use crate::plan::PlanItemStatus;
 
+use super::group::ReviewGroup;
 use super::item::{IssueStatus, ReviewIssue};
 use super::session::ReviewSession;
 
@@ -45,13 +47,12 @@ pub struct ReviewStartParams {
 
 /// Parameters for `review/preview`.
 ///
-/// The projection describes the audit window `review/start` would launch from
-/// the same selection, so a client resolves consent against exactly the shape
-/// the run would take instead of learning about a truncated window after the
-/// fact. Only the fields that decide the composition of the window travel
-/// here: the active context, the repository listing, and the configured
-/// budgets are server-side facts, while the model and the user prompt shape
-/// the audit itself and never its size.
+/// The projection describes the file window `review/start` would launch from
+/// the same selection. It does not admit the complete model input against the
+/// shared limit: the model, task and response schema are not part of preview.
+/// Only fields that decide file selection travel here: the active context and
+/// repository listing are server-side facts. The model and user prompt do not
+/// change the file window, but do contribute to the full request's size.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewPreviewParams {
     /// Optional list of directory or glob patterns selecting additional audit
@@ -68,9 +69,9 @@ pub struct ReviewPreviewParams {
 
 /// Composition of one audit window before a review runs.
 ///
-/// Every counter is a deterministic pre-computation: the projection applies
-/// the same selection order and the same limits as the launch it describes, so
-/// a window that previews clean is the window the run audits.
+/// The projection applies the launch's file selection order. It does not prove
+/// that the complete request will fit the shared input limit; admission occurs
+/// separately, before provider I/O.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewPreviewWindow {
     /// Number of files the active context contributes to the window.
@@ -88,48 +89,35 @@ pub struct ReviewPreviewWindow {
     /// instead of disappearing from the count.
     #[serde(default)]
     pub matched_files: usize,
-    /// Number of matched files the window accepted.
+    /// Number of readable new matches included in the window.
     #[serde(default)]
     pub selected_files: usize,
     /// Estimated tokens the selected files add.
     #[serde(default)]
     pub selected_tokens: usize,
-    /// Number of matched candidates the file token budget dropped.
-    ///
-    /// A candidate is a matched file the launch does not already hold, so this
-    /// aggregate and [`Self::omitted_by_budget`] report the same files: the file
-    /// token budget is the only knife the window applies, no other limit exists
-    /// to drop a candidate, and a count of files is never a limit of its own.
-    /// A match nobody could read is not a candidate and is reported by
-    /// [`Self::unreadable_files`] instead, so this number never grows because a
-    /// binary blob happened to match the pattern.
+    /// Retired compatibility counter; new projections always report zero.
     #[serde(default)]
     pub omitted_files: usize,
-    /// Matched candidates dropped because the file token budget was exhausted.
+    /// Retired file-budget counter; new projections always report zero.
     #[serde(default)]
     pub omitted_by_budget: usize,
     /// Number of matched files the window could not read as source.
     ///
     /// A binary blob, a symlink escaping the repository, and a file deleted
     /// from the working tree but still tracked all match the pattern and none
-    /// of them can be audited. They are counted here rather than charged to
-    /// the file token budget, so [`Self::is_truncated`] keeps exactly one
-    /// cause: a budget that genuinely dropped a readable candidate.
+    /// of them can be audited. They are counted separately from the retired
+    /// omission counters; the complete input is admitted before provider I/O.
     #[serde(default)]
     pub unreadable_files: usize,
-    /// File token budget the pattern expansion shares with research.
+    /// Retired file-budget allowance; new projections always report zero.
     #[serde(default)]
     pub files_token_budget: usize,
 }
 
 impl ReviewPreviewWindow {
-    /// Whether the file token budget drops files the selection matched.
-    ///
-    /// This is the single predicate a client branches on before launching the
-    /// audit: a window that drops nothing needs no consent step, because the
-    /// run audits exactly what the developer selected. The verdict is read from
-    /// the budget breakdown, never from a generic count of dropped files, so
-    /// truncation keeps exactly one cause.
+    /// Legacy file-window predicate, not a full-input admission check.
+    /// New projections return false; callers must not infer that a request
+    /// fits the shared input limit from this value.
     pub fn is_truncated(&self) -> bool {
         self.omitted_by_budget > 0
     }
@@ -329,6 +317,22 @@ pub struct ReviewUpdateItemResult {
     pub item: ReviewIssue,
 }
 
+/// Full address and new status of a leaf in an architectural review group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewUpdateGroupStepParams {
+    pub review_id: String,
+    pub group_id: String,
+    pub step_id: String,
+    pub status: PlanItemStatus,
+}
+
+/// The group as persisted after the manual transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewUpdateGroupStepResult {
+    pub group: ReviewGroup,
+}
+
 /// Parameters for `review/analyze`.
 ///
 /// Post-analysis classifies the findings of one stored session into independent
@@ -361,4 +365,162 @@ pub struct ReviewAnalyzeParams {
 pub struct ReviewAnalyzeResult {
     /// The session carrying the freshly replaced post-analysis layer.
     pub session: ReviewSession,
+}
+
+/// Parameters for `review/refineGroup`.
+///
+/// Refinement addresses one declared architectural group, not a finding or a
+/// plan step. The critic runs only when selected and not skipped; an absent
+/// critic selection never requests a critique, regardless of the flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRefineGroupParams {
+    pub review_id: String,
+    pub group_id: String,
+    /// Architect selection for drafting and reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    /// Independent Architect selection for optional critique.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic_model: Option<ModelSelection>,
+    #[serde(default)]
+    pub skip_critique: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Semantic outcome of group refinement. Cancellation and technical failures
+/// remain RPC errors; only a successful write carries the saved group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReviewRefineGroupResult {
+    Success {
+        review_id: String,
+        group_id: String,
+        group: Box<ReviewGroup>,
+        explanation: String,
+    },
+    Blocked {
+        reason: String,
+    },
+    Aborted {
+        reason: String,
+        recommendation: String,
+    },
+}
+
+#[cfg(test)]
+mod refine_group_tests {
+    use super::*;
+    use crate::model::{ModelRef, ReasoningEffort};
+
+    #[test]
+    fn request_requires_only_the_group_address() {
+        let minimal: ReviewRefineGroupParams =
+            serde_json::from_str(r#"{"review_id":"rev-1","group_id":"arch-1"}"#).unwrap();
+        assert_eq!(minimal.model, None);
+        assert_eq!(minimal.critic_model, None);
+        assert!(!minimal.skip_critique);
+        assert_eq!(minimal.instructions, None);
+        let json = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(json["review_id"], "rev-1");
+        assert_eq!(json["group_id"], "arch-1");
+        assert!(json.get("model").is_none());
+        assert!(json.get("critic_model").is_none());
+
+        for raw in [
+            r#"{}"#,
+            r#"{"review_id":"rev-1"}"#,
+            r#"{"group_id":"arch-1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ReviewRefineGroupParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        for field in ["item_id", "step_id", "plan_id", "item_ids"] {
+            let raw = format!(r#"{{"review_id":"rev-1","group_id":"arch-1","{field}":1}}"#);
+            assert!(
+                serde_json::from_str::<ReviewRefineGroupParams>(&raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_round_trips_both_full_model_selections() {
+        let params = ReviewRefineGroupParams {
+            review_id: "rev-1".into(),
+            group_id: "arch-1".into(),
+            model: Some(ModelSelection::Tier {
+                model: ModelRef::openrouter("test/planner"),
+                effort: Some(ReasoningEffort::High),
+            }),
+            critic_model: Some(ModelSelection::Tier {
+                model: ModelRef::openrouter("test/critic"),
+                effort: Some(ReasoningEffort::Low),
+            }),
+            skip_critique: true,
+            instructions: Some("Keep the completed steps".into()),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["model"]["effort"], "high");
+        assert_eq!(json["critic_model"]["effort"], "low");
+        assert_eq!(json["skip_critique"], true);
+        assert_eq!(
+            serde_json::from_value::<ReviewRefineGroupParams>(json).unwrap(),
+            params
+        );
+
+        // A skip flag cannot manufacture a critic selection.
+        let without_critic: ReviewRefineGroupParams = serde_json::from_str(
+            r#"{"review_id":"rev-1","group_id":"arch-1","skip_critique":true}"#,
+        )
+        .unwrap();
+        assert!(without_critic.critic_model.is_none());
+    }
+
+    #[test]
+    fn result_round_trips_every_semantic_outcome() {
+        let group = ReviewGroup {
+            id: "arch-1".into(),
+            ..Default::default()
+        };
+        let outcomes = [
+            ReviewRefineGroupResult::Success {
+                review_id: "rev-1".into(),
+                group_id: "arch-1".into(),
+                group: Box::new(group),
+                explanation: "Reconciled the horizon".into(),
+            },
+            ReviewRefineGroupResult::Blocked {
+                reason: "Decision pending".into(),
+            },
+            ReviewRefineGroupResult::Aborted {
+                reason: "Missing prerequisite".into(),
+                recommendation: "Provide the prerequisite".into(),
+            },
+        ];
+        for (outcome, status) in outcomes.into_iter().zip(["success", "blocked", "aborted"]) {
+            let json = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(json["status"], status);
+            if status == "success" {
+                assert_eq!(json["review_id"], "rev-1");
+                assert_eq!(json["group_id"], "arch-1");
+                assert_eq!(json["group"]["id"], "arch-1");
+                assert_eq!(json["explanation"], "Reconciled the horizon");
+            }
+            if status == "aborted" {
+                assert_eq!(json["recommendation"], "Provide the prerequisite");
+            }
+            assert_eq!(
+                serde_json::from_value::<ReviewRefineGroupResult>(json).unwrap(),
+                outcome
+            );
+        }
+        assert!(serde_json::from_str::<ReviewRefineGroupResult>(
+            r#"{"status":"aborted","reason":"missing"}"#
+        )
+        .is_err());
+    }
 }

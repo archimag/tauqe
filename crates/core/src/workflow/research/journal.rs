@@ -19,6 +19,7 @@
 //! its own round delivered instead of receiving the whole turn's investigation
 //! again. The prompt builder delivers effective file versions alongside these findings.
 
+use super::step::ResearchStep;
 use super::ResearchRoundOutcome;
 
 /// Opening marker of the epistemic tail.
@@ -27,10 +28,12 @@ const JOURNAL_OPEN: &str = "<research_journal>";
 const JOURNAL_CLOSE: &str = "</research_journal>";
 
 /// Ordered, append-only collection of epistemic feedback blocks of one turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct TurnResearchJournal {
     entries: Vec<String>,
+    evidence: Vec<String>,
     round: RoundSection,
+    last_step: ResearchStep,
 }
 
 /// Records produced by the research round currently open.
@@ -48,6 +51,19 @@ struct RoundSection {
 }
 
 impl TurnResearchJournal {
+    /// Reset only the invocation result, leaving accumulated findings untouched.
+    pub fn reset_step(&mut self) {
+        self.last_step = ResearchStep::default();
+    }
+
+    pub fn last_step(&self) -> &ResearchStep {
+        &self.last_step
+    }
+
+    pub(crate) fn record_step(&mut self, step: ResearchStep) {
+        self.last_step = step;
+    }
+
     /// Marks the boundary of the research round the loop just opened.
     ///
     /// Everything recorded after this call belongs to the new round, and
@@ -61,7 +77,7 @@ impl TurnResearchJournal {
         };
     }
 
-    pub(crate) fn round_index(&self) -> usize {
+    pub fn round_index(&self) -> usize {
         self.round.index.unwrap_or(0)
     }
 
@@ -83,10 +99,39 @@ impl TurnResearchJournal {
         self.round.blocks.push(block.to_string());
     }
 
+    /// Marks a delivered result as evidence at the point it is recorded.
+    pub fn push_evidence_block(&mut self, block: impl Into<String>) {
+        let block = block.into();
+        let trimmed = block.trim();
+        if !trimmed.is_empty() && !self.evidence.iter().any(|entry| entry == trimmed) {
+            self.evidence.push(trimmed.to_string());
+        }
+        self.push_block(block);
+    }
+
+    pub fn evidence(&self) -> &[String] {
+        &self.evidence
+    }
+
+    /// Admission feedback and directives guide the task, not its evidence view.
+    pub fn non_evidence_feedback(&self) -> Option<String> {
+        let blocks: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| !self.evidence.contains(entry))
+            .map(String::as_str)
+            .collect();
+        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+    }
+
     /// Records the findings of one round.
     pub fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
-            self.push_block(block.as_str());
+            if outcome.evidence_blocks().contains(block) {
+                self.push_evidence_block(block.as_str());
+            } else {
+                self.push_block(block.as_str());
+            }
         }
     }
 
@@ -198,6 +243,28 @@ mod tests {
         assert!(rendered.contains("<context_feedback>"));
     }
 
+    #[test]
+    fn reset_step_preserves_findings_and_round_boundary() {
+        let mut journal = TurnResearchJournal::default();
+        journal.begin_round(2);
+        journal.push_evidence_block("<search_feedback>match</search_feedback>");
+        let mut step = ResearchStep::default();
+        step.kind = super::super::step::ResearchStepKind::Widened;
+        journal.record_step(step);
+
+        journal.reset_step();
+        assert_eq!(
+            journal.last_step().kind,
+            super::super::step::ResearchStepKind::Idle
+        );
+        assert_eq!(journal.round_index(), 2);
+        assert!(journal.render_round_feedback().contains("match"));
+        assert_eq!(
+            journal.evidence(),
+            &["<search_feedback>match</search_feedback>"]
+        );
+    }
+
     /// A round renders only the records it produced, so the feedback of round
     /// N never repeats the results of round N-1.
     #[test]
@@ -226,5 +293,34 @@ mod tests {
         let tail = journal.rendered().expect("the tail renders");
         assert!(tail.contains("regex=\"alpha\""), "{tail}");
         assert!(tail.contains("<dir_list_feedback"), "{tail}");
+    }
+
+    #[test]
+    fn evidence_excludes_directives_and_deduplicates_results() {
+        let mut journal = TurnResearchJournal::default();
+        journal.push_block("<response_directive>limit exhausted</response_directive>");
+        journal.push_evidence_block("<search_feedback>unique result</search_feedback>");
+        journal.push_evidence_block("<search_feedback>unique result</search_feedback>");
+        assert_eq!(
+            journal.evidence(),
+            &["<search_feedback>unique result</search_feedback>"]
+        );
+        assert!(journal.rendered().unwrap().contains("limit exhausted"));
+        assert_eq!(
+            journal.non_evidence_feedback().as_deref(),
+            Some("<response_directive>limit exhausted</response_directive>")
+        );
+    }
+
+    #[test]
+    fn non_evidence_feedback_keeps_admission_and_missing_file_messages() {
+        let mut journal = TurnResearchJournal::default();
+        journal.push_block("<context_feedback>loaded</context_feedback>");
+        journal.push_evidence_block("<search_feedback>match</search_feedback>");
+        journal.push_block("<context_feedback>missing file</context_feedback>");
+        assert_eq!(
+            journal.non_evidence_feedback().unwrap(),
+            "<context_feedback>loaded</context_feedback>\n\n<context_feedback>missing file</context_feedback>"
+        );
     }
 }

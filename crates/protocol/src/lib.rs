@@ -73,17 +73,18 @@ pub use edit::{
 pub use errors::{
     ADD_FAILED, ADD_PATTERN_FAILED, ARCHITECTURAL_GROUP_EXECUTION_REQUIRED, CANCELLED,
     COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED, CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED,
-    EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, GROUP_UNRESOLVED_QUESTIONS, HISTORY_GET_FAILED,
-    INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
-    INVALID_PLAN_TREE, INVALID_REQUEST, ITEM_IN_DISCUSSION, ITEM_REJECTED, LIST_FILES_FAILED,
-    METHOD_NOT_FOUND, MODEL_ERROR, MODULE_CONFLICT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND,
-    NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED,
-    PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED,
-    PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED,
-    REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED,
-    REVIEW_LOAD_FAILED, REVIEW_PREVIEW_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
-    SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED, STEP_BLOCKED,
-    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION,
+    EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, GROUP_NEEDS_REFINEMENT,
+    GROUP_UNRESOLVED_QUESTIONS, HISTORY_GET_FAILED, INIT_FAILED, INTERNAL_ERROR, INVALID_KEY,
+    INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID, INVALID_PLAN_TREE, INVALID_REQUEST,
+    ITEM_IN_DISCUSSION, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR,
+    MODULE_CONFLICT, NOTHING_TO_EXECUTE, NOTHING_TO_REFINE, NOT_A_LEAF, NOT_FOUND, NO_API_KEY,
+    OPERATION_IN_PROGRESS, PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED,
+    PLAN_GET_FAILED, PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED,
+    PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED,
+    REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED,
+    REVIEW_PREVIEW_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED,
+    SQUASH_PREVIEW_FAILED, STEP_BLOCKED, STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED,
+    STEP_IMMUTABLE, STEP_IN_DISCUSSION,
 };
 
 // The event and error namespaces both declare `MODEL_ERROR`: the RPC error code
@@ -122,18 +123,18 @@ pub use message::{
     Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response, ResponseError,
 };
 pub use model::{
-    ArchitectTier, BatchFinishStatus, BatchFinishSummary, CancelMode, DocTopic, ModelAskParams,
-    ModelCancelParams, ModelCatalogEntry, ModelChangedEvent, ModelConnectionRetryingEvent,
-    ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent, ModelEscalatedEvent,
-    ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent, ModelResultProposal, ModelRole,
-    ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelectParams, ModelSelectResult,
-    ModelSelection, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
-    ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind,
-    ReasoningEffort, RepoMapInfoEvent, ReviewBatchFinishedEvent, ReviewWorkPhase,
-    StructuredAbortProposal, StructuredBlockedProposal, StructuredOutcomeProposal,
-    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent, TurnRequestReason,
-    TurnRoundStartedEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue, UsageTotals,
-    UsageTotalsSnapshot,
+    ArchitectTier, BatchFinishStatus, BatchFinishSummary, CancelMode, DeferredReviewGroup,
+    DocTopic, ModelAskParams, ModelCancelParams, ModelCatalogEntry, ModelChangedEvent,
+    ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent,
+    ModelEscalatedEvent, ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent,
+    ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
+    ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent, ModelStreamResetEvent,
+    ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent,
+    PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
+    ReviewBatchFinishedEvent, ReviewGroupDeferralReason, ReviewWorkPhase, StructuredAbortProposal,
+    StructuredBlockedProposal, StructuredOutcomeProposal, ToolchainFinishedEvent,
+    ToolchainStartedEvent, TurnPhase, TurnPhaseEvent, TurnRequestReason, TurnRoundStartedEvent,
+    TurnWorkContext, TurnWorkItem, TurnWorkQueue, UsageTotals, UsageTotalsSnapshot,
 };
 
 pub use outer_docs::{
@@ -155,9 +156,10 @@ pub use review::{
     ReviewGroupFinishedEvent, ReviewGroupKind, ReviewGroupStartedEvent, ReviewIssue, ReviewItem,
     ReviewItemStatus, ReviewLaunchConfig, ReviewListChangedEvent, ReviewListResult,
     ReviewPostAnalysis, ReviewPreviewGroup, ReviewPreviewParams, ReviewPreviewResult,
-    ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity,
-    ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
-    ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID,
+    ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewRefineGroupParams,
+    ReviewRefineGroupResult, ReviewSession, ReviewSeverity, ReviewStartParams, ReviewStartedEvent,
+    ReviewUpdateGroupStepParams, ReviewUpdateGroupStepResult, ReviewUpdateItemParams,
+    ReviewUpdateItemResult, ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID,
 };
 
 pub use review::{

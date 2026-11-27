@@ -100,8 +100,19 @@ impl PromptProtocol for JsonPromptProtocol {
             let ctx = PromptRenderContext::new(context_paths, None)
                 .with_project(self.project.as_ref())
                 .with_patch_strategy(strategy);
+            let decoded = decode_capability_expr(&self.capabilities, root, &ctx);
+            // A defective response cannot deliver even commands preceding its
+            // malformed field to research, staging, or the transcript.
+            let defects: Vec<_> = decoded
+                .iter()
+                .filter(|command| matches!(command, LlmCommand::ProtocolError { .. }))
+                .cloned()
+                .collect();
+            if !defects.is_empty() {
+                return defects;
+            }
             let mut edits = Vec::new();
-            for command in decode_capability_expr(&self.capabilities, root, &ctx) {
+            for command in decoded {
                 match command {
                     // The module decodes paths but holds no working
                     // context, so the edit batch is resolved against the
@@ -1237,5 +1248,73 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| matches!(command, LlmCommand::CommitMessage(_))));
+    }
+
+    #[test]
+    fn defective_research_rejects_the_entire_response() {
+        let protocol = JsonPromptProtocol::new(dialogue(false, false));
+        for (field, value, expected) in [
+            (
+                "context_requests",
+                serde_json::json!(["src/a.rs", "../escape"]),
+                "context_requests[1]",
+            ),
+            (
+                "repo_searches",
+                serde_json::json!([{"path":".","regex":"foo"}, {"path":"../escape","regex":"bar"}]),
+                "repo_searches[1]",
+            ),
+            (
+                "repo_maps",
+                serde_json::json!([".", "../escape"]),
+                "repo_maps[1]",
+            ),
+            (
+                "dir_lists",
+                serde_json::json!([{"path":".","recursive":false}, {"path":"../escape"}]),
+                "dir_lists[1]",
+            ),
+            ("repo_dirs", serde_json::json!("yes"), "repo_dirs"),
+            (
+                "tauqe_doc_requests",
+                serde_json::json!(["git", 7]),
+                "tauqe_doc_requests[1]",
+            ),
+            (
+                "outer_doc_requests",
+                serde_json::json!(["mylib", 7]),
+                "outer_doc_requests[1]",
+            ),
+        ] {
+            let mut action =
+                serde_json::json!({"kind":"research", "context_requests":["src/a.rs"]});
+            action[field] = value;
+            let output = serde_json::json!({"message":"Researching", "action":action});
+            let commands = protocol.decode(&output.to_string(), &[]);
+            assert_eq!(commands.len(), 1, "{field}: {commands:?}");
+            assert!(
+                matches!(&commands[0], LlmCommand::ProtocolError { message } if message.contains(expected)),
+                "{field}: {commands:?}"
+            );
+        }
+        let inactive =
+            r#"{"message":"Done","action":{"kind":"edit","changes":[]},"repo_maps":["../escape"]}"#;
+        assert!(!protocol
+            .decode(inactive, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
+    }
+
+    #[test]
+    fn defective_tool_wrapper_rejects_previous_tools_and_text() {
+        let protocol = JsonPromptProtocol::new(CapabilityTree::from_leaves([
+            LlmCapability::TextMessage,
+            LlmCapability::CustomTools,
+        ]));
+        let output = r#"{"message":"Running tools","custom_tools":[{"name":"check","args":{}},{"name":"check","args":false}]}"#;
+        let commands = protocol.decode(output, &[]);
+        assert!(
+            matches!(commands.as_slice(), [LlmCommand::ProtocolError { message }] if message.contains("custom_tools[1].args"))
+        );
     }
 }

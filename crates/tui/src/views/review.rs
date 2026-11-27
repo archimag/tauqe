@@ -173,13 +173,20 @@ impl ReviewViewState {
     /// presentation re-read, not a new audit: the Executive Summary block keeps
     /// the fold state the developer chose, so navigating between existing
     /// sessions never re-expands a summary that was folded
-    /// (concept #c-summary-fold-persistence).
+    /// (concept #c-summary-fold-persistence). Refreshing the same session also
+    /// keeps the cursor and viewport; opening another session starts at the top.
     pub fn set_session(&mut self, session: ReviewSession) {
+        let same_session = self
+            .session
+            .as_ref()
+            .is_some_and(|old| old.id == session.id);
         self.running = false;
         self.update_session(session);
         self.error = None;
-        self.selected_index = 0;
-        self.scroll = 0;
+        if !same_session {
+            self.selected_index = 0;
+            self.scroll = 0;
+        }
     }
 
     /// Settles a freshly finished audit onto the mirror.
@@ -194,6 +201,8 @@ impl ReviewViewState {
         let session_id = session.id.clone();
         self.set_session(session);
         self.collapsed_summaries.remove(&session_id);
+        self.selected_index = 0;
+        self.scroll = 0;
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<ReviewSession>, active_id: Option<String>) {
@@ -1053,6 +1062,26 @@ mod tests {
             view.is_summary_expanded("rev-other"),
             "a session nobody folded keeps its summary expanded"
         );
+    }
+
+    #[test]
+    fn test_reloading_the_same_session_preserves_cursor_and_viewport() {
+        let mut view = ReviewViewState::default();
+        view.set_session(make_session("rev-stored", &[1, 2, 3]));
+        view.selected_index = 3;
+        view.scroll = 8;
+
+        view.set_session(make_session("rev-stored", &[1, 2, 3]));
+        assert_eq!(view.selected_index, 3);
+        assert_eq!(view.scroll, 8);
+
+        view.set_session(make_session("rev-stored", &[1]));
+        assert_eq!(view.selected_index, view.row_count() - 1);
+        assert_eq!(view.scroll, 8);
+
+        view.set_session(make_session("rev-other", &[4]));
+        assert_eq!(view.selected_index, 0);
+        assert_eq!(view.scroll, 0);
     }
 
     /// A freshly finished audit is the single path that unfolds the summary and

@@ -19,12 +19,15 @@
 //! neither keeps its argument list exactly as written, so a plain filter such as
 //! `rustfmt` still reads the staged text on standard input and nothing else.
 
+use crate::blocking::StartedOperations;
 use crate::toolchain::config::{ProjectConfig, ProjectParameterSpec};
 use std::path::Path;
 
-use tokio::sync::watch;
+use crate::stop::HardCancellation;
 
-use super::exec::{run_streaming_command, CommandLine, StreamingOutcome};
+use super::exec::{
+    run_streaming_command, run_streaming_command_with_operations, CommandLine, StreamingOutcome,
+};
 use super::DEFAULT_PROJECT_TIMEOUT_SECS;
 
 /// Outcome of streaming one file's staged content through `[project.format]`.
@@ -61,7 +64,18 @@ pub async fn format_with_project_config(
     repo_root: &Path,
     project: &ProjectConfig,
     content: &str,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
+) -> Option<InMemoryFormatOutcome> {
+    format_with_project_config_and_operations(repo_root, project, content, cancel_rx, None).await
+}
+
+/// Formats one file with process completion retained by an optional owner.
+pub async fn format_with_project_config_and_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    content: &str,
+    cancel_rx: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
 ) -> Option<InMemoryFormatOutcome> {
     match resolve_formatter(project) {
         FormatterResolution::Absent => None,
@@ -72,9 +86,11 @@ pub async fn format_with_project_config(
             is_cancelled: false,
             error: Some(reason),
         }),
-        FormatterResolution::Ready(formatter) => {
-            Some(formatter.format(repo_root, "", content, cancel_rx).await)
-        }
+        FormatterResolution::Ready(formatter) => Some(
+            formatter
+                .format_with_operations(repo_root, "", content, cancel_rx, operations)
+                .await,
+        ),
     }
 }
 
@@ -165,18 +181,47 @@ impl ResolvedFormatter {
         repo_root: &Path,
         path: &str,
         content: &str,
-        cancel_rx: Option<&watch::Receiver<bool>>,
+        cancel_rx: Option<&HardCancellation>,
+    ) -> InMemoryFormatOutcome {
+        self.format_with_operations(repo_root, path, content, cancel_rx, None)
+            .await
+    }
+
+    /// Formats staged text while retaining process shutdown and completion.
+    pub(crate) async fn format_with_operations(
+        &self,
+        repo_root: &Path,
+        path: &str,
+        content: &str,
+        cancel_rx: Option<&HardCancellation>,
+        operations: Option<&StartedOperations>,
     ) -> InMemoryFormatOutcome {
         let command = self.command_for(path);
-        let outcome = run_streaming_command(
-            repo_root,
-            &command,
-            path,
-            content,
-            self.timeout_secs,
-            cancel_rx,
-        )
-        .await;
+        let outcome = match operations {
+            Some(operations) => {
+                run_streaming_command_with_operations(
+                    repo_root,
+                    &command,
+                    path,
+                    content,
+                    self.timeout_secs,
+                    cancel_rx,
+                    Some(operations),
+                )
+                .await
+            }
+            None => {
+                run_streaming_command(
+                    repo_root,
+                    &command,
+                    path,
+                    content,
+                    self.timeout_secs,
+                    cancel_rx,
+                )
+                .await
+            }
+        };
 
         if outcome.is_cancelled {
             tracing::warn!(
@@ -289,6 +334,7 @@ fn compact(text: &str) -> String {
 mod tests {
     use super::super::exec::PROCESS_GROUP_STABILITY_WINDOW;
     use super::*;
+    use crate::stop::StopSource;
     use crate::toolchain::config::ProjectCommandSpec;
 
     /// Parses a `[project]` declaration from its JSON form.
@@ -494,9 +540,11 @@ mod tests {
         let dir = repo();
         let project = project_config(r#"{"format": {"command": "sh", "args": ["-c", "cat"]}}"#);
         let authored = "pub fn value() -> i32 { 0 }\n";
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        let source = StopSource::new();
+        source.request_hard();
+        let cancel = source.token().hard_cancellation();
 
-        let outcome = format_with_project_config(dir.path(), &project, authored, Some(&cancel_rx))
+        let outcome = format_with_project_config(dir.path(), &project, authored, Some(&cancel))
             .await
             .expect("the project declares an in-memory formatter");
 

@@ -210,6 +210,7 @@ mod tests {
             methods::REVIEW_LIST,
             methods::REVIEW_GET,
             methods::REVIEW_UPDATE_ITEM,
+            methods::REVIEW_UPDATE_GROUP_STEP,
             methods::REVIEW_DELETE,
             methods::CONTEXT_GET,
             methods::CONTEXT_ADD,

@@ -538,6 +538,79 @@ mod tests {
         assert!(content.contains(&active_t("footer.request.empty_response_retry")));
     }
 
+    #[tokio::test]
+    async fn preflight_is_visible_before_model_started_and_cleared_by_the_first_turn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::sync::Arc;
+        use tauqe_protocol::{events, Event};
+        use tokio::sync::Mutex;
+
+        let mut app = crate::app::test_state();
+        app.model.status = TurnStatus::Awaiting;
+        app.model.is_batch = true;
+        let state = Arc::new(Mutex::new(app));
+        let mut reasoning = false;
+        crate::rpc::events::handle_event(
+            Event {
+                method: events::TOOLCHAIN_STARTED.into(),
+                params: Some(serde_json::json!({
+                    "operation_id": "batch-op", "command": "pre-flight"
+                })),
+            },
+            &state,
+            &mut reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            assert!(guard.running_model.is_none());
+            assert_eq!(guard.model.status, TurnStatus::Verifying);
+            let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+            terminal
+                .draw(|frame| render_footer(frame, &guard, frame.area()))
+                .unwrap();
+            let content: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(content.contains(&active_t("status.verifying")), "{content}");
+            assert!(content.contains("pre-flight"), "{content}");
+            assert!(!content.contains(&active_t("status.awaiting")), "{content}");
+        }
+        for (method, params) in [
+            (
+                events::TOOLCHAIN_FINISHED,
+                serde_json::json!({
+                    "operation_id": "batch-op", "command": "pre-flight", "success": true
+                }),
+            ),
+            (
+                events::MODEL_STARTED,
+                serde_json::json!({
+                    "operation_id": "step-op", "model": {"provider": "openrouter", "name": "coder"},
+                    "is_batch": true
+                }),
+            ),
+        ] {
+            crate::rpc::events::handle_event(
+                Event {
+                    method: method.into(),
+                    params: Some(params),
+                },
+                &state,
+                &mut reasoning,
+            )
+            .await;
+        }
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Awaiting);
+        assert!(guard.model.toolchain.is_none());
+        assert!(guard.model.is_batch);
+    }
+
     #[test]
     fn narrow_footer_keeps_an_unlimited_round_ahead_of_detail() {
         use ratatui::backend::TestBackend;

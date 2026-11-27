@@ -38,7 +38,8 @@ pub mod runner;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tokio::sync::watch;
+use crate::blocking::StartedOperations;
+use crate::stop::HardCancellation;
 
 pub use fmt::{format_with_project_config, InMemoryFormatOutcome};
 pub(crate) use fmt::{resolve_formatter, FormatterResolution};
@@ -92,19 +93,32 @@ pub async fn run_verification_pipeline_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
+) -> (bool, Vec<ToolchainCheckResult>) {
+    run_verification_pipeline_with_operations(repo_root, project, changed_files, cancel_rx, None)
+        .await
+}
+
+/// Runs verification with process completion retained by the transaction owner.
+pub async fn run_verification_pipeline_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    changed_files: &[String],
+    cancel_rx: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
     let steps = commands::resolve_verification_plan(project);
     let mut results = Vec::new();
     let change_set = change_set_payload(changed_files);
 
     for step in steps {
-        let mut result = exec::run_command(
+        let mut result = exec::run_command_with_operations(
             repo_root,
             &step.command,
             step.timeout_secs,
             change_set.as_deref(),
             cancel_rx,
+            operations,
         )
         .await;
         if !result.success && !result.is_cancelled {
@@ -139,7 +153,7 @@ pub async fn run_toolchain_check_with_timeout(
     repo_root: &Path,
     command_str: &str,
     timeout_secs: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> ToolchainCheckResult {
     let command = exec::CommandLine::tokenized(command_str);
     exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await
@@ -164,7 +178,18 @@ pub async fn run_post_hooks_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
+) -> Result<ProjectPostHookResponse, String> {
+    run_post_hooks_with_operations(repo_root, project, changed_files, cancel_rx, None).await
+}
+
+/// Runs a post-hook while retaining shutdown and completion with the owner.
+pub async fn run_post_hooks_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    changed_files: &[String],
+    cancel_rx: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
 ) -> Result<ProjectPostHookResponse, String> {
     let Some(spec) = project.post_hook.as_ref() else {
         return Ok(ProjectPostHookResponse {
@@ -183,12 +208,13 @@ pub async fn run_post_hooks_with_config(
         .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
     let command = exec::CommandLine::new(resolved.command, resolved.args);
     let change_set = change_set_payload(changed_files);
-    let outcome = exec::run_command(
+    let outcome = exec::run_command_with_operations(
         repo_root,
         &command,
         timeout_secs,
         change_set.as_deref(),
         cancel_rx,
+        operations,
     )
     .await;
 
@@ -233,7 +259,19 @@ pub async fn run_project_command_with_config(
     project: &ProjectConfig,
     name: &str,
     arguments: &BTreeMap<String, String>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
+) -> Result<ToolchainCheckResult, String> {
+    run_project_command_with_operations(repo_root, project, name, arguments, cancel_rx, None).await
+}
+
+/// Runs a named project command with retained process shutdown and completion.
+pub async fn run_project_command_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    name: &str,
+    arguments: &BTreeMap<String, String>,
+    cancel_rx: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
 ) -> Result<ToolchainCheckResult, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -264,7 +302,15 @@ pub async fn run_project_command_with_config(
     let mut args = resolved.args;
     args.extend(bind_parameters(name, &resolved.parameters, arguments)?);
     let command = exec::CommandLine::new(resolved.command, args);
-    Ok(exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await)
+    Ok(exec::run_command_with_operations(
+        repo_root,
+        &command,
+        timeout_secs,
+        None,
+        cancel_rx,
+        operations,
+    )
+    .await)
 }
 
 /// Binds one invocation onto the declared parameter contract.

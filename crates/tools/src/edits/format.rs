@@ -33,12 +33,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::edits::operation::EditOperation;
-use tokio::sync::watch;
+use crate::stop::HardCancellation;
 
 use super::change_set::{
     stage_and_validate_edits_inner, StageEditsResult, StagedConfigValidator, StagedEditsState,
 };
-use crate::blocking::{resolve_offload_failure, run_blocking_async};
+use crate::blocking::{resolve_offload_failure, run_blocking_async, StartedOperations};
 use crate::toolchain::{resolve_formatter, FormatterResolution};
 
 /// Stages edits in memory under an already resolved project configuration and
@@ -66,7 +66,7 @@ async fn prepare_staged_edits_with_config_and_validator(
     edits: &[EditOperation],
     initial_staged: Option<&StagedEditsState>,
     config_validator: Option<StagedConfigValidator>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> StageEditsResult {
     prepare_edit_batches(
         repo_root,
@@ -89,7 +89,7 @@ pub async fn prepare_edit_batches(
     batches: &[&[EditOperation]],
     initial_staged: Option<&StagedEditsState>,
     config_validator: Option<StagedConfigValidator>,
-    cancel_rx: Option<&watch::Receiver<bool>>,
+    cancel_rx: Option<&HardCancellation>,
 ) -> StageEditsResult {
     let inputs = Arc::new(StagingInputs::new(
         repo_root,
@@ -99,8 +99,69 @@ pub async fn prepare_edit_batches(
         initial_staged,
     ));
     let mut result = stage_off_the_executor(Arc::clone(&inputs), config_validator).await;
-    format_staged_files(repo_root, project, config_validator, &mut result, cancel_rx).await;
+    format_staged_files(
+        repo_root,
+        project,
+        config_validator,
+        &mut result,
+        cancel_rx,
+        None,
+    )
+    .await;
     result
+}
+
+/// Prepares bytes for publication under a retained technical-operation owner.
+/// Unlike standalone staging, cancellation is a refusal, not permission to
+/// publish the authored text after the formatter stopped.
+#[allow(clippy::too_many_arguments)] // The explicit owner and cancellation extend the staging contract.
+pub async fn prepare_edit_batches_with_operations(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    context: &[String],
+    batches: &[&[EditOperation]],
+    initial_staged: Option<&StagedEditsState>,
+    config_validator: Option<StagedConfigValidator>,
+    cancel_rx: Option<&HardCancellation>,
+    operations: &StartedOperations,
+) -> Result<StageEditsResult, String> {
+    if cancelled(cancel_rx) {
+        return Err("edit preparation was cancelled".into());
+    }
+    let inputs = Arc::new(StagingInputs::new(
+        repo_root,
+        project,
+        context,
+        batches,
+        initial_staged,
+    ));
+    let staged = Arc::clone(&inputs);
+    let handle = operations
+        .start(move || staged.stage(config_validator), None)
+        .map_err(str::to_string)?;
+    let mut result = handle
+        .take_result()
+        .await
+        .expect("staging completion is retained until consumed")
+        .map_err(|error| error.to_string())?;
+    if format_staged_files(
+        repo_root,
+        project,
+        config_validator,
+        &mut result,
+        cancel_rx,
+        Some(operations),
+    )
+    .await
+        || cancelled(cancel_rx)
+    {
+        return Err("edit preparation was cancelled".into());
+    }
+    Ok(result)
+}
+
+fn cancelled(cancel_rx: Option<&HardCancellation>) -> bool {
+    cancel_rx.is_some_and(HardCancellation::is_cancelled)
 }
 
 /// The owned inputs of one staging attempt, moved onto a blocking thread.
@@ -255,14 +316,15 @@ async fn format_staged_files(
     project: &ProjectConfig,
     config_validator: Option<StagedConfigValidator>,
     result: &mut StageEditsResult,
-    cancel_rx: Option<&watch::Receiver<bool>>,
-) {
+    cancel_rx: Option<&HardCancellation>,
+    operations: Option<&StartedOperations>,
+) -> bool {
     let formatter = match resolve_formatter(project) {
         FormatterResolution::Ready(formatter) => formatter,
         // A project that declares no filter, or one whose declaration the
         // configuration rejects, keeps every authored content; the rejection is
         // already recorded where the declaration was resolved.
-        FormatterResolution::Absent | FormatterResolution::Rejected(_) => return,
+        FormatterResolution::Absent | FormatterResolution::Rejected(_) => return false,
     };
 
     let mut formatted: Vec<(String, String)> = Vec::new();
@@ -278,9 +340,16 @@ async fn format_staged_files(
         let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
-        let outcome = formatter.format(repo_root, path, &content, cancel_rx).await;
+        let outcome = match operations {
+            Some(operations) => {
+                formatter
+                    .format_with_operations(repo_root, path, &content, cancel_rx, Some(operations))
+                    .await
+            }
+            None => formatter.format(repo_root, path, &content, cancel_rx).await,
+        };
         if outcome.is_cancelled {
-            return;
+            return true;
         }
         formatted.push((path.clone(), outcome.content));
     }
@@ -306,12 +375,69 @@ async fn format_staged_files(
             .staged_files
             .insert(path, content.into_bytes());
     }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::edits::operation::EditReplace;
+    use crate::stop::StopSource;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_formatter_refuses_publication_preparation() {
+        use std::time::Duration;
+
+        let dir = repository();
+        std::fs::write(dir.path().join(CONFIG_PATH), ORIGINAL_CONFIG).unwrap();
+        let project = project_config(
+            r#"{"format": {"command": "sh", "args": ["-c", "cat; touch formatter-started; sleep 30"]}}"#,
+        );
+        let edits = [EditOperation::Replace(EditReplace {
+            path: CONFIG_PATH.into(),
+            old_text: ORIGINAL_CONFIG.into(),
+            new_text: AUTHORED_CONFIG.into(),
+        })];
+        let source = StopSource::new();
+        let cancel = source.token().hard_cancellation();
+        let canceller_source = source.clone();
+        let marker = dir.path().join("formatter-started");
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if marker.exists() {
+                    canceller_source.request_hard();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("formatter never started");
+        });
+        let operations = StartedOperations::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare_edit_batches_with_operations(
+                dir.path(),
+                &project,
+                &context_state(),
+                &[&edits],
+                None,
+                None,
+                Some(&cancel),
+                &operations,
+            ),
+        )
+        .await
+        .expect("formatter cancellation must complete");
+        canceller.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        operations.close();
+        assert_eq!(operations.wait().await.unconfirmed, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONFIG_PATH)).unwrap(),
+            ORIGINAL_CONFIG
+        );
+    }
 
     /// The repository configuration file the filters rewrite.
     const CONFIG_PATH: &str = "tauqe.toml";
@@ -631,7 +757,7 @@ mod tests {
             .staged_files
             .insert("src/lib.rs".to_string(), b"pub fn value() {}\n".to_vec());
 
-        format_staged_files(dir.path(), &project, None, &mut result, None).await;
+        format_staged_files(dir.path(), &project, None, &mut result, None, None).await;
 
         assert_eq!(
             result

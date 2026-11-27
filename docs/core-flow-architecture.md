@@ -12,8 +12,11 @@ to be defined or whether an object is mutable.
 **Core implements technical execution.** Before a particular workflow runs,
 the application binds the configured provider, model transport, edit format,
 application policy, verification machinery, request transport, and their
-configuration. A workflow cannot silently replace these dependencies. Core
-provides the mechanisms for constructing coherent prompts, streaming requests,
+configuration. A workflow cannot silently replace these dependencies. Core,
+under `PromptExecutor`, prepares the available-file catalog, repository outline,
+external-document declarations, and contents of admitted files. A catalog entry
+does not load an external document's text. Core provides the mechanisms for
+constructing coherent prompts, streaming requests,
 decoding results, and executing admitted technical operations. It does not
 decide which scenario to run or what the scenario should do with a result.
 
@@ -39,13 +42,29 @@ filter, and decoder must agree with the same grant. Changing or revoking a
 capability takes effect on the next request, including a continuation; it
 cannot leave an old decoder or instruction in place.
 
-The executor streams provisional user-visible events and returns a typed
-outcome: decoded response, semantic refusal, exhaustion, cancellation, or
-infrastructure failure. It owns request construction, caching, provider
-streaming and technical retries. A workflow never needs to assemble a
-provider request or read raw provider JSON to decide its next step. The
-executor never schedules that step, applies a plan decision, or chooses a
-scenario-specific fallback. The factory resolves technical dependencies from
+An isolated step prepares its model, effort, provider, policy and executor from
+one operation-bound environment. The prepared attempt carries that binding and
+the repository root, not a second configuration or a second model selection;
+step publication reads the model and effort from the prepared binding. Reloading
+configuration after admission cannot alter an in-flight request.
+
+The executor admits the complete serialized provider input under
+`request.max_input_tokens`: instructions, task, history, files, external
+documents, repository outline, feedback, scratchpad, response schema, and
+adapter framing all count. The estimate is `ceil(serialized_request_bytes / 4)`,
+not an exact provider token count. Diagnostic components are rounded separately
+and need not sum to the total. Overflow refuses the request before a provider
+call or round charge without discarding accepted materials.
+
+The executor's single operational method, `execute`, accepts semantic inputs
+and returns `Result<Vec<LlmCommand>, ExecutionError>`. It owns the task's private
+transcript and scratchpad, file snapshots, request construction, caching,
+streaming, usage and decoding. A valid response with no commands is distinct
+from a blank provider stream; cancellation, incomplete streams, transport
+errors and protocol defects cannot execute partially decoded commands. A
+workflow never assembles a provider request or reads raw provider JSON. The
+executor never executes commands, schedules the next request, applies a plan
+decision, or chooses a scenario-specific fallback. The factory resolves technical dependencies from
 the operation's frozen environment; changing the selected model rung is
 workflow intent, while resolving its provider and effort is factory work.
 
@@ -54,7 +73,11 @@ inside a bounded turn without requiring every workflow to adopt the turn
 lifecycle. Different typed request contracts are legitimate; different
 provider paths and inconsistent rules for freezing inputs are not. The
 executor can maintain a request cache, but it does not own the workflow's
-context, history, or permissions.
+context, history, permissions, round budget, or continuation. Flow supplies
+intent and staging facts, including created paths; core assembles admitted
+materials and keeps original and current file projections inside the task's
+executor. Model rebinding within a task preserves the conversation; an
+independent task receives a fresh executor.
 
 ## Workflows compose workflows
 
@@ -62,9 +85,8 @@ Flow's execution logic is organized around explicit, reusable scenarios,
 not around a large `Application` facade or a collection of provider wrappers:
 
 ```text
-Application::ask → workflows::repl::run
-  └─ TurnWorkflow
-       └─ RoundWorkflow ── PromptExecutor ── provider
+Application::ask → repl::lifecycle → run_technical_turn → TurnWorkflow
+       └─ workflows::round::run_round ── PromptExecutor::execute ── provider
 
 Application::{execute_plan, execute_plan_pipeline}
   └─ PlanResources → plan batch → PlanAttempts → StepResources
@@ -72,15 +94,15 @@ Application::{execute_plan, execute_plan_pipeline}
 Application::execute_review
   └─ ReviewResources → review batch → ReviewSequence → StepResources
 
-StepResources → StepAttempt → TurnWorkflow → RoundWorkflow → PromptExecutor
+StepResources → StepAttempt → run_technical_turn → TurnWorkflow → workflows::round::run_round → PromptExecutor::execute
 
 Application::synthesize_plan → plan synthesis → Architect contour
-  └─ PromptExecutor → PreparedPrompt::execute_decoded → shared request transport
+  └─ workflows::round::run_round → PromptExecutor::execute → shared request transport
 
 Application::{preview_review, start_review, analyze_review} → review::{audit, analysis}
   └─ preview reads the audit window; audit and analysis use bound model requests
 
-One-off structured request → StructuredExecution::run
+One-off structured request (Scribe, audit, critique) → StructuredExecution::run
   └─ core::execution::structured::execute → shared request transport
 ```
 
@@ -93,25 +115,57 @@ points and reach the same bounded turn through an isolated step attempt.
 | `Application` | Public entry points, binding of session services, and interactive admission | Plan/review phases, next model request or batch verdict |
 | Plan and review workflows | Operation admission, readiness, continuation, document decisions and terminal publication | Provider transport or shared edit-turn mechanics |
 | Shared leaf queue and `StepResources` | Queue and attempt mechanics, step supervision and recovery | Plan or review status and batch policy |
-| `workflows::repl::run` | Supervision of one interactive task, receipt settlement, history and terminal publication | Provider transport |
-| `TurnWorkflow` | Technical continuation, staging/edit state and transaction settlement | Plan/review persistence decisions |
-| `RoundWorkflow` | One admission, budget charge and accepted-response registration | Research execution or retries |
-| `PromptExecutor` / `PreparedPrompt` | Technical cache and one frozen, single-use request | Mutable turn state, budget or continuation |
+| `workflows::repl::run` | Interpretation of one interactive technical result and awaited document preparation, correction and save | Provider transport or independent document workers |
+| `run_technical_turn` / `TurnWorkflow` | Retained transaction settlement; technical rounds, staging/edit state and continuation | Plan/review persistence decisions |
+| `workflows::round::run_round` | One request, admitted-call budget charge and common command handling through research mechanisms; passes remaining commands in order | Task lifecycle, retry policy or transcript |
+| `PromptExecutor::execute` | One admitted request, private task transcript, snapshots, decoding and sanitized recovery registration | Command execution, workflow context, budget or continuation |
 | Server | RPC decoding, error translation and event projection | Scenario execution |
 
 The edit-turn routes compose three workflow layers between application admission
 and the executor. The infrastructure factory binds collaborators; it does not
 decide when a scenario continues.
 
-`RoundWorkflow` prepares and admits one request from workflow-owned inputs,
-uses the executor, and registers only a completed, structurally valid response.
-It does not execute commands or decide whether to continue.
+The free function `workflows::round::run_round` passes the workflow's semantic
+inputs to the separately supplied executor, charges the budget only for an
+admitted request, and handles common commands through the existing research
+mechanisms with explicit context, journal, frozen project configuration and
+cancellation. It removes handled commands while preserving the order of those
+left for the scenario. It creates no task or lifecycle, cannot access the
+transcript, and neither retries nor decides whether to continue.
+The executor projects files and feedback provisionally and admits the complete
+request before committing either projection or charging a call. It publishes
+the round start before provider deltas; transport retries remain within that
+call. Only a completed, structurally valid decoded payload (including a valid
+empty command result) can register an accepted round; blank streams, protocol
+defects, incomplete streams and transport failures cannot. Registration occurs
+without an await gap before the recovery record. It is not successful edit or
+document persistence. The recovery reader retains sanitized rounds and bounded
+feedback, never private prompts, file bodies or scratchpad; accepted round IDs
+identify the final response's source even after patch repair.
 `TurnWorkflow` composes rounds into one bounded unit: research, rejected-patch
-retry, verification healing, transcript, budget, staging, and transaction
-settlement have one explicit lifetime. The supervised REPL task owns its
-`TurnState`, focus, document interpretation and corrective continuations.
-`repl::run` relays provisional events, then waits for a report containing the
-task outcome and the independently settled disk and document writes. It chooses
+retry, verification healing, budget, staging, and transaction
+settlement have one explicit lifetime. REPL and isolated steps both enter
+`run_technical_turn`, a concrete function that accepts turn data rather than
+computation or registration callbacks. It retains the policy while computation runs and returns
+one technical report with settled file facts and an optional continuation
+containing the turn state and executor. If computation stops or panics, the
+supervisor confirms its exit and settles the policy before returning; neither
+scenario starts a file worker or performs separate Git recovery. Only the
+computation is registered for forced abort. A retained operation hold keeps
+admission closed through settlement even if the caller stops waiting; cleanup
+checks the task identity before clearing its abort handle. Transaction settlement
+is a separate function running in the supervisor, not an abortable computation.
+The supervised
+REPL task owns its `TurnState`, focus, document interpretation and corrective
+continuations. After
+the universal TURN settles successfully, REPL selects the plan or review branch
+and awaits `apply_plan_commands` or `apply_review_commands` in the same task;
+TURN does not know about document storage. Plan preparation retains accepted
+mutations in memory across corrective rounds on the same transcript and budget.
+Only payload defects prompt correction; storage failures and authorization
+refusals do not. Review decisions have no corrective loop.
+`repl::lifecycle::run` relays provisional events, then waits for the task outcome
+and the settled file facts from the same technical report. It chooses
 whether to record a completed response or an interruption before publishing the
 terminal outcome. A normal answer is recorded once before `Finished`. A plan
 storage refusal produces a diagnostic, not a correction request or a saved plan
@@ -121,6 +175,16 @@ writes before terminal publication, while still holding the operation. History
 failures suppress `Result` and `Finished`, not an already finalized commit. If
 Git finalization fails after verification, the accepted reply stays among the
 rounds and the response records the Git diagnostic, not a commit or a rollback.
+Document persistence is a final awaited blocking call, not a separate queue.
+`PlanStorage::commit_prepared_batch` and `ReviewStorage::commit_prepared_decisions`
+commit prepared documents and active markers through reversible file replacements.
+Cancellation before final acceptance restores the original bytes; a failed
+restoration is reported explicitly. A blocking filesystem call already underway
+cannot be interrupted by dropping its Tokio waiter: wait for it to settle and
+perform only required cleanup on cancellation, not further preparation or
+saving. Once committed, a later abort or cancellation of terminal publication
+does not undo the saved documents; the typed result carries them for publication.
+Git transaction recovery for code edits remains independent of this boundary.
 Plan and review entry points pass scoped resources, not `Application` or a
 callback to it. The scenarios retain readiness, escalation, status changes and
 persistence. An isolated step starts a fresh turn with its own grant and no
@@ -188,7 +252,7 @@ lets active work settle without undoing verified commits.
 Both routes use `workflows::step::{queue, attempts}` for leaf sequencing and
 retry mechanics. Both converge at
 [`StepResources::execute_prepared_single_step`](../crates/flow/src/workflows/step/run.rs)
-and the same `StepAttempt → TurnWorkflow → RoundWorkflow` path. That path
+and the same `StepAttempt → TurnWorkflow → workflows::round::run_round` path. That path
 settles repository edits; it does not decide whether to write `Done` or `Fixed`.
 
 Plan creation, refinement and replanning enter
@@ -199,6 +263,16 @@ the same audit window rules serve preview and execution. Post-analysis enters
 or from a preset audit. These paths can use Architect research and one-off
 structured requests without entering an edit transaction.
 
+Plain audit expands the active context plus matched paths; preset audit expands
+each configured group independently. Preview uses the same full expansion, with
+no separate file-token allowance or silent truncation. The complete structured
+request is admitted against `request.max_input_tokens` before transport; an
+oversized audit fails rather than silently dropping readable files. A failed
+group remains a failed member in the report: a local domain failure can permit
+the next group, while an infrastructure failure stops the batch. Automatic
+post-analysis follows only a successful group report; explicit post-analysis
+remains an independent admitted scenario.
+
 The application-owned [`Documents`](../crates/flow/src/application/documents.rs)
 service handles document reads and writes, including
 [execution-specific writes](../crates/flow/src/application/documents/execution.rs).
@@ -207,7 +281,82 @@ projections, and its `PlanStorage` and `ReviewStorage` own document paths and
 file persistence. SQLite is a possible future replacement for file persistence
 behind this boundary, not an implemented backend.
 
+## Consolidated mechanics and remaining session dependencies
+
+The plan and review routes use the same `step::attempts::LeafExecutor` for
+readiness, coder rung attempts and retry mechanics, and `step::queue` for leaf
+sequencing. Their `LeafOperations` implementations still supply distinct task
+prompts, document transitions and persistence. Plan synthesis owns its draft,
+critique and reconciliation beats separately from directed replanning; both
+reuse the Architect contour without merging their budgets. Audit and
+post-analysis share `workflows::structured::run_accounted`, which supervises
+one operation-bound structured request and charges its usage but does not close
+the enclosing scenario's usage window or decide its durable result.
+
+Core's request cache prepares project configuration, repository outlines and
+context file contents for both interactive and isolated turns. Core's task
+helpers confirm joins and bounded stops; flow decides what an orphaned task
+means for its scenario. No common workflow dispatches between Plan, Review and
+REPL or calls back into `Application` to execute part of a scenario.
+
+The computational REPL continuation does not borrow `Application` or session services.
+`Application::ask` binds the executor to an operation and spawns
+the independent `repl::lifecycle::run` coordinator. That coordinator uses
+`HistorySession` alongside context and execution session services for
+history, usage and terminal publication; the infrastructure factory binds providers and operation
+policy from the same session environment. No second supervisor is required
+when the caller stops waiting after admission.
+
+`HistorySession` owns the decision to compact and the protected registration
+of the current prompt. The launch passes the operation, frozen configuration
+and current usage binding to that call; Scribe is resolved lazily by execution
+infrastructure only when compaction is needed, inside the active accounting
+window. History holds no turn binding between calls. Registration returns an
+`OpenInteractiveTurn`, the consumable right to complete or interrupt that
+specific journal entry after execution settles.
+
+The computational REPL continuation interprets responses and document corrections
+on one turn state and returns its local context without post-edit cleanup.
+`InteractiveTask` starts with its operation guard, serial lease, open journal
+turn and round reader already owned. Its join waits for technical settlement
+even when computation is aborted. Only after that report may REPL consume its
+continuation for document correction or persistence; document calls are awaited
+inside the REPL task, not drained by an independent worker. Document acceptance
+is a separate boundary: a completed file transaction does not itself save a plan
+or review decision, and late cancellation does not undo an already saved document.
+The classifier pairs completed decisions with `CompleteTurn` and interrupted
+decisions with `InterruptTurn`; `OpenInteractiveTurn` consumes exactly one such
+decision. The journal moves only an eligible final accepted round into the
+response, restoring it among the rounds if the response write fails. Empty
+cancellation rolls back the prompt only without rounds, diagnostics or
+confirmed writes.
+
+After journal settlement, `ContextSession::settle_turn_context` merges context
+from completed results (including diagnostic results), then alone clears
+transient context and rotates the dialogue identity for a confirmed applied
+edit, even without returned context or successful journal persistence.
+Interrupted computation does not implicitly merge its context. Confirmed
+commits and documents are published before usage closes. Cancellation is
+checked before the journal decision and again after all asynchronous settlement
+and usage work. The final snapshot chooses the terminal sequence: late
+cancellation emits `Cancelled`, not `Result`/`Finished` or `Error`, without
+undoing a saved response, commit or document. Usage and confirmed-write
+notices remain visible. No await separates this snapshot from publication.
+
 ## Lifetimes and invariants
+
+An operation owns one monotone `StopSource` in tools: `Running → Soft → Hard`.
+Its `StopToken` reads the full state at scheduling boundaries; a cloned
+`HardCancellation` receiver exposes only Hard to current work. A new observer
+sees the latest state, and a closed source in Running or Soft leaves Hard waits
+pending; a previously requested Hard remains observable after closure. Soft
+stops the next plan step or pipeline plan, or the next outer review member,
+while the active review member finishes its internal queue (which ignores Soft).
+Hard interrupts active work and prevents the next member, but transaction
+recovery, reap, usage drain, protected journal registration, and terminal
+publication must still settle before ownership is released. The watchdog and
+abort handle retain their separate forced-stop role. Process-local stop-on-drop
+and transport shutdown are independent signals and never promote an operation.
 
 1. **Request:** freeze the supplied context version, optional history, grant,
    and model selection for one provider call. Only an admitted physical call
@@ -239,16 +388,29 @@ policy, and decoder without building a repository prompt or scheduling another
 request. Both this runner and `PreparedPrompt` call `core::execution::request`
 for provider streaming and event delivery.
 
-The interactive workflow owns one `TurnState` across technical and document
-corrections. After transaction settlement, a defective plan payload is retried
-directly through `RoundWorkflow`, with only its original plan operation,
-message, scratchpad, blocked and abort capabilities. These requests spend the
-same budget and retain the accepted transcript. The supervisor retains a narrow
+Before registering a new REPL turn, Scribe compacts the eligible journal head
+when its history budget requires it, preserving the retained tail. Full-request
+admission follows; overflow in other input components does not trigger a
+separate compaction retry. Accepted history is never silently truncated.
+
+The interactive workflow owns one `TurnState` and the same executor across technical
+and document corrections. After file transaction settlement, a defective plan payload is
+retried by calling `workflows::round::run_round` directly with the same
+`TurnState` and executor, but only its original plan operation, message,
+scratchpad, blocked and abort capabilities. These requests spend the same
+technical turn budget and retain the accepted conversation inside the executor.
+The supervisor retains a narrow
 history reader before task launch and reads it after join and recovery.
 
-`execution::transcript`
-stores originals, accepted rounds, discoveries, feedback and bounded private
-notes, and provides a read-only accepted-history recovery handle.
+`PromptExecutor` privately holds `execution::transcript` with the frozen task,
+first delivered file versions, discoveries, feedback and scratchpad, alongside
+a separate accepted-round journal and read-only recovery handle. Created paths
+are staging facts supplied to `execute`, not opening originals;
+later staged changes, deletions and access changes are explicit current
+versions. Architect requests are fresh, without dialogue replay or interactive
+answer registration; evidence continuation projects frozen read-only evidence
+without carrying conversation between phases. Architect research and tier
+budgets remain independent of the technical turn's correction budget.
 `workflow::research::step` executes one research operation against explicit
 context, journal, configuration and cancellation inputs. `edits::staging`
 owns cumulative virtual staging and reports new destinations for the caller
@@ -262,11 +424,12 @@ none of these mechanisms decides the scenario's next request.
 
 | Mechanism | Authoritative location |
 | --- | --- |
-| Request construction and provider transport | `core::execution::{executor, request}` |
+| Request construction, private task transcript and provider transport | `core::execution::{executor, request, transcript}` |
 | Cancellation, semantic event sink, response envelope | `core::execution::{support, outcome}` |
-| Original files, accepted rounds, discoveries, feedback and recovery reader | `core::execution::transcript` |
+| Original files, discoveries, feedback and scratchpad | `core::execution::transcript`, owned by `PromptExecutor` |
+| Sanitized accepted rounds and recovery reader | `core::execution::accepted_rounds`, owned by `PromptExecutor` |
 | Research commands and feedback journal | `core::workflow::research` and `core::workflow::research::journal` |
-| Research step in an edit turn | `core::workflow::research::step` |
+| Shared command handling in a round | `flow::workflows::round::run_round` using `core::workflow::research::step` |
 | One-off structured request | `core::execution::structured` |
 | Virtual staging | `core::edits::staging` |
 | Application and verification | `core::edits::execution` |

@@ -1,13 +1,16 @@
 //! Project settled REPL facts into application events.
-use super::documents::DocumentOutcome;
-use crate::api::{Application, ApplicationEvent, ApplicationObserver};
+use super::documents::DocumentChanges;
+use crate::api::{ApplicationEvent, ApplicationObserver};
+use crate::application::context::ContextSession;
 use crate::application::edit_cycle::{EditCycle, EditTermination};
 use crate::application::interactive_completion::REPL_EDIT_SUMMARY;
-use crate::application::usage::UsageGuard;
-use std::sync::Arc;
+use crate::application::interactive_updates::{
+    interactive_plan_updates, interactive_review_updates, repository_after_turn_commit,
+};
 use tauqe_core::edits::EditOutcome;
 use tauqe_core::providers::StreamEvent;
-use tokio::sync::{mpsc, watch};
+use tauqe_core::stop::HardCancellation;
+use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub(super) struct StreamTermination {
@@ -16,13 +19,11 @@ pub(super) struct StreamTermination {
 }
 
 pub(super) async fn relay_stream(
-    application: &Application,
     observer: &dyn ApplicationObserver,
     id: &str,
     cycle: &EditCycle,
-    usage: &UsageGuard,
     mut events: mpsc::UnboundedReceiver<StreamEvent>,
-    cancel: &mut watch::Receiver<bool>,
+    cancel: &HardCancellation,
 ) -> StreamTermination {
     let mut terminal = StreamTermination::default();
     while let Some(event) = events.recv().await {
@@ -34,13 +35,6 @@ pub(super) async fn relay_stream(
             event => {
                 observer.ready(&event, cancel).await;
                 cycle.observe(&event);
-                if let StreamEvent::Usage(report) = &event {
-                    usage.observe(report).await;
-                    observer.publish(
-                        id,
-                        ApplicationEvent::Usage(application.usage_snapshot().await),
-                    );
-                }
                 observer.publish(id, ApplicationEvent::Stream(event));
             }
         }
@@ -59,7 +53,7 @@ pub(super) fn close_failed(cycle: &EditCycle, termination: EditTermination, reas
 }
 
 pub(super) async fn publish_edit(
-    application: &Application,
+    context: &ContextSession,
     observer: &dyn ApplicationObserver,
     id: &str,
     cycle: &EditCycle,
@@ -74,7 +68,9 @@ pub(super) async fn publish_edit(
                 changed_files: outcome.changed_files.clone(),
             },
         );
-        if let Some(repository) = application.repository_after_turn_commit().await {
+        if let Some(repository) =
+            repository_after_turn_commit(context.repository_root().await).await
+        {
             observer.publish(id, ApplicationEvent::Repository(repository));
         }
     }
@@ -83,13 +79,13 @@ pub(super) async fn publish_edit(
 }
 
 pub(super) async fn publish_documents(
-    application: &Application,
+    context: &ContextSession,
     observer: &dyn ApplicationObserver,
     id: &str,
-    documents: &[Arc<DocumentOutcome>],
+    documents: &DocumentChanges,
 ) {
-    let root = application.repository_root().await;
-    if let Some(updates) = application.interactive_plan_updates(&root, documents).await {
+    let root = context.repository_root().await;
+    if let Some(updates) = interactive_plan_updates(&root, documents).await {
         for plan in updates.saved {
             observer.publish(
                 id,
@@ -103,10 +99,7 @@ pub(super) async fn publish_documents(
             observer.publish(id, ApplicationEvent::PlanList { plans, active_id });
         }
     }
-    for updates in application
-        .interactive_review_updates(&root, documents)
-        .await
-    {
+    for updates in interactive_review_updates(&root, documents).await {
         for _ in 0..updates.decisions_applied {
             observer.publish(
                 id,

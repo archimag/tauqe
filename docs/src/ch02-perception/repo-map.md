@@ -1,7 +1,7 @@
 # Repository Map and Blinkers
 
 The repository map is the model's view of the codebase: symbol contours extracted
-deterministically from tracked files and compressed into a fixed token budget. It
+deterministically from tracked files without a separate map-token budget. It
 is the blinkers of the harness — enough orientation to navigate, never enough to
 mistake a contour for a contract.
 
@@ -31,8 +31,8 @@ declaration.
 2. **Contours, not contracts.** The map carries names, kinds, and shapes. Exact
    field layouts, trait bounds, lifetimes, error types, and invariants must be
    read from source before a step depends on them.
-3. **Budgeted.** Every outline fits `context.repomap_token_budget`, or is
-   truncated deterministically.
+3. **Complete.** An outline is not truncated to a map quota; the complete
+   provider request containing it must pass `request.max_input_tokens` admission.
 4. **Stable within a turn.** The map is generated once for a turn and frozen;
    context additions never regenerate it.
 5. **Links are classified, never followed.** A tracked symbolic link is inspected
@@ -75,8 +75,8 @@ path and the file's line count.
 | `OutlinesOnly` | public declaration headers, methods of trait implementations |
 | `TopLevelOnly` | declaration headers only |
 
-The levels are a ladder. The renderer starts at `Full` and steps down until the
-outline fits the budget.
+These detail levels describe possible renderings; request admission does not
+compress an outline to a separate token budget.
 
 ### 2.4 Symbolic links
 
@@ -101,11 +101,11 @@ parsed:
 4. Keep every remaining regular file as a plain path entry, so unsupported
    languages and data files still appear in the outline.
 5. Sort and deduplicate the tracked entries.
-6. Format symbols and plain paths within the token budget.
+6. Format symbols and plain paths deterministically without budget truncation.
 The pipeline is deterministic substrate: it lives in `crates/tools/src/repomap.rs`
 and is rendered into the prompt by the engine, which never derives a symbol on
 its own.
-### 3.2 Compression and the budget ladder
+### 3.2 Rendering without a separate map budget
 
 Each file renders as `path (N lines)` followed by its symbols, indented two spaces
 per nesting level. As the level drops, function signatures collapse to
@@ -114,11 +114,12 @@ non-public members disappear, and implementations lose private helpers while
 keeping trait methods. Headers are cut at the opening brace or the trailing
 semicolon, so a declaration occupies one line regardless of its body.
 
-The renderer does not guess which level fits. It formats the whole map at `Full`,
-then `PublicWithDetails`, `OutlinesOnly`, and `TopLevelOnly`, and returns the first
-result inside the budget. If even the last level overshoots, it greedily includes
-whole file blocks and then plain paths until the next entry would exceed the
-budget. The returned outline therefore never overshoots its budget silently.
+The map is rendered in full rather than discarding blocks to fit a separate
+quota. The executor measures the complete serialized provider input, including
+the map, messages, schema, and adapter framing, as
+`ceil(serialized_request_bytes / 4)`. This is an estimate, not the provider's
+tokenizer count. Overflow refuses the request before the provider call rather
+than silently shortening the outline.
 
 ### 3.3 Symbolic links
 
@@ -137,19 +138,18 @@ global outline, research requests a targeted outline with
   `crates/tools` covers `crates/tools/src/lib.rs` but never `crates/tools-utils/`.
 - Naming a single file narrows the outline to that file; an empty path names the
   whole repository.
-- The targeted map uses the same budget and degrades through the same ladder.
+- The targeted map retains matching symbols without a separate size quota.
 - Files already in context are not excluded: the request exists precisely to read
   the symbols of the subsystem under inspection.
 - An unknown prefix yields an empty outline with an explanatory block instead of a
   repository-wide map.
-- At most three distinct targeted outlines are honored per research round.
 
 ### 3.5 Eager map versus compact directory outline
 
 `context.include_repo_map` selects the outline:
 
 - `true` (default) renders the eager symbol map on every turn within
-  `context.repomap_token_budget` (4,000 tokens by default).
+  the complete repository outline, subject to full-request admission.
 - `false` removes the eager map and renders `<repo_dirs>` instead: a folder tree
   derived from the tracked file list, indented two spaces per level, with service
   directories filtered out.
@@ -186,8 +186,8 @@ outlines requested during research are round feedback, not a new map.
   other tracked file appears as a path entry.
 - **It is not recursive through links.** A symbolic link is classified and
   rendered, never traversed.
-- **It is not unbounded.** Every outline is clipped deterministically to its
-  budget.
+- **It is not silently clipped.** An oversized complete request is refused
+  before the provider call.
 - **It is not both outlines.** The prompt never carries the symbol map and the
   folder tree at the same time.
 

@@ -32,13 +32,22 @@ pub struct HistoryPage {
 pub(crate) struct HistorySession {
     state: Arc<Mutex<Option<HistoryManager>>>,
     sender: Option<mpsc::UnboundedSender<HistoryMutation>>,
+    #[cfg(test)]
+    registration_pause: Arc<Mutex<Option<Arc<RegistrationPause>>>>,
+}
+
+#[cfg(test)]
+pub(crate) struct RegistrationPause {
+    pub written: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
 }
 
 fn manager(
     root: PathBuf,
+    budget_tokens: usize,
     sender: Option<mpsc::UnboundedSender<HistoryMutation>>,
 ) -> HistoryManager {
-    let mut history = HistoryManager::new(root);
+    let mut history = HistoryManager::new(root, budget_tokens);
     if let Some(sender) = sender {
         history.set_listener(move |mutation| {
             let _ = sender.send(mutation);
@@ -48,16 +57,24 @@ fn manager(
 }
 
 impl HistorySession {
-    pub(crate) fn new(root: PathBuf, sender: mpsc::UnboundedSender<HistoryMutation>) -> Self {
+    pub(crate) fn new(
+        root: PathBuf,
+        budget_tokens: usize,
+        sender: mpsc::UnboundedSender<HistoryMutation>,
+    ) -> Self {
         let listener = sender.clone();
-        let history = tauqe_core::blocking::run_blocking(move || manager(root, Some(listener)));
+        let history = tauqe_core::blocking::run_blocking(move || {
+            manager(root, budget_tokens, Some(listener))
+        });
         Self {
             state: Arc::new(Mutex::new(Some(history))),
             sender: Some(sender),
+            #[cfg(test)]
+            registration_pause: Arc::new(Mutex::new(None)),
         }
     }
 
-    async fn mutate<T, F>(&self, mutate: F) -> Result<T, HistoryError>
+    pub(crate) async fn mutate<T, F>(&self, mutate: F) -> Result<T, HistoryError>
     where
         F: FnOnce(&mut HistoryManager) -> Result<T, HistoryError> + Send + 'static,
         T: Send + 'static,
@@ -74,14 +91,15 @@ impl HistorySession {
         })?
     }
 
-    async fn rebind(&self, root: PathBuf) -> Result<(), HistoryError> {
+    async fn rebind(&self, root: PathBuf, budget_tokens: usize) -> Result<(), HistoryError> {
         let sender = self.sender.clone();
-        let history = tauqe_core::blocking::run_blocking_async(move || manager(root, sender))
-            .await
-            .map_err(|error| {
-                tauqe_core::blocking::log_join_error(&error, "rebind session history");
-                HistoryError::Offload(error.to_string())
-            })?;
+        let history =
+            tauqe_core::blocking::run_blocking_async(move || manager(root, budget_tokens, sender))
+                .await
+                .map_err(|error| {
+                    tauqe_core::blocking::log_join_error(&error, "rebind session history");
+                    HistoryError::Offload(error.to_string())
+                })?;
         *self.state.lock().await = Some(history);
         Ok(())
     }
@@ -93,8 +111,93 @@ impl HistorySession {
             .clone()
             .ok_or(HistoryError::Unavailable)
     }
+
+    pub(crate) async fn set_budget_tokens(&self, budget_tokens: usize) -> Result<(), HistoryError> {
+        let mut guard = self.state.lock().await;
+        guard
+            .as_mut()
+            .ok_or(HistoryError::Unavailable)?
+            .set_budget_tokens(budget_tokens);
+        Ok(())
+    }
+    #[cfg(test)]
     pub(crate) async fn adopt(&self, history: HistoryManager) {
         *self.state.lock().await = Some(history);
+    }
+
+    pub(crate) async fn accept_compaction(
+        &self,
+        prepared: tauqe_core::history::PreparedCompaction,
+    ) -> Result<HistorySnapshot, HistoryError> {
+        self.mutate(move |history| history.accept_compaction(prepared).map_err(storage_error))
+            .await
+    }
+
+    pub(crate) async fn start_turn(
+        &self,
+        prompt: String,
+        files: Vec<String>,
+        watermark: Option<u64>,
+    ) -> Result<(u64, HistorySnapshot), HistoryError> {
+        let started = self
+            .mutate(move |history| {
+                let snapshot = history.snapshot().map_err(storage_error)?;
+                let id = history
+                    .record_turn_with_watermark(prompt, files, watermark)
+                    .map_err(storage_error)?
+                    .id()
+                    .ok_or_else(|| {
+                        HistoryError::Storage("Recorded history turn has no ID".into())
+                    })?;
+                Ok((id, snapshot))
+            })
+            .await?;
+        #[cfg(test)]
+        if let Some(pause) = self.registration_pause.lock().await.clone() {
+            pause.written.notify_one();
+            pause.resume.notified().await;
+        }
+        Ok(started)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_registration(&self) -> Arc<RegistrationPause> {
+        let pause = Arc::new(RegistrationPause {
+            written: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        *self.registration_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    pub(crate) async fn set_turn_rounds(
+        &self,
+        id: u64,
+        rounds: Vec<tauqe_core::history::TurnRoundRecord>,
+    ) -> Result<(), HistoryError> {
+        self.mutate(move |history| history.set_turn_rounds(id, rounds).map_err(storage_error))
+            .await
+    }
+
+    pub(crate) async fn record_response(
+        &self,
+        text: String,
+        commit: Option<String>,
+        summary: Option<String>,
+        files: Vec<HistoryFileChange>,
+    ) -> Result<(), HistoryError> {
+        self.mutate(move |history| {
+            history
+                .record_response(text, commit, summary, files)
+                .map(|_| ())
+                .map_err(storage_error)
+        })
+        .await
+    }
+
+    pub(crate) async fn rollback_turn(&self, id: u64, reason: String) -> Result<(), HistoryError> {
+        self.mutate(move |history| history.rollback_entry(id, reason).map_err(storage_error))
+            .await
     }
 
     pub(crate) async fn record_history_exchange(
@@ -153,29 +256,10 @@ impl Application {
     }
 
     pub(crate) async fn rebind_history(&self, root: PathBuf) -> Result<(), HistoryError> {
-        self.history_session().rebind(root).await
+        let budget_tokens = self.configuration().await.config.history.budget_tokens;
+        self.history_session().rebind(root, budget_tokens).await
     }
 
-    pub(crate) async fn start_history_turn(
-        &self,
-        prompt: String,
-        files: Vec<String>,
-        watermark: Option<u64>,
-    ) -> Result<(u64, HistorySnapshot), HistoryError> {
-        self.history_session()
-            .mutate(move |history| {
-                let snapshot = history.snapshot().map_err(storage_error)?;
-                let id = history
-                    .record_turn_with_watermark(prompt, files, watermark)
-                    .map_err(storage_error)?
-                    .id()
-                    .ok_or_else(|| {
-                        HistoryError::Storage("Recorded history turn has no ID".into())
-                    })?;
-                Ok((id, snapshot))
-            })
-            .await
-    }
     pub async fn record_history_turn(
         &self,
         prompt: String,
@@ -190,15 +274,6 @@ impl Application {
             })
             .await
     }
-    pub(crate) async fn set_history_turn_rounds(
-        &self,
-        id: u64,
-        rounds: Vec<tauqe_core::history::TurnRoundRecord>,
-    ) -> Result<(), HistoryError> {
-        self.history_session()
-            .mutate(move |history| history.set_turn_rounds(id, rounds).map_err(storage_error))
-            .await
-    }
 
     pub(crate) async fn record_history_response(
         &self,
@@ -208,12 +283,7 @@ impl Application {
         files: Vec<HistoryFileChange>,
     ) -> Result<(), HistoryError> {
         self.history_session()
-            .mutate(move |history| {
-                history
-                    .record_response(text, commit, summary, files)
-                    .map(|_| ())
-                    .map_err(storage_error)
-            })
+            .record_response(text, commit, summary, files)
             .await
     }
 }
@@ -238,15 +308,6 @@ impl HistorySession {
 }
 
 impl Application {
-    pub(crate) async fn rollback_history_entry(
-        &self,
-        id: u64,
-        reason: String,
-    ) -> Result<(), HistoryError> {
-        self.history_session()
-            .mutate(move |history| history.rollback_entry(id, reason).map_err(storage_error))
-            .await
-    }
     pub(crate) async fn clear_history(
         &self,
         operation: &crate::api::OperationGuard,
@@ -373,6 +434,30 @@ mod tests {
             events.try_recv(),
             Ok(HistoryMutation::Appended { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn history_budget_changes_at_configuration_boundary_without_mutating_a_clone() {
+        let root = tempfile::tempdir().unwrap();
+        let (app, _events) = application(root.path().to_path_buf());
+        let original = app.history_session().clone_for_turn().await.unwrap();
+        assert_eq!(original.budget_tokens(), 20_000);
+        let operation = app.begin_configuration_change().unwrap();
+        let mut config = AppConfig::default();
+        config.history.budget_tokens = 1;
+        operation
+            .replace_configuration(config, crate::api::ReloadSelection::Preserve)
+            .await;
+        assert_eq!(original.budget_tokens(), 20_000);
+        assert_eq!(
+            app.history_session()
+                .clone_for_turn()
+                .await
+                .unwrap()
+                .budget_tokens(),
+            1
+        );
+        assert!(app.try_begin_operation().is_err());
     }
 
     #[tokio::test]

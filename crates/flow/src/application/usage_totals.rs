@@ -1,7 +1,9 @@
 //! Domain accounting values, independent of RPC snapshots.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tauqe_core::providers::ModelUsageInfo;
+use tauqe_core::workflow::batch::{BatchStepOutcome, BatchUsage};
 
 /// Aggregated usage accounting shared by every operation kind.
 ///
@@ -136,9 +138,110 @@ impl UsageTotalsSnapshot {
     }
 }
 
+/// Immutable accounting result of one closed window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageReceipt {
+    pub window_id: u64,
+    pub totals: UsageTotals,
+    pub cost_complete: bool,
+    pub snapshot: UsageTotalsSnapshot,
+}
+
+impl UsageReceipt {
+    /// Project a completed window for a batch without charging the ledger.
+    pub fn batch_usage(&self) -> ModelUsageInfo {
+        ModelUsageInfo {
+            prompt_tokens: self.totals.prompt_tokens,
+            completion_tokens: self.totals.completion_tokens,
+            total_tokens: self.totals.total_tokens,
+            reasoning_tokens: self.totals.reasoning_tokens,
+            cached_tokens: self.totals.cached_tokens,
+            cost: self.cost_complete.then_some(self.totals.cost),
+        }
+    }
+}
+
+/// Projects distinct closed windows into batch totals without charging the ledger.
+#[derive(Default)]
+pub(crate) struct ReceiptAccumulator {
+    windows: HashSet<u64>,
+    usage: BatchUsage,
+}
+
+impl ReceiptAccumulator {
+    pub(crate) fn include(&mut self, receipt: &UsageReceipt) {
+        if self.windows.insert(receipt.window_id) {
+            self.usage.accumulate_outcome(
+                &BatchStepOutcome::succeeded().with_usage(receipt.batch_usage()),
+            );
+        }
+    }
+
+    pub(crate) fn usage(&self) -> BatchUsage {
+        self.usage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_core::workflow::batch::{BatchStepOutcome, BatchUsage};
+
+    #[test]
+    fn receipt_projection_is_repeatable_without_changing_ledger_snapshot() {
+        let receipt = UsageReceipt {
+            window_id: 7,
+            totals: UsageTotals {
+                total_tokens: 9,
+                cost: -0.2,
+                ..Default::default()
+            },
+            cost_complete: true,
+            snapshot: UsageTotalsSnapshot::default(),
+        };
+        let first = receipt.batch_usage();
+        assert_eq!(first, receipt.batch_usage());
+        let mut batch = BatchUsage::default();
+        batch.accumulate_outcome(&BatchStepOutcome::failed("decode").with_usage(first));
+        assert_eq!(batch.total_tokens, 9);
+        assert_eq!(batch.cost, Some(-0.2));
+        assert_eq!(receipt.snapshot, UsageTotalsSnapshot::default());
+
+        let unknown = UsageReceipt {
+            cost_complete: false,
+            ..receipt.clone()
+        };
+        batch.accumulate_outcome(&BatchStepOutcome::cancelled().with_usage(unknown.batch_usage()));
+        assert_eq!(batch.total_tokens, 18);
+        assert_eq!(batch.cost, None);
+        let mut projection = ReceiptAccumulator::default();
+        projection.include(&receipt);
+        projection.include(&unknown);
+        assert_eq!(projection.usage().total_tokens, 9);
+        assert_eq!(projection.usage().cost, Some(-0.2));
+        assert_eq!(receipt.snapshot, UsageTotalsSnapshot::default());
+    }
+
+    #[test]
+    fn multiple_attempt_receipts_keep_unknown_cost_and_ignore_duplicates() {
+        let mut projection = ReceiptAccumulator::default();
+        for (window_id, tokens, complete) in [(1, 4, true), (2, 6, false), (3, 8, true)] {
+            let receipt = UsageReceipt {
+                window_id,
+                totals: UsageTotals {
+                    total_tokens: tokens,
+                    cost: 0.5,
+                    ..Default::default()
+                },
+                cost_complete: complete,
+                snapshot: UsageTotalsSnapshot::default(),
+            };
+            projection.include(&receipt);
+            projection.include(&receipt);
+        }
+        assert_eq!(projection.usage().total_tokens, 18);
+        assert_eq!(projection.usage().cost, None);
+    }
 
     #[test]
     fn provider_reports_keep_legacy_accounting_cost_semantics() {

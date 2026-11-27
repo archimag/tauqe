@@ -1,7 +1,7 @@
 //! Completion classification for a typed single-audit result.
 
-use crate::application::structured_task::StructuredTaskError;
-use tauqe_core::execution::structured::StructuredError;
+use crate::workflows::structured::{StructuredFailure, StructuredTaskError};
+use tauqe_core::execution::budget::InputLimitExceeded;
 use tauqe_core::review::parser::SingleReviewOutput;
 use tauqe_core::review::synthesis::{
     materialize_review, EmptyReviewResponse, ReviewSynthesisMetadata,
@@ -14,6 +14,8 @@ pub enum ReviewSynthesisCompletionError {
     Cancelled,
     #[error("{0}")]
     Provider(String),
+    #[error(transparent)]
+    InputLimit(#[from] InputLimitExceeded),
     #[error(transparent)]
     EmptyResponse(#[from] EmptyReviewResponse),
 }
@@ -32,43 +34,18 @@ impl ReviewSynthesisStream {
         }
         let output = match result {
             Ok(output) => output,
-            Err(
-                StructuredTaskError::Cancelled
-                | StructuredTaskError::Request(StructuredError::Cancelled),
-            ) => {
-                return Err(ReviewSynthesisCompletionError::Cancelled);
-            }
-            Err(StructuredTaskError::Request(StructuredError::Empty)) => {
-                return Err(EmptyReviewResponse.into());
-            }
-            Err(StructuredTaskError::Request(StructuredError::Decode(message)))
-                if message == "Model returned an empty review" =>
-            {
-                return Err(EmptyReviewResponse.into());
-            }
-            Err(
-                StructuredTaskError::Stream(message)
-                | StructuredTaskError::Task(message)
-                | StructuredTaskError::Request(StructuredError::Failed(message))
-                | StructuredTaskError::Request(StructuredError::Decode(message)),
-            ) => {
-                return Err(ReviewSynthesisCompletionError::Provider(message));
-            }
-            Err(StructuredTaskError::Request(StructuredError::Incomplete)) => {
-                return Err(ReviewSynthesisCompletionError::Provider(
-                    "Structured request closed without Done".into(),
-                ));
-            }
-            Err(StructuredTaskError::ForeignOperation) => {
-                return Err(ReviewSynthesisCompletionError::Provider(
-                    "review synthesis requires an active operation for this session".into(),
-                ));
-            }
-            Err(StructuredTaskError::Orphaned) => {
-                return Err(ReviewSynthesisCompletionError::Provider(
-                    "review synthesis task did not stop within its exit deadline".into(),
-                ));
-            }
+            Err(error) => match error.classify("review synthesis") {
+                StructuredFailure::Cancelled => {
+                    return Err(ReviewSynthesisCompletionError::Cancelled);
+                }
+                StructuredFailure::Empty => {
+                    return Err(EmptyReviewResponse.into());
+                }
+                StructuredFailure::InputLimit(error) => return Err(error.into()),
+                StructuredFailure::Failed(message) | StructuredFailure::Decode(message) => {
+                    return Err(ReviewSynthesisCompletionError::Provider(message));
+                }
+            },
         };
         Ok(materialize_review(metadata, output))
     }
@@ -77,6 +54,7 @@ impl ReviewSynthesisStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_core::execution::structured::StructuredError;
     use tauqe_core::models::ModelRef;
 
     fn metadata() -> ReviewSynthesisMetadata {
@@ -122,6 +100,27 @@ mod tests {
             ReviewSynthesisStream::finish(Err(StructuredTaskError::Cancelled), metadata(), false),
             Err(ReviewSynthesisCompletionError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn input_limit_remains_typed_after_completion() {
+        let limit = InputLimitExceeded {
+            size: 12,
+            limit: 1,
+            messages: 5,
+            response_format: 4,
+            adapter_and_framing: 3,
+        };
+        let result = ReviewSynthesisStream::finish(
+            Err(StructuredTaskError::Request(StructuredError::InputLimit(
+                limit,
+            ))),
+            metadata(),
+            false,
+        );
+        assert!(
+            matches!(result, Err(ReviewSynthesisCompletionError::InputLimit(error)) if error.size == 12 && error.limit == 1)
+        );
     }
 
     #[test]
